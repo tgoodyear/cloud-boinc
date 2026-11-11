@@ -1,32 +1,38 @@
-# AI Usage Policy
+# Working in this repository
 
-## Responsibility and enforcement
+This is cloud-boinc, a fork of [BOINC/boinc](https://github.com/BOINC/boinc) that re-implements
+the BOINC project server on Cloudflare Workers. The design is in
+[cloud/docs/architecture.md](cloud/docs/architecture.md).
 
-These rules apply to all public contributions and interactions, no matter how they're done.
+## Layout
 
-The entity operating or authorizing the contributions and interactions is responsible for them.
-AI assistance does not relieve contributors of responsibility for their work. "The AI did it" is not an excuse.
+- `cloud/` holds everything this fork adds. Work happens here.
+- The rest of the tree is upstream BOINC, kept unmodified as the behaviour reference and as the
+  source of the client used in end-to-end tests. The `master` branch tracks upstream; `main` is
+  this fork's default branch.
 
-Violations may result in contributions being closed without further comment.
-Cases of deception, evasion, or repeat violations may result in account bans.
+## AI-assisted work and upstream
 
-## Permitted and prohibited uses
+Code under `cloud/` is written with AI assistance and reviewed in this repository.
 
-Allowed:
-- All AI usage that *remains* non-public (e.g. questions, reviews, local experiments).
-- Machine and AI translations (e.g. a human translating their comments before submission).
-- Any contributions, *IF* a human has *personally* read, understood, and verified the complete change.
-- Bug reports and code reviews, *IF* AI-use is disclosed *AND* a human has personally verified all findings and evidence.
+BOINC has its own
+[AI usage policy](https://github.com/BOINC/boinc/blob/master/AGENTS.md) for contributions to
+BOINC. It applies to anything sent to BOINC/boinc, so:
 
-Banned:
-- Any AI-use in public contributions and interactions not explicitly allowed above.
-  In particular, AI-authored interactions (GitHub comments, etc.) not explicitly permitted above are banned.
-- Commits with `Co-authored-by`, crediting an AI.
+- Pull requests, issues and comments from agents go to `tgoodyear/cloud-boinc` only, with `main`
+  as the base branch. Always pass `--repo tgoodyear/cloud-boinc --base main` to `gh pr create`;
+  a fork's default PR target is the upstream repository.
+- Agents do not open pull requests, issues or comments on BOINC/boinc. A change intended for
+  upstream is prepared, verified and submitted by a person under the upstream policy.
+- Do not edit files outside `cloud/`, `AGENTS.md`, `CLAUDE.md` and `.github/workflows/cloud-*.yml`
+  unless the task is a merge from upstream.
 
-Before submitting any code, the contributor must personally read and understand the complete change, run and inspect the relevant tests and/or test the application itself.
-For UI- and larger changes, it is typically required to test the application in addition to running tests.
+## Rules for `cloud/`
 
-## Instructions for agents
-
-Read this policy and [a more detailed BOINC AI Assistants Usage Policy](https://github.com/BOINC/boinc/wiki/Contributing-to-BOINC-with-AI-assistants) before acting. If the requested work is prohibited, STOP.
-Explain the restriction to the requester. Attempting a workaround is considered a deception.
+- Rust, formatted with `cargo fmt`, clean under `cargo clippy --all-targets -- -D warnings`.
+- Protocol and policy code lives in the plain crates (`cb-proto`, `cb-crypto`, `cb-core`) and is
+  tested natively. Worker crates stay thin.
+- Every SQL statement goes through the `Db` trait so it runs on both SQLite and D1.
+- Scripts and CLI commands take named flags, not positional arguments.
+- Documentation cites files by path and function or setting name, not by line number.
+- Tests and development use only a deployment's own dev hostname, database, bucket and keys.
