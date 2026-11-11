@@ -789,8 +789,13 @@ impl PrefsForm {
 
     /// `global_prefs_make_xml` / `project_prefs_make_xml`. Global
     /// preferences get `now` as their `<mod_time>`, so that clients take
-    /// them in place of their own copy.
+    /// them in place of their own copy, but never less than one second after
+    /// the `<mod_time>` they replace (`p.mod_time`, as stored): the scheduler
+    /// sends preferences only when the stored `<mod_time>` is greater than
+    /// the one the client has, and two saves within a second would otherwise
+    /// carry the same one.
     pub fn write(&self, p: &Prefs, now: i64) -> String {
+        let now = now.max(p.mod_time.floor() as i64 + 1);
         let root = match self.subset {
             Subset::Global => "global_preferences",
             Subset::Project => "project_preferences",

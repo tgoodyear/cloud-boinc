@@ -825,9 +825,10 @@ refused with `ERR_DB_NOT_UNIQUE` when another account has it, by the `WHERE` cla
 `password_hash` with it. The stored hash depends on the address, so a request that names the
 address or gives a hash writes only if the address and hash are still the ones read with the
 account (as the site's password and email actions do); if a site request changed them meanwhile,
-nothing is written and the reply is `ERR_RETRY`. Project preferences without a `<project_specific>`
-part inherit the stored one, so that write is conditional on `project_prefs` being still what was
-read; a site save of the application selection or task limit in between is not undone. `teamid` is accepted and ignored until there are
+nothing is written and the reply is `ERR_RETRY`. A project preferences document without a `<project_specific>`
+part inherits the stored one (or has none, if none was stored), so that write is conditional on
+`project_prefs` being still what was read; a site save of the application selection or task limit
+in between, including the first one, is not undone. `teamid` is accepted and ignored until there are
 teams, and the consent fields are ignored. A new address is also refused when it is another
 account's previous address within the seven days of an undo link (see Email); an address change
 is refused within seven days of the last change and otherwise records the previous address as
@@ -926,9 +927,12 @@ links in mail) is not sent to a site it links to. The list is `SITE_HEADERS` in
 
 The preference documents are read and written by `cloud/crates/cb-core/src/prefs.rs` in
 upstream's formats (`html/inc/prefs.inc`, `prefs_project.inc`), and they are what the scheduler
-already sends: a save of computing preferences sets `<mod_time>` to the current time, so the
-scheduler's comparison with the client's copy (`handle_request` in
-`cloud/crates/cb-core/src/scheduler.rs`) sends the new set on the next request; project
+already sends: a save of computing preferences sets `<mod_time>` to the current time, and to at
+least one second more than the `<mod_time>` it replaces (`PrefsForm::write`), so that two saves
+within a second still differ and the scheduler's comparison with the client's copy
+(`handle_request` in `cloud/crates/cb-core/src/scheduler.rs`, which sends preferences only when the
+stored one is newer) sends the new set on the next request; removing a venue's set stamps the same
+way; project
 preferences go out in every reply. Each document has a main set and optional sets for the
 venues `home`, `school` and `work`; a computer whose venue matches uses that set. A new venue set
 starts as a copy of the main one, as upstream's `add_venue.php`. The default venue for new

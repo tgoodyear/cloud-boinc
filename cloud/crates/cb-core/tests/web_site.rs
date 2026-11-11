@@ -3933,3 +3933,112 @@ fn the_address_form_says_only_what_the_change_changes() {
     assert!(without.body.contains("your cross-project ID."));
     assert!(!without.body.contains("weak account key"));
 }
+
+// ---------------------------------------------------------------------------
+// Follow-ups to the account and preference pages.
+
+#[test]
+fn am_set_info_does_not_undo_a_first_project_specific_block() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.sql(
+        "UPDATE user SET project_prefs = '<project_preferences>\n<resource_share>5</resource_share>\n</project_preferences>\n'",
+    );
+    let from_the_manager =
+        "<project_preferences>\n<resource_share>7</resource_share>\n</project_preferences>\n";
+    // A site save adds the first task limit after the RPC read the account:
+    // there was no block to keep, but the write must not drop the new one.
+    let racing = changed_meanwhile(
+        &w,
+        stmt!(
+            "UPDATE user SET project_prefs = '<project_preferences>\n<resource_share>5</resource_share>\n<project_specific>\n<max_jobs>3</max_jobs>\n</project_specific>\n</project_preferences>\n' WHERE id = ?",
+            ada.id
+        ),
+    );
+    let params: Params = [
+        ("account_key", ada.auth.as_str()),
+        ("project_prefs", from_the_manager),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        NOW,
+        &params,
+    ))
+    .unwrap();
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    assert!(w
+        .user(ada.id)
+        .project_prefs
+        .contains("<max_jobs>3</max_jobs>"));
+    assert!(w.user(ada.id).project_prefs.contains("<resource_share>5<"));
+    // Asked again, it writes and keeps the block.
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            ("project_prefs", from_the_manager),
+        ],
+    );
+    assert!(reply.contains("<success/>"), "{reply}");
+    let stored = w.user(ada.id).project_prefs;
+    assert!(stored.contains("<max_jobs>3</max_jobs>") && stored.contains("<resource_share>7<"));
+}
+
+#[test]
+fn each_computing_preferences_save_gets_a_later_mod_time() {
+    use cb_core::prefs::{PrefsForm, Subset};
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let global = PrefsForm::new(Subset::Global, &w.project);
+    let fields: Vec<(String, String)> =
+        global.form_values(&global.defaults()).into_iter().collect();
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mod_time = || {
+        cb_proto::sched_request::GlobalPrefs::parse(&w.user(ada.id).global_prefs, "").mod_time
+            as i64
+    };
+    let save = |venue: Option<&str>| {
+        let mut q = vec![("subset", "global")];
+        q.extend(venue.map(|v| ("venue", v)));
+        let form = w.get("/prefs_edit.php", Some(&ada.auth), &q);
+        assert_eq!(
+            w.submit(&form, "/prefs_edit.php", Some(&ada.auth), &pairs)
+                .0
+                .status,
+            303
+        );
+    };
+    // Three saves in the same second: each is newer than the one before,
+    // so a client that has the first still takes the next.
+    save(None);
+    assert_eq!(mod_time(), NOW);
+    save(None);
+    assert_eq!(mod_time(), NOW + 1);
+    save(Some("work"));
+    assert_eq!(mod_time(), NOW + 2);
+    // So is the removal of a venue's set.
+    let confirm = w.get(
+        "/prefs_remove.php",
+        Some(&ada.auth),
+        &[("subset", "global"), ("venue", "work")],
+    );
+    assert_eq!(
+        w.submit(&confirm, "/prefs_remove.php", Some(&ada.auth), &[])
+            .0
+            .status,
+        303
+    );
+    assert_eq!(mod_time(), NOW + 3);
+    // And a later clock still wins.
+    w.at(100);
+    save(None);
+    assert_eq!(mod_time(), NOW + 100);
+}

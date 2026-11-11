@@ -457,9 +457,14 @@ pub async fn am_set_info(
             ));
         }
         let merged = crate::prefs::keep_project_specific(&project_prefs, &user.project_prefs);
-        // The stored block came from the row read above; a site save of the
-        // application selection or task limit since would be undone.
-        keeps_stored_prefs = merged != project_prefs;
+        // A document without its own `<project_specific>` replaces whatever
+        // the account has there now: the block read above if there was one
+        // (it is kept), or none (a site save that adds the first task limit
+        // or application selection since would be lost). Either way the write
+        // is conditional on `project_prefs` being still what was read.
+        keeps_stored_prefs = !project_prefs
+            .to_ascii_lowercase()
+            .contains("<project_specific>");
         let project_prefs = merged;
         if project_prefs.len() > crate::prefs::MAX_PREFS_BYTES {
             return Ok(write_error(err::ERR_BUFFER_OVERFLOW, None));
