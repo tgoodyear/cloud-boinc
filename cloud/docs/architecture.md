@@ -31,7 +31,7 @@ In scope, because the reference deployment uses it:
 | --- | --- |
 | Scheduler | account keys and weak keys, host records, result reporting, work requests for CPU and GPU, plan classes (container, NVIDIA, AMD, Intel, Apple GPU, multi-thread), client-version floors, batch and workunit-ID gates, per-app weights, assigned (targeted) jobs, `one_result_per_host_per_wu`, in-progress and daily limits, lost-result resend, request back-off |
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
-| Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits and checksums |
+| Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits, checksums and resume |
 | Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
 | Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
@@ -179,6 +179,7 @@ One bucket per project.
 | --- | --- | --- | --- |
 | `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
+| `partial/<name>/<md5>/<start>` | pieces of unfinished uploads over 8 MiB (see "Upload") | files Worker | until the file is finished, else by bucket lifecycle rule |
 | `archive/<date>/` | purged workunit and result rows, as JSON lines, one object per purge pass | pipeline cron | by bucket lifecycle rule |
 
 Names are flat. The stock fan-out directories exist to keep directory sizes down on a POSIX
@@ -532,9 +533,24 @@ repeats the deletes, which is harmless because an R2 delete of a missing object 
 
 ### Validation
 
+Whatever the validator, a result is accepted only if every required output file (a `<file_ref>`
+not marked `<optional/>`, whether or not it is `<no_validate/>`) that the client is told to
+upload is stored under `upload/` (`output_stats` in `crates/cb-core/src/pipeline.rs`, called
+from `fingerprints`). The client is told to upload a file when its `<file_info>` has an upload
+URL (`FILE_INFO::uploadable`: a `<url>` containing `file_upload_handler`, or an `<upload_url>`);
+a file without one stays on the client, which reports the result without it
+(`RESULT::is_upload_done`), so no object exists for it and it is not looked up
+(`uploadable` in `OutputFile`, `crates/cb-core/src/template.rs`). Assimilation lists, and clean-up
+deletes, outputs by name and treat a missing object as nothing to do, so they need no change. A result with
+a required, uploadable output missing is a validate error and the work is issued again; an output marked
+optional may be absent. This matters because a client counts an upload as done when the
+server's size answer is at least its file's size (see "Upload"), so a result can arrive whose
+output was never stored. The check is one head per required output of each result not yet
+validated; the canonical result is not looked up again beside a late result.
+
 Per app, one of:
 
-- `trivial`: any successful result is valid (quorum 1 apps).
+- `trivial`: any successful result with its outputs stored is valid (quorum 1 apps).
 - `bitwise`: results agree when every output file has the same MD5. Upload stores each
   object's MD5, so comparison reads metadata, not file bodies.
 - `webhook`: the pipeline posts the workunit, the candidate results and short-lived signed
@@ -586,13 +602,182 @@ R2 with the client's MD5 as an integrity check. A stored output is never replace
 is conditional on the object not existing, so a second upload of the same name cannot change a
 file a result was validated against.
 
-Two differences from the stock handler:
+An upload cut off part-way resumes as it does with the stock handler. A client asks
+`<get_file_size>` before sending a file of 8 KB or more, and again after a failed attempt that
+sent any bytes, then sends the rest of the file with `<offset>` set to the answer
+(`FILE_XFER::init_upload` in `client/file_xfer.cpp`). The stock handler appends to the file on
+disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receive`,
+`file_size`) keeps the bytes in pieces:
 
-- No partial-file resume. An interrupted upload starts again from zero (`get_file_size`
-  answers 0 until the object is complete). The stock handler appends to a file at an offset,
-  which an object store cannot do.
-- One upload request is limited by the zone plan's request body limit (100 MB on Free and Pro).
-  Larger outputs need the client's `gzip_when_done` or a higher plan.
+- The file is divided on a fixed grid of 8 MiB (`PIECE_BYTES`). Each grid piece that ends
+  before the last byte of the file is stored as its own object, `partial/<name>/<md5>/<start>`,
+  as soon as its bytes have arrived. A put is atomic, so a piece exists only if all its bytes
+  do. `<md5>` is the whole-file `<md5_cksum>` the client sent, so pieces of two different files
+  that share a name never share a key, and a request reuses only the pieces under its own MD5.
+  A request whose `<md5_cksum>` is missing or not an MD5 writes no pieces: its file goes into
+  one put and no earlier piece is reused (stock clients always send the checksum: they compute
+  it when the task ends, `md5_file` in `client/cs_apps.cpp`, and put it in every upload
+  request, `FILE_XFER::init_upload`).
+- The last stretch of the file, 1 byte to 8 MiB long, is never a piece. The request that
+  carries it writes the finished object with one conditional put whose body is the stored
+  pieces read back in order followed by that tail from the request. R2 therefore holds the
+  MD5 of the whole object, checks it against the client's `<md5_cksum>`, and bitwise
+  validation keeps reading MD5s from metadata. Pieces are only composed with that check on.
+  The pieces are deleted afterwards.
+- `<get_file_size>` answers the size of the finished object, or else the pieces present
+  without a gap from offset 0, or 0 when pieces of more than one file are present. The tail
+  is never a piece, so that number is always below the size of the file that wrote the pieces.
+  A request whose data stops early keeps the pieces it finished; the bytes of the piece in
+  flight are lost and sent again. A dropped connection keeps pieces only with a zone rule; see
+  below.
+- A file of 8 MiB or less has no pieces: its upload is one head and one put, as before.
+
+Offsets follow `copy_socket_to_file` in `sched/file_upload_handler.cpp`. An offset beyond the
+bytes held is a transient error ("length of file ... < offset ..."), after which the client
+asks for the size again. An offset below them is accepted, and the bytes already held are read
+and dropped where upstream writes them again in place. One difference: upstream answers
+success to an offset at or past the end of the file without reading anything; here that is
+the same transient error, because this handler never reports success for a file it does not
+hold.
+
+File bytes do not pass through the Worker's WebAssembly. The Rust code reads and parses the
+header from the first chunks of the body; everything after it is moved by a small JavaScript
+module, `workers/files/src/upload.js` (`Splitter`), bound in `workers/files/src/store.rs`. It
+reads the body in blocks of up to 1 MiB with the runtime's `readAtLeast`, writes the next n
+bytes into a `FixedLengthStream` for each piece put (`take`), and for the finished object pipes
+the stored pieces, opened one at a time, and then the tail into one `FixedLengthStream`
+(`compose`). The Rust side passes those streams to `Bucket::put` and reads two flags back to
+classify a failure: the body ended early (`failed`) or a piece could not be read (`missing`).
+CPU time per request, measured on the dev deployment: 4 to 26 ms for a 1 MB upload (was 57 to
+84 ms with the bytes in wasm), 30 to 42 ms for a 20 MB upload from offset 0 (was 500 to
+1,550 ms), 17 to 30 ms for the resumed second half of a 20 MB upload (was 190 to 600 ms, with
+some requests stopped for exceeding the CPU limit), and 46 to 53 ms for the last 35 MB of a
+60 MB upload. That is about 1 ms per MB moved, so the Free plan's CPU limit is not what bounds
+the size of an upload.
+
+What a dropped connection keeps depends on one zone setting. By default Cloudflare holds the
+whole request body before it starts the Worker. A real client announces the length of its
+request (`HTTP_OP::libcurl_exec` in `client/http_curl.cpp`), and on the dev deployment a 4 MB
+and a 30 MB request sent over 10 seconds each started the Worker only when their last byte had
+arrived. A request whose connection drops never runs: there was no Worker invocation for the
+dropped requests, so nothing is kept, `<get_file_size>` reports 0, and the client sends the
+file again from the start.
+
+A Configuration Rule with `request_body_buffering` set to `none`, matched to the deployment's
+hostname and to paths that start with `/upload/`, makes the body stream to the Worker (setup in
+`docs/deploy.md`). The Free plan accepted the rule. Cloudflare's caution is that with `none`,
+products that inspect request bodies, such as the WAF, do not see them for matching requests.
+Upload bodies here are checked by the upload certificate signature, the size limit and the MD5.
+
+With the rule on, the upload runs under `wait_until` (`fetch` in `workers/files/src/lib.rs`),
+so a piece whose bytes all arrived before the disconnect is still stored. Measured on the dev
+deployment: a 20 MB upload cut by dropping the connection at 12 MB, then a size query 3
+seconds later, reported 8388608 bytes held, and the client resumed from there (4 of 4 uploads;
+every result reported, no errors). The dropped requests appear in Worker telemetry with outcome
+`canceled` and 15 to 19 ms of CPU. A size query sent immediately after the drop got 0, and the
+file was sent again whole and stored. An immediate query can be too early, because the Worker
+is still storing the piece. The stock client waits before it retries a transfer.
+
+CPU time per request with the rule on: 3 to 5 ms for a 1 MB upload, 14 to 38 ms for a 20 MB
+upload from offset 0, and 22 to 28 ms for a resumed 20 MB upload. No request stopped for
+exceeding the CPU limit.
+
+A complete request whose data stops early (a client that hit its own error) keeps its finished
+pieces with or without the rule.
+
+A recomputed file under an old name. A task the server sends again after the client lost it
+(`resend_lost_work` in `sched/sched_resend.cpp`; the scheduler Worker's lost-result resend)
+runs again and uploads under the same names, because the names and their signed certificates
+are made when the result is created and the scheduler Worker holds no upload key. If the
+first attempt left pieces and the new output differs, three cases follow:
+
+- The new upload request has other contents (another MD5): the old pieces are not reused. The
+  request drops them and, if its offset was the one the size query gave, is answered with a
+  transient error; the client asks again, hears 0 and sends the file from the start. The
+  finished object is exactly the new file. Nothing from the old attempt can end up in it.
+- The new request has no valid MD5: the same, and the file is sent whole in one put.
+- The size query comes first and reports the old pieces, and the new file is no longer than
+  they are. The query carries only the name, so the server cannot know this, and the stock
+  client counts the upload as done without sending a request (`FILE_XFER_SET::poll`: a
+  reported size at least the file's size). This is the stock handler's behaviour too, with
+  the old bytes on disk as the answer, and there the stale file stays as the output. Here
+  nothing is stored under the finished name, so the pipeline rejects the result for its
+  missing output, whatever the validator (see "Validation"), and the work is issued again; a
+  wrong file is never served. Closing this fully needs the attempt to be known when the size query
+  arrives. A result's upload names cannot change per attempt (they are signed), and the
+  scheduler Worker has no bucket binding to clear the pieces when it resends a result. One way
+  is for the resend to set `sent_time` as the stock scheduler does and for the size query to
+  ignore pieces older than it; that is not built. The regression tests
+  (`a_recomputed_file_never_mixes_with_an_earlier_attempt` in `crates/cb-core/tests/upload.rs`)
+  pin both outcomes, and `a_result_without_its_finished_output_is_not_accepted_by_any_validator`
+  in `crates/cb-core/tests/pipeline.rs` drives the result through validation.
+
+Every request passes the same checks before any byte is stored, whatever its offset
+(`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
+the name. The finished object is exactly `<nbytes>` long, so pieces left by an earlier attempt
+cannot make it longer. A stored file is never replaced or appended to: a request for a name
+that is stored gets success if the size and the MD5 match (the size alone when the request
+has no valid MD5) and a permanent error if not, and writes
+nothing.
+
+Failure cases:
+
+- The finished object's put is refused with the body and pieces intact (the MD5 does not
+  match: pieces stored under this MD5 hold other bytes): the pieces are deleted and the client
+  is told to start again, so a retry cannot fail the same way forever.
+- A piece cannot be read back (it expired, or a request that finished the file deleted it):
+  transient error, pieces kept; the next size query reports what is left.
+- Two requests for the same file: pieces sit on a fixed grid, so they write the same keys with
+  the same bytes, and the conditional put lets only one finished object exist. The loser is
+  answered as a retry of a stored file. Pieces written after another request finished the file
+  are never read again.
+- Stale pieces, from uploads that are never finished or from a lost race, are removed by a
+  bucket lifecycle rule on `partial/` (see `docs/deploy.md`). The rule removes the oldest piece
+  first, and that ends what is held at its start, so a client whose pieces expired starts
+  again from 0.
+
+R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
+(`one_shot_upload_costs_a_head_and_a_put`, `large_upload_writes_pieces_then_one_object`):
+
+| Request | Operations |
+| --- | --- |
+| Upload of a file of 8 MiB or less from offset 0 | 1 head, 1 put (unchanged) |
+| Upload of a larger file from offset 0, with n pieces | 1 head, 1 list, n + 1 puts, n gets, 1 delete |
+| Resumed upload | the same; pieces already held are not written again |
+| `<get_file_size>` | 1 head and 1 list, run together |
+
+No database query is added. The settings read on the upload path is unchanged. A retry of an
+upload for a stored file is one head, which now also reads the stored MD5.
+
+Validation adds R2 heads in the pipeline Worker: one per required output of each result that
+is validated, for the `trivial` validator too (`bitwise` and `webhook` already looked up every
+validated output). A transition does these one after another within one invocation, and a
+queue batch holds up to 25 workunits, so a batch with one result and one output per workunit
+is 25 heads.
+
+Alternatives not taken:
+
+- R2 multipart upload with a part per request. Parts other than the last must be at least
+  5 MiB and the same size, which a cut at any byte does not give, and a multipart object has
+  no MD5 for bitwise validation to read.
+- A row per upload in D1 recording the bytes held. A listing of `partial/<name>/` is strongly
+  consistent and holds the same facts, and a row would add a query to every upload, including
+  the common small ones.
+- Buffering the body in the Worker and writing on a cut. Work started after the disconnect
+  can only run under `wait_until`, which has a time limit, and memory is limited to 128 MB.
+  The streamed pieces already run under `wait_until`, so this adds nothing once the zone
+  rule is on.
+
+Limits:
+
+- One upload request is limited by the zone plan's request body limit (100 MB on Free and
+  Pro), and a client always sends from its offset to the end, so files above that limit still
+  need the client's `gzip_when_done` or a higher plan.
+- A file over 8 MiB is read back from R2 once more when it is finished. That costs R2 reads
+  and wall time, but little CPU time (see the figures above).
+- Resume after a dropped connection needs the `request_body_buffering` rule. Without it,
+  uploads work but restart from byte 0. A size query sent right after a drop can report less
+  than the Worker goes on to store.
 
 ## Keys and secrets
 
@@ -933,7 +1118,6 @@ Not implemented yet:
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
-- Upload resume, as described under Upload.
 - On the site: password reset and email login links, email address verification and change
   notices, invitation codes, consent records, merging and deleting computers, per-app details of
   a computer, cross-project statistics links and certificates, and anything that sends email.
@@ -953,5 +1137,4 @@ server.
 
 - Whether the queue is worth keeping once the sweep interval and scheduler-triggered
   transitions are measured.
-- Upload resume for large outputs (R2 multipart keyed by upload offset).
 - Importing an existing project's MySQL database, and cutting a live master URL over.

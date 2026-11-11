@@ -149,6 +149,7 @@ dependencies = [
  "cb-proto",
  "cb-sqlite",
  "futures-lite",
+ "futures-util",
  "regex",
  "serde",
  "serde_json",
@@ -192,15 +193,18 @@ dependencies = [
 name = "cb-files-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "cb-core",
- "cb-crypto",
  "cb-db",
  "cb-proto",
  "cb-worker",
- "futures-util",
- "hex",
+ "futures-channel",
+ "js-sys",
  "serde",
  "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "worker",
 ]
 

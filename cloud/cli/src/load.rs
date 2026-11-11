@@ -1,6 +1,13 @@
 //! `cboinc load`: simulated hosts that fetch work, upload an output file
 //! per result and report, the way a client does, with latencies measured.
+//!
+//! With `--cut-at`, every upload is first interrupted after that many bytes
+//! of file data, then resumed the way a client resumes it: a
+//! `<get_file_size>` query, and the rest of the file sent with `<offset>`
+//! set to the answer.
 
+use std::cell::Cell;
+use std::io::{self, Read};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,12 +44,65 @@ pub struct LoadArgs {
     /// Distinguishes the hosts of this run from those of another.
     #[arg(long, default_value = "load")]
     run_name: String,
+    /// Interrupt each upload after this many bytes of file data, then
+    /// resume it. Outputs no longer than this are sent whole.
+    #[arg(long)]
+    cut_at: Option<usize>,
+    /// How the first attempt is interrupted: `abort` drops the connection
+    /// in the middle of the request body; `short` sends a complete request
+    /// whose data stops at the cut.
+    #[arg(long, value_enum, default_value_t = CutMode::Abort)]
+    cut_mode: CutMode,
+    /// With `--cut-mode abort`, how long to wait after sending the last
+    /// byte before dropping the connection.
+    #[arg(long, default_value_t = 0)]
+    cut_pause_ms: u64,
+    /// How long to wait after the interrupted attempt before asking for
+    /// the size and resuming. A real client waits at least a minute.
+    #[arg(long, default_value_t = 0)]
+    resume_wait_ms: u64,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CutMode {
+    Abort,
+    Short,
+}
+
+/// A request body that fails after its `data`, and after a pause, so the
+/// HTTP client drops the connection part-way through the upload.
+struct CutBody {
+    data: Vec<u8>,
+    pos: usize,
+    pause: Duration,
+}
+
+impl Read for CutBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.data.len() {
+            thread::sleep(self.pause);
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "upload cut on purpose",
+            ));
+        }
+        let n = buf.len().min(self.data.len() - self.pos);
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 #[derive(Default)]
 struct Tally {
     sched_ms: Vec<f64>,
     upload_ms: Vec<f64>,
+    /// Every HTTP request a host sent, successful or not: scheduler
+    /// requests, uploads, the interrupted first attempts and size queries.
+    /// The timings above are only for the requests they name.
+    requests: u64,
+    /// Bytes the server reported holding after each cut upload.
+    resumed_from: Vec<u64>,
     results_received: u64,
     results_reported: u64,
     errors: Vec<String>,
@@ -82,6 +142,8 @@ struct Host {
     hostid: i64,
     seqno: u32,
     version_num: i32,
+    /// Requests sent so far, whether or not they succeeded.
+    requests: Cell<u64>,
     /// Results to report with the next request: `(name, <result> element)`.
     reports: Vec<(String, String)>,
 }
@@ -112,6 +174,7 @@ impl Host {
     fn sched(&mut self, work: bool, tally: &mut Tally) -> Result<Vec<Task>, String> {
         self.seqno += 1;
         let body = self.request_xml(work);
+        self.requests.set(self.requests.get() + 1);
         let started = Instant::now();
         let reply = self
             .agent
@@ -185,23 +248,89 @@ impl Host {
         Ok(tasks)
     }
 
-    fn upload(&self, info: &str, data: &[u8], tally: &mut Tally) -> Result<(), String> {
-        let url = element(info, "url").ok_or("upload: the file has no URL")?;
-        let mut body = format!(
-            "<data_server_request>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>0</core_client_minor_version>\n    <core_client_release>4</core_client_release>\n<file_upload>\n<file_info>{info}</file_info>\n<nbytes>{}</nbytes>\n<md5_cksum>{}</md5_cksum>\n<offset>0</offset>\n<data>\n",
+    fn upload_header(info: &str, data: &[u8], offset: usize) -> Vec<u8> {
+        format!(
+            "<data_server_request>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>0</core_client_minor_version>\n    <core_client_release>4</core_client_release>\n<file_upload>\n<file_info>{info}</file_info>\n<nbytes>{}</nbytes>\n<md5_cksum>{}</md5_cksum>\n<offset>{offset}</offset>\n<data>\n",
             data.len(),
             md5_hex(data)
         )
-        .into_bytes();
-        body.extend_from_slice(data);
-        let started = Instant::now();
-        let reply = self
-            .agent
+        .into_bytes()
+    }
+
+    fn post(&self, url: &str, body: &[u8]) -> Result<String, String> {
+        self.requests.set(self.requests.get() + 1);
+        self.agent
             .post(url)
-            .send_bytes(&body)
+            .send_bytes(body)
             .map_err(|e| format!("upload: {e}"))?
             .into_string()
-            .map_err(|e| format!("upload: {e}"))?;
+            .map_err(|e| format!("upload: {e}"))
+    }
+
+    /// The first, interrupted attempt and the size query after it. Returns
+    /// the offset to resume from.
+    fn cut_upload(&self, url: &str, info: &str, data: &[u8], cut: usize) -> Result<usize, String> {
+        let mut body = Self::upload_header(info, data, 0);
+        body.extend_from_slice(&data[..cut]);
+        match self.args.cut_mode {
+            CutMode::Short => {
+                let reply = self.post(url, &body)?;
+                if element(&reply, "status") == Some("0") {
+                    return Err(format!(
+                        "upload: a cut upload was answered with success: {}",
+                        reply.replace('\n', " ")
+                    ));
+                }
+            }
+            // The request fails on the client side; what matters is what the
+            // server kept. Like a real client (`HTTP_OP::libcurl_exec` in
+            // `client/http_curl.cpp`), it announces the length of the whole
+            // request.
+            CutMode::Abort => {
+                let full = body.len() - cut + data.len();
+                self.requests.set(self.requests.get() + 1);
+                let _ = self
+                    .agent
+                    .post(url)
+                    .set("Content-Length", &full.to_string())
+                    .send(CutBody {
+                        data: body,
+                        pos: 0,
+                        pause: Duration::from_millis(self.args.cut_pause_ms),
+                    });
+            }
+        }
+        thread::sleep(Duration::from_millis(self.args.resume_wait_ms));
+        let name = element(info, "name").ok_or("upload: the file has no name")?;
+        let query = format!(
+            "<data_server_request>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>0</core_client_minor_version>\n    <core_client_release>4</core_client_release>\n    <get_file_size>{name}</get_file_size>\n</data_server_request>\n"
+        );
+        let reply = self.post(url, query.as_bytes())?;
+        let held: usize = element(&reply, "file_size")
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("get_file_size: {}", reply.replace('\n', " ")))?;
+        if held > cut {
+            return Err(format!(
+                "get_file_size: the server reports {held} bytes of {name}, but only {cut} were sent"
+            ));
+        }
+        Ok(held)
+    }
+
+    fn upload(&self, info: &str, data: &[u8], tally: &mut Tally) -> Result<(), String> {
+        let url = element(info, "url").ok_or("upload: the file has no URL")?;
+        let offset = match self.args.cut_at {
+            Some(cut) if cut < data.len() => {
+                let held = self.cut_upload(url, info, data, cut)?;
+                tally.resumed_from.push(held as u64);
+                held
+            }
+            _ => 0,
+        };
+        let mut body = Self::upload_header(info, data, offset);
+        body.extend_from_slice(&data[offset..]);
+        let started = Instant::now();
+        let reply = self.post(url, &body)?;
         tally.upload_ms.push(started.elapsed().as_secs_f64() * 1e3);
         if element(&reply, "status") != Some("0") {
             return Err(format!("upload: {}", reply.replace('\n', " ")));
@@ -260,6 +389,7 @@ impl Host {
                 self.reports.len()
             ));
         }
+        tally.requests = self.requests.get();
         tally
     }
 }
@@ -296,6 +426,7 @@ pub fn run(args: &LoadArgs) -> Result<(), String> {
                 hostid: 0,
                 seqno: 0,
                 version_num: 0,
+                requests: Cell::new(0),
                 reports: Vec::new(),
             };
             thread::spawn(move || host.run())
@@ -306,12 +437,14 @@ pub fn run(args: &LoadArgs) -> Result<(), String> {
         let t = h.join().map_err(|_| "a host thread panicked".to_string())?;
         total.sched_ms.extend(t.sched_ms);
         total.upload_ms.extend(t.upload_ms);
+        total.requests += t.requests;
+        total.resumed_from.extend(t.resumed_from);
         total.results_received += t.results_received;
         total.results_reported += t.results_reported;
         total.errors.extend(t.errors);
     }
     let seconds = started.elapsed().as_secs_f64();
-    let requests = total.sched_ms.len() + total.upload_ms.len();
+    let requests = total.requests;
     let failed = !total.errors.is_empty();
     total.errors.sort();
     total.errors.dedup();
@@ -324,6 +457,11 @@ pub fn run(args: &LoadArgs) -> Result<(), String> {
             "requests_per_second": (requests as f64 / seconds * 10.0).round() / 10.0,
             "scheduler": summary(total.sched_ms),
             "upload": summary(total.upload_ms),
+            "resumed_uploads": total.resumed_from.len(),
+            "resumed_from_bytes": {
+                "min": total.resumed_from.iter().min(),
+                "max": total.resumed_from.iter().max(),
+            },
             "results_received": total.results_received,
             "results_reported": total.results_reported,
             "errors": total.errors,
@@ -334,4 +472,112 @@ pub fn run(args: &LoadArgs) -> Result<(), String> {
         return Err("some requests failed".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// A server on the loopback interface that answers the three requests
+    /// of one cut upload: the interrupted attempt (an error), the size
+    /// query, and the resumed upload.
+    fn serve(listener: TcpListener) {
+        thread::spawn(move || {
+            let mut uploads = 0;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head_end, length) = loop {
+                    let n = stream.read(&mut chunk).unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (i + 4, length);
+                    }
+                };
+                while buf.len() < head_end + length {
+                    let n = stream.read(&mut chunk).unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
+                let reply = if body.contains("<get_file_size>") {
+                    "<data_server_reply><status>0</status><file_size>0</file_size></data_server_reply>"
+                } else {
+                    uploads += 1;
+                    if uploads == 1 {
+                        "<data_server_reply><status>1</status></data_server_reply>"
+                    } else {
+                        "<data_server_reply><status>0</status></data_server_reply>"
+                    }
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn a_cut_upload_counts_all_three_requests_and_times_only_the_last() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/upload/file_upload_handler",
+            listener.local_addr().unwrap()
+        );
+        serve(listener);
+        let args = LoadArgs {
+            url: url.clone(),
+            authenticator: "a".into(),
+            platform: "p".into(),
+            hosts: 1,
+            rounds: 1,
+            work_seconds: 1.0,
+            output_bytes: 100,
+            think_ms: 0,
+            run_name: "t".into(),
+            cut_at: Some(10),
+            cut_mode: CutMode::Short,
+            cut_pause_ms: 0,
+            resume_wait_ms: 0,
+        };
+        let host = Host {
+            args,
+            index: 0,
+            agent: ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(10))
+                .build(),
+            hostid: 0,
+            seqno: 0,
+            version_num: 0,
+            requests: Cell::new(0),
+            reports: Vec::new(),
+        };
+        let info = format!("<name>f</name><url>{url}</url><max_nbytes>1000</max_nbytes>");
+        let mut tally = Tally::default();
+        host.upload(&info, &[7u8; 100], &mut tally).unwrap();
+        // The interrupted attempt, the size query and the resumed upload.
+        assert_eq!(host.requests.get(), 3);
+        // Only the resumed upload is timed as an upload.
+        assert_eq!(tally.upload_ms.len(), 1);
+        assert_eq!(tally.resumed_from, [0]);
+
+        // Without a cut, one request.
+        let mut host = host;
+        host.args.cut_at = None;
+        host.requests.set(0);
+        let mut tally = Tally::default();
+        host.upload(&info, &[7u8; 100], &mut tally).unwrap();
+        assert_eq!(host.requests.get(), 1);
+    }
 }

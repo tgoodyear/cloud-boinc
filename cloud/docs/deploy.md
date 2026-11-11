@@ -56,8 +56,36 @@ the schema:
 cd workers/scheduler && npx wrangler d1 migrations apply cloud-boinc-dev --remote
 ```
 
+Unfinished uploads over 8 MiB leave pieces under `partial/` (see "Upload" in
+[architecture.md](architecture.md)). A finished upload deletes its own; give the bucket a
+lifecycle rule for the ones that are never finished:
+
+```
+npx wrangler r2 bucket lifecycle add cloud-boinc-dev --name partial --prefix partial/ --expire-days 14
+```
+
+A client whose pieces expired is told it holds fewer bytes and sends the file again from the
+start.
+
 The hostname needs a proxied DNS record in the zone. An `AAAA` record pointing at `100::` is
 enough, since the routes answer every path.
+
+Add a Configuration Rule so that an upload that is cut off part-way can resume. By default
+Cloudflare holds a whole request body before it starts the Worker, so a request whose
+connection drops never runs and nothing is kept. The rule makes the body stream to the Worker.
+In the dashboard it is under Rules > Configuration Rules. As a ruleset in the zone's
+`http_config_settings` phase it is:
+
+```
+expression: (http.host eq "<hostname>" and starts_with(http.request.uri.path, "/upload/"))
+action:     set_config
+action_parameters: { "request_body_buffering": "none" }
+```
+
+The Free plan accepts this rule. Cloudflare notes that products that inspect request bodies,
+such as the WAF, do not see the bodies of requests that match. The upload bodies here are
+checked by the upload certificate signature, the size limit and the MD5. Without the rule,
+uploads work, but after a dropped connection they restart from byte 0.
 
 ## Workers
 
@@ -116,6 +144,30 @@ cboinc load --authenticator <key> --hosts 4 --rounds 3
 
 `cboinc load` runs simulated hosts against jobs already submitted. It reports made-up
 results for those jobs, so use a deployment that holds test jobs and nothing else.
+
+To check upload resume, submit test jobs whose result template allows outputs above one
+piece (`<max_nbytes>` of at least `--output-bytes`), then cut every upload part-way:
+
+```
+cboinc submit --app <test app> --input-template <file> --result-template <file with max_nbytes 30000000> --count 4
+cboinc load --authenticator <key> --hosts 2 --rounds 2 --output-bytes 20000000 --cut-at 12000000 --cut-mode abort
+```
+
+Each upload is first sent with the connection dropped after 12,000,000 bytes of file data
+(`--cut-mode short` sends a complete request whose data stops there instead), then the host
+asks `<get_file_size>` and sends the rest from the offset it hears, as a client does. The run
+fails if the server reports more bytes than were sent or refuses the resumed upload; the final
+put checks the MD5 of the whole file, so a success means the stored file is byte-identical.
+`resumed_from_bytes` in the output shows the offsets the server gave (multiples of 8 MiB).
+
+In `abort` mode the request announces the length of the whole file, as a client does;
+`--cut-pause-ms` waits that long after the last byte before dropping the connection, and
+`--resume-wait-ms` waits before the size query. In `abort` mode `resumed_from_bytes` is
+8388608 with the request body buffering rule above and 0 without it, because without the rule
+the Worker never sees a dropped request and the whole file is sent again. A size query sent
+immediately after the drop can be too early: the Worker may not have stored the piece yet, and
+it reports 0. Use `--resume-wait-ms` to leave a few seconds. `short` mode reports 8388608 either
+way (see "Upload" in [architecture.md](architecture.md)).
 
 ## Plan limits
 
