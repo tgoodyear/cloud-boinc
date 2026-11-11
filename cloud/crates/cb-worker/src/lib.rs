@@ -177,6 +177,14 @@ pub fn xml(body: String) -> Result<Response> {
         .fixed(body.into_bytes()))
 }
 
+/// Like [`xml`], for a reply that is UTF-8 and declares it.
+pub fn xml_utf8(body: String) -> Result<Response> {
+    Ok(Response::builder()
+        .with_header("Content-Type", "text/xml; charset=utf-8")?
+        .with_header("Cache-Control", "no-store")?
+        .fixed(body.into_bytes()))
+}
+
 pub fn text(status: u16, body: &str) -> Result<Response> {
     Ok(Response::builder()
         .with_status(status)

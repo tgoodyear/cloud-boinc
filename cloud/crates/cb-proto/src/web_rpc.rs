@@ -12,6 +12,10 @@ use std::fmt::Write as _;
 /// First line of every web RPC reply (`xml_header` in `html/inc/xml.inc`).
 pub const XML_HEADER: &str = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n";
 
+/// First line of the replies that carry non-ASCII text as UTF-8 (see
+/// `xml_escape_text`). Served as `text/xml; charset=utf-8`.
+pub const XML_HEADER_UTF8: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n";
+
 /// Error numbers from `lib/error_numbers.h`.
 pub mod err {
     pub const BOINC_SUCCESS: i32 = 0;

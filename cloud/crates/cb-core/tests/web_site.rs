@@ -212,6 +212,11 @@ fn am_get_info_takes_the_account_key_only() {
     assert!(reply.contains("<country>United+Kingdom</country>"));
     assert!(reply.contains("<show_hosts>1</show_hosts>"));
     assert!(reply.contains("<venue>home</venue>"));
+    // A non-ASCII venue stays UTF-8 under a UTF-8 declaration.
+    assert!(reply.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\""));
+    w.sql("UPDATE user SET venue = 'Jos\u{e9} \u{65e5}\u{672c}'");
+    let reply = block_on(am_get_info(&w.db, &ada.auth)).unwrap();
+    assert!(reply.contains("<venue>Jos\u{e9} \u{65e5}\u{672c}</venue>"));
     let user: cb_core::model::User = block_on(cb_db::query_one(
         &w.db,
         stmt!("SELECT * FROM user WHERE id = ?", ada.id),
@@ -301,7 +306,10 @@ fn show_user_xml_lists_computers_only_with_the_key() {
         None,
         &[("userid", &id), ("format", "xml")],
     );
-    assert_eq!(public.content_type, "text/xml");
+    assert_eq!(public.content_type, "text/xml; charset=utf-8");
+    assert!(public
+        .body
+        .starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\""));
     assert!(public.body.contains("<name>Ada &lt;b></name>"));
     assert!(public.body.contains("<country></country>"));
     assert!(!public.body.contains("<host>"));
@@ -319,6 +327,22 @@ fn show_user_xml_lists_computers_only_with_the_key() {
         &[("userid", "999"), ("format", "xml")],
     );
     assert_eq!(error_num(&missing.body), Some(-136));
+
+    // Non-ASCII text is kept as UTF-8, not split into one reference per byte.
+    let jose = w.account("jose@example.com", "secret", "Jos\u{e9} \u{65e5}\u{672c}");
+    w.host(jose.id, "caf\u{e9}-pc", NOW);
+    let reply = w.get(
+        "/show_user.php",
+        None,
+        &[("auth", &jose.auth), ("format", "xml")],
+    );
+    assert!(reply
+        .body
+        .contains("<name>Jos\u{e9} \u{65e5}\u{672c}</name>"));
+    assert!(reply
+        .body
+        .contains("<domain_name>caf\u{e9}-pc</domain_name>"));
+    assert!(!reply.body.contains("&#195;"));
 
     let html = w.get("/show_user.php", None, &[("userid", &id)]);
     assert!(html.body.contains("Ada &lt;b&gt;"));

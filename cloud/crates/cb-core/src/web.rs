@@ -8,9 +8,9 @@ use cb_db::{query_one, stmt, Db, Stmt};
 use cb_proto::consts::*;
 use cb_proto::web_rpc::{
     err, write_create_account, write_error, write_lookup_account, write_lookup_account_exists,
-    AccountError, ConfigPlatform, ProjectConfig, XML_HEADER,
+    AccountError, ConfigPlatform, ProjectConfig, XML_HEADER, XML_HEADER_UTF8,
 };
-use cb_proto::xml::xml_escape;
+use cb_proto::xml::{xml_escape, xml_escape_text};
 use serde::Serialize;
 
 use crate::model::{Host, User};
@@ -221,7 +221,7 @@ pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
         return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
     };
     Ok(format!(
-        "{XML_HEADER}<am_get_info_reply>\n    <success/>\n    <id>{}</id>\n<name>{}</name>\n\
+        "{XML_HEADER_UTF8}<am_get_info_reply>\n    <success/>\n    <id>{}</id>\n<name>{}</name>\n\
          <country>{}</country>\n<weak_auth>{}</weak_auth>\n<cpid>{}</cpid>\n\
          <has_profile>0</has_profile>\n<create_time>{}</create_time>\n\
          <global_prefs>\n{}\n</global_prefs>\n<project_prefs>\n{}\n</project_prefs>\n\
@@ -239,7 +239,7 @@ pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
         user.send_email,
         user.show_hosts,
         user.teamid,
-        xml_escape(&user.venue),
+        xml_escape_text(&user.venue),
     ))
 }
 
@@ -293,7 +293,8 @@ pub async fn am_set_host_info(
     ))
 }
 
-/// `show_host_xml` in `html/inc/xml.inc`. Strings are escaped.
+/// `show_host_xml` in `html/inc/xml.inc`. Strings are escaped with
+/// [`xml_escape_text`]; the reply is UTF-8.
 fn host_xml(out: &mut String, h: &Host) {
     out.push_str(&format!(
         "    <host>\n        <id>{}</id>\n        <create_time>{}</create_time>\n        \
@@ -309,43 +310,47 @@ fn host_xml(out: &mut String, h: &Host) {
         h.create_time,
         h.rpc_seqno,
         h.rpc_time,
-        xml_escape(&h.host_cpid),
+        xml_escape_text(&h.host_cpid),
         h.total_credit,
         h.expavg_credit,
         h.expavg_time,
-        xml_escape(&h.domain_name),
+        xml_escape_text(&h.domain_name),
         h.p_ncpus,
-        xml_escape(&h.p_vendor),
-        xml_escape(&h.p_model),
+        xml_escape_text(&h.p_vendor),
+        xml_escape_text(&h.p_model),
         h.p_fpops,
         h.p_iops,
-        xml_escape(&h.os_name),
-        xml_escape(&h.os_version),
+        xml_escape_text(&h.os_name),
+        xml_escape_text(&h.os_version),
         h.m_nbytes,
         h.d_free,
         h.d_total,
-        xml_escape(&h.venue),
+        xml_escape_text(&h.venue),
     ));
 }
 
 /// `show_user.php?format=xml` (`show_user_xml` in `html/inc/xml.inc`).
-/// `hosts` is given when the request carried the account key.
+/// `hosts` is given when the request carried the account key. The reply is
+/// UTF-8 and says so, unlike the other web RPC replies.
 pub fn show_user_xml(config: &Config, user: &User, hosts: Option<&[Host]>) -> String {
     let mut out = format!(
-        "{XML_HEADER}<user>\n    <id>{}</id>\n    <cpid>{}</cpid>\n    <create_time>{}</create_time>\n    \
+        "{XML_HEADER_UTF8}<user>\n    <id>{}</id>\n    <cpid>{}</cpid>\n    <create_time>{}</create_time>\n    \
          <name>{}</name>\n    <total_credit>{}</total_credit>\n    <expavg_credit>{}</expavg_credit>\n    \
          <expavg_time>{}</expavg_time>\n    <teamid>{}</teamid>\n    <has_profile>0</has_profile>\n",
         user.id,
         user_cpid(&user.cross_project_id, &user.email_addr),
         user.create_time,
-        xml_escape(&user.name),
+        xml_escape_text(&user.name),
         user.total_credit,
         user.expavg_credit,
         user.expavg_time,
         user.teamid,
     );
     if let Some(hosts) = hosts {
-        out.push_str(&format!("   <venue>{}</venue>\n", xml_escape(&user.venue)));
+        out.push_str(&format!(
+            "   <venue>{}</venue>\n",
+            xml_escape_text(&user.venue)
+        ));
         for h in hosts {
             host_xml(&mut out, h);
         }
@@ -353,11 +358,11 @@ pub fn show_user_xml(config: &Config, user: &User, hosts: Option<&[Host]>) -> St
     if config.user_country {
         out.push_str(&format!(
             "     <country>{}</country>\n",
-            xml_escape(&user.country)
+            xml_escape_text(&user.country)
         ));
     }
     if config.user_url && !user.url.is_empty() {
-        out.push_str(&format!("    <url>{}</url>\n", xml_escape(&user.url)));
+        out.push_str(&format!("    <url>{}</url>\n", xml_escape_text(&user.url)));
     }
     out.push_str("</user>\n");
     out
