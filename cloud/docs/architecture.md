@@ -83,7 +83,8 @@ flowchart LR
 | `transitioner` | `pipeline` Worker, driven by the queue, with a cron sweep for deadlines |
 | validators | `pipeline` Worker: built-in trivial and bitwise validators, and a webhook validator for project code |
 | assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API or receives a webhook |
-| `file_deleter`, `db_purge` | cron handlers in the `pipeline` Worker |
+| `file_deleter` | part of the transition in the `pipeline` Worker |
+| `db_purge` | cron handler in the `pipeline` Worker |
 | `file_upload_handler` | `files` Worker writing to R2 |
 | Apache download directory | `files` Worker reading from R2 |
 | PHP web RPCs and site | `web` Worker |
@@ -130,9 +131,12 @@ charges, and KV charges per write operation at several times the D1 row price.
 D1 is SQLite, single-writer, and each query is a network round trip from the Worker. The design
 follows from that:
 
-- Each scheduler request makes a fixed, small number of round trips (four batches; see
-  "Scheduler request path"). Statements are grouped into `batch()` calls, which run as one
-  transaction.
+- Each scheduler request makes a small, bounded number of round trips (see "Scheduler request
+  path"). Statements are grouped into `batch()` calls, which run as one transaction.
+- A `batch()` takes statements prepared in advance, so a transaction cannot span a read, a
+  decision in Rust and a write. Every read-decide-write path is therefore optimistic: it
+  reads, decides, and commits with one batch whose statements carry their own conditions
+  (see "Concurrency").
 - Smart Placement runs the Workers next to the database.
 - Rows written are the main cost. The schema keeps few indexes, uses partial indexes so a
   row is in an index only while it is in the state that index serves, and the pipeline writes
@@ -169,7 +173,7 @@ One bucket per project.
 
 | Prefix | Content | Written by | Lifetime |
 | --- | --- | --- | --- |
-| `download/<name>` | app version files, job inputs | admin API | until the workunit is purged, or forever when marked `no_delete` or sticky |
+| `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
 | `archive/` | purged workunit and result rows, as JSON lines per day | pipeline cron | by bucket lifecycle rule |
 
@@ -186,6 +190,11 @@ one-minute cron sweep transitions anything whose time has passed. A lost or dupl
 message therefore costs only latency or an idempotent re-run. This is the stock
 design (daemons poll `transition_time`) with the queue as a fast path.
 
+Messages are sent in the two cases where a transition has work to do at once: when a result is reported
+and when assimilation is acknowledged. Submission creates the first results in the same
+batch as the workunit, and dispatch only lowers `transition_time` to the new result's
+deadline, so neither sends a message.
+
 ## Scheduler request path
 
 `POST /sched` with a `<scheduler_request>` body, as sent by the client.
@@ -200,20 +209,30 @@ design (daemons poll `transition_time`) with the queue as a fast path.
    `rpc_seqno` checks, CPID match to detect a copied or reset client).
 4. Batch 2 (read): reported results by name, this host's in-progress results, its
    `host_app_version` rows.
-5. Pick usable app versions for the host: platform match, plan class evaluation
-   (`plan_class_spec.cpp` semantics, including GPU model, VRAM, driver and client-version
-   floors, container runtime, batch and workunit-ID gates), best version per app and resource.
-6. Batch 3 (read): candidate unsent results for those apps, joined to their workunits, ordered
-   by priority then age, interleaved across apps by weight; plus assigned jobs for this host
-   or user.
-7. Filter candidates in memory: feasibility (memory, disk, deadline against the host's
-   estimated speed and availability), `one_result_per_host_per_wu`, per-host and per-app
+5. Find the app versions the host can run: platform match and the host-dependent part of
+   plan class evaluation (`plan_class_spec.cpp` semantics: GPU model, VRAM, driver and
+   client-version floors, container runtime). Every version that passes is kept, with its
+   projected speed. Nothing is chosen yet, because the batch and workunit-ID gates of a plan
+   class depend on the job.
+6. Batch 3 (read): candidate unsent results for the apps that have a usable version, joined
+   to their workunits, ordered by priority then age, interleaved across apps by weight; plus
+   assigned jobs for this host or user.
+7. Batch 4 (read, only when `one_result_per_host_per_wu` or `one_result_per_user_per_wu` is
+   set): which of the candidate workunits already have a result for this host or user, in
+   any state. A host that returned, failed or timed out on a replica must not get another
+   one (`sched/sched_check.cpp`, `slow_check`), so the in-progress list from batch 2 is not
+   enough.
+8. Filter candidates in memory. For each candidate, apply the batch and workunit-ID gates to
+   the kept versions and take the fastest version that remains; drop the candidate if none
+   does. Then feasibility (memory, disk, deadline against the host's estimated speed and
+   availability), the replica rule from batch 4 and within this reply, per-host and per-app
    in-progress limits, daily quota, requested seconds and instances per resource.
-8. Batch 4 (write, one transaction): update the host; apply result reports; claim each chosen
-   result with `UPDATE result SET server_state = 4, hostid = ?, ... WHERE id = ? AND
-   server_state = 2 RETURNING id`; set `transition_time` on affected workunits.
-9. Send the affected workunit IDs to the queue, build the `<scheduler_reply>` from the claims
-   that succeeded, return it.
+9. Batch 5 (write, one transaction): update the host; apply result reports; claim each chosen
+   result; lower `transition_time` on the workunits of claimed results and set it to now on
+   the workunits of reported ones. The claim statements enforce the limits again (see
+   "Limits under concurrent requests").
+10. Send the workunit IDs of reported results to the queue, build the `<scheduler_reply>`
+    from the claims that succeeded, return it.
 
 ### Dispatch without a feeder
 
@@ -229,6 +248,30 @@ If D1 read latency or row reads ever limit throughput, the next step is a Durabl
 holds the unsent window in memory, which is the feeder again. We build it only if measurements
 show that D1 limits throughput.
 
+### Limits under concurrent requests
+
+A client can have two scheduler requests in flight (a retry after a timeout, or two clients
+sharing a host ID). Both read the same spare capacity in batch 2, and the per-result claim
+alone would let both use it. So each claim statement carries the limits in its `WHERE`
+clause, evaluated against the database at commit time:
+
+```sql
+UPDATE result SET server_state = 4, hostid = ?, ...
+WHERE id = ? AND server_state = 2
+  AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4) < ?          -- per host
+  AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4 AND appid = ?) < ?  -- per app
+  AND (SELECT n_jobs_today FROM host_app_version WHERE host_id = ? AND app_version_id = ?) < ?  -- daily quota
+RETURNING id
+```
+
+Each claim is followed in the batch by the `host_app_version` counter update for that
+result, itself conditional on the claim having succeeded. The batch creates a missing
+`host_app_version` row before the first claim that needs it. D1 applies a batch as one
+transaction and runs writes one at a time, so a later claim in the same batch, or in a
+concurrent request, sees the earlier ones. A request that loses the race claims fewer
+results than it chose; it never exceeds a limit. The subqueries read the partial index on
+in-progress results for one host, a few rows.
+
 ### Plan classes and admission gates
 
 Plan classes are stored as the stock `plan_class_spec.xml` document in the `config` table and
@@ -243,18 +286,46 @@ The upstream state machine is kept: `server_state`, `outcome`, `validate_state`,
 `assimilate_state`, `file_delete_state` and `error_mask` have the same values and meanings.
 What changes is that one handler does the work of three daemons.
 
-`transition(workunit_id)`, called from the queue or the sweep, in one transaction:
+`transition(workunit_id)`, called from the queue or the sweep:
 
-1. Load the workunit and its results.
+1. Load the workunit and its results (one read batch).
 2. Time out in-progress results past their deadline.
 3. Count outcomes; set error bits when a limit is reached (`max_error_results`,
    `max_total_results`, `max_success_results`), and cancel unsent results if so.
-4. If there is no canonical result and enough successful results have arrived, validate.
+4. Validate. With no canonical result, once enough successful results have arrived, look for
+   a quorum that agrees (`check_set`). With a canonical result, compare each later successful
+   result to it (`check_pair`): it becomes valid, with the canonical result's credit, or
+   invalid. A result that arrives after the canonical result's files are deleted is marked
+   too late, as upstream does, and gets no credit.
 5. If more results are needed (`target_nresults`, or a quorum not yet reached), create them,
    signing each output file's upload certificate with the upload key.
 6. If a canonical result exists or the workunit has failed, mark it ready to assimilate.
-7. When everything is reported and assimilated, mark files for deletion.
+7. When everything is reported and assimilated and `delete_delay_hours` has passed, delete
+   the output objects, and the input objects not marked `no_delete`, and record that.
 8. Set the next `transition_time` to the earliest outstanding deadline.
+9. Commit (one write batch).
+
+Steps 2 to 8 run in memory on the rows read in step 1. Validation may read object metadata
+or call a webhook; that happens between the read and the commit, outside any transaction.
+
+### Concurrency
+
+A scheduler request can report or claim a result of the workunit while a transition is
+between its read and its commit. The `workunit` row has a revision counter, `rev`, and every
+writer of a workunit or of one of its results (scheduler, admin API, transition) increments
+it in the same batch as its change.
+
+The commit batch of a transition starts with
+`UPDATE workunit SET ..., rev = rev + 1 WHERE id = ? AND rev = <the revision read>`. Every
+other statement in the batch (result updates and inserts, credit, host statistics) carries
+`AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND rev = <the new revision>)`. If anything
+changed since the read, the first statement matches no row, so none of the others do either;
+the transition reads again and retries, a bounded number of times, and after that leaves the
+workunit to the sweep.
+
+Objects are deleted before the commit that records the deletion. A transition that loses the
+race after deleting repeats the deletion, which is harmless; the reverse order could record a
+deletion that never happened.
 
 ### Validation
 
@@ -367,12 +438,25 @@ page, about 1 TB of inputs kept.
 | Worker requests | ~15,000/day with downloads | 100,000/day | 10 million/month |
 | D1 rows written | up to ~50,000/day at 25 per job | 100,000/day | 50 million/month |
 | D1 rows read | under 1 million/day | 5 million/day | 25 billion/month |
-| D1 storage | under 2 GB | 5 GB | 5 GB, then $0.75/GB |
+| D1 storage | grows ~10 MB/day at 2,000 jobs/day until purged | 500 MB per database (5 GB per account) | 10 GB per database; 5 GB included, then $0.75/GB |
+| Queue operations | ~6,000/day at 2,000 jobs/day | 10,000/day | 1 million/month, then $0.40/million |
 | R2 storage | inputs dominate | 10 GB | $0.015/GB-month |
 | CPU per request | a few ms | 10 ms limit | 30 s limit |
 
+The design uses one database, so the per-database limit applies. A job's rows
+are about 5 KB (the workunit and result XML documents, stderr, index entries; to be measured),
+so on the Free plan the database fills at roughly 100,000 jobs, 50 days at the reference rate,
+and `purge_days` has to stay well under that; a month leaves headroom. On the Paid plan the 10 GB limit holds about two
+million jobs.
+
+Queue operations are counted per write, read and delete, so a message costs three. With one
+message per reported result that is 6,000 a day at 2,000 jobs a day, before retries; replicated
+jobs and assimilation acknowledgements add to it. When the Free allowance runs out, sends fail
+and the one-minute sweep runs the transitions, up to a minute late.
+
 The Free plan carries the reference job rate with little headroom and a hard stop at each daily
-limit. The Paid plan is the realistic production choice. Input storage is the largest line:
+limit: the queue allowance runs out first, then the database reaches its size limit. The Paid plan is the
+realistic production choice. Input storage is the largest line:
 1 TB in R2 is about $15 a month, so a project that keeps every input should keep cold inputs
 elsewhere and stage only the working set.
 
