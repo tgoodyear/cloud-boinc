@@ -25,6 +25,19 @@ use crate::project::Project;
 use crate::web::{html_escape, page, show_user_xml, weak_account_key};
 use crate::CoreResult;
 
+#[derive(serde::Deserialize)]
+struct CountRow {
+    n: i64,
+}
+
+/// The task IDs a filtered task list looked at.
+#[derive(serde::Deserialize)]
+struct WindowRow {
+    lo: Option<i64>,
+    hi: Option<i64>,
+    n: i64,
+}
+
 /// Request parameters: the query string, then form fields of a POST.
 pub type Params = HashMap<String, String>;
 
@@ -34,6 +47,10 @@ pub const AUTH_COOKIE: &str = "auth";
 const PERMANENT_COOKIE_SECS: i64 = 365 * 86400;
 /// Tasks per page of `results.php`, as upstream.
 pub const RESULTS_PER_PAGE: usize = 20;
+/// Most tasks a task list with a state or application filter reads for one
+/// page. A page that finds fewer matches than fit links on from the last
+/// task it looked at.
+pub const RESULTS_FILTER_WINDOW: usize = 500;
 /// Computers listed by `hosts_user.php`, as upstream's `limit 100`.
 pub const MAX_HOSTS_LISTED: usize = 100;
 /// Tasks of one workunit listed by `workunit.php`.
@@ -776,15 +793,35 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         sort
     };
     let order = if rev != desc { "DESC" } else { "ASC" };
-    let hosts: Vec<Host> = ctx
-        .db
-        .run(stmt!(
-            format!("SELECT * FROM host WHERE userid = ? ORDER BY {column} {order}, id LIMIT ?"),
+    // Without `show_all`, computers out of contact for 30 days are left out
+    // by the query, before its limit, and counted by a second statement.
+    let cutoff = if show_all {
+        i64::MIN
+    } else {
+        ctx.now - OLD_HOST_SECS
+    };
+    let mut reads = vec![stmt!(
+        format!(
+            "SELECT * FROM host WHERE userid = ? AND rpc_time >= ? \
+             ORDER BY {column} {order}, id LIMIT ?"
+        ),
+        user.id,
+        cutoff,
+        MAX_HOSTS_LISTED
+    )];
+    if !show_all {
+        reads.push(stmt!(
+            "SELECT count(*) AS n FROM host WHERE userid = ? AND rpc_time < ?",
             user.id,
-            MAX_HOSTS_LISTED
-        ))
-        .await?
-        .decode()?;
+            cutoff
+        ));
+    }
+    let mut out = ctx.db.batch(reads).await?.into_iter();
+    let hosts: Vec<Host> = out.next().unwrap_or_default().decode()?;
+    let hidden = match out.next() {
+        Some(rows) => rows.first::<CountRow>()?.map_or(0, |r| r.n),
+        None => 0,
+    };
 
     let user_q = if private {
         String::new()
@@ -818,13 +855,8 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         link("os", "Operating system"),
         link("rpc_time", "Last contact"),
     ));
-    let mut hidden = 0;
     let mut i = 0;
     for h in &hosts {
-        if !show_all && ctx.now - h.rpc_time > OLD_HOST_SECS {
-            hidden += 1;
-            continue;
-        }
         i += 1;
         b.push_str(&format!(
             "<tr><td>{0}<br><a href=\"show_host_detail.php?hostid={0}\">Details</a> | \
@@ -1384,7 +1416,13 @@ fn result_row(
 ///
 /// Paging is by task ID (`before=<id>` for older, `after=<id>` for newer)
 /// rather than upstream's `offset`, so that a page reads the same number
-/// of index entries however deep it is. One round trip of two statements.
+/// of index entries however deep it is.
+///
+/// The indexes hold the computer or account and the task ID only, so with a
+/// state or application filter a page reads at most
+/// [`RESULTS_FILTER_WINDOW`] tasks and, when those hold fewer matches than
+/// fit, links on from the last one read. One round trip of two statements,
+/// three with a filter.
 pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
     let hostid = int_param(q, "hostid").filter(|&id| id > 0);
@@ -1403,7 +1441,7 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let (first, mut sql, mut params): (Stmt, String, Vec<cb_db::Value>) = if let Some(h) = hostid {
         (
             stmt!("SELECT id FROM host WHERE id = ?", h),
-            format!("SELECT {RESULT_LIST_COLS} FROM result WHERE hostid = ? AND hostid > 0"),
+            "hostid = ? AND hostid > 0".to_string(),
             vec![h.into()],
         )
     } else if let Some(u) = userid {
@@ -1412,20 +1450,16 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         };
         (
             user_by_auth_stmt(auth),
-            format!(
-                "SELECT {RESULT_LIST_COLS} FROM result WHERE userid = ? AND userid > 0 \
-                 AND userid = (SELECT id FROM user WHERE authenticator = ? AND blocked = 0)"
-            ),
+            "userid = ? AND userid > 0 \
+             AND userid = (SELECT id FROM user WHERE authenticator = ? AND blocked = 0)"
+                .to_string(),
             vec![u.into(), auth.into()],
         )
     } else {
         return Ok(error_page(project, 400, "Missing user ID or host ID"));
     };
-    sql.push_str(&state_clause(state));
-    if let Some(a) = appid {
-        sql.push_str(" AND appid = ?");
-        params.push(a.into());
-    }
+    // `sql` is the computer's or account's tasks from the cursor on, in
+    // index order (`res_host`, `res_user`).
     let ascending = before.is_none() && after.is_some();
     if let Some(b) = before {
         sql.push_str(" AND id < ?");
@@ -1434,17 +1468,54 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         sql.push_str(" AND id > ?");
         params.push(a.into());
     }
-    sql.push_str(if ascending {
-        " ORDER BY id ASC LIMIT ?"
+    let dir = if ascending { "ASC" } else { "DESC" };
+    let filtered = state != 0 || appid.is_some();
+    let mut reads = vec![first];
+    if filtered {
+        // The indexes hold no state or application, so a filter with few
+        // matches would read the whole history. It reads the next
+        // RESULTS_FILTER_WINDOW tasks instead, and a third statement tells
+        // how far that went.
+        let window =
+            format!("FROM result WHERE {sql} ORDER BY id {dir} LIMIT {RESULTS_FILTER_WINDOW}");
+        let mut page_sql = format!(
+            "SELECT {RESULT_LIST_COLS} FROM (SELECT {RESULT_LIST_COLS} {window}) WHERE 1 = 1{}",
+            state_clause(state)
+        );
+        let mut page_params = params.clone();
+        if let Some(a) = appid {
+            page_sql.push_str(" AND appid = ?");
+            page_params.push(a.into());
+        }
+        page_sql.push_str(&format!(" ORDER BY id {dir} LIMIT ?"));
+        page_params.push((RESULTS_PER_PAGE + 1).into());
+        reads.push(Stmt {
+            sql: page_sql,
+            params: page_params,
+        });
+        reads.push(Stmt {
+            sql: format!(
+                "SELECT min(id) AS lo, max(id) AS hi, count(*) AS n FROM (SELECT id {window})"
+            ),
+            params,
+        });
     } else {
-        " ORDER BY id DESC LIMIT ?"
-    });
-    params.push((RESULTS_PER_PAGE + 1).into());
-    let page_stmt = Stmt { sql, params };
+        params.push((RESULTS_PER_PAGE + 1).into());
+        reads.push(Stmt {
+            sql: format!(
+                "SELECT {RESULT_LIST_COLS} FROM result WHERE {sql} ORDER BY id {dir} LIMIT ?"
+            ),
+            params,
+        });
+    }
 
-    let mut out = ctx.db.batch(vec![first, page_stmt]).await?.into_iter();
+    let mut out = ctx.db.batch(reads).await?.into_iter();
     let first_rows = out.next().unwrap_or_default();
     let mut rows: Vec<JobResult> = out.next().unwrap_or_default().decode()?;
+    let window: Option<WindowRow> = match out.next() {
+        Some(rows) => rows.first()?,
+        None => None,
+    };
 
     let title;
     let clause;
@@ -1476,10 +1547,24 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     if ascending {
         rows.reverse();
     }
-    let (has_newer, has_older) = if ascending {
-        (more, true)
+    // Where the neighbouring pages start: after the last task shown or,
+    // when a filter's window ended before the page was full, after the last
+    // task it looked at.
+    let window_end = window
+        .filter(|w| !more && w.n >= RESULTS_FILTER_WINDOW as i64)
+        .and_then(|w| if ascending { w.hi } else { w.lo });
+    let newest = rows.first().map(|r| r.id);
+    let oldest = rows.last().map(|r| r.id);
+    let (newer, older): (Option<i64>, Option<i64>) = if ascending {
+        (
+            if more { newest } else { window_end },
+            oldest.or(after.map(|a| a + 1)),
+        )
     } else {
-        (before.is_some(), more)
+        (
+            before.and_then(|b| newest.or(Some(b - 1))),
+            if more { oldest } else { window_end },
+        )
     };
 
     let app_name = appid.and_then(|a| project.catalog.apps.iter().find(|x| x.id == a));
@@ -1516,31 +1601,29 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     }
     b.push_str("</p>\n");
     let mut nav = String::from("<p>");
-    if has_newer {
-        if let Some(first) = rows.first() {
-            nav.push_str(&format!(
-                "<a href=\"{}&amp;after={}\">Previous {RESULTS_PER_PAGE}</a>",
-                base(state, show_names),
-                first.id
-            ));
-        }
+    if let Some(id) = newer {
+        nav.push_str(&format!(
+            "<a href=\"{}&amp;after={id}\">Previous {RESULTS_PER_PAGE}</a>",
+            base(state, show_names)
+        ));
     }
-    if has_older {
-        if let Some(last) = rows.last() {
-            if has_newer {
-                nav.push_str(" &middot; ");
-            }
-            nav.push_str(&format!(
-                "<a href=\"{}&amp;before={}\">Next {RESULTS_PER_PAGE}</a>",
-                base(state, show_names),
-                last.id
-            ));
+    if let Some(id) = older {
+        if newer.is_some() {
+            nav.push_str(" &middot; ");
         }
+        nav.push_str(&format!(
+            "<a href=\"{}&amp;before={id}\">Next {RESULTS_PER_PAGE}</a>",
+            base(state, show_names)
+        ));
     }
     nav.push_str("</p>\n");
 
     if rows.is_empty() {
-        b.push_str("<p>No tasks to display</p>\n");
+        b.push_str(if window_end.is_some() {
+            "<p>No matching tasks among the ones looked at; older or newer ones may match.</p>\n"
+        } else {
+            "<p>No tasks to display</p>\n"
+        });
     } else {
         b.push_str(&nav);
         let names_link = format!(

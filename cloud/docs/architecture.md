@@ -528,7 +528,12 @@ pages are served with `Cache-Control: private, no-store`.
 Each page makes at most two round trips and three statements, and every list has a `LIMIT`:
 20 tasks per page, 100 computers, 100 tasks of a workunit. `results.php` pages by task ID
 (`before=` and `after=`) instead of upstream's `offset`, so a deep page reads as few index
-entries as the first one. It does not show upstream's per-state counts, which would count every
+entries as the first one. Its indexes (`res_host`, `res_user`) hold no state or application, so
+a filtered page reads at most 500 tasks (`RESULTS_FILTER_WINDOW`) and filters those; when they
+hold fewer than a page of matches, the page links on from the last task read, and can be
+empty while older tasks still match. `hosts_user.php` leaves out computers that have been out
+of contact for 30 days in the query, before the limit, and counts them separately. `results.php`
+does not show upstream's per-state counts, which would count every
 task of the computer or account. A computer page links to its tasks without counting them for
 the same reason.
 

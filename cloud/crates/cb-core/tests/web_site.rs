@@ -5,7 +5,9 @@
 use std::cell::Cell;
 
 use cb_core::project::{put_setting, Project, SETTING_CONFIG};
-use cb_core::site::{site_page, Params, SiteCtx, SitePage, RESULTS_PER_PAGE};
+use cb_core::site::{
+    site_page, Params, SiteCtx, SitePage, RESULTS_FILTER_WINDOW, RESULTS_PER_PAGE,
+};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, make_user, weak_account_key, NewAccount,
 };
@@ -456,7 +458,7 @@ fn computers_are_private_unless_the_account_shows_them() {
 
     // The holder sees names; old computers only with show_all.
     let (mine, n) = w.page("/hosts_user.php", Some(&ada.auth), false, &[]);
-    assert_eq!(n, 2);
+    assert_eq!(n, 3);
     assert!(mine.body.contains("Your computers"));
     assert!(mine.body.contains("ada-&lt;b&gt;desk&lt;/b&gt;"));
     assert!(!mine.body.contains("<b>desk"));
@@ -528,6 +530,111 @@ fn computers_are_private_unless_the_account_shows_them() {
     assert!(bob_host.body.contains("Anonymous"));
     let missing = w.get("/show_host_detail.php", None, &[("hostid", "999")]);
     assert_eq!(missing.status, 404);
+}
+
+#[test]
+fn the_row_limit_counts_only_the_computers_listed() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    for i in 0..105 {
+        w.host(ada.id, &format!("old-{i}"), NOW - 40 * 86400);
+    }
+    let active = w.host(ada.id, "ada-desk", NOW - 100);
+
+    // The oldest IDs come first, and all of them are out of contact.
+    let (mine, n) = w.page("/hosts_user.php", Some(&ada.auth), false, &[("sort", "id")]);
+    assert_eq!(n, 3);
+    assert!(mine
+        .body
+        .contains(&format!("show_host_detail.php?hostid={active}")));
+    assert!(!mine.body.contains("old-"));
+    assert!(mine.body.contains("105"), "{}", mine.body);
+    let (all, n) = w.page(
+        "/hosts_user.php",
+        Some(&ada.auth),
+        false,
+        &[("sort", "id"), ("show_all", "1")],
+    );
+    assert_eq!(n, 2);
+    assert!(all.body.contains("old-0"));
+}
+
+#[test]
+fn a_filtered_task_list_reads_a_bounded_window() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let host = w.host(ada.id, "ada-desk", NOW);
+    let wu = w.workunit("wu", 1);
+    // Three tasks in progress, then more finished ones than two windows hold.
+    let mut running = Vec::new();
+    for i in 0..3 {
+        running.push(w.result(wu, &format!("running_{i}"), host, ada.id, 4, ""));
+    }
+    let mut done = Vec::new();
+    for i in 0..RESULTS_FILTER_WINDOW * 2 + 10 {
+        done.push(w.result(wu, &format!("done_{i}"), host, ada.id, 5, ""));
+    }
+    let hid = host.to_string();
+    let rows = |p: &SitePage| p.body.matches("<a href=\"result.php?resultid=").count();
+    let next = |p: &SitePage, key: &str| -> Option<String> {
+        let at = p.body.find(&format!("&amp;{key}="))? + key.len() + 6;
+        let digits: String = p.body[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some(digits)
+    };
+
+    // The newest window holds no task in progress: an empty page that links
+    // on from the last task read, in three statements.
+    let filter = [("hostid", hid.as_str()), ("state", "1")];
+    let (first, n) = w.page("/results.php", None, false, &filter);
+    assert_eq!(n, 3);
+    assert_eq!(rows(&first), 0);
+    assert!(first.body.contains("older or newer ones may match"));
+    let before = next(&first, "before").unwrap();
+    assert_eq!(before, done[done.len() - RESULTS_FILTER_WINDOW].to_string());
+    assert!(!first.body.contains("Previous 20"));
+
+    let second = w.get(
+        "/results.php",
+        None,
+        &[filter[0], filter[1], ("before", &before)],
+    );
+    assert_eq!(rows(&second), 0);
+    let before = next(&second, "before").unwrap();
+    // Back from an empty page.
+    assert!(next(&second, "after").is_some());
+
+    let third = w.get(
+        "/results.php",
+        None,
+        &[filter[0], filter[1], ("before", &before)],
+    );
+    assert_eq!(rows(&third), 3);
+    assert!(third.body.contains(&format!("resultid={}\"", running[0])));
+    assert!(!third.body.contains("Next 20"));
+
+    // Upwards from the oldest task the same way.
+    let after = running[2].to_string();
+    let up = w.get(
+        "/results.php",
+        None,
+        &[filter[0], filter[1], ("after", &after)],
+    );
+    assert_eq!(rows(&up), 0);
+    assert_eq!(
+        next(&up, "after").unwrap(),
+        done[RESULTS_FILTER_WINDOW - 1].to_string()
+    );
+
+    // A filter that fills its page links from the last task shown.
+    let valid = w.get("/results.php", None, &[filter[0], ("state", "4")]);
+    assert_eq!(rows(&valid), RESULTS_PER_PAGE);
+    assert_eq!(
+        next(&valid, "before").unwrap(),
+        done[done.len() - RESULTS_PER_PAGE].to_string()
+    );
 }
 
 #[test]
@@ -688,13 +795,22 @@ fn task_lists_read_their_indexes() {
             .collect::<Vec<_>>()
             .join("; ")
     };
+    // A filtered list: the window walks the index, the filter sees only it.
     let by_host = plan(
-        "SELECT id FROM result WHERE hostid = ? AND hostid > 0 AND server_state = 4 \
-         AND id < ? ORDER BY id DESC LIMIT ?",
+        "SELECT id FROM (SELECT id, server_state FROM result WHERE hostid = ? AND hostid > 0 \
+         AND id < ? ORDER BY id DESC LIMIT 500) WHERE 1 = 1 AND server_state = 4 \
+         ORDER BY id DESC LIMIT ?",
         vec![5.into(), 100.into(), 21.into()],
     );
     assert!(by_host.contains("INDEX res_host"), "{by_host}");
     assert!(!by_host.contains("TEMP B-TREE"), "{by_host}");
+    let window = plan(
+        "SELECT min(id) AS lo, max(id) AS hi, count(*) AS n FROM (SELECT id FROM result \
+         WHERE hostid = ? AND hostid > 0 AND id < ? ORDER BY id DESC LIMIT 500)",
+        vec![5.into(), 100.into()],
+    );
+    assert!(window.contains("INDEX res_host"), "{window}");
+    assert!(!window.contains("TEMP B-TREE"), "{window}");
     let all_by_host = plan(
         "SELECT id FROM result WHERE hostid = ? AND hostid > 0 ORDER BY id DESC LIMIT ?",
         vec![5.into(), 21.into()],
@@ -715,8 +831,8 @@ fn task_lists_read_their_indexes() {
     );
     assert!(by_wu.contains("INDEX res_wuid"), "{by_wu}");
     let hosts = plan(
-        "SELECT * FROM host WHERE userid = ? ORDER BY rpc_time DESC, id LIMIT ?",
-        vec![5.into(), 100.into()],
+        "SELECT * FROM host WHERE userid = ? AND rpc_time >= ? ORDER BY rpc_time DESC, id LIMIT ?",
+        vec![5.into(), 0.into(), 100.into()],
     );
     assert!(hosts.contains("INDEX host_user"), "{hosts}");
 }
