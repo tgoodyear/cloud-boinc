@@ -41,8 +41,7 @@ fn cacheable_xml(body: String) -> Result<Response> {
 /// Pages that are the same for every client and need no database read when
 /// the edge cache has them.
 fn is_static_page(req: &Request, path: &str) -> bool {
-    req.method() == Method::Get
-        && matches!(path, "/" | "/index.php" | "/get_project_config.php")
+    req.method() == Method::Get && matches!(path, "/" | "/index.php" | "/get_project_config.php")
 }
 
 /// Query parameters, then form fields for a POST.
