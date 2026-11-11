@@ -11,8 +11,8 @@ use cb_proto::ProtoError;
 use cb_worker::{db, object_key, project, text, xml, BUCKET};
 use futures_util::StreamExt;
 use worker::{
-    console_error, console_log, event, Bucket, ByteStream, Context, Env, FixedLengthStream,
-    Headers, Method, Object, Range, Request, Response, Result,
+    console_error, console_log, event, Bucket, ByteStream, Conditional, Context, Env,
+    FixedLengthStream, Headers, Method, Object, Range, Request, Response, Result,
 };
 
 /// A client treats a `<url>` in a `<file_info>` as an upload URL only when it
@@ -201,17 +201,36 @@ async fn store(
             "partial uploads are not kept; send the file from the start",
         ));
     }
-    let mut put = bucket.put(&key, data_stream(prefix, body, nbytes));
+    // The check above and the write are not one step. The condition keeps
+    // a slow upload that started before another one finished from replacing
+    // the stored object.
+    let mut put = bucket
+        .put(&key, data_stream(prefix, body, nbytes))
+        .only_if(Conditional {
+            etag_matches: None,
+            etag_does_not_match: Some("*".into()),
+            uploaded_before: None,
+            uploaded_after: None,
+        });
     if let Ok(md5) = hex::decode(header.md5_cksum.trim()) {
         if md5.len() == 16 {
             put = put.md5(md5);
         }
     }
     match put.execute().await {
-        Ok(_) => {
+        Ok(Some(_)) => {
             console_log!("upload {} {} bytes", header.name, nbytes);
             xml(reply_success())
         }
+        // Another request stored the file first. A retry of the same
+        // upload is answered as the check above answers it.
+        Ok(None) => match bucket.head(&key).await? {
+            Some(object) if object.size() == nbytes => xml(reply_success()),
+            _ => refuse(UploadError::permanent(format!(
+                "file {} exists with another size",
+                header.name
+            ))),
+        },
         Err(e) => {
             console_error!("upload {}: {e}", header.name);
             refuse(UploadError::transient("the file could not be stored"))

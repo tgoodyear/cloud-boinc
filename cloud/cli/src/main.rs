@@ -113,6 +113,9 @@ enum Command {
         /// Keep the file when the jobs using it are done.
         #[arg(long)]
         no_delete: bool,
+        /// Overwrite a stored file of the same name that has other contents.
+        #[arg(long)]
+        replace: bool,
     },
     /// Upload, sign and register the files of an app version.
     VersionAdd {
@@ -323,15 +326,19 @@ impl Client {
 
     /// Stores a local file under `download/<name>`; returns what the server
     /// recorded.
-    fn put_file(&self, path: &Path, name: &str, no_delete: bool) -> Res<Value> {
+    fn put_file(&self, path: &Path, name: &str, no_delete: bool, replace: bool) -> Res<Value> {
+        let (md5, _) = file_md5(path)?;
         let f = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let len = f
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?
             .len();
-        let mut target = format!("files/{name}");
+        let mut target = format!("files/{name}?md5={md5}");
         if no_delete {
-            target.push_str("?no_delete=1");
+            target.push_str("&no_delete=1");
+        }
+        if replace {
+            target.push_str("&replace=1");
         }
         Self::json(Self::finish(
             self.request("PUT", &target)
@@ -360,7 +367,7 @@ fn file_name(path: &Path) -> Res<String> {
 /// signs its MD5.
 fn stage_signed(client: &Client, key: &PrivateKey, path: &Path, name: &str) -> Res<String> {
     let (md5, nbytes) = file_md5(path)?;
-    let stored = client.put_file(path, name, true)?;
+    let stored = client.put_file(path, name, true, false)?;
     if stored["md5"].as_str() != Some(md5.as_str()) || stored["nbytes"].as_u64() != Some(nbytes) {
         return Err(format!(
             "{name}: the server stored something else than {}",
@@ -438,12 +445,13 @@ fn run(cli: Cli) -> Res<()> {
             file,
             name,
             no_delete,
+            replace,
         } => {
             let name = match name {
                 Some(n) => n,
                 None => file_name(&file)?,
             };
-            show(&Client::new(&server)?.put_file(&file, &name, no_delete)?)
+            show(&Client::new(&server)?.put_file(&file, &name, no_delete, replace)?)
         }
         Command::VersionAdd {
             server,

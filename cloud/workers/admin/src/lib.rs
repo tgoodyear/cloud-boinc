@@ -171,13 +171,43 @@ async fn put_file(mut req: Request, env: &Env, db: &D1Db, name: &str) -> Result<
         return error(411, "Content-Length is required");
     };
     let no_delete = query(&req, "no_delete")?.is_some_and(|v| v != "0");
+    let replace = query(&req, "replace")?.is_some_and(|v| v != "0");
+    let md5 = match query(&req, "md5")? {
+        None => None,
+        Some(v) => match hex::decode(&v) {
+            Ok(bytes) if bytes.len() == 16 => Some((v.to_ascii_lowercase(), bytes)),
+            _ => return error(400, "md5 is not 32 hex digits"),
+        },
+    };
+    // App versions and jobs refer to a stored file by name, with its MD5 and
+    // signature recorded elsewhere, so a name keeps its contents unless the
+    // caller asks to replace them.
+    if !replace {
+        let files = R2Files(env.bucket(BUCKET)?);
+        match cb_core::Files::stat(&files, FileKind::Download, name).await {
+            Ok(None) => {}
+            Ok(Some(stat)) => {
+                if md5.as_ref().is_some_and(|(sent, _)| *sent == stat.md5) {
+                    return register_file(env, db, name, no_delete).await;
+                }
+                return error(
+                    409,
+                    "a file of that name is stored with other contents; pass replace=1 to overwrite it",
+                );
+            }
+            Err(e) => return core_error(e),
+        }
+    }
     let bucket = env.bucket(BUCKET)?;
     let key = object_key(FileKind::Download, name);
-    let put = if length == 0 {
+    let mut put = if length == 0 {
         bucket.put(&key, Vec::new())
     } else {
         bucket.put(&key, FixedLengthStream::wrap(req.stream()?, length))
     };
+    if let Some((_, bytes)) = md5 {
+        put = put.md5(bytes);
+    }
     if let Err(e) = put.execute().await {
         console_error!("put {name}: {e}");
         return error(500, "the file could not be stored");

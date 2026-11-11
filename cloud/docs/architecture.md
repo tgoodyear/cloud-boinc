@@ -411,7 +411,9 @@ only when it contains `file_upload_handler` (`FILE_INFO::parse` in `client/clien
 any other URL is taken for a download. The requests are `<get_file_size>` and
 `<file_upload>` with a signed `<file_info>`, then raw bytes. The Worker verifies the
 `<xml_signature>` with the upload public key, checks `max_nbytes`, and streams the body into
-R2 with the client's MD5 as an integrity check.
+R2 with the client's MD5 as an integrity check. A stored output is never replaced: the write
+is conditional on the object not existing, so a second upload of the same name cannot change a
+file a result was validated against.
 
 Two differences from the stock handler:
 
@@ -457,7 +459,7 @@ implemented" error. PHP file names are kept in the URLs because clients have the
 | `platforms`, `apps` | create, update |
 | `app-versions` | upload signed files and register, deprecate, restore |
 | `config` | project settings, plan classes, public keys |
-| `files` | stage inputs (upload, or register an object already in the bucket) |
+| `files` | stage inputs (upload, or register an object already in the bucket); a stored name keeps its contents unless the caller asks to replace them |
 | `jobs` | submit a batch of workunits in one call, query, cancel |
 | `assimilate`, `outputs` | list finished work, fetch output files, acknowledge |
 | `users`, `hosts` | create an account, block a user, set a host's daily result limit |

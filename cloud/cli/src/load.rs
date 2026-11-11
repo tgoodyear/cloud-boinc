@@ -82,8 +82,8 @@ struct Host {
     hostid: i64,
     seqno: u32,
     version_num: i32,
-    /// Results to report with the next request, as `<result>` elements.
-    reports: Vec<String>,
+    /// Results to report with the next request: `(name, <result> element)`.
+    reports: Vec<(String, String)>,
 }
 
 impl Host {
@@ -102,7 +102,7 @@ impl Host {
             "<host_info>\n    <domain_name>{}-{}</domain_name>\n    <host_cpid>{cpid}</host_cpid>\n    <p_ncpus>4</p_ncpus>\n    <p_vendor>GenuineIntel</p_vendor>\n    <p_model>load generator</p_model>\n    <p_fpops>2e9</p_fpops>\n    <p_iops>1e10</p_iops>\n    <m_nbytes>8e9</m_nbytes>\n    <d_total>1e11</d_total>\n    <d_free>5e10</d_free>\n    <os_name>Linux</os_name>\n    <os_version>6.1</os_version>\n</host_info>\n",
             self.args.run_name, self.index
         ));
-        for r in &self.reports {
+        for (_, r) in &self.reports {
             s.push_str(r);
         }
         s.push_str("</scheduler_request>\n");
@@ -112,7 +112,6 @@ impl Host {
     fn sched(&mut self, work: bool, tally: &mut Tally) -> Result<Vec<Task>, String> {
         self.seqno += 1;
         let body = self.request_xml(work);
-        let reported = self.reports.len() as u64;
         let started = Instant::now();
         let reply = self
             .agent
@@ -138,9 +137,18 @@ impl Host {
                 blocks(&reply, "message").join("; ")
             ));
         }
-        // The server answered, so it has the reports.
-        self.reports.clear();
-        tally.results_reported += reported;
+        if reply.contains("<project_is_down/>") {
+            return Err("sched: the project is down".into());
+        }
+        // A report stays queued until the server acknowledges it by name.
+        let acked: Vec<&str> = blocks(&reply, "result_ack")
+            .into_iter()
+            .filter_map(|b| element(b, "name"))
+            .collect();
+        let before = self.reports.len();
+        self.reports
+            .retain(|(name, _)| !acked.contains(&name.as_str()));
+        tally.results_reported += (before - self.reports.len()) as u64;
         if let Some(v) = blocks(&reply, "app_version")
             .first()
             .and_then(|b| element(b, "version_num"))
@@ -215,10 +223,12 @@ impl Host {
                 md5_hex(&data)
             ));
         }
-        self.reports.push(format!(
+        self.reports.push((
+            task.name.clone(),
+            format!(
             "<result>\n    <name>{}</name>\n    <final_cpu_time>1</final_cpu_time>\n    <final_elapsed_time>1</final_elapsed_time>\n    <exit_status>0</exit_status>\n    <state>5</state>\n    <app_version_num>{}</app_version_num>\n{files}</result>\n",
             task.name, self.version_num
-        ));
+        )));
         Ok(())
     }
 
@@ -243,6 +253,12 @@ impl Host {
             if self.args.think_ms > 0 {
                 thread::sleep(Duration::from_millis(self.args.think_ms));
             }
+        }
+        if !self.reports.is_empty() {
+            tally.errors.push(format!(
+                "{} reports were not acknowledged",
+                self.reports.len()
+            ));
         }
         tally
     }
