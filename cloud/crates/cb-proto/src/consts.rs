@@ -74,8 +74,15 @@ pub const WU_ERROR_NO_CANONICAL_RESULT: i32 = 32;
 
 /// `transitioner_flags`: the transitioner leaves this workunit alone.
 pub const TRANSITION_NONE: i32 = 1;
-/// `transitioner_flags`: no new results are created.
+/// `transitioner_flags`: an assigned job. Upstream's transitioner creates
+/// no results for it; here its results are created reserved
+/// (`RESULT_SERVER_STATE_INACTIVE`) for the scheduler to claim.
 pub const TRANSITION_NO_NEW_RESULTS: i32 = 2;
+
+/// `assignment.target_type`: one host.
+pub const ASSIGN_HOST: i32 = 1;
+/// `assignment.target_type`: any host of one user.
+pub const ASSIGN_USER: i32 = 2;
 
 /// Client result state (`<state>` in a reported result): new.
 pub const RESULT_NEW: i32 = 0;

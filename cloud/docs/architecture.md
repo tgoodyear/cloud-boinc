@@ -217,14 +217,16 @@ deadline, so neither sends a message.
    projected speed. Nothing is chosen yet, because the batch and workunit-ID gates of a plan
    class depend on the job.
 6. Batch 3 (read): candidate unsent results for the apps that have a usable version, joined
-   to their workunits, ordered by priority then age, interleaved across apps by weight; plus
-   assigned jobs for this host or user.
-7. Batch 4 (read, only when `one_result_per_host_per_wu` or `one_result_per_user_per_wu` is
+   to their workunits, ordered by priority then age, interleaved across apps by weight; plus,
+   with `enable_assignment`, assigned jobs for this host or user (see "Assigned jobs").
+7. If an assigned job can be sent, the reply carries assigned jobs and no other new work,
+   and steps 8 and 9 are skipped.
+8. Batch 4 (read, only when `one_result_per_host_per_wu` or `one_result_per_user_per_wu` is
    set): which of the candidate workunits already have a result for this host or user, in
    any state. A host that returned, failed or timed out on a replica must not get another
    one (`sched/sched_check.cpp`, `slow_check`), so the in-progress list from batch 2 is not
    enough.
-8. Filter candidates in memory. For each candidate, narrow the kept versions to the ones
+9. Filter candidates in memory. For each candidate, narrow the kept versions to the ones
    that can still be sent: the batch and workunit-ID gates admit the job, the client still
    wants work for the version's resource (seconds or idle instances not yet filled by this
    reply, as `need_this_resource` in `sched/sched_version.cpp`), and the version's daily
@@ -234,11 +236,11 @@ deadline, so neither sends a message.
    filled. Then check feasibility with that version (memory, disk, deadline against the
    host's estimated speed and availability) and the replica rule from batch 4 and within
    this reply.
-9. Batch 5 (write, one transaction): update the host; apply result reports; claim each chosen
-   result; lower `transition_time` on the workunits of claimed results and set it to now on
-   the workunits of reported ones. The claim statements enforce the limits again (see
-   "Limits under concurrent requests").
-10. Send the workunit IDs of reported results to the queue, build the `<scheduler_reply>`
+10. Batch 5 (write, one transaction): update the host; apply result reports; claim each chosen
+    result; lower `transition_time` on the workunits of claimed results and set it to now on
+    the workunits of reported ones. The claim statements enforce the limits again (see
+    "Limits under concurrent requests").
+11. Send the workunit IDs of reported results to the queue, build the `<scheduler_reply>`
     from the claims that succeeded, return it.
 
 ### Dispatch without a feeder
@@ -278,6 +280,51 @@ transaction and runs writes one at a time, so a later claim in the same batch, o
 concurrent request, sees the earlier ones. A request that loses the race claims fewer
 results than it chose; it never exceeds a limit. The subqueries read the partial index on
 in-progress results for one host, a few rows.
+
+### Assigned jobs
+
+A job can be assigned to one host or to one user's hosts, as with `create_work --target_host`
+and `--target_user` upstream. The project turns this on with `enable_assignment`; a submission
+that assigns a job while it is off is refused. Team targets and broadcast assignments
+(`multi`, `enable_assignment_multi`) are not implemented.
+
+Upstream creates the result of an assigned job in the scheduler, at the moment it sends it
+(`send_assigned_job` in `sched/sched_assign.cpp`), and its transitioner creates no results
+for such a workunit, which `create_work` marks `TRANSITION_NO_NEW_RESULTS`. That cannot work
+here: creating a result signs its upload certificates, and the scheduler Worker does not hold
+the upload key. So the results of an assigned job are created ahead of time, by job
+submission (`create_work` in `crates/cb-core/src/work.rs`) and by the transition that
+replaces a failed or timed-out instance (`transitioner_pass` in
+`crates/cb-core/src/pipeline.rs`), in the reserved state `RESULT_SERVER_STATE_INACTIVE` (1)
+instead of unsent (2). The workunit is still marked `TRANSITION_NO_NEW_RESULTS`, which here
+means "create its results reserved". Dispatch reads only unsent results, so it never sees a
+reserved one.
+
+`handle_request` in `crates/cb-core/src/scheduler.rs` adds one query to batch 3: the
+assignments for this host or user (`multi = 0`) whose workunit has no error and no canonical
+result, has a reserved result, and has no result on this host, with the reserved result of
+lowest ID for each, at most `MAX_ASSIGNED` (20). Assigned jobs go first. As upstream, they
+skip the memory, disk, deadline, daily-quota and in-progress checks, but the request must ask
+for work and the host must have a usable app version that the plan class's batch and
+workunit-ID gates admit. The fastest such version is taken, preferring one for a resource the
+client asks for. The claim is the same conditional `UPDATE` as for an unsent result, with
+`server_state = 1` in place of 2, without the limit subqueries, and with a guard that the
+host holds no other result of the workunit: upstream sends at most one instance of an
+assigned job to a host, whatever `one_result_per_host_per_wu` says. Two requests that choose
+the same reserved result cannot both claim it. If any assigned job is chosen, no other new
+work goes in the reply (`send_work` in `sched/sched_send.cpp`); if its claim then loses a race,
+that reply is empty and the client asks again.
+
+Reserved results count as unsent in the transition. When a workunit gets its canonical
+result, fails or is cancelled, its reserved results are retired (`OVER`, `DIDNT_NEED`) as
+unsent ones are, so the purge, which waits for every result to be over, still takes the
+workunit. An assigned workunit nobody claims keeps its reserved results and sits on the
+safety-net transition time, as upstream's would sit with no results. The behaviours upstream
+has follow from its rules: a host-assigned job whose only instance failed is not sent to that
+host again, and a replacement for a user-assigned job goes to another of the user's hosts.
+Because a host never gets a second instance, `build_workunit` in `crates/cb-core/src/work.rs`
+refuses a host-assigned job with `target_nresults` above 1.
+Assignment rows stay until the purge removes them with their workunit.
 
 ### Plan classes and admission gates
 
@@ -468,7 +515,15 @@ implemented" error. The account and computer counts on the status page (`server_
 | `users`, `hosts` | create an account, block a user, set a host's daily result limit |
 
 Job submission takes many workunits per request and writes them in batched statements, since
-the reference pipeline submits in chunks of hundreds.
+the reference pipeline submits in chunks of hundreds. `POST /admin/v1/jobs` takes
+`{"app", "input_template", "result_template", "jobs": [...]}`; each job object has `name` and
+optionally `input_files`, `command_line`, `additional_xml`, `batch`, `priority`, the `rsc_*`
+bounds, `delay_bound`, `min_quorum`, `target_nresults`, the `max_*_results` limits, and
+`assign`, as `{"target": "host", "id": <host ID>}` or `{"target": "user", "id": <user ID>}`
+(see "Assigned jobs"). Unset numbers come from the input template, then from the upstream
+`create_work` defaults (`JobSpec` in `crates/cb-core/src/work.rs`). `cboinc submit` builds the
+job objects from its flags, with `--target-host` and `--target-user` for `assign`, or reads
+them from a file given with `--jobs`.
 
 ## Cost model
 
@@ -577,9 +632,9 @@ certificates are checked.
 
 Not implemented yet:
 
-- In the scheduler: anonymous platform, assigned jobs, homogeneous redundancy and homogeneous
-  app version, locality scheduling, size classes, and the client workload simulation behind
-  upstream's deadline check.
+- In the scheduler: anonymous platform, assigned jobs for teams and broadcast (`multi`)
+  assignments, homogeneous redundancy and homogeneous app version, locality scheduling, size
+  classes, and the client workload simulation behind upstream's deadline check.
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.

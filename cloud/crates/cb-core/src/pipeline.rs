@@ -9,6 +9,14 @@
 //! with a random commit token; the other statements apply only while that
 //! token is there. A transition whose read is stale writes nothing and
 //! starts over.
+//!
+//! Assigned (targeted) jobs differ from upstream. Upstream's transitioner
+//! creates no results for a workunit flagged `TRANSITION_NO_NEW_RESULTS`,
+//! and the scheduler creates one when it sends the job. The scheduler here
+//! does not hold the upload key, so the results of such a workunit are
+//! created here as usual but reserved (`RESULT_SERVER_STATE_INACTIVE`),
+//! where normal dispatch does not see them; the scheduler claims them for
+//! the assigned host or user.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -152,7 +160,11 @@ pub(crate) fn new_result(
     Ok(JobResult {
         create_time: now,
         workunitid: wu.id,
-        server_state: RESULT_SERVER_STATE_UNSENT,
+        server_state: if wu.transitioner_flags == TRANSITION_NO_NEW_RESULTS {
+            RESULT_SERVER_STATE_INACTIVE
+        } else {
+            RESULT_SERVER_STATE_UNSENT
+        },
         outcome: RESULT_OUTCOME_INIT,
         name,
         xml_doc_in,
@@ -197,7 +209,8 @@ pub(crate) fn insert_result_stmt(r: &JobResult, guard: WuGuard) -> Stmt {
 }
 
 /// The initial results of a workunit that is about to be inserted, so that
-/// creating work does not need a transition of its own.
+/// creating work does not need a transition of its own. An assigned job's
+/// results are reserved for its assignment.
 pub(crate) fn initial_results(
     wu: &Workunit,
     config: &Config,
@@ -205,9 +218,6 @@ pub(crate) fn initial_results(
     now: i64,
     random: &dyn Fn() -> u32,
 ) -> CoreResult<Vec<JobResult>> {
-    if wu.transitioner_flags == TRANSITION_NO_NEW_RESULTS {
-        return Ok(Vec::new());
-    }
     let n = wu.target_nresults.min(wu.max_total_results).max(0);
     (0..n)
         .map(|i| new_result(wu, i, 0, config, signer, now, random))
@@ -354,10 +364,9 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
         if wu.assimilate_state == ASSIMILATE_INIT {
             wu.assimilate_state = ASSIMILATE_READY;
         }
-    } else if wu.canonical_resultid == 0
-        && wu.transitioner_flags != TRANSITION_NO_NEW_RESULTS
-        && n_new_results_needed > 0
-    {
+    } else if wu.canonical_resultid == 0 && n_new_results_needed > 0 {
+        // An assigned job (`TRANSITION_NO_NEW_RESULTS`) gets its results
+        // too, reserved; upstream's scheduler would create them on sending.
         let priority_increase = if nover > 0 && config.reliable_priority_on_over != 0 {
             config.reliable_priority_on_over
         } else if nover > 0 && nerrors == 0 && config.reliable_priority_on_over_except_error != 0 {
@@ -812,7 +821,10 @@ fn validator_pass(st: &mut State, app: &App, fps: &HashMap<usize, Fp>, ctx: &Ctx
                 st.wu.canonical_credit = credit;
                 st.wu.assimilate_state = ASSIMILATE_READY;
                 for res in st.results.iter_mut() {
-                    if res.row.server_state == RESULT_SERVER_STATE_UNSENT {
+                    if matches!(
+                        res.row.server_state,
+                        RESULT_SERVER_STATE_INACTIVE | RESULT_SERVER_STATE_UNSENT
+                    ) {
                         res.row.server_state = RESULT_SERVER_STATE_OVER;
                         res.row.outcome = RESULT_OUTCOME_DIDNT_NEED;
                     }

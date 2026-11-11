@@ -40,6 +40,34 @@ pub struct JobSpec {
     pub max_error_results: Option<i32>,
     pub max_total_results: Option<i32>,
     pub max_success_results: Option<i32>,
+    /// Send the job only to this host, or only to this user's hosts
+    /// (`create_work --target_host` and `--target_user`).
+    pub assign: Option<Assign>,
+}
+
+/// Who an assigned (targeted) job goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Assign {
+    pub target: AssignTarget,
+    /// The host or user ID.
+    pub id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssignTarget {
+    Host,
+    User,
+}
+
+impl AssignTarget {
+    /// `assignment.target_type`.
+    pub fn target_type(self) -> i32 {
+        match self {
+            AssignTarget::Host => ASSIGN_HOST,
+            AssignTarget::User => ASSIGN_USER,
+        }
+    }
 }
 
 /// A submission: jobs of one app sharing their templates.
@@ -182,8 +210,44 @@ fn build_workunit(
             "min_quorum is above target_nresults".into(),
         ));
     }
+    if let Some(a) = &job.assign {
+        if !config.enable_assignment {
+            return Err(CoreError::Invalid(
+                "assigned jobs need enable_assignment in the project config".into(),
+            ));
+        }
+        if a.id <= 0 {
+            return Err(CoreError::Invalid(
+                "an assigned job needs a nonzero host or user ID".into(),
+            ));
+        }
+        // A host gets at most one instance of an assigned job, so a
+        // second instance could never be sent.
+        if a.target == AssignTarget::Host && wu.target_nresults > 1 {
+            return Err(CoreError::Invalid(
+                "a job assigned to a host needs target_nresults 1".into(),
+            ));
+        }
+        // As create_work does. Here the flag also means that the
+        // workunit's results are created reserved for the assignment
+        // (`initial_results`).
+        wu.transitioner_flags = TRANSITION_NO_NEW_RESULTS;
+    }
     wu.transition_time = safety_net_time(&wu, now);
     Ok(wu)
+}
+
+/// The assignment row of a job, for a workunit inserted earlier in the same
+/// batch. Upstream does not check that the host or user exists.
+fn insert_assignment_stmt(a: &Assign, wu_name: &str, now: i64) -> Stmt {
+    stmt!(
+        "INSERT INTO assignment (create_time, target_id, target_type, multi, workunitid) \
+         SELECT ?, ?, ?, 0, id FROM workunit WHERE name = ?",
+        now,
+        a.id,
+        a.target.target_type(),
+        wu_name
+    )
 }
 
 fn insert_workunit_stmt(wu: &Workunit) -> Stmt {
@@ -323,6 +387,9 @@ pub async fn create_work(
                 writes.push(insert_workunit_stmt(&wu));
                 for r in &results {
                     writes.push(insert_result_stmt(r, WuGuard::NewByName(&wu.name)));
+                }
+                if let Some(a) = &job.assign {
+                    writes.push(insert_assignment_stmt(a, &wu.name, now));
                 }
                 out.push(SubmittedJob {
                     name: job.name.clone(),
@@ -519,7 +586,8 @@ pub enum CancelTarget {
     Batch(i64),
 }
 
-/// Cancels workunits (`cancel_jobs`): unsent results are withdrawn and the
+/// Cancels workunits (`cancel_jobs`): unsent results, and results reserved
+/// for an assigned job, are withdrawn and the
 /// workunit is flagged, so nothing more is sent; results in progress are
 /// told to abort at their host's next request. Returns the IDs to transition.
 pub async fn cancel_workunits(
@@ -530,12 +598,13 @@ pub async fn cancel_workunits(
     let mut stmts = Vec::new();
     let mut push = |wu_where: &str, binds: Vec<i64>| {
         let mut r = Stmt::new(format!(
-            "UPDATE result SET server_state = ?, outcome = ?, mod_time = ? WHERE server_state = ? \
+            "UPDATE result SET server_state = ?, outcome = ?, mod_time = ? WHERE server_state IN (?, ?) \
              AND workunitid IN (SELECT id FROM workunit WHERE {wu_where})"
         ))
         .bind(RESULT_SERVER_STATE_OVER)
         .bind(RESULT_OUTCOME_DIDNT_NEED)
         .bind(now)
+        .bind(RESULT_SERVER_STATE_INACTIVE)
         .bind(RESULT_SERVER_STATE_UNSENT);
         let mut w = Stmt::new(format!(
             "UPDATE workunit SET error_mask = error_mask | ?, transition_time = ?, mod_time = ?, rev = rev + 1 \
