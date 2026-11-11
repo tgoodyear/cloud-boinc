@@ -300,22 +300,27 @@ What changes is that one handler does the work of three daemons.
 4. Validate. With no canonical result, once enough successful results have arrived, look for
    a quorum that agrees (`check_set`). With a canonical result, compare each later successful
    result to it (`check_pair`): it becomes valid, with the canonical result's credit, or
-   invalid. A result that arrives after the canonical result's files are deleted is marked
-   too late, as upstream does, and gets no credit.
+   invalid. A successful result found when `file_delete_state` is no longer the initial
+   value is marked too late and gets no credit (upstream does this once the canonical
+   result's files are deleted); its files are not read.
 5. If more results are needed (`target_nresults`, or a quorum not yet reached), create them,
    signing each output file's upload certificate with the upload key.
 6. If a canonical result exists or the workunit has failed, and assimilation has not started
    (`ASSIMILATE_INIT`), mark it ready to assimilate. A workunit that is already ready or
    acknowledged (`ASSIMILATE_DONE`) keeps its state, so the transition that follows an
    acknowledgement does not put it back in the result feed.
-7. When everything is reported and assimilated and `delete_delay_hours` has passed, delete
-   the output objects, and the input objects not marked `no_delete`, and record that.
+7. Clean up, in two transitions. When every result is over, every successful result has a
+   final validation verdict (none is still waiting for a validator or a retry), assimilation
+   is acknowledged and `delete_delay_hours` has passed, set `file_delete_state` to ready.
+   This transition deletes nothing. A later transition that reads the workunit in the ready
+   state deletes the output objects, and the input objects not marked `no_delete`, and then
+   records the deletion as done.
 8. Set the next `transition_time` to the earliest of: the deadlines of results in progress,
    the time deferred deletion falls due (the most recently returned result plus
-   `delete_delay_hours`, as `deferred_file_delete_time` in `sched/transitioner.cpp`), and
-   the next validation retry when a webhook or storage read failed. With none of these
-   outstanding, `transition_time` is set to 2147483647, which keeps the workunit out of the
-   deadline sweep.
+   `delete_delay_hours`, as `deferred_file_delete_time` in `sched/transitioner.cpp`), the
+   next validation retry when a webhook or storage read failed, and the next deletion retry
+   when a delete failed. With none of these outstanding, `transition_time` is set to
+   2147483647, which keeps the workunit out of the deadline sweep.
 9. Commit (one write batch).
 
 Steps 2 to 8 run in memory on the rows read in step 1. Validation may read object metadata
@@ -341,9 +346,16 @@ The guard tests the token and not the new revision, because two transitions that
 same revision expect to write the same next one: the loser would find it in place, written
 by the winner, and its result updates and credit would go through.
 
-Objects are deleted before the commit that records the deletion. A transition that loses the
-race after deleting repeats the deletion, which is harmless; the reverse order could record a
-deletion that never happened.
+Deletion takes two transitions. The first sets `file_delete_state` to ready, commits under
+the revision check and deletes no object. A report that arrives between its read and its
+commit changes the revision, so the commit fails and the next attempt sees the new result and its later deletion time. Once the ready state is committed, nothing
+reads those objects again: validation marks any later successful result too late without
+opening files, and the report itself needs none.
+
+A transition that reads the workunit in the ready state deletes the objects and then commits
+the done state. If a delete call fails, the state stays ready
+and the transition is retried; if the commit loses the revision race, the next transition
+repeats the deletes, which is harmless because an R2 delete of a missing object succeeds.
 
 ### Validation
 
