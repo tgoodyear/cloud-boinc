@@ -1,0 +1,20 @@
+[package]
+name = "cb-web-worker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "cloud-boinc web Worker. Master page, web RPCs and status"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cb-core = { path = "../../crates/cb-core" }
+cb-crypto = { path = "../../crates/cb-crypto" }
+cb-db = { path = "../../crates/cb-db" }
+cb-proto = { path = "../../crates/cb-proto" }
+cb-worker = { path = "../../crates/cb-worker" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+worker = { version = "0.8", features = ["d1", "queue"] }

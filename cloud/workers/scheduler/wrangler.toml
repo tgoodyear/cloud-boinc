@@ -1,0 +1,28 @@
+# The top-level values describe the reference dev deployment. Another
+# deployment changes the route host, zone and database_id; see
+# docs/deploy.md.
+name = "cloud-boinc-scheduler"
+# Built by dev/build.sh; wrangler only bundles and uploads it.
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[observability]
+enabled = true
+
+[placement]
+mode = "smart"
+
+[[routes]]
+pattern = "boinc-dev.usnewsmap.com/sched*"
+zone_name = "usnewsmap.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cloud-boinc-dev"
+database_id = "3ae057c8-0c75-418c-b975-b2a91b60ac33"
+migrations_dir = "../../migrations"
+
+[[queues.producers]]
+binding = "TRANSITIONS"
+queue = "cloud-boinc-dev-transitions"

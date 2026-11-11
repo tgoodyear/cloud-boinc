@@ -1,0 +1,21 @@
+[package]
+name = "cb-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Scheduler and job pipeline logic of cloud-boinc, independent of the runtime"
+
+[dependencies]
+async-trait = "0.1"
+cb-crypto = { path = "../cb-crypto" }
+cb-db = { path = "../cb-db" }
+cb-proto = { path = "../cb-proto" }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+cb-sqlite = { path = "../cb-sqlite" }
+cb-crypto = { path = "../cb-crypto", features = ["keygen"] }
+futures-lite = "2"

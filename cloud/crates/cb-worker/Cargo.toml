@@ -1,0 +1,18 @@
+[package]
+name = "cb-worker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "What the cloud-boinc Workers share: R2 files, webhooks, the settings cache"
+
+[dependencies]
+async-trait = "0.1"
+cb-core = { path = "../cb-core" }
+cb-crypto = { path = "../cb-crypto" }
+cb-d1 = { path = "../cb-d1" }
+cb-db = { path = "../cb-db" }
+futures-util = { version = "0.3", default-features = false }
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+worker = { version = "0.8", features = ["d1", "queue"] }

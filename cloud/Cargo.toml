@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "workers/*", "cli", "tests/app"]
+# The Workers build for wasm32-unknown-unknown only.
+default-members = ["crates/cb-proto", "crates/cb-crypto", "crates/cb-db", "crates/cb-sqlite", "crates/cb-core", "cli"]
+
+[workspace.package]
+edition = "2021"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/tgoodyear/cloud-boinc"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
