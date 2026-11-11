@@ -1291,8 +1291,16 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         reads.push(s.bind(host.id));
     }
     // Assigned jobs for this host or user, one reserved result each, that
-    // the host holds no result of (`need_targeted_instance`).
-    let want_assigned = send && config.enable_assignment;
+    // the host holds no result of (`need_targeted_instance`). Only jobs of
+    // an app, and a pinned version, this host has a usable version of: the
+    // limit counts jobs that can be sent, so ones the host cannot run do
+    // not hold back later ones. The IDs are integers of the catalog.
+    let want_assigned = send && config.enable_assignment && !app_ids.is_empty();
+    let id_list = |ids: &mut dyn Iterator<Item = i64>| {
+        ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+    };
+    let assigned_apps = id_list(&mut app_ids.iter().copied());
+    let assigned_versions = id_list(&mut versions.iter().map(|v| v.av.id));
     if want_assigned {
         reads.push(stmt!(
             format!(
@@ -1303,6 +1311,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                  WHERE a.multi = 0 AND ((a.target_type = ? AND a.target_id = ?) \
                  OR (a.target_type = ? AND a.target_id = ?)) \
                  AND w.error_mask = 0 AND w.canonical_resultid = 0 \
+                 AND w.appid IN ({assigned_apps}) \
+                 AND w.app_version_id IN (0,{assigned_versions}) \
                  AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = a.workunitid \
                  AND r2.hostid = ?) \
                  ORDER BY a.id LIMIT ?"

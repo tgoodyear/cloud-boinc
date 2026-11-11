@@ -303,7 +303,10 @@ reserved one.
 `handle_request` in `crates/cb-core/src/scheduler.rs` adds one query to batch 3: the
 assignments for this host or user (`multi = 0`) whose workunit has no error and no canonical
 result, has a reserved result, and has no result on this host, with the reserved result of
-lowest ID for each, at most `MAX_ASSIGNED` (20). Assigned jobs go first. As upstream, they
+lowest ID for each, at most `MAX_ASSIGNED` (20). The query keeps only workunits of an app the
+host has a usable version of and, when the workunit is pinned to a version, that version, so
+jobs the host cannot run do not use up the 20. A plan class's batch and workunit-ID gates are
+checked after the read. Assigned jobs go first. As upstream, they
 skip the memory, disk, deadline, daily-quota and in-progress checks, but the request must ask
 for work and the host must have a usable app version that the plan class's batch and
 workunit-ID gates admit. The fastest such version is taken, preferring one for a resource the

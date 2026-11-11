@@ -727,6 +727,27 @@ fn assignment_disabled_sends_no_assigned_jobs() {
     assert_eq!(w.results(wu)[0].server_state, RESULT_SERVER_STATE_INACTIVE);
 }
 
+#[test]
+fn assigned_jobs_the_host_cannot_run_do_not_hold_back_later_ones() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let req = computer(&w, "auth1", "aa", 1000);
+    // More jobs than one request looks at, pinned to a version the host
+    // has no use of, ahead of one it can run.
+    for i in 0..25 {
+        let wu = w.submit_assigned(&format!("p{i}"), 1100, 1, 1, to_host(req.hostid));
+        block_on(w.db.run(stmt!(
+            "UPDATE workunit SET app_version_id = 999999 WHERE id = ?",
+            wu
+        )))
+        .unwrap();
+    }
+    let wu = w.submit_assigned("t1", 1100, 1, 1, to_host(req.hostid));
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(w.results(wu)[0].hostid, req.hostid);
+}
+
 /// A database that, before the first write batch of a request, runs another
 /// request to completion: two requests planned from the same reads.
 struct Interleave<'a> {
