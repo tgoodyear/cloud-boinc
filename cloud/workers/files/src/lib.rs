@@ -12,7 +12,6 @@ use cb_proto::upload::{
 };
 use cb_proto::ProtoError;
 use cb_worker::{db, object_key, project, text, xml, BUCKET};
-use futures_util::StreamExt;
 use store::{Body, R2Uploads};
 use worker::{
     console_error, console_log, event, Bucket, Context, Env, Headers, Method, Object, Range,
@@ -142,15 +141,15 @@ fn refuse(e: UploadError) -> Result<Response> {
     xml(e.reply())
 }
 
-async fn upload(mut req: Request, env: &Env) -> Result<Response> {
-    let mut body = req.stream()?;
+async fn upload(req: Request, env: Env) -> Result<Response> {
+    let body = Body::new(req.inner().body());
     let mut buf: Vec<u8> = Vec::new();
     let request = loop {
         match parse_request(&buf) {
             Ok(r) => break r,
             Err(ProtoError::Incomplete) if buf.len() <= MAX_HEADER_BYTES => {
-                match body.next().await {
-                    Some(chunk) => buf.extend_from_slice(&chunk?),
+                match body.read_more().await? {
+                    Some(chunk) => buf.extend_from_slice(&chunk),
                     None => return refuse(incomplete_error(&buf)),
                 }
             }
@@ -180,7 +179,7 @@ async fn upload(mut req: Request, env: &Env) -> Result<Response> {
             if header.data_offset > MAX_HEADER_BYTES {
                 return refuse(UploadError::permanent("the request header is too long"));
             }
-            let db = db(env)?;
+            let db = db(&env)?;
             let project = match project(&db).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -196,8 +195,8 @@ async fn upload(mut req: Request, env: &Env) -> Result<Response> {
             ) {
                 return refuse(e);
             }
-            let data = Body::new(buf.split_off(header.data_offset.min(buf.len())), body);
-            match upload::receive(&store, &header, &data, PIECE_BYTES).await {
+            body.start_data(header.data_offset.min(buf.len()));
+            match upload::receive(&store, &header, &body, PIECE_BYTES).await {
                 Ok(Ok(())) => {
                     console_log!(
                         "upload {} {} bytes from offset {}",
@@ -221,14 +220,26 @@ async fn upload(mut req: Request, env: &Env) -> Result<Response> {
 }
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let path = req.path();
     match req.method() {
         Method::Get | Method::Head => match path.strip_prefix("/download/") {
             Some(name) => download(&req, &env.bucket(BUCKET)?, name).await,
             None => text(404, "not found\n"),
         },
-        Method::Post if path == UPLOAD_PATH => upload(req, &env).await,
+        // The upload runs under `wait_until`: if the client drops the
+        // connection while the body streams in, the runtime cancels the
+        // request's own work but lets this finish, so a piece whose bytes
+        // all arrived is still stored. With the zone's default request body
+        // buffering, a dropped request never reaches the Worker.
+        Method::Post if path == UPLOAD_PATH => {
+            let (tx, rx) = futures_channel::oneshot::channel();
+            ctx.wait_until(async move {
+                let _ = tx.send(upload(req, env).await);
+            });
+            rx.await
+                .unwrap_or_else(|_| Err(worker::Error::RustError("the upload was dropped".into())))
+        }
         _ => text(405, "method not allowed\n"),
     }
 }

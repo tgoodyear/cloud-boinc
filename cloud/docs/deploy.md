@@ -143,6 +143,13 @@ fails if the server reports more bytes than were sent or refuses the resumed upl
 put checks the MD5 of the whole file, so a success means the stored file is byte-identical.
 `resumed_from_bytes` in the output shows the offsets the server gave (multiples of 8 MiB).
 
+In `abort` mode the request announces the length of the whole file, as a client does;
+`--cut-pause-ms` waits that long after the last byte before dropping the connection, and
+`--resume-wait-ms` waits before the size query. With the zone's default request body
+buffering, the Worker never sees a dropped request, so `abort` mode reports 0 and the whole
+file is sent again; `short` mode reports 8388608 (see "Upload" in
+[architecture.md](architecture.md)).
+
 ## Plan limits
 
 The Workers Free plan stops at 100,000 requests, 100,000 D1 rows written and 10,000 queue

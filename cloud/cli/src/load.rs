@@ -52,6 +52,14 @@ pub struct LoadArgs {
     /// whose data stops at the cut.
     #[arg(long, value_enum, default_value_t = CutMode::Abort)]
     cut_mode: CutMode,
+    /// With `--cut-mode abort`, how long to wait after sending the last
+    /// byte before dropping the connection.
+    #[arg(long, default_value_t = 0)]
+    cut_pause_ms: u64,
+    /// How long to wait after the interrupted attempt before asking for
+    /// the size and resuming. A real client waits at least a minute.
+    #[arg(long, default_value_t = 0)]
+    resume_wait_ms: u64,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,16 +68,18 @@ enum CutMode {
     Short,
 }
 
-/// A request body that fails after `len` bytes, so the HTTP client drops
-/// the connection part-way through the upload.
+/// A request body that fails after its `data`, and after a pause, so the
+/// HTTP client drops the connection part-way through the upload.
 struct CutBody {
     data: Vec<u8>,
     pos: usize,
+    pause: Duration,
 }
 
 impl Read for CutBody {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.pos >= self.data.len() {
+            thread::sleep(self.pause);
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "upload cut on purpose",
@@ -264,11 +274,23 @@ impl Host {
                 }
             }
             // The request fails on the client side; what matters is what the
-            // server kept.
+            // server kept. Like a real client (`HTTP_OP::libcurl_exec` in
+            // `client/http_curl.cpp`), it announces the length of the whole
+            // request.
             CutMode::Abort => {
-                let _ = self.agent.post(url).send(CutBody { data: body, pos: 0 });
+                let full = body.len() - cut + data.len();
+                let _ = self
+                    .agent
+                    .post(url)
+                    .set("Content-Length", &full.to_string())
+                    .send(CutBody {
+                        data: body,
+                        pos: 0,
+                        pause: Duration::from_millis(self.args.cut_pause_ms),
+                    });
             }
         }
+        thread::sleep(Duration::from_millis(self.args.resume_wait_ms));
         let name = element(info, "name").ok_or("upload: the file has no name")?;
         let query = format!(
             "<data_server_request>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>0</core_client_minor_version>\n    <core_client_release>4</core_client_release>\n    <get_file_size>{name}</get_file_size>\n</data_server_request>\n"

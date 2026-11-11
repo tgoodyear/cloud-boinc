@@ -605,9 +605,9 @@ disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receiv
 - `<get_file_size>` answers the size of the finished object, or else the pieces present
   without a gap from offset 0. The tail is never a piece, so that number is always below the
   file size: the client counts an upload as done when the server reports at least its size
-  (`FILE_XFER_SET::poll`), and it never hears that for a file that is not stored. A cut
-  request keeps the pieces it finished; the bytes of the piece in flight are lost and sent
-  again.
+  (`FILE_XFER_SET::poll`), and it never hears that for a file that is not stored. A request
+  whose data stops early keeps the pieces it finished; the bytes of the piece in flight are
+  lost and sent again. A dropped connection is different; see below.
 - A file of 8 MiB or less has no pieces: its upload is one head and one put, as before.
 
 Offsets follow `copy_socket_to_file` in `sched/file_upload_handler.cpp`. An offset beyond the
@@ -617,6 +617,35 @@ and dropped where upstream writes them again in place. One difference: upstream 
 success to an offset at or past the end of the file without reading anything; here that is
 the same transient error, because this handler never reports success for a file it does not
 hold.
+
+File bytes do not pass through the Worker's WebAssembly. The Rust code reads and parses the
+header from the first chunks of the body; everything after it is moved by a small JavaScript
+module, `workers/files/src/upload.js` (`Splitter`), bound in `workers/files/src/store.rs`. It
+reads the body in blocks of up to 1 MiB with the runtime's `readAtLeast`, writes the next n
+bytes into a `FixedLengthStream` for each piece put (`take`), and for the finished object pipes
+the stored pieces, opened one at a time, and then the tail into one `FixedLengthStream`
+(`compose`). The Rust side passes those streams to `Bucket::put` and reads two flags back to
+classify a failure: the body ended early (`failed`) or a piece could not be read (`missing`).
+CPU time per request, measured on the dev deployment: 4 to 26 ms for a 1 MB upload (was 57 to
+84 ms with the bytes in wasm), 30 to 42 ms for a 20 MB upload from offset 0 (was 500 to
+1,550 ms), 17 to 30 ms for the resumed second half of a 20 MB upload (was 190 to 600 ms, with
+some requests stopped for exceeding the CPU limit), and 46 to 53 ms for the last 35 MB of a
+60 MB upload. That is about 1 ms per MB moved, so the Free plan's CPU limit is not what bounds
+the size of an upload.
+
+What a dropped connection keeps: nothing, on a zone with default settings. A real client
+announces the length of its request (`HTTP_OP::libcurl_exec` in `client/http_curl.cpp`), and
+the edge holds the whole body before it starts the Worker: on the dev deployment a 4 MB and a
+30 MB request sent over 10 seconds each started the Worker only when their last byte had
+arrived, and an upload whose connection was dropped after 12,000,000 bytes, at once or after
+a 5-second pause, never started the Worker at all; `<get_file_size>` then reports 0 and the
+client sends the file again from the start. Resume from a cut-off connection therefore needs
+the zone to stream request bodies to the Worker (the Configuration Rules setting
+`request_body_buffering`, set to `none` for the upload path), which has not been tried. If the
+body does stream, the upload runs under `wait_until` (`fetch` in `workers/files/src/lib.rs`),
+so that a piece whose bytes all arrived before the disconnect is still stored. A complete
+request whose data stops early (a client that hit its own error) keeps its finished pieces
+either way.
 
 Every request passes the same checks before any byte is stored, whatever its offset
 (`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
@@ -662,18 +691,16 @@ Alternatives not taken:
 - A row per upload in D1 recording the bytes held. A listing of `partial/<name>/` is strongly
   consistent and holds the same facts, and a row would add a query to every upload, including
   the common small ones.
-- Buffering the body in the Worker and writing on a cut. A Worker stops when the client
-  disconnects, so nothing written after the cut can be relied on, and memory is limited to
-  128 MB.
+- Buffering the body in the Worker and writing on a cut. Work started after the disconnect
+  can only run under `wait_until`, which has a time limit, and memory is limited to 128 MB.
 
 Limits:
 
 - One upload request is limited by the zone plan's request body limit (100 MB on Free and
   Pro), and a client always sends from its offset to the end, so files above that limit still
   need the client's `gzip_when_done` or a higher plan.
-- File data passes through the Worker's WebAssembly, and a file over 8 MiB is read back once
-  more when it is finished, which costs CPU time. Large outputs may need the Workers Paid
-  plan's CPU limit.
+- A file over 8 MiB is read back from R2 once more when it is finished. That costs R2 reads
+  and wall time, but little CPU time (see the figures above).
 
 ## Keys and secrets
 
