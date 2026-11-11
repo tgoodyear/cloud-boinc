@@ -250,6 +250,39 @@ pub fn xml_escape(input: &str) -> String {
     out
 }
 
+/// Escape text for XML that a standard parser reads, keeping non-ASCII
+/// characters as they are.
+///
+/// Use this for replies the output of which is UTF-8 and declared so
+/// (`XML_HEADER_UTF8`), such as `show_user.php?format=xml`. [`xml_escape`]
+/// is for everything the BOINC client parses with its own byte-oriented
+/// parser: it turns each byte of a multi-byte character into its own
+/// reference, which a standard parser reads as several Latin-1 characters.
+///
+/// `<` and `&` become entities, `]]>` becomes `]]&gt;`, and tab, newline and
+/// carriage return become `&#N;`, so for ASCII input the output equals
+/// [`xml_escape`]'s. Other control characters and U+FFFE and U+FFFF, which
+/// XML 1.0 forbids, are dropped. Every other character is kept.
+pub fn xml_escape_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut chars = input.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '&' => out.push_str("&amp;"),
+            '\t' | '\n' | '\r' => out.push_str(&format!("&#{};", c as u32)),
+            '\0'..='\x1f' | '\u{fffe}' | '\u{ffff}' => {}
+            ']' if input[i..].starts_with("]]>") => {
+                out.push_str("]]&gt;");
+                chars.next();
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Undo [`xml_escape`] (`xml_unescape` in `lib/parse.cpp`).
 ///
 /// Handles `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&amp;`, `&#xD;`, `&#xA;`
@@ -1245,6 +1278,25 @@ mod tests {
         assert_eq!(xml_escape("a\tb\nc\rd\x01e"), "a&#9;b&#10;c&#13;de");
         assert_eq!(xml_escape("\u{e9}"), "&#195;&#169;");
         assert_eq!(xml_escape("\"quoted\" 'x'"), "\"quoted\" 'x'");
+    }
+
+    #[test]
+    fn escape_text_keeps_unicode_and_matches_escape_for_ascii() {
+        assert_eq!(
+            xml_escape_text("Jos\u{e9} \u{65e5}\u{672c}"),
+            "Jos\u{e9} \u{65e5}\u{672c}"
+        );
+        assert_eq!(xml_escape_text("\u{1f600}"), "\u{1f600}");
+        assert_eq!(xml_escape_text("a<b>&c"), "a&lt;b>&amp;c");
+        assert_eq!(xml_escape_text("x]]>y]z"), "x]]&gt;y]z");
+        assert_eq!(xml_escape_text("]]]>\u{e9}"), "]]]&gt;\u{e9}");
+        assert_eq!(
+            xml_escape_text("a\tb\nc\rd\x01e\u{fffe}"),
+            "a&#9;b&#10;c&#13;de"
+        );
+        for s in ["", "plain", "a<b>&c]]>d", "t\t\r\n\x02", "\"q\" 'x'"] {
+            assert_eq!(xml_escape_text(s), xml_escape(s));
+        }
     }
 
     #[test]

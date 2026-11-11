@@ -12,7 +12,8 @@ use cb_core::web::{
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
-    db, now, project, random_u32, read_body, secret_bytes, text, xml, SECRET_PASSWD_PEPPER,
+    db, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
+    SECRET_PASSWD_PEPPER,
 };
 use worker::{
     console_error, event, Cache, Context, Env, Headers, Method, Request, Response, Result,
@@ -182,7 +183,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             let q = params(&mut req).await?;
             let key = q.get("account_key").map(String::as_str).unwrap_or_default();
             match am_get_info(&db, key).await {
-                Ok(reply) => xml(reply),
+                Ok(reply) => xml_utf8(reply),
                 Err(e) => {
                     console_error!("am_get_info: {e}");
                     xml(AccountError::DbError.reply())

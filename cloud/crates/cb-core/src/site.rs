@@ -76,7 +76,7 @@ pub struct SitePage {
 }
 
 const HTML: &str = "text/html; charset=utf-8";
-const XML: &str = "text/xml";
+const XML: &str = "text/xml; charset=utf-8";
 
 impl SitePage {
     fn html(status: u16, body: String) -> SitePage {
