@@ -233,6 +233,8 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 pepper: pepper.as_deref(),
                 now: now(),
                 random: &random,
+                // No transport yet: the pages that need email say so.
+                mailer: None,
             };
             match site_page(&ctx, p, &q).await {
                 Ok(Some(page)) => site_response(page),

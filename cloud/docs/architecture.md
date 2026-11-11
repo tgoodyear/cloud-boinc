@@ -33,7 +33,7 @@ In scope, because the reference deployment uses it:
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
 | Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits, checksums and resume |
 | Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
-| Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences |
+| Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences; password recovery, address verification and change notices through a mailer the deployment supplies |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
 
 Out of scope for now: forums, teams, profiles, locality scheduling,
@@ -841,7 +841,7 @@ weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream
 The site pages are in `cloud/crates/cb-core/src/site.rs`, reached through `site_page`:
 `login_form.php`, `login_action.php`, `logout.php`, `home.php`, `hosts_user.php`,
 `show_host_detail.php`, `results.php`, `result.php`, `workunit.php` and `show_user.php`, and
-the account and preference pages listed below. Logging in, with the account key or with email address and password, sets the `auth` cookie
+the account and preference pages listed below, and the pages that send email (see Email below). Logging in, with the account key or with email address and password, sets the `auth` cookie
 to the account key as upstream does, with `HttpOnly`, `Secure` and `SameSite=Lax`. It lasts a
 year when "stay logged in" is ticked, and for the browser session otherwise. A password is
 taken from a POST only. Logging out is a POST with the form token, as described under the account pages below. Private fields follow upstream: the account page, the IP address,
@@ -876,7 +876,7 @@ The pages that change an account are in `cloud/crates/cb-core/src/site_account.r
 | `edit_passwd_form.php` | GET | |
 | `edit_passwd_action.php` | POST | `passwd_hash`, given the current password or the account key |
 | `edit_email_form.php` | GET | |
-| `edit_email_action.php` | POST | `email_addr` and `passwd_hash`, given the password (the account key for an account without one); `email_validated` back to 0 |
+| `edit_email_action.php` | POST | `email_addr` and `passwd_hash`, given the password (the account key for an account without one); `email_validated` back to 0; with email also `previous_email_addr` and `email_addr_change_time` (see Email) |
 | `prefs.php?subset=global\|project` | GET | |
 | `prefs_edit.php?subset=...&venue=...` | GET form, POST to save | `global_prefs`, or `project_prefs` and, for the main set, `send_email`, `show_hosts` and `venue` |
 | `prefs_remove.php?subset=...&venue=...` | GET to confirm, POST to remove | one venue's set from `global_prefs` or `project_prefs` |
@@ -893,9 +893,9 @@ Passwords are stored as everywhere else here: the client-side `md5(password + em
 pepper (`pepper_passwd_hash`). The hash depends on the email address, so an address change
 makes it again from the password given. A password or address change also changes the weak
 account key, which is derived from the stored hash, and an address change changes the
-cross-project ID; the pages say so. No email is sent and a new address is not verified. Upstream
-sends a message to both addresses on a change and refuses a second change within seven days, so
-that the old address can undo it; with no email, neither is done. Upstream refuses a name
+cross-project ID; the pages say so. Without a mailer no email is sent and a new address is not
+verified; with one, an address change sends the notices and waits a week, as upstream does (see
+Email below). Upstream refuses a name
 another account has when the details are edited; names are not unique here, and checking would
 scan the `user` table.
 
@@ -975,6 +975,125 @@ have takes the in-use value; an empty `<tag></tag>` number is 0.
 
 A computing-preferences save keeps only the fields above, as upstream's form does; anything else
 a client stored in the document is dropped.
+
+### Email
+
+Without email a site cannot recover a password, verify an address or tell an address that it
+was changed away from. The pages that do these are in `cloud/crates/cb-core/src/site_email.rs`,
+and what sends the messages is left to the deployment.
+
+**Transport.** `Mailer` in `cloud/crates/cb-core/src/mail.rs` is the one thing a deployment
+supplies:
+
+```rust
+#[async_trait(?Send)]
+pub trait Mailer {
+    async fn send(&self, message: &MailMessage) -> Result<(), MailError>;
+}
+```
+
+A `MailMessage` has one sender (`from_addr`, `from_name`), one recipient (`to`), a `subject` and a
+plain-text `body`, read through accessors. It is built only by `MailMessage::new`, which is the
+check at the boundary: the two addresses must be a single plain `local@domain` (the form
+`is_valid_email` accepts), so a space, comma, angle bracket, quote or line break refuses the
+message; the subject and the sender name lose every control character and line or paragraph
+separator, and the sender name also the characters that delimit a mailbox (`<>"\,;:@()[]`); the body
+loses CR and control characters other than LF and tab. A transport has to encode the name and
+subject for a header and write the body with CRLF line ends. `SiteCtx` has `mailer:
+Option<&dyn Mailer>`; the `web` Worker passes `None` until a transport is chosen, so a
+deployment sends no email yet. Nothing in the Workers' bindings changes.
+
+**Settings.** `email_from` and `email_from_name` in the project config, named as upstream's
+`EMAIL_FROM` and `EMAIL_FROM_NAME` (`html/inc/email.inc`; upstream sets them in `project.inc`).
+`put_setting` refuses an `email_from` that is not one plain address. A mailer with no `email_from`
+counts as no mailer (`SiteCtx::mail`). With none, `get_passwd.php`, `mail_passwd.php`,
+`validate_email_addr.php`, `recover_email.php` and the login-link form of `login_action.php`
+answer with a plain page that the project does not send email, and every other page is as it was:
+the account page has no verify button, the login page no reset link, and `edit_email_action.php`
+changes the address with no notice and no wait.
+
+| Page | Method | Does |
+| --- | --- | --- |
+| `get_passwd.php` | GET | asks for an email address |
+| `mail_passwd.php` | POST | mails the account a login link |
+| `login_action.php?id=&t=` | GET, POST | the login link: a GET shows a button, the POST logs in |
+| `validate_email_addr.php` | GET, POST | logged in: a button, and the POST sends the verification message |
+| `validate_email_addr.php?validate=1&u=&x=` | GET | the verification link: sets `email_validated` |
+| `recover_email.php?id=&token=` | GET, POST | the undo link of an address change: a GET shows a button, the POST undoes the change |
+
+**Links.** Every link in a message is `master_url` of the config plus a page and a query of an
+account ID and a token. Nothing from the request goes into a link, and a link is the only thing
+in a message that is not text the project wrote or an address a page has already validated. A
+message never carries a user's name.
+
+**Tokens.** Each link carries 256 random bits from the same source as account keys. The
+database holds only their SHA-256 (`token_hash` in `cloud/crates/cb-crypto/src/account.rs`) in
+the `token` table (`cloud/migrations/0004_email.sql`), with the account, a type (`L` login, `V`
+verification, `E` undo), when it was made, when it expires and when it was used. Upstream's
+`token` table, which holds the token as made, is used for undo links only. A login or undo
+token is used by one `UPDATE ... WHERE used_time = 0 AND expire_time > now RETURNING id`, so two
+requests cannot both use it. A newer login or undo token ends the older unused ones; a
+verification link may be used again until it expires, and is good only while the account has the
+address it was sent to. A message the transport refuses removes its token. Whatever makes the
+next token removes up to twenty rows older than eight days.
+
+**Limits.** An account gets at most one login-link message and at most one verification message
+in any ten minutes (`MAIL_INTERVAL_SECS`). The limit is part of the statement that adds the
+token (`INSERT ... SELECT ... WHERE NOT EXISTS` over the account's earlier tokens of the type),
+so concurrent requests cannot both pass it, and a used token still counts. A request inside the
+limit sends nothing and is answered as one outside it. A change of address needs a week since
+the last one (`EMAIL_CHANGE_WAIT_SECS`). An address is the address of one account at a time,
+which bounds the notices a third party can cause to an address. There is no limit per client
+address or per request; a Cloudflare rate-limiting rule on these paths does that, as for login.
+
+**Password recovery.** `mail_passwd.php` looks the account up by address, makes a login token
+(a day), and mails `login_action.php?id=&t=`. The link logs in for a year, as upstream's link
+does, and goes to `home.php`, where the account key can stand in for the current password on
+`edit_passwd_form.php`.
+
+**Verification.** `home.php` offers a button when the site sends email and the address is not
+verified; sign-up sends the message when it makes an account (or logs in to one with that
+address and password, if that is not verified), and ignores a failure to send. The link works
+without a login, as upstream's.
+
+**Address change.** With email, `edit_email_action.php` refuses a change within seven days of the
+last, stores `previous_email_addr` and `email_addr_change_time` in the same `UPDATE`, then
+sends the new address a notice (both addresses and when the next change may be made) and the
+previous address the undo link, an `E` token valid for seven days and bound to that previous
+address. If either message cannot be sent, the page says so, as upstream's does, and the change
+stands. `recover_email.php` puts the previous address back, clears `previous_email_addr` and
+`email_addr_change_time`, sets `email_validated` to 0 and replaces the password hash with the
+peppered hash of a random value nobody knows, as upstream does with `password_hash`. It also
+ends the account's unused login and verification links, which the holder of the new address
+may have asked for. It does nothing when another account has the previous address, and then does
+not use the link up. The browser is logged out.
+
+**Differences from upstream.**
+
+- The login link is `id` and `t`, where `t` is a random token that works once and the database
+  holds its hash. Upstream's has `t` as a time and `h` as an MD5 prefix of the account ID,
+  account key and time, works for a day any number of times, and stores nothing.
+- A GET of a login link or an undo link shows a button; the POST of the button acts. Upstream acts
+  on the GET, which lets a mail scanner that fetches links use the token up or, for an undo
+  link, undo a change nobody meant to undo.
+- `mail_passwd.php` gives one answer whether or not an account has the address (upstream says
+  "No such user" and prints the address), whether or not the message was sent, and for a blocked
+  account. The time it takes still differs, since only a known account sends a message.
+- At most one recovery message and one verification message per account per ten minutes.
+  Upstream has no limit.
+- The verification token is a random one-per-message token in the `token` table. Upstream's is
+  `login_token` of the `user` row, reused for a day and shared with other uses; the fork has no
+  such column. The page that sends the message is a POST with the form token, not a GET, so a
+  link on another site cannot make it send.
+- The page is `validate_email_addr.php`, the name upstream's file has.
+- An undo link is bound to the previous address and is replaced by the next change's link;
+  `recover_email.php` also ends the account's other unused links, and does not say whether the
+  token was bad or the previous address is taken, beyond one message that names both.
+- The seven-day wait and the notices exist only with email, so the same page changes the
+  address at once when the site sends none. The account is not asked to verify a new address
+  automatically after a change; the account page has the button.
+- `SHOW_NONVALIDATED_EMAIL_ADDR`, HTML mail, `EMAIL_USE_CMD`, PHPMailer settings, banned and
+  `stopforumspam.com` address checks, and the account deletion mail are not implemented.
 
 ## Admin API and CLI
 
@@ -1118,9 +1237,10 @@ Not implemented yet:
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
-- On the site: password reset and email login links, email address verification and change
-  notices, invitation codes, consent records, merging and deleting computers, per-app details of
-  a computer, cross-project statistics links and certificates, and anything that sends email.
+- On the site: invitation codes, consent records, merging and deleting computers, per-app
+  details of a computer, cross-project statistics links and certificates, account deletion, and
+  any email beyond the messages under Email. The Worker has no mail transport yet, so a
+  deployment sends none.
 - Rate limiting. Nothing limits how often an address may try to log in, sign up or call
   `lookup_account.php`; upstream sleeps after a failed login (`LOGIN_FAIL_SLEEP_SEC`). A
   deployment can put a Cloudflare rate-limiting rule on those paths.

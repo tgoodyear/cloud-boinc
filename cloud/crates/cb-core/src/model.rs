@@ -78,6 +78,11 @@ pub struct User {
     pub passwd_hash: String,
     pub email_validated: i32,
     pub blocked: i32,
+    /// The address before the last change, while the previous address can
+    /// still undo it; empty otherwise.
+    pub previous_email_addr: String,
+    /// When the address was last changed through the site with email on.
+    pub email_addr_change_time: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

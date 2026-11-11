@@ -20,9 +20,11 @@ use cb_db::{stmt, Db, Stmt};
 use cb_proto::consts::*;
 use cb_proto::web_rpc::{err, write_error};
 
+use crate::mail::{Mail, Mailer};
 use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
 use crate::site_account;
+use crate::site_email;
 use crate::web::{account_creation_refusal, html_escape, page, show_user_xml, weak_account_key};
 use crate::CoreResult;
 
@@ -124,10 +126,28 @@ pub struct SiteCtx<'a> {
     pub now: i64,
     /// Random numbers, for new account keys.
     pub random: &'a dyn Fn() -> u32,
+    /// How the site sends email; `None` for a deployment without a
+    /// transport. The pages that need email say so, and the others do not
+    /// change. A mailer counts only when the config has `email_from`; see
+    /// [`SiteCtx::mail`].
+    pub mailer: Option<&'a dyn Mailer>,
+}
+
+impl<'a> SiteCtx<'a> {
+    /// The mailer with the project's sender settings, or `None` when the
+    /// site sends no email: no mailer, or no `email_from` in the config.
+    pub fn mail(&self) -> Option<Mail<'a>> {
+        let config = &self.project.config;
+        if config.email_from.is_empty() {
+            return None;
+        }
+        self.mailer
+            .map(|m| Mail::new(m, &config.email_from, &config.email_from_name))
+    }
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 22] = [
+pub const SITE_PATHS: [&str; 26] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -150,12 +170,16 @@ pub const SITE_PATHS: [&str; 22] = [
     "/prefs.php",
     "/prefs_edit.php",
     "/prefs_remove.php",
+    "/get_passwd.php",
+    "/mail_passwd.php",
+    "/validate_email_addr.php",
+    "/recover_email.php",
 ];
 
 /// Answers one of [`SITE_PATHS`]; `None` for any other path.
 pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<Option<SitePage>> {
     Ok(Some(match path {
-        "/login_form.php" => login_form(ctx.project, q),
+        "/login_form.php" => login_form(ctx.project, q, ctx.mail().is_some()),
         "/login_action.php" => login_action(ctx, q).await?,
         "/logout.php" => site_account::logout(ctx, q).await?,
         "/home.php" => home(ctx).await?,
@@ -178,6 +202,10 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/prefs.php" => site_account::prefs(ctx, q).await?,
         "/prefs_edit.php" => site_account::prefs_edit(ctx, q).await?,
         "/prefs_remove.php" => site_account::prefs_remove(ctx, q).await?,
+        "/get_passwd.php" => site_email::get_passwd(ctx),
+        "/mail_passwd.php" => site_email::mail_passwd(ctx, q).await?,
+        "/validate_email_addr.php" => site_email::validate_email_addr(ctx, q).await?,
+        "/recover_email.php" => site_email::recover_email(ctx, q).await?,
         _ => return Ok(None),
     }))
 }
@@ -430,8 +458,9 @@ pub(crate) fn local_url(next: &str) -> Option<&str> {
     (page_ok && query_ok).then_some(next)
 }
 
-/// `login_form.php`.
-pub fn login_form(project: &Project, q: &Params) -> SitePage {
+/// `login_form.php`. With `can_mail`, a link to the page that mails a login
+/// link to an account's address.
+pub fn login_form(project: &Project, q: &Params, can_mail: bool) -> SitePage {
     let next = local_url(str_param(q, "next_url")).unwrap_or("home.php");
     let body = format!(
         "<form method=\"post\" action=\"login_action.php\">\n\
@@ -443,8 +472,13 @@ pub fn login_form(project: &Project, q: &Params) -> SitePage {
          <p><label><input type=\"checkbox\" name=\"stay_logged_in\" value=\"1\"> Stay logged in</label></p>\n\
          <p><input type=\"submit\" value=\"Log in\"></p>\n</form>\n\
          <p>Your account key is in the file <code>account_*.xml</code> for this project in the \
-         BOINC data directory of a computer attached to your account.</p>\n{}",
+         BOINC data directory of a computer attached to your account.</p>\n{}{}",
         html_escape(next),
+        if can_mail {
+            "<p>Forgot your password? <a href=\"get_passwd.php\">Get a login link by email</a>.</p>\n"
+        } else {
+            ""
+        },
         if account_creation_refusal(&project.config).is_none() {
             "<p>No account yet? <a href=\"create_account_form.php\">Create one</a>.</p>\n"
         } else {
@@ -456,8 +490,13 @@ pub fn login_form(project: &Project, q: &Params) -> SitePage {
 
 /// `login_action.php`: by account key (`key` in the query or
 /// `authenticator` in the form), or by email address and password in a POST.
-/// On success the browser gets the `auth` cookie and goes to `next_url`.
+/// On success the browser gets the `auth` cookie and goes to `next_url`. With
+/// `id` and `t` it is the target of a mailed login link
+/// ([`site_email::login_via_link`]).
 pub async fn login_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
+    if !str_param(q, "id").is_empty() && !str_param(q, "t").is_empty() {
+        return site_email::login_via_link(ctx, q).await;
+    }
     let project = ctx.project;
     let next = local_url(str_param(q, "next_url")).unwrap_or("home.php");
     let permanent = q.get("stay_logged_in").is_some_and(|v| !v.is_empty());
@@ -542,7 +581,11 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     let account_file = account_file_name(&project.config.master_url);
     let mut b = String::from("<h2>Account information</h2>\n<table>\n");
     row2(&mut b, "Name", &html_escape(&user.name));
-    row2(&mut b, "Email address", &html_escape(&user.email_addr));
+    let mut email_cell = html_escape(&user.email_addr);
+    if ctx.mail().is_some() {
+        email_cell.push_str(&site_email::verify_cell(&user, ctx.now));
+    }
+    row2(&mut b, "Email address", &email_cell);
     row2(
         &mut b,
         &format!("{} member since", html_escape(&project.config.long_name)),

@@ -134,6 +134,12 @@ A database created before `migrations/0002_purge.sql` existed needs
 Likewise, `migrations/0003_user_tasks.sql` adds the index behind an account's task list
 (`results.php?userid=`); apply it before the web Worker that serves that page is deployed.
 
+`migrations/0004_email.sql` adds the `token` table and two columns of `user` for the pages that
+send email. Apply it before the web Worker that has them is deployed. The Worker has no mail
+transport yet, so those pages answer that the project does not send email; email is on when the
+Worker is given a `Mailer` (`cloud/crates/cb-core/src/mail.rs`) and the config has `<email_from>`
+(and optionally `<email_from_name>`).
+
 ## Checks
 
 ```

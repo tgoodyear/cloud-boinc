@@ -162,6 +162,14 @@ pub fn form_token(authenticator: &str, tnow: i64) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// How a site stores a token it mailed out: the lowercase hex SHA-256 of the
+/// token. The token is 128 or more random bits and used once, so a plain hash
+/// is enough; reading the database does not give a working link.
+pub fn token_hash(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
 fn pepper_mac(pepper: &[u8], passwd_hash: &str) -> Hmac<Sha256> {
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(pepper).expect("HMAC accepts keys of any length");
@@ -181,6 +189,14 @@ mod tests {
             md5_hex("secretuser@example.com")
         );
         assert_eq!(passwd_hash("abc", ""), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn token_hash_is_sha256_hex() {
+        assert_eq!(
+            token_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

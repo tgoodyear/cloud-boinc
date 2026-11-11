@@ -52,6 +52,11 @@ pub struct Config {
     pub prefer_primary_platform: bool,
     pub user_url: bool,
     pub user_country: bool,
+    /// Sender address of the email the site sends (`EMAIL_FROM` in upstream's
+    /// `project.inc`). Empty: the site sends no email.
+    pub email_from: String,
+    /// Sender name (`EMAIL_FROM_NAME`).
+    pub email_from_name: String,
     // cloud-boinc options without an upstream counterpart.
     /// Whether `create_account` is open to anyone.
     pub account_creation: bool,
@@ -104,6 +109,8 @@ impl Default for Config {
             prefer_primary_platform: false,
             user_url: true,
             user_country: true,
+            email_from: String::new(),
+            email_from_name: String::new(),
             account_creation: false,
             max_granted_credit: 200.0 * 1000.0 * 365.0,
             max_upload_nbytes: 100e6,
@@ -190,6 +197,8 @@ impl Config {
             take!(xp.parse_bool("prefer_primary_platform") => c.prefer_primary_platform);
             take!(xp.parse_bool("user_url") => c.user_url);
             take!(xp.parse_bool("user_country") => c.user_country);
+            take!(xp.parse_str("email_from") => c.email_from);
+            take!(xp.parse_str("email_from_name") => c.email_from_name);
             take!(xp.parse_bool("account_creation") => c.account_creation);
             take!(xp.parse_double("max_granted_credit") => c.max_granted_credit);
             take!(xp.parse_double("max_upload_nbytes") => c.max_upload_nbytes);
@@ -255,6 +264,24 @@ mod tests {
         assert_eq!(c.delete_delay, 7200.0);
         assert_eq!(c.min_core_client_version, 70900);
         assert_eq!(c.max_wus_to_send, 10);
+    }
+
+    #[test]
+    fn parses_the_sender_settings() {
+        let c = Config::parse(
+            "<config><master_url>https://example.org/</master_url>\n\
+             <email_from>boinc@example.org</email_from>\n\
+             <email_from_name>Example Project</email_from_name></config>",
+        )
+        .unwrap();
+        assert_eq!(c.email_from, "boinc@example.org");
+        assert_eq!(c.email_from_name, "Example Project");
+        let none = Config::parse("<config><master_url>https://example.org/</master_url></config>")
+            .unwrap();
+        assert_eq!(
+            (none.email_from.as_str(), none.email_from_name.as_str()),
+            ("", "")
+        );
     }
 
     #[test]

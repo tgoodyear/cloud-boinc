@@ -19,8 +19,9 @@ use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
 use crate::site::{
     error_page, label_row, layout, local_url, login_cookie, logout_cookie, row2, str_param,
-    to_login, viewer, Params, SiteCtx, SitePage,
+    to_login, user_by_auth, viewer, Params, SiteCtx, SitePage,
 };
+use crate::site_email::{self, EMAIL_CHANGE_WAIT_SECS};
 use crate::web::{
     account_creation_refusal, html_escape, is_valid_email, is_valid_postal_code,
     is_valid_user_name, is_valid_user_url, make_user, NewAccount,
@@ -35,7 +36,8 @@ const MAX_PASSWD_LENGTH: usize = 256;
 /// How long a form token is accepted, as upstream's `valid_tokens`.
 pub const FORM_TOKEN_SECS: i64 = 86400;
 
-const TIMED_OUT: &str = "Link has timed out. Please go back, reload the page, and try again.";
+pub(crate) const TIMED_OUT: &str =
+    "Link has timed out. Please go back, reload the page, and try again.";
 
 /// The hidden fields that tie a form to the logged-in account.
 pub(crate) fn token_fields(user: &User, now: i64) -> String {
@@ -47,7 +49,7 @@ pub(crate) fn token_fields(user: &User, now: i64) -> String {
 }
 
 /// Whether the request is a POST carrying a current token for `user`.
-fn token_ok(ctx: &SiteCtx<'_>, user: &User, q: &Params) -> bool {
+pub(crate) fn token_ok(ctx: &SiteCtx<'_>, user: &User, q: &Params) -> bool {
     let Ok(tnow) = str_param(q, "tnow").parse::<i64>() else {
         return false;
     };
@@ -265,6 +267,15 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
         }
         Err(e) => return Ok(error_page(project, 400, e.message())),
     };
+    if let Some(mail) = ctx.mail() {
+        // The account exists whether or not this works; the account page can
+        // ask for the message again.
+        if let Ok(Some(user)) = user_by_auth(ctx.db, &authenticator).await {
+            if user.email_validated == 0 {
+                let _ = site_email::send_verification(ctx, &mail, &user).await;
+            }
+        }
+    }
     let next = local_url(str_param(q, "next_url")).unwrap_or("home.php");
     let mut out = SitePage::redirect(format!("{}{next}", project.config.master_url));
     out.set_cookie = Some(login_cookie(project, &authenticator, true));
@@ -503,23 +514,38 @@ pub async fn edit_email_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
         "Password"
     };
     b.push_str(&passwd_input("passwd", label, "current-password"));
-    b.push_str(
-        "<p><input type=\"submit\" value=\"Change email address\"></p>\n</form>\n\
-         <p>No message is sent to either address, and the new address is not verified. \
-         The change also changes your cross-project ID and weak account key.</p>\n",
-    );
+    b.push_str("<p><input type=\"submit\" value=\"Change email address\"></p>\n</form>\n");
+    if ctx.mail().is_some() {
+        b.push_str(
+            "<p>A message about the change is sent to both addresses; the one to the previous \
+             address has a link that undoes the change for seven days. You cannot change the \
+             address again for seven days. The new address is not verified until you ask for \
+             a verification message on your account page. The change also changes your \
+             cross-project ID and weak account key.</p>\n",
+        );
+    } else {
+        b.push_str(
+            "<p>No message is sent to either address, and the new address is not verified. \
+             The change also changes your cross-project ID and weak account key.</p>\n",
+        );
+    }
     Ok(page(project, "Change email address", &b))
 }
 
 /// `edit_email_action.php`. The stored password hash is made from the
 /// address, so it is made again from the password given. An account with
 /// no password proves itself with its account key and stays without one;
-/// upstream would make the account key its password instead. Upstream's
-/// seven-day wait between changes and its messages to both addresses are
-/// not implemented: they exist so that the previous address can undo a
-/// change, and nothing here sends email.
+/// upstream would make the account key its password instead.
+///
+/// With email ([`SiteCtx::mail`]) it does what upstream does besides: refuses
+/// a change within seven days of the last, keeps the previous address and the
+/// time of the change, and sends a notice to the new address and the link
+/// that undoes the change (`recover_email.php`) to the previous one
+/// ([`site_email::send_change_notices`]). Without email only the address,
+/// the hash and `email_validated` change, as before.
 pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
+    let mail = ctx.mail();
     let Some(user) = viewer(ctx).await? else {
         return Ok(to_login(project, "edit_email_form.php"));
     };
@@ -548,6 +574,17 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
             "New email address is same as existing address. Nothing is changed.",
         ));
     }
+    if mail.is_some() && user.email_addr_change_time + EMAIL_CHANGE_WAIT_SECS > ctx.now {
+        return Ok(error_page(
+            project,
+            429,
+            &format!(
+                "The email address was changed within the past 7 days; please look for a \
+                 message at {} if that change is not yours.",
+                user.previous_email_addr
+            ),
+        ));
+    }
     let passwd = q.get("passwd").map(String::as_str).unwrap_or_default();
     let new_hash = if user.passwd_hash.is_empty() {
         if !constant_time_eq(user.authenticator.as_bytes(), passwd.as_bytes()) {
@@ -564,6 +601,35 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         }
         pepper_passwd_hash(pepper, &passwd_hash(passwd, &email))
     };
+    let update = if mail.is_some() {
+        stmt!(
+            "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0, \
+             previous_email_addr = ?, email_addr_change_time = ? \
+             WHERE id = ? AND email_addr = ? AND passwd_hash = ? AND email_addr_change_time = ? \
+             AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) RETURNING id",
+            email.as_str(),
+            new_hash.as_str(),
+            user.email_addr.as_str(),
+            ctx.now,
+            user.id,
+            user.email_addr.as_str(),
+            user.passwd_hash.as_str(),
+            user.email_addr_change_time,
+            email.as_str()
+        )
+    } else {
+        stmt!(
+            "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0 \
+             WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
+             AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) RETURNING id",
+            email.as_str(),
+            new_hash.as_str(),
+            user.id,
+            user.email_addr.as_str(),
+            user.passwd_hash.as_str(),
+            email.as_str()
+        )
+    };
     let out = ctx
         .db
         .batch(vec![
@@ -571,17 +637,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
                 "SELECT count(*) AS n FROM user WHERE email_addr = ?",
                 email.as_str()
             ),
-            stmt!(
-                "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0 \
-                 WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
-                 AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) RETURNING id",
-                email.as_str(),
-                new_hash.as_str(),
-                user.id,
-                user.email_addr.as_str(),
-                user.passwd_hash.as_str(),
-                email.as_str()
-            ),
+            update,
         ])
         .await?;
     let taken = out.first().and_then(|r| r.scalar_i64()).unwrap_or(0) > 0;
@@ -600,11 +656,19 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
             "The account changed meanwhile; please try again.",
         ));
     }
-    Ok(done(
-        project,
-        "Change email address",
-        &format!("The email address of your account is now {email}."),
-    ))
+    let mut msg = format!("The email address of your account is now {email}.");
+    if let Some(mail) = &mail {
+        let sent =
+            site_email::send_change_notices(ctx, mail, user.id, &user.email_addr, &email).await?;
+        if !sent {
+            msg.push_str(&format!(
+                " The address was changed, but we were unable to send the confirmation \
+                 email to {email} or {}. Please note this change yourself.",
+                user.email_addr
+            ));
+        }
+    }
+    Ok(done(project, "Change email address", &msg))
 }
 
 // ---------------------------------------------------------------------------
