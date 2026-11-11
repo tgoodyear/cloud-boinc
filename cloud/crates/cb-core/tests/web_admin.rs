@@ -15,7 +15,7 @@ use cb_core::project::{
 use cb_core::scheduler::{handle_request, SchedCtx};
 use cb_core::web::{
     create_account, lookup_account, master_page, project_config, server_status, server_status_xml,
-    NewAccount,
+    NewAccount, STATUS_COUNTS_TTL,
 };
 use cb_core::work::{create_work, register_job_file, JobSpec, Submission};
 use cb_core::CoreError;
@@ -376,4 +376,31 @@ fn a_registered_version_is_sent_to_a_client() {
     assert!(block_on(set_app_version_deprecated(&w.db, avid, true)).unwrap());
     assert!(w.project().catalog.app_versions.is_empty());
     assert_eq!(block_on(list_catalog(&w.db)).unwrap().app_versions.len(), 1);
+}
+
+#[test]
+fn status_counts_come_from_a_snapshot_until_it_expires() {
+    let db = SqliteDb::with_schema().unwrap();
+    let first = block_on(server_status(&db, 1000)).unwrap();
+    assert_eq!((first.users, first.hosts), (0, 0));
+
+    block_on(db.run(stmt!(
+        "INSERT INTO host (create_time, userid, expavg_credit) VALUES (1, 0, 5)"
+    )))
+    .unwrap();
+
+    // Within the TTL: the stored counts are used, and the aggregates do not run.
+    let before = db.statements();
+    let cached = block_on(server_status(&db, 1000 + STATUS_COUNTS_TTL - 1)).unwrap();
+    assert_eq!((cached.hosts, cached.hosts_with_recent_credit), (0, 0));
+    assert_eq!(db.statements() - before, 5);
+
+    // Past the TTL: counts are recomputed and stored again.
+    let fresh = block_on(server_status(&db, 1000 + STATUS_COUNTS_TTL)).unwrap();
+    assert_eq!((fresh.hosts, fresh.hosts_with_recent_credit), (1, 1));
+    let again = block_on(server_status(&db, 1000 + STATUS_COUNTS_TTL + 1)).unwrap();
+    assert_eq!(again.hosts, 1);
+
+    // The snapshot row does not disturb project settings.
+    block_on(Project::load(&db)).unwrap();
 }

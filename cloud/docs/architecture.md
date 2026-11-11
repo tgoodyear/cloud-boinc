@@ -447,7 +447,10 @@ The `web` Worker serves the master URL page, which carries the scheduler URL in 
 `<link rel="boinc_scheduler">` form the client looks for, `get_project_config.php`,
 `lookup_account.php` and `create_account.php` with the stock XML shapes and error numbers, and
 `server_status.php` in HTML and XML. The account manager RPCs answer with the stock "not
-implemented" error. PHP file names are kept in the URLs because clients have them built in.
+implemented" error. The account and computer counts on the status page (`server_status` in
+`cloud/crates/cb-core/src/web.rs`) are a snapshot stored in the `config` table under
+`status_counts` and refreshed after `STATUS_COUNTS_TTL` (10 minutes), so a poll does not scan the
+`user` and `host` tables. PHP file names are kept in the URLs because clients have them built in.
 
 ## Admin API and CLI
 
