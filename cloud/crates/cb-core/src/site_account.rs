@@ -716,6 +716,17 @@ pub async fn prefs(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     ))
 }
 
+/// The page for a save that found the stored document changed since it was
+/// read.
+fn prefs_conflict(project: &Project) -> SitePage {
+    error_page(
+        project,
+        409,
+        "Your preferences changed while this was being saved, and nothing was saved. \
+         Reload the preferences and try again.",
+    )
+}
+
 fn venue_title(subset: Subset, venue: Option<usize>) -> String {
     match venue {
         Some(i) => format!(
@@ -881,16 +892,22 @@ pub async fn prefs_edit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             "These preferences are too long to store.",
         ));
     }
+    // The new document is the one read with the account plus this edit, so
+    // it replaces only that document: if another request changed it
+    // meanwhile (another venue's set, say), this one would revert that edit.
+    let observed = stored_prefs(&user, subset);
     let update = match (subset, venue) {
         (Subset::Global, _) => stmt!(
-            "UPDATE user SET global_prefs = ? WHERE id = ?",
+            "UPDATE user SET global_prefs = ? WHERE id = ? AND global_prefs IS ? RETURNING id",
             xml.as_str(),
-            user.id
+            user.id,
+            observed
         ),
         (Subset::Project, Some(_)) => stmt!(
-            "UPDATE user SET project_prefs = ? WHERE id = ?",
+            "UPDATE user SET project_prefs = ? WHERE id = ? AND project_prefs IS ? RETURNING id",
             xml.as_str(),
-            user.id
+            user.id,
+            observed
         ),
         (Subset::Project, None) => {
             let default_venue = str_param(q, "default_venue");
@@ -900,16 +917,19 @@ pub async fn prefs_edit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             let flag = |k: &str| i32::from(q.get(k).is_some_and(|v| !v.is_empty()));
             stmt!(
                 "UPDATE user SET project_prefs = ?, send_email = ?, show_hosts = ?, venue = ? \
-                 WHERE id = ?",
+                 WHERE id = ? AND project_prefs IS ? RETURNING id",
                 xml.as_str(),
                 flag("send_email"),
                 flag("show_hosts"),
                 default_venue,
-                user.id
+                user.id,
+                observed
             )
         }
     };
-    ctx.db.run(update).await?;
+    if ctx.db.run(update).await?.rows.is_empty() {
+        return Ok(prefs_conflict(project));
+    }
     Ok(SitePage::redirect(format!(
         "{}prefs.php?subset={}&updated=1",
         project.config.master_url,
@@ -957,13 +977,18 @@ pub async fn prefs_remove(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
             Subset::Global => "global_prefs",
             Subset::Project => "project_prefs",
         };
-        ctx.db
+        let updated = ctx
+            .db
             .run(stmt!(
-                format!("UPDATE user SET {col} = ? WHERE id = ?"),
+                format!("UPDATE user SET {col} = ? WHERE id = ? AND {col} IS ? RETURNING id"),
                 xml.as_str(),
-                user.id
+                user.id,
+                stored_prefs(&user, subset)
             ))
             .await?;
+        if updated.rows.is_empty() {
+            return Ok(prefs_conflict(project));
+        }
     }
     Ok(SitePage::redirect(format!(
         "{}prefs.php?subset={}",

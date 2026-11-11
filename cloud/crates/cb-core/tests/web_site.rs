@@ -175,13 +175,25 @@ impl World {
         post: bool,
         params: &[(&str, &str)],
     ) -> (SitePage, u64) {
+        self.page_on(&self.db, path, auth, post, params)
+    }
+
+    /// The same, through another handle on the database.
+    fn page_on(
+        &self,
+        db: &dyn Db,
+        path: &str,
+        auth: Option<&str>,
+        post: bool,
+        params: &[(&str, &str)],
+    ) -> (SitePage, u64) {
         let q: Params = params
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let random = || self.rand();
         let ctx = SiteCtx {
-            db: &self.db,
+            db,
             project: &self.project,
             auth,
             post,
@@ -2038,4 +2050,247 @@ fn clearing_every_application_is_refused() {
         .user(ada.id)
         .project_prefs
         .contains("<apps_selected>\n<app_id>1</app_id>\n</apps_selected>"));
+}
+
+/// The statement of another request that lands between the read and the
+/// write of the one under test.
+fn changed_meanwhile(w: &World, sql: Stmt) -> ChangedMeanwhile<'_> {
+    ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(Some(sql)),
+    }
+}
+
+#[test]
+fn preference_saves_do_not_revert_a_change_made_meanwhile() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let global_other =
+        "<global_preferences>\n<mod_time>1</mod_time>\n<venue name=\"home\">\n<max_ncpus_pct>11</max_ncpus_pct>\n</venue>\n</global_preferences>\n";
+    let project_other = "<project_preferences>\n<project_specific>\n<max_jobs>9</max_jobs>\n</project_specific>\n</project_preferences>\n";
+
+    // Computing preferences, a venue's set: the form is read, then another
+    // request saves the home set, then this one writes the work set.
+    let form = w.get(
+        "/prefs_edit.php",
+        auth,
+        &[("subset", "global"), ("venue", "work")],
+    );
+    let global = cb_core::prefs::PrefsForm::new(cb_core::prefs::Subset::Global, &w.project);
+    let fields: Vec<(String, String)> =
+        global.form_values(&global.defaults()).into_iter().collect();
+    let mut sent = hidden_fields(&form.body);
+    sent.extend(fields.iter().cloned());
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile(
+        &w,
+        stmt!(
+            "UPDATE user SET global_prefs = ? WHERE id = ?",
+            global_other,
+            ada.id
+        ),
+    );
+    let (page, _) = w.page_on(&racing, "/prefs_edit.php", auth, true, &pairs);
+    assert_eq!(page.status, 409);
+    assert!(page.body.contains("Reload the preferences and try again"));
+    assert_eq!(w.user(ada.id).global_prefs, global_other);
+
+    // Project preferences, a venue's set and the main set.
+    let project = cb_core::prefs::PrefsForm::new(cb_core::prefs::Subset::Project, &w.project);
+    let fields: Vec<(String, String)> = project
+        .form_values(&project.defaults())
+        .into_iter()
+        .collect();
+    for venue in [Some("school"), None] {
+        w.sql("UPDATE user SET project_prefs = ''");
+        let mut q = vec![("subset", "project")];
+        q.extend(venue.map(|v| ("venue", v)));
+        let form = w.get("/prefs_edit.php", auth, &q);
+        let mut sent = hidden_fields(&form.body);
+        sent.extend(fields.iter().cloned());
+        let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let racing = changed_meanwhile(
+            &w,
+            stmt!(
+                "UPDATE user SET project_prefs = ? WHERE id = ?",
+                project_other,
+                ada.id
+            ),
+        );
+        let (page, _) = w.page_on(&racing, "/prefs_edit.php", auth, true, &pairs);
+        assert_eq!(page.status, 409, "{venue:?}");
+        assert_eq!(w.user(ada.id).project_prefs, project_other, "{venue:?}");
+        // Nor are the account's settings written by the refused save.
+        assert_eq!(w.user(ada.id).show_hosts, 0);
+    }
+
+    // Removing a venue's set.
+    let stored = "<global_preferences>\n<mod_time>1</mod_time>\n<venue name=\"work\">\n<max_ncpus_pct>20</max_ncpus_pct>\n</venue>\n</global_preferences>\n";
+    w.sql(&format!("UPDATE user SET global_prefs = '{stored}'"));
+    let confirm = w.get(
+        "/prefs_remove.php",
+        auth,
+        &[("subset", "global"), ("venue", "work")],
+    );
+    let mut sent = hidden_fields(&confirm.body);
+    sent.push(("subset".into(), "global".into()));
+    sent.push(("venue".into(), "work".into()));
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile(
+        &w,
+        stmt!(
+            "UPDATE user SET global_prefs = ? WHERE id = ?",
+            global_other,
+            ada.id
+        ),
+    );
+    let (page, _) = w.page_on(&racing, "/prefs_remove.php", auth, true, &pairs);
+    assert_eq!(page.status, 409);
+    assert_eq!(w.user(ada.id).global_prefs, global_other);
+
+    // Unhindered, the same save works.
+    w.sql(&format!("UPDATE user SET global_prefs = '{stored}'"));
+    let (page, n) = w.page("/prefs_remove.php", auth, true, &pairs);
+    assert_eq!(page.status, 303);
+    assert_eq!(n, 2);
+}
+
+#[test]
+fn am_set_info_keeps_a_site_change_to_the_stored_project_specific_part() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.sql("UPDATE user SET project_prefs = '<project_preferences>\n<project_specific>\n<max_jobs>2</max_jobs>\n</project_specific>\n</project_preferences>\n'");
+    let site = "<project_preferences>\n<project_specific>\n<max_jobs>8</max_jobs>\n</project_specific>\n</project_preferences>\n";
+    let params: Params = [
+        ("account_key", ada.auth.as_str()),
+        (
+            "project_prefs",
+            "<project_preferences>\n<resource_share>5</resource_share>\n</project_preferences>\n",
+        ),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let racing = changed_meanwhile(
+        &w,
+        stmt!(
+            "UPDATE user SET project_prefs = ? WHERE id = ?",
+            site,
+            ada.id
+        ),
+    );
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        &params,
+    ))
+    .unwrap();
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    assert_eq!(w.user(ada.id).project_prefs, site);
+
+    // A document with its own `<project_specific>` does not use the stored
+    // one, so a change meanwhile is not a conflict.
+    let own: Params = [
+        ("account_key", ada.auth.as_str()),
+        (
+            "project_prefs",
+            "<project_preferences>\n<project_specific>\n<max_jobs>3</max_jobs>\n</project_specific>\n</project_preferences>\n",
+        ),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let racing = changed_meanwhile(
+        &w,
+        stmt!("UPDATE user SET send_email = 1 WHERE id = ?", ada.id),
+    );
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        &own,
+    ))
+    .unwrap();
+    assert!(reply.contains("<success/>"), "{reply}");
+    assert!(w
+        .user(ada.id)
+        .project_prefs
+        .contains("<max_jobs>3</max_jobs>"));
+}
+
+#[test]
+fn a_blank_idle_threshold_stays_blank() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let global = cb_core::prefs::PrefsForm::new(cb_core::prefs::Subset::Global, &w.project);
+    let mut fields: Vec<(String, String)> =
+        global.form_values(&global.defaults()).into_iter().collect();
+    let mut set = |k: &str, v: &str| {
+        fields.retain(|(a, _)| a != k);
+        fields.push((k.into(), v.into()));
+    };
+    set("suspend_cpu_usage", "25");
+    set("niu_suspend_cpu_usage", "");
+    let pairs = |f: &[(String, String)]| -> Vec<(String, String)> { f.to_vec() };
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "global")]);
+    let send = |form: &SitePage, f: &[(String, String)]| {
+        let f = pairs(f);
+        let p: Vec<(&str, &str)> = f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        w.submit(form, "/prefs_edit.php", auth, &p).0
+    };
+    assert_eq!(send(&form, &fields).status, 303);
+    let stored = w.user(ada.id).global_prefs;
+    assert!(stored.contains("<niu_suspend_cpu_usage>0</niu_suspend_cpu_usage>"));
+    // The form shows it blank, not as the in-use value.
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "global")]);
+    assert!(form
+        .body
+        .contains("name=\"niu_suspend_cpu_usage\" value=\"\""));
+    assert!(form
+        .body
+        .contains("name=\"suspend_cpu_usage\" value=\"25\""));
+    let shown = w.get("/prefs.php", auth, &[("subset", "global")]);
+    // Only the in-use threshold shows 25.
+    assert_eq!(shown.body.matches("25 %").count(), 1);
+    // Saving something else, as the browser sends the form back, keeps it.
+    let mut again = hidden_fields(&form.body);
+    again.extend(fields.iter().filter(|(k, _)| k != "max_ncpus_pct").cloned());
+    again.push(("max_ncpus_pct".into(), "80".into()));
+    let p: Vec<(&str, &str)> = again
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(w.post("/prefs_edit.php", auth, &p).status, 303);
+    assert!(w
+        .user(ada.id)
+        .global_prefs
+        .contains("<niu_suspend_cpu_usage>0</niu_suspend_cpu_usage>"));
+    // And so does adding and removing a venue.
+    let form = w.get(
+        "/prefs_edit.php",
+        auth,
+        &[("subset", "global"), ("venue", "work")],
+    );
+    let mut work = hidden_fields(&form.body);
+    work.extend(fields.iter().cloned());
+    let p: Vec<(&str, &str)> = work.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(w.post("/prefs_edit.php", auth, &p).status, 303);
+    let confirm = w.get(
+        "/prefs_remove.php",
+        auth,
+        &[("subset", "global"), ("venue", "work")],
+    );
+    let (page, _) = w.submit(
+        &confirm,
+        "/prefs_remove.php",
+        auth,
+        &[("subset", "global"), ("venue", "work")],
+    );
+    assert_eq!(page.status, 303);
+    let stored = w.user(ada.id).global_prefs;
+    assert!(stored.contains("<niu_suspend_cpu_usage>0</niu_suspend_cpu_usage>"));
+    assert!(!stored.contains("<niu_suspend_cpu_usage>25"));
 }

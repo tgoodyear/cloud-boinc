@@ -525,16 +525,28 @@ pub struct PrefsForm {
     apps: Vec<(i64, String)>,
 }
 
-/// `set_niu_prefs`: not-in-use limits that are unset take the in-use ones.
-fn set_niu_prefs(s: &mut PrefSet) {
-    for (niu, inuse) in [
-        ("niu_max_ncpus_pct", "max_ncpus_pct"),
-        ("niu_cpu_usage_limit", "cpu_usage_limit"),
-        ("niu_suspend_cpu_usage", "suspend_cpu_usage"),
-    ] {
-        if s.get(niu) == Some(0.0) {
+/// The not-in-use limits that take the in-use ones when the document does not
+/// have them, and whether a value of 0 or less is read as 100 (the client
+/// does so for the first two); for `niu_suspend_cpu_usage` 0 is "no limit".
+const NIU: [(&str, &str, bool); 3] = [
+    ("niu_max_ncpus_pct", "max_ncpus_pct", true),
+    ("niu_cpu_usage_limit", "cpu_usage_limit", true),
+    ("niu_suspend_cpu_usage", "suspend_cpu_usage", false),
+];
+
+/// `set_niu_prefs`, as the client does it (`GLOBAL_PREFS::parse` and
+/// `parse_override`): a not-in-use limit the document does not have takes
+/// the in-use one, and one it has stays as it is, a 0 included. Upstream's
+/// PHP tests the value instead, so it cannot keep an explicit 0 for
+/// `niu_suspend_cpu_usage`: a blank idle threshold would come back as the
+/// in-use one and be written out as that on the next save.
+fn set_niu_prefs(s: &mut PrefSet, present: &[&str]) {
+    for (niu, inuse, zero_is_full) in NIU {
+        if !present.contains(&niu) {
             let v = s.get(inuse).unwrap_or(0.0);
             s.vals.insert(niu, v);
+        } else if zero_is_full && s.get(niu).unwrap_or(0.0) <= 0.0 {
+            s.vals.insert(niu, 100.0);
         }
     }
 }
@@ -671,11 +683,22 @@ impl PrefsForm {
 
     fn parse_set(&self, buf: &str) -> PrefSet {
         let mut s = self.raw_defaults();
+        // The tags the document has, with a value that was read.
+        let mut present: Vec<&str> = Vec::new();
         for d in &self.defs {
             let Some(text) = element(buf, d.tag) else {
                 continue;
             };
             let text = text.trim();
+            // `<tag></tag>` is 0 to the client's number parsers; `<tag/>` is
+            // not read as a number.
+            let is_bool = matches!(d.kind, Kind::Bool { .. });
+            let text =
+                if !is_bool && text.is_empty() && buf.contains(&format!("<{0}></{0}>", d.tag)) {
+                    "0"
+                } else {
+                    text
+                };
             let v = match d.kind {
                 // `PREF_BOOL::xml_parse`: anything but "0" is true.
                 Kind::Bool { .. } => f64::from(u8::from(text != "0")),
@@ -693,9 +716,10 @@ impl PrefsForm {
                 },
             };
             s.vals.insert(d.tag, v);
+            present.push(d.tag);
         }
         if self.subset == Subset::Global {
-            set_niu_prefs(&mut s);
+            set_niu_prefs(&mut s, &present);
         } else {
             let ids = app_ids(buf);
             s.apps = (!ids.is_empty()).then_some(ids);
@@ -1464,6 +1488,52 @@ mod tests {
         let html = form.form(&form.defaults(), None, &[]);
         assert!(html.contains("<div role=\"group\" aria-labelledby=\"pref_apps_label\">"));
         assert!(html.contains("<td id=\"pref_apps_label\">Run only the selected applications</td>"));
+    }
+
+    #[test]
+    fn an_explicit_zero_is_not_an_absent_value() {
+        let form = PrefsForm::new(Subset::Global, &project(1, false));
+        let doc = |extra: &str| {
+            format!(
+                "<global_preferences>\n<suspend_cpu_usage>25</suspend_cpu_usage>\n\
+                 <max_ncpus_pct>40</max_ncpus_pct>\n{extra}</global_preferences>\n"
+            )
+        };
+        // Absent: the in-use value. Present, 0: no limit, as the client reads it.
+        let absent = form.parse(&doc(""));
+        assert_eq!(absent.main.get("niu_suspend_cpu_usage"), Some(25.0));
+        assert_eq!(absent.main.get("niu_max_ncpus_pct"), Some(40.0));
+        let zero = form.parse(&doc("<niu_suspend_cpu_usage>0</niu_suspend_cpu_usage>\n"));
+        assert_eq!(zero.main.get("niu_suspend_cpu_usage"), Some(0.0));
+        // Writing and reading again keeps it.
+        let again = form.parse(&form.write(&zero, 1));
+        assert_eq!(again.main.get("niu_suspend_cpu_usage"), Some(0.0));
+        assert_eq!(again.main, zero.main);
+        // Not-in-use CPU limits of 0 or less are 100 to the client.
+        let full = form.parse(&doc("<niu_max_ncpus_pct>0</niu_max_ncpus_pct>\n"));
+        assert_eq!(full.main.get("niu_max_ncpus_pct"), Some(100.0));
+        // A venue is read the same way.
+        let venue = form.parse(&format!(
+            "{}<venue name=\"work\">\n<suspend_cpu_usage>30</suspend_cpu_usage>\n\
+             <niu_suspend_cpu_usage>0</niu_suspend_cpu_usage>\n</venue>\n",
+            doc("")
+        ));
+        assert_eq!(
+            venue.venues[1]
+                .as_ref()
+                .unwrap()
+                .get("niu_suspend_cpu_usage"),
+            Some(0.0)
+        );
+        // An empty number element is 0 to the client; a self-closed one is
+        // not read.
+        let empty = form.parse(&doc(
+            "<work_buf_min_days></work_buf_min_days>\n<disk_interval/>\n",
+        ));
+        assert_eq!(empty.main.get("work_buf_min_days"), Some(0.0));
+        assert_eq!(empty.main.get("disk_interval"), Some(60.0));
+        let flag = form.parse(&doc("<run_on_batteries></run_on_batteries>\n"));
+        assert_eq!(flag.main.get("run_on_batteries"), Some(1.0));
     }
 
     #[test]

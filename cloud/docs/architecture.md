@@ -640,7 +640,9 @@ refused with `ERR_DB_NOT_UNIQUE` when another account has it, by the `WHERE` cla
 `password_hash` with it. The stored hash depends on the address, so a request that names the
 address or gives a hash writes only if the address and hash are still the ones read with the
 account (as the site's password and email actions do); if a site request changed them meanwhile,
-nothing is written and the reply is `ERR_RETRY`. `teamid` is accepted and ignored until there are
+nothing is written and the reply is `ERR_RETRY`. Project preferences without a `<project_specific>`
+part inherit the stored one, so that write is conditional on `project_prefs` being still what was
+read; a site save of the application selection or task limit in between is not undone. `teamid` is accepted and ignored until there are
 teams, and the consent fields are ignored. Two statements: the account, then the update (a
 refused update costs a third, which tells a taken address from a changed account). The web
 Worker reads a form body of at most `MAX_FORM_BYTES` (in `cloud/crates/cb-core/src/web.rs`): both
@@ -776,6 +778,15 @@ begin "Use no more than") is also named by its group heading and its unit with
 end hour, hidden from sight. When a save is refused, the page is shown again with every value as
 it was submitted (numbers, checkboxes, the application selection and the account settings
 beside the project preferences), the refused ones marked, and nothing is stored.
+
+A preferences save replaces a whole document (all the venues' sets are in one column), built from
+the document read with the account, so each save (`prefs_edit.php`, `prefs_remove.php`) is one
+`UPDATE` conditional on the column still being what was read (`IS`, so it is NULL-safe). If
+another request saved meanwhile, nothing is written and the page is a 409 saying to reload and try
+again, rather than reverting the other edit (another venue's set, say). The documents are read as
+the client reads them: a not-in-use CPU limit that the document has stays as it is, a 0 included
+(`niu_suspend_cpu_usage` of 0 is "no limit" and stays blank in the form), and one it does not
+have takes the in-use value; an empty `<tag></tag>` number is 0.
 
 A computing-preferences save keeps only the fields above, as upstream's form does; anything else
 a client stored in the document is dropped.

@@ -337,8 +337,10 @@ pub const MAX_FORM_BYTES: usize = 2 * 3 * crate::prefs::MAX_PREFS_BYTES + 64 * 1
 /// clause refuses an email address another account has. The stored hash
 /// depends on the address, so a write of either (or a request that names the
 /// address) is also conditional on the address and hash read with the
-/// account; when the account changed meanwhile, nothing is written and the
-/// reply is `ERR_RETRY`; a refused write costs one more statement, to tell
+/// account, and project preferences that inherit the stored
+/// `<project_specific>` block are conditional on `project_prefs` being still
+/// what was read; when the account changed meanwhile, nothing is written
+/// and the reply is `ERR_RETRY`; a refused write costs one more statement, to tell
 /// that from a taken address.
 pub async fn am_set_info(
     db: &dyn Db,
@@ -395,6 +397,7 @@ pub async fn am_set_info(
         }
         set("global_prefs", global_prefs.into());
     }
+    let mut keeps_stored_prefs = false;
     let project_prefs = get("project_prefs").replace("\r\n", "\n");
     if !project_prefs.is_empty() {
         if let Some(why) = crate::prefs::bad_xml(&project_prefs, "project_preferences") {
@@ -403,8 +406,11 @@ pub async fn am_set_info(
                 Some(&format!("Invalid project preferences: {why}")),
             ));
         }
-        let project_prefs =
-            crate::prefs::keep_project_specific(&project_prefs, &user.project_prefs);
+        let merged = crate::prefs::keep_project_specific(&project_prefs, &user.project_prefs);
+        // The stored block came from the row read above; a site save of the
+        // application selection or task limit since would be undone.
+        keeps_stored_prefs = merged != project_prefs;
+        let project_prefs = merged;
         if project_prefs.len() > crate::prefs::MAX_PREFS_BYTES {
             return Ok(write_error(err::ERR_BUFFER_OVERFLOW, None));
         }
@@ -464,21 +470,24 @@ pub async fn am_set_info(
         // hash are what this RPC compared with. If a site request changed
         // either since, the pair written would not match.
         let credentials = !password_hash.is_empty() || !email.is_empty();
-        let guard = if credentials {
-            " AND email_addr = ? AND passwd_hash = ?"
-        } else {
-            ""
-        };
+        let mut guard = String::new();
+        let mut observed: Vec<&str> = Vec::new();
+        if credentials {
+            guard.push_str(" AND email_addr = ? AND passwd_hash = ?");
+            observed.extend([user.email_addr.as_str(), user.passwd_hash.as_str()]);
+        }
+        if keeps_stored_prefs {
+            guard.push_str(" AND project_prefs IS ?");
+            observed.push(user.project_prefs.as_str());
+        }
         update.sql = format!(
             "UPDATE user SET {} WHERE id = ?{guard} AND NOT EXISTS \
              (SELECT 1 FROM user WHERE email_addr = ? AND id != ?) RETURNING id",
             assignments.join(", ")
         );
         update = update.bind(user.id);
-        if credentials {
-            update = update
-                .bind(user.email_addr.as_str())
-                .bind(user.passwd_hash.as_str());
+        for v in observed {
+            update = update.bind(v);
         }
         update = update.bind(target).bind(user.id);
         if db.run(update).await?.rows.is_empty() {
