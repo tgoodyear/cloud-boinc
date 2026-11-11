@@ -1,12 +1,14 @@
-//! The master URL page, the web RPCs a client uses to attach, and the
-//! server status. PHP file names stay in the URLs because clients have them
-//! built in.
+//! The master URL page, the web RPCs of clients and account managers, the
+//! server status and the site pages. PHP file names stay in the URLs because
+//! clients have them built in. Everything past routing is in
+//! `cb_core::web` and `cb_core::site`.
 
 use std::collections::HashMap;
 
+use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_PATHS};
 use cb_core::web::{
-    create_account, lookup_account, master_page, not_implemented, project_config, server_status,
-    server_status_page, server_status_xml, NewAccount,
+    am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
+    project_config, server_status, server_status_page, server_status_xml, NewAccount,
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
@@ -39,6 +41,22 @@ fn cacheable_xml(body: String) -> Result<Response> {
             &format!("public, max-age={PAGE_CACHE_SECS}"),
         )?
         .fixed(body.into_bytes()))
+}
+
+/// A site page. These depend on the visitor's cookie, so no cache keeps them.
+fn site_response(page: SitePage) -> Result<Response> {
+    let mut builder = Response::builder()
+        .with_status(page.status)
+        .with_header("Content-Type", page.content_type)?
+        .with_header("Cache-Control", "private, no-store")?
+        .with_header("X-Content-Type-Options", "nosniff")?;
+    if let Some(location) = &page.location {
+        builder = builder.with_header("Location", location)?;
+    }
+    if let Some(cookie) = &page.set_cookie {
+        builder = builder.with_header("Set-Cookie", cookie)?;
+    }
+    Ok(builder.fixed(page.body.into_bytes()))
 }
 
 /// Pages that are the same for every client and need no database read when
@@ -160,8 +178,53 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 }
             }
         }
-        "/am_get_info.php" | "/am_set_info.php" | "/am_set_host_info.php" | "/show_user.php" => {
-            xml(not_implemented())
+        "/am_get_info.php" => {
+            let q = params(&mut req).await?;
+            let key = q.get("account_key").map(String::as_str).unwrap_or_default();
+            match am_get_info(&db, key).await {
+                Ok(reply) => xml(reply),
+                Err(e) => {
+                    console_error!("am_get_info: {e}");
+                    xml(AccountError::DbError.reply())
+                }
+            }
+        }
+        "/am_set_info.php" => xml(am_set_info()),
+        "/am_set_host_info.php" => {
+            let q = params(&mut req).await?;
+            let get = |k: &str| q.get(k).map(String::as_str).unwrap_or_default();
+            match am_set_host_info(&db, get("account_key"), get("hostid"), get("venue")).await {
+                Ok(reply) => xml(reply),
+                Err(e) => {
+                    console_error!("am_set_host_info: {e}");
+                    xml(AccountError::DbError.reply())
+                }
+            }
+        }
+        p if SITE_PATHS.contains(&p) => {
+            let post = req.method() == Method::Post;
+            let cookie = req
+                .headers()
+                .get("Cookie")?
+                .and_then(|h| auth_from_cookie(&h));
+            let q = params(&mut req).await?;
+            let pepper = secret_bytes(&env, SECRET_PASSWD_PEPPER).ok();
+            let ctx = SiteCtx {
+                db: &db,
+                project: &project,
+                auth: cookie.as_deref(),
+                post,
+                pepper: pepper.as_deref(),
+                now: now(),
+            };
+            match site_page(&ctx, p, &q).await {
+                Ok(Some(page)) => site_response(page),
+                Ok(None) => text(404, "not found\n"),
+                Err(e) => {
+                    console_error!("{p}: {e}");
+                    text(503, "The project is temporarily unavailable.\n")
+                }
+            }
         }
         _ => text(404, "not found\n"),
     }
