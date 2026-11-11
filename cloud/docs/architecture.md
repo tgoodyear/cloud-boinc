@@ -33,7 +33,7 @@ In scope, because the reference deployment uses it:
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
 | Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits, checksums and resume |
 | Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
-| Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences; password recovery, address verification and change notices through a mailer the deployment supplies |
+| Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences; password recovery, address verification and change notices through Cloudflare Email Service when the Worker has the binding |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
 
 Out of scope for now: forums, teams, profiles, locality scheduling,
@@ -980,7 +980,7 @@ a client stored in the document is dropped.
 
 Without email a site cannot recover a password, verify an address or tell an address that it
 was changed away from. The pages that do these are in `cloud/crates/cb-core/src/site_email.rs`,
-and what sends the messages is left to the deployment.
+and the `Mailer` trait is what sends them.
 
 **Transport.** `Mailer` in `cloud/crates/cb-core/src/mail.rs` is the one thing a deployment
 supplies:
@@ -998,10 +998,22 @@ check at the boundary: the two addresses must be a single plain `local@domain` (
 `is_valid_email` accepts), so a space, comma, angle bracket, quote or line break refuses the
 message; the subject and the sender name lose every control character and line or paragraph
 separator, and the sender name also the characters that delimit a mailbox (`<>"\,;:@()[]`); the body
-loses CR and control characters other than LF and tab. A transport has to encode the name and
-subject for a header and write the body with CRLF line ends. `SiteCtx` has `mailer:
-Option<&dyn Mailer>`; the `web` Worker passes `None` until a transport is chosen, so a
-deployment sends no email yet. Nothing in the Workers' bindings changes.
+loses CR and control characters other than LF and tab. `SiteCtx` has `mailer:
+Option<&dyn Mailer>`.
+
+The web Worker's transport is `EmailBinding` in `cloud/crates/cb-worker/src/email.rs`: the
+`send()` method of a Cloudflare Email Service `send_email` binding named `EMAIL` (Email Sending,
+a beta at the time of writing). `MailMessage::fields` gives the values of the structured call:
+`from` as an address with the optional name, one `to`, `subject` and `text` (no HTML). The
+service builds the message; the Cloudflare docs say nothing about header encoding or line
+endings for the structured call, so the transport does none beyond the checks above. The
+Worker looks the binding up on each site request, and with no binding there is no mailer and the
+site sends no email, as before. A failed `send()` throws an error with a `code`
+(`E_SENDER_NOT_VERIFIED`, `E_RATE_LIMIT_EXCEEDED`, `E_RECIPIENT_SUPPRESSED`, ...); the transport
+logs only that code (`error_class` in `cloud/crates/cb-core/src/mail.rs`, which refuses anything
+that does not look like a code) and returns `MailError::Send`, never a message that could
+contain an address. The pages treat any failure as "not sent". How to turn it on is in
+`deploy.md`.
 
 **Settings.** `email_from` and `email_from_name` in the project config, named as upstream's
 `EMAIL_FROM` and `EMAIL_FROM_NAME` (`html/inc/email.inc`; upstream sets them in `project.inc`).
@@ -1239,8 +1251,7 @@ Not implemented yet:
   `crates/cb-core/src/plan_class.rs`.
 - On the site: invitation codes, consent records, merging and deleting computers, per-app
   details of a computer, cross-project statistics links and certificates, account deletion, and
-  any email beyond the messages under Email. The Worker has no mail transport yet, so a
-  deployment sends none.
+  any email beyond the messages under Email.
 - Rate limiting. Nothing limits how often an address may try to log in, sign up or call
   `lookup_account.php`; upstream sleeps after a failed login (`LOGIN_FAIL_SLEEP_SEC`). A
   deployment can put a Cloudflare rate-limiting rule on those paths.

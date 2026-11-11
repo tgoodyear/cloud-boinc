@@ -1,6 +1,8 @@
 //! What the Workers share: the bindings by name, R2 behind the core's
 //! [`Files`] trait, `fetch` behind [`Webhook`], and the per-isolate cache of
-//! project settings.
+//! project settings, and the email binding behind the core's `Mailer` trait.
+
+mod email;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,6 +13,7 @@ use cb_core::{CoreError, CoreResult, FileKind, FileStat, Files, Webhook};
 use cb_crypto::account::constant_time_eq;
 use cb_crypto::{PrivateKey, Signer};
 pub use cb_d1::D1Db;
+pub use email::{mailer, EmailBinding, EMAIL};
 use futures_util::StreamExt;
 use worker::wasm_bindgen::JsValue;
 use worker::{Bucket, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result};

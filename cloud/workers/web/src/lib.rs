@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use cb_core::mail::Mailer;
 use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_PATHS};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
@@ -13,7 +14,7 @@ use cb_core::web::{
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
-    db, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
+    db, mailer, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
     SECRET_PASSWD_PEPPER,
 };
 use worker::{
@@ -225,6 +226,9 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             let q = params(&mut req).await?;
             let pepper = secret_bytes(&env, SECRET_PASSWD_PEPPER).ok();
             let random = random_u32;
+            // `None` without an `EMAIL` binding: the pages that need email
+            // say the project sends none.
+            let mail = mailer(&env);
             let ctx = SiteCtx {
                 db: &db,
                 project: &project,
@@ -233,8 +237,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 pepper: pepper.as_deref(),
                 now: now(),
                 random: &random,
-                // No transport yet: the pages that need email say so.
-                mailer: None,
+                mailer: mail.as_ref().map(|m| m as &dyn Mailer),
             };
             match site_page(&ctx, p, &q).await {
                 Ok(Some(page)) => site_response(page),

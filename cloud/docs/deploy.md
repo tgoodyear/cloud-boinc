@@ -134,11 +134,81 @@ A database created before `migrations/0002_purge.sql` existed needs
 Likewise, `migrations/0003_user_tasks.sql` adds the index behind an account's task list
 (`results.php?userid=`); apply it before the web Worker that serves that page is deployed.
 
-`migrations/0004_email.sql` adds the `token` table and two columns of `user` for the pages that
-send email. Apply it before the web Worker that has them is deployed. The Worker has no mail
-transport yet, so those pages answer that the project does not send email; email is on when the
-Worker is given a `Mailer` (`cloud/crates/cb-core/src/mail.rs`) and the config has `<email_from>`
-(and optionally `<email_from_name>`).
+## Email
+
+The site's password recovery, address verification and address-change notices
+need a mail transport (see Email in `architecture.md`). The web Worker sends through the
+`send_email` binding of Cloudflare Email Service, which the Cloudflare docs call Email Sending
+and describe as a beta. A Worker without the binding, or a config without `email_from`, sends
+nothing: the pages that need email say the project does not send email, and the rest of the
+site is unchanged. To turn email on:
+
+1. **Plan.** The Cloudflare docs (Email Service, "Pricing") say sending to arbitrary recipients
+   requires the Workers Paid plan, and that outbound email is not available on Workers Free.
+   Sends to verified destination addresses in the account are free on any plan. The same page
+   gives the included monthly quota and the price beyond it; read the figures there. The
+   "Limits" page says a new account starts with a conservative daily quota and gives no
+   number. The zone must use Cloudflare DNS.
+2. **Sending domain.** In the dashboard go to Compute > Email Service > Email Sending, choose
+   Onboard Domain, and choose the project's own hostname (a subdomain such as the master URL's
+   host, not the zone apex). The docs ("Configure subdomains") say Email Sending treats a
+   subdomain as a separate sending domain and onboarding adds the records to it. The records
+   are, on a `cf-bounce` subdomain of the sending domain: three MX records to
+   `route1.mx.cloudflare.net`, `route2.mx.cloudflare.net` and `route3.mx.cloudflare.net` (the
+   bounce address); a TXT SPF record `v=spf1 include:_spf.mx.cloudflare.net ~all`; a TXT DKIM
+   record at `cf-bounce._domainkey` with a key Cloudflare provides; and a TXT DMARC record at
+   `_dmarc` of the sending domain. The docs show `p=reject` in one place and recommend
+   `p=none` for new setups in another; look at what onboarding creates and choose the policy
+   on purpose. Records usually propagate in 5 to 15 minutes, at most 24 hours, and Settings >
+   DNS records on the Email Sending page lists each as Locked or Unlocked (both mean it is
+   configured). The sender address must be on this domain.
+3. **Binding.** The Worker looks for a binding named `EMAIL`. Restrict it to the project's
+   sender address with `allowed_sender_addresses`, which the docs ("Send bindings") describe as
+   limiting the binding to sending from the addresses listed. In `workers/web/wrangler.toml`
+   (the block is there, commented out):
+
+   ```toml
+   [[send_email]]
+   name = "EMAIL"
+   allowed_sender_addresses = ["boinc@<sending domain>"]
+   ```
+
+   For a deployment that uploads the Worker through the API, the binding in the `bindings`
+   array of the multipart `metadata` part is (field names from the API reference for the
+   Workers script upload, `SendEmail` binding):
+
+   ```json
+   { "type": "send_email", "name": "EMAIL", "allowed_sender_addresses": ["boinc@<sending domain>"] }
+   ```
+
+   The binding does not restrict the recipients, which is right: the recipients are the
+   project's users. The address in `allowed_sender_addresses` has to be the config's
+   `email_from`; the binding is not updated when the config is.
+4. **Migration.** `migrations/0004_email.sql` adds the `token` table and two columns of
+   `user`. Apply it (`wrangler d1 migrations apply cloud-boinc-dev --remote`, as above) before
+   the Worker with the email pages is deployed; the pages query those tables as soon as the
+   binding and `email_from` are both there.
+5. **Config.** Set the sender in the project config (through the admin API, as the other
+   settings), the address on the sending domain and optionally a name:
+
+   ```xml
+   <email_from>boinc@<sending domain></email_from>
+   <email_from_name>Project name</email_from_name>
+   ```
+
+6. **Deploy and check.** Deploy the web Worker (`cd workers/web && npx wrangler deploy`).
+   Create an account on the site with an address you can read, and see that the verification
+   message arrives (sign-up sends it) and its link marks the address verified on the account
+   page. Then ask `get_passwd.php` for a login link for that address; the link should log in.
+   A failed send is not shown to the user; the Worker logs `email send failed: <code>`, where
+   the code is the Email Service error code (for example `E_SENDER_NOT_VERIFIED`, the domain is
+   not onboarded or not yet verified, or `E_SENDER_DOMAIN_NOT_AVAILABLE`). It does not log
+   addresses or message text.
+
+The binding is commented out in the repository's `wrangler.toml` because the Cloudflare docs
+do not say whether a deploy of a Worker with a `send_email` binding succeeds on the Workers
+Free plan or before a sending domain exists. A deployment that is not ready for email keeps it
+commented out and deploys as before.
 
 ## Checks
 

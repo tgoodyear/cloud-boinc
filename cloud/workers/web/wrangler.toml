@@ -22,3 +22,11 @@ binding = "DB"
 database_name = "cloud-boinc-dev"
 database_id = "3ae057c8-0c75-418c-b975-b2a91b60ac33"
 migrations_dir = "../../migrations"
+
+# Email: the site sends password recovery, verification and address-change mail
+# through this binding when it is present (see "Email" in docs/deploy.md). Left
+# commented out here: it needs the Workers Paid plan and a sending domain. Set
+# the address to the config's email_from.
+# [[send_email]]
+# name = "EMAIL"
+# allowed_sender_addresses = ["boinc@mail.example.org"]

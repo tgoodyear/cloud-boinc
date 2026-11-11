@@ -27,10 +27,12 @@ pub enum MailError {
 }
 
 /// One checked message: one sender, one recipient, a subject and a plain-text
-/// body. A transport must encode the sender name and the subject for a header
-/// (RFC 5322 quoting or RFC 2047 words) and write the body with CRLF line
-/// ends; the strings here have no line breaks, except in the body, which has
-/// LF only.
+/// body. The strings here have no line breaks, except in the body, which has
+/// LF only. A transport that writes the MIME message itself must encode the
+/// sender name and the subject for a header (RFC 5322 quoting or RFC 2047
+/// words) and write the body with CRLF line ends; one that hands the fields
+/// to a service that builds the message (see [`MailMessage::fields`]) leaves
+/// that to the service.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MailMessage {
     from_addr: String,
@@ -105,6 +107,46 @@ impl MailMessage {
     pub fn body(&self) -> &str {
         &self.body
     }
+
+    /// The parts of the message as the structured `send()` call of Cloudflare
+    /// Email Service takes them: `from` as an address with an optional name,
+    /// one `to`, `subject` and `text`. The name is `None` when empty.
+    pub fn fields(&self) -> SendFields<'_> {
+        SendFields {
+            from_addr: &self.from_addr,
+            from_name: (!self.from_name.is_empty()).then_some(self.from_name.as_str()),
+            to: &self.to,
+            subject: &self.subject,
+            text: &self.body,
+        }
+    }
+}
+
+/// See [`MailMessage::fields`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendFields<'a> {
+    pub from_addr: &'a str,
+    pub from_name: Option<&'a str>,
+    pub to: &'a str,
+    pub subject: &'a str,
+    pub text: &'a str,
+}
+
+/// What a transport may log of a failed send: the `code` of the error the
+/// service threw (`E_SENDER_NOT_VERIFIED`, `E_RATE_LIMIT_EXCEEDED`, ...) if it
+/// has the form of one, and `unknown` otherwise. Never the error's message,
+/// which could repeat an address.
+pub fn error_class(code: Option<&str>) -> String {
+    match code {
+        Some(c)
+            if c.starts_with("E_")
+                && c.len() <= 64
+                && c.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') =>
+        {
+            c.to_string()
+        }
+        _ => "unknown".to_string(),
+    }
 }
 
 /// `s` on one line: each run of control characters and line separators
@@ -176,6 +218,43 @@ mod tests {
         assert_eq!(m.subject(), "Hi Bcc: x@example.org Cc: y@example.org");
         assert!(!m.subject().contains(['\r', '\n']));
         assert_eq!(m.body(), "one\ntwothree\tfour");
+    }
+
+    #[test]
+    fn the_send_fields_are_the_checked_parts() {
+        let m =
+            MailMessage::new("boinc@example.org", "Proj", "a@example.org", "Hi", "text\n").unwrap();
+        assert_eq!(
+            m.fields(),
+            SendFields {
+                from_addr: "boinc@example.org",
+                from_name: Some("Proj"),
+                to: "a@example.org",
+                subject: "Hi",
+                text: "text\n",
+            }
+        );
+        let bare =
+            MailMessage::new("boinc@example.org", " \r\n", "a@example.org", "s", "b").unwrap();
+        assert_eq!(bare.fields().from_name, None);
+    }
+
+    #[test]
+    fn only_an_error_code_is_logged() {
+        assert_eq!(
+            error_class(Some("E_RATE_LIMIT_EXCEEDED")),
+            "E_RATE_LIMIT_EXCEEDED"
+        );
+        for bad in [
+            None,
+            Some(""),
+            Some("ada@example.org"),
+            Some("E_x"),
+            Some("E_SENDER bad"),
+            Some(&"E_A".repeat(40)[..]),
+        ] {
+            assert_eq!(error_class(bad), "unknown", "{bad:?}");
+        }
     }
 
     #[test]
