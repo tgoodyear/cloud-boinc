@@ -558,11 +558,15 @@ fn purge_archives_then_deletes_finished_workunits() {
     let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
     assert_eq!((rep.workunits, rep.results), (1, 1));
     let name = rep.archive.unwrap();
+    let archive = w.files.archive.borrow();
     assert_eq!(
         name,
-        format!("1970-01-04/wu_{done}_{done}_{}.jsonl", 3 * day)
+        format!(
+            "1970-01-04/wu_{done}_{done}_{}_{}.jsonl",
+            3 * day,
+            cb_crypto::md5::md5_hex(&archive[&name])
+        )
     );
-    let archive = w.files.archive.borrow();
     let lines: Vec<serde_json::Value> = String::from_utf8(archive[&name].clone())
         .unwrap()
         .lines()

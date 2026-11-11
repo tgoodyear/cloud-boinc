@@ -560,7 +560,11 @@ upload, report, validation, assimilation and file deletion.
 With `purge_days` set, a second cron trigger in the `pipeline` Worker removes workunits whose
 files are deleted and that have not changed for that many days, together with their results
 and assignments (`purge_pass` in `crates/cb-core/src/purge.rs`). The rows go to the bucket
-under `archive/` first. A workunit with `nodelete` in its name is kept, as `db_purge` keeps it.
+under `archive/` first, in an object whose key ends in the MD5 of its contents. A purged
+workunit's name becomes free again, as it does after `db_purge`; a project that purges should
+not submit a job under a name it has used before, because a late report for the old job's
+result would match the new one. A workunit with `nodelete` in its name is kept, as `db_purge`
+keeps it.
 So are the workunit with the highest ID and the one holding the result with the highest ID,
 so that no ID is given out twice; they go once newer jobs exist. A workunit that changes
 between the archive write and the delete stays and is archived again later, so the archive can

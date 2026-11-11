@@ -2,6 +2,7 @@
 //! files are deleted and that has not changed for `purge_days` is written to
 //! the archive with its results, then removed from the database.
 
+use cb_crypto::md5::md5_hex;
 use cb_db::{stmt, Db, Row, Stmt, Value};
 use cb_proto::consts::{FILE_DELETE_DONE, RESULT_SERVER_STATE_OVER};
 use serde::{Deserialize, Serialize};
@@ -167,7 +168,7 @@ pub async fn plan_purge(
     let (Some(first), Some(last)) = (revs.first(), revs.last()) else {
         return Ok(None);
     };
-    let name = format!("{}/wu_{}_{}_{now}.jsonl", utc_date(now), first.0, last.0);
+    let (first, last) = (first.0, last.0);
     let mut body = Vec::new();
     for row in workunits {
         push_line(&mut body, "workunit", row)?;
@@ -175,6 +176,13 @@ pub async fn plan_purge(
     for row in results {
         push_line(&mut body, "result", row)?;
     }
+    // The digest keeps two passes that read different snapshots in the same
+    // second from writing over each other's object.
+    let name = format!(
+        "{}/wu_{first}_{last}_{now}_{}.jsonl",
+        utc_date(now),
+        md5_hex(&body)
+    );
     Ok(Some(PurgePlan {
         name,
         body,
