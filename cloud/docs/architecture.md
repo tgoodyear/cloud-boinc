@@ -642,8 +642,11 @@ reference deployment's observed rate is about 0.1 requests a second.
 4. Deployed end-to-end on the dev hostname with a stock client. Clients on several machines
    and platforms, CPU and GPU, are still to do.
 5. Load test against the dev deployment with `cboinc load`.
+6. Parser oracle: the stock client's own parsers read the replies the server writes; see
+   [compatibility.md](compatibility.md).
 
-The `cloud-ci` workflow runs formatting, Clippy, the native tests and the WebAssembly builds.
+The `cloud-ci` workflow runs formatting, Clippy, the native tests, the WebAssembly builds and
+the parser oracle.
 
 ## Implementation status
 

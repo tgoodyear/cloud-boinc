@@ -9,3 +9,4 @@ implemented; see the list in [docs/architecture.md](docs/architecture.md#impleme
 
 - [docs/architecture.md](docs/architecture.md): design, cost, measured performance
 - [docs/deploy.md](docs/deploy.md): local stack and deployment
+- [docs/compatibility.md](docs/compatibility.md): what is checked against the stock client's code

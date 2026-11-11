@@ -18,7 +18,7 @@
 //! size limit to the file name. Verifying the signature against the upload
 //! public key is the caller's job.
 
-use crate::xml::line;
+use crate::xml::{line, xml_escape};
 use crate::ProtoError;
 
 /// A sensible bound on the size of the text header. A caller that has read
@@ -328,11 +328,16 @@ pub fn reply_file_size(nbytes: u64) -> String {
 
 /// Error reply (`return_error`): status 1 for a transient error, -1 for a
 /// permanent one.
+///
+/// The message is escaped. Upstream writes it as is, and the client then
+/// shows only the text before the first `<`, so `Missing <data> tag` reaches
+/// the user as `Missing`; the client unescapes the message it reads
+/// (`parse_str` in `lib/parse.cpp`), so the escaped form shows in full.
 pub fn reply_error(transient: bool, message: &str) -> String {
     format!(
         "<data_server_reply>\n    <status>{}</status>\n    <message>{}</message>\n</data_server_reply>\n",
         if transient { 1 } else { -1 },
-        message
+        xml_escape(message)
     )
 }
 
@@ -663,6 +668,21 @@ mod tests {
         assert_eq!(r.status, Some(1));
         let r = parse_reply("<html>502</html>");
         assert_eq!(r.status, None);
+    }
+
+    #[test]
+    fn error_messages_with_markup_reach_the_client_whole() {
+        let text = reply_error(false, "Missing <data> tag & more");
+        assert_eq!(
+            text,
+            "<data_server_reply>\n    <status>-1</status>\n    <message>Missing &lt;data> tag &amp; more</message>\n</data_server_reply>\n"
+        );
+        // `parse_str` stops at the first `<`, as the client's does.
+        assert_eq!(parse_reply(&text).message, "Missing <data> tag & more");
+        assert_eq!(
+            incomplete_error(b"<file_upload>\n<name>x</name>\n").reply(),
+            "<data_server_reply>\n    <status>-1</status>\n    <message>Missing &lt;data> tag</message>\n</data_server_reply>\n"
+        );
     }
 
     #[test]

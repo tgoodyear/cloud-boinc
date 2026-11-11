@@ -5,11 +5,19 @@ on:
     paths:
       - 'cloud/**'
       - '.github/workflows/cloud-ci.yml'
+      - 'client/**'
+      - 'lib/**'
+      - 'version.h'
+      - 'project_specific_defines.h'
   push:
     branches: [main]
     paths:
       - 'cloud/**'
       - '.github/workflows/cloud-ci.yml'
+      - 'client/**'
+      - 'lib/**'
+      - 'version.h'
+      - 'project_specific_defines.h'
 
 permissions:
   contents: read
@@ -51,3 +59,30 @@ jobs:
         run: |
           cargo install worker-build --version 0.8.7 --locked
           dev/build.sh
+
+  # The client's own parsers read the replies the server writes. The oracle
+  # is built from the upstream sources in this tree, so the job also runs
+  # when a merge from upstream changes client/ or lib/.
+  parser-oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ make libcurl4-openssl-dev libssl-dev zlib1g-dev
+      - name: Build the oracle
+        run: make -C tests/parser-oracle -j"$(nproc)"
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cloud
+      - name: Compare replies
+        env:
+          CB_PARSER_ORACLE_REQUIRED: '1'
+        run: cargo test -p cb-core --test parser_oracle
