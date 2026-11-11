@@ -66,8 +66,8 @@ dev/build.sh
 for w in scheduler files pipeline web admin; do (cd workers/$w && npx wrangler deploy); done
 ```
 
-The configs declare the routes, the queue consumer and the pipeline's cron trigger for
-`wrangler deploy` to create. The dev deployment's resources and Workers were created through
+The configs declare the routes, the queue consumer and the pipeline's two cron triggers (the
+sweep every minute, the purge every five) for `wrangler deploy` to create. The dev deployment's resources and Workers were created through
 the Cloudflare API, so the `wrangler` commands on this page have not been run as written.
 
 ## Secrets
@@ -88,6 +88,20 @@ for `config`, `code_sign_public_key` and `upload_public_key`, then `platform-put
 `version-add`, `file-put` and `submit`. `cboinc assimilate`, `output-get` and `ack` collect
 finished work. The pipeline deletes a workunit's files once it is acknowledged and
 `delete_delay_hours` have passed.
+
+## Purge
+
+Set `<purge_days>` in the config to have finished workunits and their results removed from
+the database that many days after their files are deleted. Each purge pass first writes the
+rows to `archive/<date>/` in the bucket. Nothing reads the archive; to keep it from growing
+without bound, give the bucket a lifecycle rule for that prefix:
+
+```
+npx wrangler r2 bucket lifecycle add cloud-boinc-dev --name archive --prefix archive/ --expire-days 365
+```
+
+A database created before `migrations/0002_purge.sql` existed needs
+`wrangler d1 migrations apply` again before the purge is switched on.
 
 ## Checks
 

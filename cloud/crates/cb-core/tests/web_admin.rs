@@ -368,6 +368,8 @@ fn a_registered_version_is_sent_to_a_client() {
     assert_eq!(s.results_ready_to_send, 0);
     assert_eq!(s.users, 1);
     assert_eq!(s.hosts, 1);
+    assert_eq!(s.users_with_recent_credit, 0);
+    assert_eq!(s.hosts_with_recent_credit, 0);
     assert!(server_status_xml(&project, &s, 300)
         .contains("<results_in_progress>1</results_in_progress>"));
 

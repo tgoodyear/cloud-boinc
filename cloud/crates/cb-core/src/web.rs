@@ -304,6 +304,10 @@ pub struct ServerStatus {
     pub transitions_due: i64,
     pub users: i64,
     pub hosts: i64,
+    /// Accounts and computers with `expavg_credit` over 1, as upstream
+    /// counts "recent credit".
+    pub users_with_recent_credit: i64,
+    pub hosts_with_recent_credit: i64,
 }
 
 pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
@@ -325,11 +329,22 @@ pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
                 "SELECT count(*) AS n FROM workunit WHERE transition_time < ? AND transition_time < 2147483647",
                 now
             ),
-            Stmt::new("SELECT coalesce(max(id), 0) AS n FROM user"),
-            Stmt::new("SELECT coalesce(max(id), 0) AS n FROM host"),
+            Stmt::new(
+                "SELECT count(*) AS n, coalesce(sum(expavg_credit > 1), 0) AS recent FROM user",
+            ),
+            Stmt::new(
+                "SELECT count(*) AS n, coalesce(sum(expavg_credit > 1), 0) AS recent FROM host",
+            ),
         ])
         .await?;
     let n = |i: usize| out.get(i).and_then(|r| r.scalar_i64()).unwrap_or(0);
+    let recent = |i: usize| {
+        out.get(i)
+            .and_then(|r| r.rows.first())
+            .and_then(|row| row.get("recent"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
     Ok(ServerStatus {
         results_ready_to_send: n(0),
         results_in_progress: n(1),
@@ -337,6 +352,8 @@ pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
         transitions_due: n(3),
         users: n(4),
         hosts: n(5),
+        users_with_recent_credit: recent(4),
+        hosts_with_recent_credit: recent(5),
     })
 }
 
@@ -358,8 +375,8 @@ pub fn server_status_xml(project: &Project, s: &ServerStatus, now: i64) -> Strin
         s.results_in_progress,
         s.workunits_waiting_for_assimilation,
         if s.transitions_due > 0 { "0.02" } else { "0" },
-        s.users,
-        s.hosts,
+        s.users_with_recent_credit,
+        s.hosts_with_recent_credit,
     )
 }
 
@@ -373,7 +390,9 @@ pub fn server_status_page(project: &Project, s: &ServerStatus) -> String {
         ),
         ("Transitions due", s.transitions_due),
         ("Accounts", s.users),
+        ("Accounts with recent credit", s.users_with_recent_credit),
         ("Computers", s.hosts),
+        ("Computers with recent credit", s.hosts_with_recent_credit),
     ];
     let mut body = format!(
         "<h1>{} server status</h1>\n<table>\n",

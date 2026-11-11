@@ -278,11 +278,23 @@ impl UploadHeader {
 
     /// The checks upstream makes after verifying the signature: `nbytes`
     /// is present, within the signed limit, and the name is safe to use
-    /// in a path.
-    pub fn check_limits(&self, ignore_upload_certificates: bool) -> Result<(), UploadError> {
+    /// in a path. `max_upload_nbytes` is the project's own bound, which
+    /// holds with or without a certificate.
+    pub fn check_limits(
+        &self,
+        ignore_upload_certificates: bool,
+        max_upload_nbytes: f64,
+    ) -> Result<(), UploadError> {
         // NaN is rejected too; upstream's `nbytes < 0` would let it pass.
         if self.nbytes.is_nan() || self.nbytes < 0.0 {
             return Err(UploadError::permanent("nbytes missing or negative"));
+        }
+        if self.nbytes > max_upload_nbytes {
+            return Err(UploadError::permanent(format!(
+                "file size ({} KB) exceeds the project limit ({} KB)",
+                (self.nbytes / 1024.0) as i64,
+                (max_upload_nbytes / 1024.0) as i64
+            )));
         }
         if !ignore_upload_certificates && self.nbytes > self.max_nbytes {
             return Err(UploadError::permanent(format!(
@@ -458,7 +470,7 @@ mod tests {
             "<name>wu_1_0_r77_0</name><max_nbytes>1000000</max_nbytes>"
         );
         assert!(h.check_signature_fields(false).is_ok());
-        assert!(h.check_limits(false).is_ok());
+        assert!(h.check_limits(false, 1e9).is_ok());
     }
 
     #[test]
@@ -553,7 +565,7 @@ mod tests {
         );
         assert!(h.check_signature_fields(true).is_ok());
         assert_eq!(
-            h.check_limits(true),
+            h.check_limits(true, 1e9),
             Err(UploadError::permanent("nbytes missing or negative"))
         );
 
@@ -569,18 +581,26 @@ mod tests {
             "<file_upload>\n<name>a</name>\n<max_nbytes>2048</max_nbytes>\n<nbytes>4096</nbytes>\n<data>\n",
         );
         assert_eq!(
-            h.check_limits(false),
+            h.check_limits(false, 1e9),
             Err(UploadError::permanent(
                 "file size (4 KB) exceeds limit (2 KB)"
             ))
         );
-        assert!(h.check_limits(true).is_ok());
+        assert!(h.check_limits(true, 1e9).is_ok());
+        // The project's bound holds when certificates are ignored.
+        assert!(h.check_limits(true, 4096.0).is_ok());
+        assert_eq!(
+            h.check_limits(true, 4095.0),
+            Err(UploadError::permanent(
+                "file size (4 KB) exceeds the project limit (3 KB)"
+            ))
+        );
 
         for bad in ["../a", "a/../b", "/abs", "a\tb"] {
             let h = header(&format!(
                 "<file_upload>\n<name>{bad}</name>\n<max_nbytes>10</max_nbytes>\n<nbytes>1</nbytes>\n<data>\n"
             ));
-            let e = h.check_limits(false).unwrap_err();
+            let e = h.check_limits(false, 1e9).unwrap_err();
             assert!(!e.transient);
             assert!(
                 e.message
@@ -589,7 +609,7 @@ mod tests {
             );
         }
         let h = header("<file_upload>\n<name>a</name>\n<max_nbytes>10</max_nbytes>\n<nbytes>nan</nbytes>\n<data>\n");
-        assert!(h.check_limits(false).is_err());
+        assert!(h.check_limits(false, 1e9).is_err());
         assert_eq!(
             UploadHeader::invalid_signature().message,
             "invalid signature"

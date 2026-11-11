@@ -229,6 +229,15 @@ impl Files for R2Files {
         }
         Ok(())
     }
+
+    async fn put(&self, kind: FileKind, name: &str, bytes: Vec<u8>) -> CoreResult<()> {
+        self.0
+            .put(object_key(kind, name), bytes)
+            .execute()
+            .await
+            .map_err(files_err)?;
+        Ok(())
+    }
 }
 
 /// `fetch` behind the core's [`Webhook`] trait.

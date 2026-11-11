@@ -34,4 +34,5 @@ max_batch_timeout = 1
 max_retries = 5
 
 [triggers]
-crons = ["* * * * *"]
+# Every minute: the sweep. Every five minutes: the purge (PURGE_CRON in src/lib.rs).
+crons = ["* * * * *", "*/5 * * * *"]

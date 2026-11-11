@@ -12,6 +12,7 @@ pub mod model;
 pub mod pipeline;
 pub mod plan_class;
 pub mod project;
+pub mod purge;
 pub mod scheduler;
 pub mod template;
 pub mod web;
@@ -57,6 +58,8 @@ pub enum FileKind {
     Download,
     /// Result outputs, written through `/upload/file_upload_handler`.
     Upload,
+    /// Purged workunit and result rows. Nothing serves these.
+    Archive,
 }
 
 impl FileKind {
@@ -64,6 +67,7 @@ impl FileKind {
         match self {
             FileKind::Download => "download/",
             FileKind::Upload => "upload/",
+            FileKind::Archive => "archive/",
         }
     }
 }
@@ -81,6 +85,8 @@ pub trait Files {
     async fn stat(&self, kind: FileKind, name: &str) -> CoreResult<Option<FileStat>>;
     /// Deleting a file that does not exist is not an error.
     async fn delete(&self, kind: FileKind, names: &[String]) -> CoreResult<()>;
+    /// Stores a whole object, replacing one of the same name.
+    async fn put(&self, kind: FileKind, name: &str, bytes: Vec<u8>) -> CoreResult<()>;
 }
 
 /// Outbound JSON POST for validator and assimilation webhooks.

@@ -177,7 +177,7 @@ One bucket per project.
 | --- | --- | --- | --- |
 | `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
-| `archive/` | purged workunit and result rows, as JSON lines per day | pipeline cron | by bucket lifecycle rule |
+| `archive/<date>/` | purged workunit and result rows, as JSON lines, one object per purge pass | pipeline cron | by bucket lifecycle rule |
 
 Names are flat. The stock fan-out directories exist to keep directory sizes down on a POSIX
 file system and have no purpose in an object store. R2 has no egress charge, serves range
@@ -554,10 +554,18 @@ The `cloud-ci` workflow runs formatting, Clippy, the native tests and the WebAss
 Working end to end with a stock 8.0.4 client: attach, signature-checked download, compute,
 upload, report, validation, assimilation and file deletion.
 
+With `purge_days` set, a second cron trigger in the `pipeline` Worker removes workunits whose
+files are deleted and that have not changed for that many days, together with their results
+and assignments (`purge_pass` in `crates/cb-core/src/purge.rs`). The rows go to the bucket
+under `archive/` first. A workunit with `nodelete` in its name is kept, as `db_purge` keeps it.
+With `purge_days` at 0, the default, nothing is purged and the database grows until rows are
+removed by hand.
+
+`max_upload_nbytes` in the config bounds the size of one uploaded file, whether or not upload
+certificates are checked.
+
 Not implemented yet:
 
-- Purging old workunits and results. `purge_days` is read from the config and nothing acts
-  on it, so the database grows until rows are removed by hand.
 - In the scheduler: anonymous platform, assigned jobs, homogeneous redundancy and homogeneous
   app version, locality scheduling, size classes, and the client workload simulation behind
   upstream's deadline check.
