@@ -1079,10 +1079,11 @@ the pages answer as for a send that failed, and a message that fails still count
 verification mail may use at most half of the cap (the `signup` column), so that sign-ups cannot
 use up what recovery needs. The notices of an address change, including the undo link, are not
 counted: one address change per account per seven days bounds them, and they have to arrive
-whatever else was sent that day. Because the cap is shared, anyone can use up the day's allowance
-for login-link mail, by asking for links for enough accounts, and then nobody gets a login link
-or a verification message from the account page until 00:00 UTC; the exempt mail and the half
-kept for sign-ups are what the cap does not stop. The cap is a cost and abuse guard, not a
+whatever else was sent that day. Because the cap is shared, anyone can use up the day's allowance for login-link mail, by asking
+for links for enough accounts, and then nobody gets a login link or a verification message
+(sign-up included) until 00:00 UTC; the exempt mail still goes. The half for sign-ups works the
+other way: it stops sign-ups from using up the allowance recovery needs, not recovery requests
+from using up the sign-ups'. The cap is a cost and abuse guard, not a
 defence of recovery mail; a rate-limiting rule on `mail_passwd.php` is what would be. These bound
 what one account, and the project as a whole, can be made to send. What the site does not have:
 a limit per client address, a CAPTCHA on sign-up or recovery (a Cloudflare rate-limiting rule on
