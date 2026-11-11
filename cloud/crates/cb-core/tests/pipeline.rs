@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use cb_core::model::{JobResult, Workunit};
 use cb_core::pipeline::{due_workunits, transition, Ctx};
+use cb_core::purge::{commit_purge, plan_purge, purge_pass};
 use cb_core::work::{
     acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, CancelTarget,
     JobSpec, Submission,
@@ -23,6 +24,7 @@ const RESULT_TEMPLATE: &str = "<output_template>\n<file_info>\n    <name><OUTFIL
 #[derive(Default)]
 struct MemFiles {
     objects: RefCell<HashMap<(FileKind, String), FileStat>>,
+    archive: RefCell<HashMap<String, Vec<u8>>>,
     fail: Cell<bool>,
 }
 
@@ -42,6 +44,14 @@ impl Files for MemFiles {
         for n in names {
             self.objects.borrow_mut().remove(&(kind, n.clone()));
         }
+        Ok(())
+    }
+    async fn put(&self, kind: FileKind, name: &str, bytes: Vec<u8>) -> CoreResult<()> {
+        if self.fail.get() {
+            return Err(CoreError::Files("down".into()));
+        }
+        assert_eq!(kind, FileKind::Archive);
+        self.archive.borrow_mut().insert(name.to_string(), bytes);
         Ok(())
     }
 }
@@ -504,4 +514,139 @@ fn duplicate_and_invalid_jobs_are_reported_per_job() {
     assert!(out[0].error.is_some() && out[1].error.is_some() && out[2].error.is_some());
     assert!(out[3].error.is_none() && out[3].workunit_id > 0);
     assert_eq!(w.results(out[3].workunit_id).len(), 2);
+}
+
+/// Runs a quorum-1 job to `FILE_DELETE_DONE`; its last change is at 4800.
+fn finished_job(w: &World, name: &str) -> i64 {
+    let wu = w.submit(name, 1000, 1, 1);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("out"), 0);
+    w.transition(wu, 1200);
+    block_on(acknowledge_assimilation(&w.db, &[wu], 1300)).unwrap();
+    w.transition(wu, 4800);
+    w.transition(wu, 4800);
+    assert_eq!(w.wu(wu).file_delete_state, FILE_DELETE_DONE);
+    wu
+}
+
+#[test]
+fn purge_archives_then_deletes_finished_workunits() {
+    let mut w = World::new("trivial");
+    let done = finished_job(&w, "p1");
+    let kept = finished_job(&w, "p2_nodelete");
+    let open = w.submit("p3", 1000, 1, 1);
+    let day = 86400;
+
+    // Off by default.
+    let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 100 * day, 10)).unwrap();
+    assert_eq!(rep.workunits, 0);
+    assert!(w.files.archive.borrow().is_empty());
+
+    w.config.purge_days = 2.0;
+    // Not old enough yet.
+    let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 4800 + 2 * day, 10)).unwrap();
+    assert_eq!(rep, Default::default());
+
+    // A failed archive write leaves the rows in place.
+    w.files.fail.set(true);
+    assert!(block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).is_err());
+    w.files.fail.set(false);
+    let count = |sql: &str| w.scalar(sql) as i64;
+    assert_eq!(count("SELECT count(*) FROM workunit"), 3);
+
+    let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
+    assert_eq!((rep.workunits, rep.results), (1, 1));
+    let name = rep.archive.unwrap();
+    let archive = w.files.archive.borrow();
+    assert_eq!(
+        name,
+        format!(
+            "1970-01-04/wu_{done}_{done}_{}_{}.jsonl",
+            3 * day,
+            cb_crypto::md5::md5_hex(&archive[&name])
+        )
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8(archive[&name].clone())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["table"], "workunit");
+    assert_eq!(lines[0]["name"], "p1");
+    assert_eq!(lines[1]["table"], "result");
+    assert_eq!(lines[1]["name"], "p1_0");
+    assert_eq!(lines[1]["workunitid"], done);
+
+    // The "nodelete" workunit and the unfinished one stay, with their results.
+    assert_eq!(
+        count(&format!(
+            "SELECT count(*) FROM workunit WHERE id IN ({kept}, {open})"
+        )),
+        2
+    );
+    assert_eq!(count("SELECT count(*) FROM workunit"), 2);
+    assert_eq!(count("SELECT count(*) FROM result"), 2);
+    let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
+    assert_eq!(rep, Default::default());
+}
+
+#[test]
+fn purge_leaves_changed_pending_and_highest_workunits() {
+    let mut w = World::new("trivial");
+    w.config.purge_days = 2.0;
+    let day = 86400;
+    let only = finished_job(&w, "q1");
+    let count = |sql: &str| w.scalar(sql) as i64;
+
+    // The newest workunit keeps its ID in use.
+    assert!(block_on(plan_purge(&w.db, &w.config, 3 * day, 10))
+        .unwrap()
+        .is_none());
+    let second = finished_job(&w, "q2");
+    let _newest = w.submit("q3", 1000, 1, 1);
+
+    // A change between the archive read and the delete keeps the workunit.
+    let plan = block_on(plan_purge(&w.db, &w.config, 3 * day, 10))
+        .unwrap()
+        .unwrap();
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET rev = rev + 1 WHERE id = ?",
+        only
+    )))
+    .unwrap();
+    let rep = block_on(commit_purge(&w.db, &plan)).unwrap();
+    assert_eq!((rep.workunits, rep.results), (1, 1));
+    assert_eq!(count("SELECT count(*) FROM workunit"), 2);
+    assert_eq!(
+        count(&format!(
+            "SELECT count(*) FROM result WHERE workunitid = {only}"
+        )),
+        1
+    );
+    assert_eq!(
+        count(&format!(
+            "SELECT count(*) FROM workunit WHERE id = {second}"
+        )),
+        0
+    );
+
+    // A workunit with a transition pending waits for the pipeline.
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET transition_time = 5000 WHERE id = ?",
+        only
+    )))
+    .unwrap();
+    assert!(block_on(plan_purge(&w.db, &w.config, 3 * day, 10))
+        .unwrap()
+        .is_none());
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET transition_time = ? WHERE id = ?",
+        NEVER,
+        only
+    )))
+    .unwrap();
+    let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
+    assert_eq!((rep.workunits, rep.results), (1, 1));
 }

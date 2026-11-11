@@ -36,6 +36,7 @@ impl SqliteDb {
     pub fn with_schema() -> DbResult<Self> {
         let db = Self::open_in_memory()?;
         db.apply(include_str!("../../../migrations/0001_init.sql"))?;
+        db.apply(include_str!("../../../migrations/0002_purge.sql"))?;
         Ok(db)
     }
 

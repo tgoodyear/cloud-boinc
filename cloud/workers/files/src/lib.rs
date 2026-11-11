@@ -300,7 +300,7 @@ async fn upload(mut req: Request, env: &Env) -> Result<Response> {
                     return refuse(UploadHeader::invalid_signature());
                 }
             }
-            if let Err(e) = header.check_limits(ignore) {
+            if let Err(e) = header.check_limits(ignore, project.config.max_upload_nbytes) {
                 return refuse(e);
             }
             if !is_flat_name(&header.name) {

@@ -295,7 +295,8 @@ pub fn master_page(project: &Project) -> String {
     page(&c.long_name, &head, &body)
 }
 
-/// Job counts by state. Each count walks a partial index or a small range.
+/// Job counts by state, plus account and computer counts from a snapshot at
+/// most `STATUS_COUNTS_TTL` seconds old.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ServerStatus {
     pub results_ready_to_send: i64,
@@ -304,6 +305,69 @@ pub struct ServerStatus {
     pub transitions_due: i64,
     pub users: i64,
     pub hosts: i64,
+    /// Accounts and computers with `expavg_credit` over 1, as upstream
+    /// counts "recent credit".
+    pub users_with_recent_credit: i64,
+    pub hosts_with_recent_credit: i64,
+}
+
+/// `config` row holding the account and computer counts. `Project::load`
+/// ignores names it does not know, so the row is safe beside the settings.
+const STATUS_COUNTS_SETTING: &str = "status_counts";
+
+/// Seconds a stored count snapshot is reused. The counts scan the whole
+/// `user` and `host` tables, so a public poll must not run them each time.
+pub const STATUS_COUNTS_TTL: i64 = 600;
+
+#[derive(Serialize, serde::Deserialize)]
+struct StatusCounts {
+    at: i64,
+    users: i64,
+    users_recent: i64,
+    hosts: i64,
+    hosts_recent: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct CountsRow {
+    value: String,
+}
+
+async fn refresh_status_counts(db: &dyn Db, now: i64) -> CoreResult<StatusCounts> {
+    let out = db
+        .batch(vec![
+            Stmt::new(
+                "SELECT count(*) AS n, coalesce(sum(expavg_credit > 1), 0) AS recent FROM user",
+            ),
+            Stmt::new(
+                "SELECT count(*) AS n, coalesce(sum(expavg_credit > 1), 0) AS recent FROM host",
+            ),
+        ])
+        .await?;
+    let get = |i: usize, col: &str| {
+        out.get(i)
+            .and_then(|r| r.rows.first())
+            .and_then(|row| row.get(col))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+    };
+    let counts = StatusCounts {
+        at: now,
+        users: get(0, "n"),
+        users_recent: get(0, "recent"),
+        hosts: get(1, "n"),
+        hosts_recent: get(1, "recent"),
+    };
+    let json = serde_json::to_string(&counts).map_err(|e| CoreError::Invalid(e.to_string()))?;
+    db.run(stmt!(
+        "INSERT INTO config (name, value, mod_time) VALUES (?, ?, ?) \
+         ON CONFLICT (name) DO UPDATE SET value = excluded.value, mod_time = excluded.mod_time",
+        STATUS_COUNTS_SETTING,
+        json,
+        now
+    ))
+    .await?;
+    Ok(counts)
 }
 
 pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
@@ -325,18 +389,32 @@ pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
                 "SELECT count(*) AS n FROM workunit WHERE transition_time < ? AND transition_time < 2147483647",
                 now
             ),
-            Stmt::new("SELECT coalesce(max(id), 0) AS n FROM user"),
-            Stmt::new("SELECT coalesce(max(id), 0) AS n FROM host"),
+            stmt!(
+                "SELECT value FROM config WHERE name = ?",
+                STATUS_COUNTS_SETTING
+            ),
         ])
         .await?;
     let n = |i: usize| out.get(i).and_then(|r| r.scalar_i64()).unwrap_or(0);
+    let cached = match out.get(4).cloned() {
+        Some(rows) => rows
+            .first::<CountsRow>()?
+            .and_then(|r| serde_json::from_str::<StatusCounts>(&r.value).ok()),
+        None => None,
+    };
+    let counts = match cached {
+        Some(c) if c.at <= now && now - c.at < STATUS_COUNTS_TTL => c,
+        _ => refresh_status_counts(db, now).await?,
+    };
     Ok(ServerStatus {
         results_ready_to_send: n(0),
         results_in_progress: n(1),
         workunits_waiting_for_assimilation: n(2),
         transitions_due: n(3),
-        users: n(4),
-        hosts: n(5),
+        users: counts.users,
+        hosts: counts.hosts,
+        users_with_recent_credit: counts.users_recent,
+        hosts_with_recent_credit: counts.hosts_recent,
     })
 }
 
@@ -358,8 +436,8 @@ pub fn server_status_xml(project: &Project, s: &ServerStatus, now: i64) -> Strin
         s.results_in_progress,
         s.workunits_waiting_for_assimilation,
         if s.transitions_due > 0 { "0.02" } else { "0" },
-        s.users,
-        s.hosts,
+        s.users_with_recent_credit,
+        s.hosts_with_recent_credit,
     )
 }
 
@@ -373,7 +451,9 @@ pub fn server_status_page(project: &Project, s: &ServerStatus) -> String {
         ),
         ("Transitions due", s.transitions_due),
         ("Accounts", s.users),
+        ("Accounts with recent credit", s.users_with_recent_credit),
         ("Computers", s.hosts),
+        ("Computers with recent credit", s.hosts_with_recent_credit),
     ];
     let mut body = format!(
         "<h1>{} server status</h1>\n<table>\n",

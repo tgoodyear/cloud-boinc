@@ -177,7 +177,7 @@ One bucket per project.
 | --- | --- | --- | --- |
 | `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
-| `archive/` | purged workunit and result rows, as JSON lines per day | pipeline cron | by bucket lifecycle rule |
+| `archive/<date>/` | purged workunit and result rows, as JSON lines, one object per purge pass | pipeline cron | by bucket lifecycle rule |
 
 Names are flat. The stock fan-out directories exist to keep directory sizes down on a POSIX
 file system and have no purpose in an object store. R2 has no egress charge, serves range
@@ -447,7 +447,10 @@ The `web` Worker serves the master URL page, which carries the scheduler URL in 
 `<link rel="boinc_scheduler">` form the client looks for, `get_project_config.php`,
 `lookup_account.php` and `create_account.php` with the stock XML shapes and error numbers, and
 `server_status.php` in HTML and XML. The account manager RPCs answer with the stock "not
-implemented" error. PHP file names are kept in the URLs because clients have them built in.
+implemented" error. The account and computer counts on the status page (`server_status` in
+`cloud/crates/cb-core/src/web.rs`) are a snapshot stored in the `config` table under
+`status_counts` and refreshed after `STATUS_COUNTS_TTL` (10 minutes), so a poll does not scan the
+`user` and `host` tables. PHP file names are kept in the URLs because clients have them built in.
 
 ## Admin API and CLI
 
@@ -554,10 +557,26 @@ The `cloud-ci` workflow runs formatting, Clippy, the native tests and the WebAss
 Working end to end with a stock 8.0.4 client: attach, signature-checked download, compute,
 upload, report, validation, assimilation and file deletion.
 
+With `purge_days` set, a second cron trigger in the `pipeline` Worker removes workunits whose
+files are deleted and that have not changed for that many days, together with their results
+and assignments (`purge_pass` in `crates/cb-core/src/purge.rs`). The rows go to the bucket
+under `archive/` first, in an object whose key ends in the MD5 of its contents. A purged
+workunit's name becomes free again, as it does after `db_purge`; a project that purges should
+not submit a job under a name it has used before, because a late report for the old job's
+result would match the new one. A workunit with `nodelete` in its name is kept, as `db_purge`
+keeps it.
+So are the workunit with the highest ID and the one holding the result with the highest ID,
+so that no ID is given out twice; they go once newer jobs exist. A workunit that changes
+between the archive write and the delete stays and is archived again later, so the archive can
+hold a workunit more than once, and the latest copy is the final one.
+With `purge_days` at 0, the default, nothing is purged and the database grows until rows are
+removed by hand.
+
+`max_upload_nbytes` in the config bounds the size of one uploaded file, whether or not upload
+certificates are checked.
+
 Not implemented yet:
 
-- Purging old workunits and results. `purge_days` is read from the config and nothing acts
-  on it, so the database grows until rows are removed by hand.
 - In the scheduler: anonymous platform, assigned jobs, homogeneous redundancy and homogeneous
   app version, locality scheduling, size classes, and the client workload simulation behind
   upstream's deadline check.
