@@ -277,6 +277,13 @@ fn quorum_one_job_runs_to_deletion() {
     assert_eq!(rep.files_deleted, 0);
     assert_eq!(rep.transition_time, 1200 + 3600);
     assert_eq!(w.files.objects.borrow().len(), 1);
+    // The first transition after the delay only marks the files.
+    let rep = w.transition(wu, 4800);
+    assert_eq!(rep.files_deleted, 0);
+    assert_eq!(rep.transition_time, 4800);
+    assert_eq!(w.files.objects.borrow().len(), 1);
+    assert_eq!(w.wu(wu).file_delete_state, FILE_DELETE_READY);
+    assert_eq!(w.results(wu)[0].file_delete_state, FILE_DELETE_READY);
     let rep = w.transition(wu, 4800);
     assert_eq!(rep.files_deleted, 1);
     assert!(w.files.objects.borrow().is_empty());
@@ -287,7 +294,7 @@ fn quorum_one_job_runs_to_deletion() {
     // The design's write budget for a quorum-1 job, as SQLite counts changes
     // (index writes come on top on D1 and are measured there).
     let written = w.db.rows_written() - before;
-    assert!(written <= 16, "{written} rows written");
+    assert!(written <= 18, "{written} rows written");
 }
 
 #[test]

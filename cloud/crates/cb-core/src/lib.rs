@@ -10,6 +10,7 @@ pub mod config;
 pub mod model;
 pub mod pipeline;
 pub mod plan_class;
+pub mod scheduler;
 pub mod template;
 pub mod work;
 

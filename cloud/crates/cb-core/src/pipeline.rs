@@ -241,7 +241,7 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
         None
     };
     let canonical_result_files_deleted =
-        canonical_index.is_some_and(|i| st.results[i].row.file_delete_state == FILE_DELETE_DONE);
+        canonical_index.is_some_and(|i| st.results[i].row.file_delete_state != FILE_DELETE_INIT);
 
     for res in st.results.iter_mut() {
         let r = &mut res.row;
@@ -410,27 +410,43 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
         wu.assimilate_state = ASSIMILATE_READY;
     }
 
-    // Once assimilated, the files can go. Upstream marks them
-    // FILE_DELETE_READY for a separate daemon; here the caller deletes the
-    // objects before it writes this state, so they go straight to DONE.
+    // Once assimilated, the files can go, in two transitions. This one marks
+    // them FILE_DELETE_READY and deletes nothing, so a report that races it
+    // fails the revision check and keeps its files. A transition that reads
+    // the ready state deletes the objects; the caller does that before it
+    // writes FILE_DELETE_DONE.
+    let mut delete_reserved = false;
+    if wu.file_delete_state == FILE_DELETE_READY {
+        wu.file_delete_state = FILE_DELETE_DONE;
+        let own = format!("{}/", config.download_url);
+        for fi in file_infos(&wu.xml_doc) {
+            // Only files this project serves, and not shared ones.
+            let ours =
+                cb_proto::xml::line::parse_str(&file_info_body(&wu.xml_doc, &fi.name), "<url>")
+                    .is_some_and(|u| u.starts_with(&own));
+            if ours && !fi.no_delete {
+                st.delete_downloads.push(fi.name);
+            }
+        }
+    }
+    for res in st.results.iter_mut() {
+        let r = &mut res.row;
+        if r.file_delete_state == FILE_DELETE_READY {
+            r.file_delete_state = FILE_DELETE_DONE;
+            for fi in file_infos(&r.xml_doc_in) {
+                if !fi.no_delete {
+                    st.delete_uploads.push(fi.name);
+                }
+            }
+        }
+    }
     let mut deferred_file_delete_time = 0;
     if wu.assimilate_state == ASSIMILATE_DONE {
         let delete_at = most_recently_returned + config.delete_delay as i64;
         if now >= delete_at {
             if all_over_and_validated && wu.file_delete_state == FILE_DELETE_INIT {
-                wu.file_delete_state = FILE_DELETE_DONE;
-                let own = format!("{}/", config.download_url);
-                for fi in file_infos(&wu.xml_doc) {
-                    // Only files this project serves, and not shared ones.
-                    let ours = cb_proto::xml::line::parse_str(
-                        &file_info_body(&wu.xml_doc, &fi.name),
-                        "<url>",
-                    )
-                    .is_some_and(|u| u.starts_with(&own));
-                    if ours && !fi.no_delete {
-                        st.delete_downloads.push(fi.name);
-                    }
-                }
+                wu.file_delete_state = FILE_DELETE_READY;
+                delete_reserved = true;
             }
             for (i, res) in st.results.iter_mut().enumerate() {
                 // The canonical result stays until every success is validated.
@@ -444,12 +460,8 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
                     _ => false,
                 };
                 if do_delete && r.file_delete_state == FILE_DELETE_INIT {
-                    r.file_delete_state = FILE_DELETE_DONE;
-                    for fi in file_infos(&r.xml_doc_in) {
-                        if !fi.no_delete {
-                            st.delete_uploads.push(fi.name);
-                        }
-                    }
+                    r.file_delete_state = FILE_DELETE_READY;
+                    delete_reserved = true;
                 }
             }
         } else {
@@ -469,6 +481,10 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
     }
     if deferred_file_delete_time != 0 {
         wu.transition_time = wu.transition_time.min(deferred_file_delete_time);
+    }
+    if delete_reserved {
+        // Come straight back to delete what was just marked.
+        wu.transition_time = now;
     }
     // Upstream pushes a transition time in the past further out to shed
     // load. Here a time in the past can only be a deadline that passed
@@ -1346,7 +1362,8 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
         }
 
         // Never zero, the value of a workunit no transition has written.
-        let token = ((i64::from((ctx.random)()) << 31) | i64::from((ctx.random)() & 0x7fff_ffff)) | 1;
+        let token =
+            ((i64::from((ctx.random)()) << 31) | i64::from((ctx.random)() & 0x7fff_ffff)) | 1;
         let wu = &st.wu;
         let mut batch = vec![stmt!(
             "UPDATE workunit SET need_validate = ?, canonical_resultid = ?, canonical_credit = ?, \
