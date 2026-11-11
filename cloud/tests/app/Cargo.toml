@@ -1,0 +1,9 @@
+[package]
+name = "cb-test-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A BOINC app without the BOINC library, for end-to-end tests: upper-cases a file"
+publish = false
+
+[dependencies]

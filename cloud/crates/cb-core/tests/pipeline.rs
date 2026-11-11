@@ -221,7 +221,7 @@ fn quorum_one_job_runs_to_deletion() {
     assert!(rs[0].xml_doc_in.contains("<xml_signature>"));
     assert!(rs[0]
         .xml_doc_in
-        .contains("<url>https://p.example/upload</url>"));
+        .contains("<url>https://p.example/upload/file_upload_handler</url>"));
     assert!(block_on(due_workunits(&w.db, 1000, 10)).unwrap().is_empty());
 
     w.dispatch(&rs[0], 1, 1100);

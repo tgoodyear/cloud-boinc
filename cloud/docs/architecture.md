@@ -403,7 +403,10 @@ authentication and holds no secret.
 
 ### Upload
 
-`POST /upload` implements the `file_upload_handler` protocol: `<get_file_size>` and
+`POST /upload/file_upload_handler` implements the `file_upload_handler` protocol. The path
+keeps that name because a client treats a `<url>` in an output `<file_info>` as an upload URL
+only when it contains `file_upload_handler` (`FILE_INFO::parse` in `client/client_types.cpp`);
+any other URL is taken for a download. The requests are `<get_file_size>` and
 `<file_upload>` with a signed `<file_info>`, then raw bytes. The Worker verifies the
 `<xml_signature>` with the upload public key, checks `max_nbytes`, and streams the body into
 R2 with the client's MD5 as an integrity check.

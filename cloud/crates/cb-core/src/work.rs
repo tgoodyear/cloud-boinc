@@ -222,6 +222,7 @@ struct JobFileRow {
     name: String,
     md5: String,
     nbytes: f64,
+    no_delete: i64,
 }
 
 #[derive(Deserialize)]
@@ -263,7 +264,7 @@ pub async fn create_work(
     let mut reads = Vec::new();
     for chunk in file_names.chunks(MAX_IN_LIST) {
         let mut s = Stmt::new(format!(
-            "SELECT name, md5, nbytes FROM job_file WHERE name IN ({})",
+            "SELECT name, md5, nbytes, no_delete FROM job_file WHERE name IN ({})",
             in_list(chunk.len())
         ));
         for n in chunk {
@@ -293,6 +294,7 @@ pub async fn create_work(
                         StagedFile {
                             md5: f.md5,
                             nbytes: f.nbytes,
+                            no_delete: f.no_delete != 0,
                         },
                     );
                 }

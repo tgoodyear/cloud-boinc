@@ -1,0 +1,25 @@
+# Local development only: one port in front of the Workers, routing by path
+# as the routes of a deployment do. Never deployed.
+name = "cloud-boinc-dev-router"
+main = "router.js"
+compatibility_date = "2026-10-01"
+
+[[services]]
+binding = "SCHEDULER"
+service = "cloud-boinc-scheduler"
+
+[[services]]
+binding = "FILES"
+service = "cloud-boinc-files"
+
+[[services]]
+binding = "ADMIN"
+service = "cloud-boinc-admin"
+
+[[services]]
+binding = "WEB"
+service = "cloud-boinc-web"
+
+[[services]]
+binding = "PIPELINE"
+service = "cloud-boinc-pipeline"

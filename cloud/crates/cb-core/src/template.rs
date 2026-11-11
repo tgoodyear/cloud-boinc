@@ -111,6 +111,9 @@ pub struct InputFile {
 pub struct StagedFile {
     pub md5: String,
     pub nbytes: f64,
+    /// Kept when the jobs using it are done; written into the workunit as
+    /// `<no_delete/>`, which is what the file deletion step reads.
+    pub no_delete: bool,
 }
 
 /// Names the input template refers to with `<physical_name>`; the caller
@@ -254,6 +257,9 @@ fn process_file_info(
                         "    <name>{}</name>\n    <url>{}/{}</url>\n    <md5_cksum>{}</md5_cksum>\n    <nbytes>{:.0}</nbytes>\n",
                         vf.name, download_url, vf.name, st.md5, st.nbytes
                     ));
+                    if st.no_delete {
+                        out.push_str("    <no_delete/>\n");
+                    }
                     name = vf.name.clone();
                 }
                 *n_var_infiles += 1;
@@ -263,6 +269,9 @@ fn process_file_info(
                     "    <name>{}</name>\n    <url>{}/{}</url>\n    <md5_cksum>{}</md5_cksum>\n    <nbytes>{:.0}</nbytes>\n",
                     physical_name, download_url, physical_name, st.md5, st.nbytes
                 ));
+                if st.no_delete {
+                    out.push_str("    <no_delete/>\n");
+                }
                 name = physical_name.clone();
             }
             infiles.push(FileOut { name });
@@ -575,11 +584,11 @@ mod tests {
             OUT_TEMPLATE,
             None,
             "wu1_0_r123_",
-            "https://x.example/upload",
+            "https://x.example/upload/file_upload_handler",
         )
         .unwrap();
         assert!(doc.starts_with("<file_info>\n    <name>wu1_0_r123_0</name>"));
-        assert!(doc.contains("<url>https://x.example/upload</url>"));
+        assert!(doc.contains("<url>https://x.example/upload/file_upload_handler</url>"));
         assert!(doc.ends_with("</result>"));
         assert!(!doc.contains("xml_signature"));
         let outs = output_files(&doc);
@@ -626,6 +635,7 @@ mod tests {
             StagedFile {
                 md5: "0cc175b9c0f1b6a831c399e269772661".into(),
                 nbytes: 1.0,
+                no_delete: false,
             },
         );
         let files = vec![
@@ -656,6 +666,40 @@ mod tests {
         assert_eq!(wu.min_quorum, 2);
         let expect = "<file_info>\n    <name>a.txt</name>\n    <url>https://x.example/download/a.txt</url>\n    <md5_cksum>0cc175b9c0f1b6a831c399e269772661</md5_cksum>\n    <nbytes>1</nbytes>\n</file_info>\n<file_info>\n<sticky/>\n    <name>jf_92eb5ffee6ae2fec3ad71c777531578f</name>\n    <url>https://other.example/b</url>\n    <md5_cksum>92eb5ffee6ae2fec3ad71c777531578f</md5_cksum>\n    <nbytes>7</nbytes>\n</file_info>\n<workunit>\n<command_line>\n--n 3\n</command_line>\n<file_ref>\n    <file_name>a.txt</file_name>\n    <open_name>in</open_name>\n</file_ref>\n<file_ref>\n    <file_name>jf_92eb5ffee6ae2fec3ad71c777531578f</file_name>\n    <copy_file/>\n    <open_name>jf_92eb5ffee6ae2fec3ad71c777531578f</open_name>\n</file_ref>\n</workunit>";
         assert_eq!(wu.xml_doc, expect);
+    }
+
+    #[test]
+    fn kept_staged_file_is_marked_no_delete() {
+        let template = "<file_info>\n<number>0</number>\n</file_info>\n<workunit>\n<file_ref><file_number>0</file_number><open_name>in</open_name></file_ref>\n</workunit>";
+        let mut staged = HashMap::new();
+        staged.insert(
+            "shared.txt".to_string(),
+            StagedFile {
+                md5: "0cc175b9c0f1b6a831c399e269772661".into(),
+                nbytes: 1.0,
+                no_delete: true,
+            },
+        );
+        let files = vec![InputFile {
+            name: "shared.txt".into(),
+            ..Default::default()
+        }];
+        let mut wu = Workunit::default();
+        process_input_template(
+            &mut wu,
+            template,
+            &files,
+            &staged,
+            "https://x.example/download",
+            None,
+            None,
+        )
+        .unwrap();
+        let kept: Vec<_> = file_infos(&wu.xml_doc)
+            .into_iter()
+            .map(|f| (f.name, f.no_delete))
+            .collect();
+        assert_eq!(kept, [("shared.txt".to_string(), true)]);
     }
 
     #[test]

@@ -55,7 +55,7 @@ pub const NEVER: i64 = 2147483647;
 pub enum FileKind {
     /// App version files and job inputs, served under `/download`.
     Download,
-    /// Result outputs, written through `/upload`.
+    /// Result outputs, written through `/upload/file_upload_handler`.
     Upload,
 }
 

@@ -1,0 +1,37 @@
+# The top-level values describe the reference dev deployment. Another
+# deployment changes the route host, zone and database_id; see
+# docs/deploy.md.
+name = "cloud-boinc-pipeline"
+# Built by dev/build.sh; wrangler only bundles and uploads it.
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+[observability]
+enabled = true
+
+[placement]
+mode = "smart"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cloud-boinc-dev"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "../../migrations"
+
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "cloud-boinc-dev"
+
+[[queues.producers]]
+binding = "TRANSITIONS"
+queue = "cloud-boinc-dev-transitions"
+
+[[queues.consumers]]
+queue = "cloud-boinc-dev-transitions"
+max_batch_size = 25
+max_batch_timeout = 1
+max_retries = 5
+
+[triggers]
+crons = ["* * * * *"]

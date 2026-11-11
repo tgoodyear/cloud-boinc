@@ -221,7 +221,9 @@ impl Config {
                 self.download_url = format!("{base}download");
             }
             if self.upload_url.is_empty() {
-                self.upload_url = format!("{base}upload");
+                // A client takes a `<url>` for an upload URL only when it
+                // contains `file_upload_handler`.
+                self.upload_url = format!("{base}upload/file_upload_handler");
             }
         }
     }
@@ -242,7 +244,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.master_url, "https://example.org/");
-        assert_eq!(c.upload_url, "https://example.org/upload");
+        assert_eq!(
+            c.upload_url,
+            "https://example.org/upload/file_upload_handler"
+        );
         assert_eq!(c.download_url, "https://example.org/download");
         assert_eq!(c.daily_result_quota, 500);
         assert!(c.one_result_per_user_per_wu);

@@ -1,4 +1,4 @@
-//! File transfer: `GET /download/<name>` from the bucket and `POST /upload`,
+//! File transfer: `GET /download/<name>` from the bucket and `POST /upload/file_upload_handler`,
 //! the `file_upload_handler` protocol. This Worker holds no private key.
 
 use cb_core::FileKind;
@@ -14,6 +14,10 @@ use worker::{
     console_error, console_log, event, Bucket, ByteStream, Context, Env, FixedLengthStream,
     Headers, Method, Object, Range, Request, Response, Result,
 };
+
+/// A client treats a `<url>` in a `<file_info>` as an upload URL only when it
+/// contains `file_upload_handler`, so the path keeps the stock handler's name.
+const UPLOAD_PATH: &str = "/upload/file_upload_handler";
 
 fn is_flat_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && is_valid_filename(name) && !name.contains('/')
@@ -292,7 +296,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Some(name) => download(&req, &env.bucket(BUCKET)?, name).await,
             None => text(404, "not found\n"),
         },
-        Method::Post if path == "/upload" || path == "/upload/" => upload(req, &env).await,
+        Method::Post if path == UPLOAD_PATH => upload(req, &env).await,
         _ => text(405, "method not allowed\n"),
     }
 }
