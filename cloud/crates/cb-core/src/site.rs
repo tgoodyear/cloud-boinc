@@ -303,6 +303,14 @@ pub(crate) fn row2(out: &mut String, label: &str, value: &str) {
     out.push_str(&format!("<tr><th>{label}</th><td>{value}</td></tr>\n"));
 }
 
+/// A row of a form: the caption is the `<label>` of the control with ID `id`
+/// (which `control` must carry), so that the control has a name.
+pub(crate) fn label_row(out: &mut String, id: &str, caption: &str, control: &str) {
+    out.push_str(&format!(
+        "<tr><th scope=\"row\"><label for=\"{id}\">{caption}</label></th><td>{control}</td></tr>\n"
+    ));
+}
+
 fn host_link(hostid: i64) -> String {
     if hostid > 0 {
         format!("<a href=\"show_host_detail.php?hostid={hostid}\">{hostid}</a>")

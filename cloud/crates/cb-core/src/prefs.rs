@@ -19,7 +19,7 @@
 //!   (`<app_id>`) and `max_jobs` (read by the scheduler, `ProjectPrefs` in
 //!   `scheduler.rs`). A GPU flag is offered only when the project has a
 //!   version for that GPU type, and `allow_beta_work` only when an
-//!   application is marked beta, as upstream. Other contents of
+//!   application or an application version is marked beta, as upstream. Other contents of
 //!   `<project_specific>` are kept as they are.
 
 use std::collections::BTreeMap;
@@ -30,6 +30,13 @@ use cb_proto::xml::extract_venue;
 use crate::project::Project;
 use crate::web::html_escape;
 use crate::Config;
+
+/// The name [`PrefsForm::parse_form`] gives the application selection in the
+/// list of refused fields.
+pub const APPS_FIELD: &str = "apps";
+
+/// Style of a label that screen readers read and the page does not show.
+pub const HIDDEN: &str = "position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden";
 
 /// Venue names, in the order upstream writes them.
 pub const VENUES: [&str; 3] = ["home", "work", "school"];
@@ -78,6 +85,19 @@ struct NumSpec {
     max: f64,
     default: f64,
     scale: f64,
+    /// Only whole numbers are accepted: the reader of the stored value takes
+    /// an integer (`max_jobs` in the scheduler, `daily_xfer_period_days` in
+    /// the client), so a fraction would be shown but read as something else.
+    whole: bool,
+}
+
+impl NumSpec {
+    const fn whole(self) -> NumSpec {
+        NumSpec {
+            whole: true,
+            ..self
+        }
+    }
 }
 
 const fn num(unit: &'static str, min: f64, max: f64, default: f64) -> NumSpec {
@@ -87,6 +107,7 @@ const fn num(unit: &'static str, min: f64, max: f64, default: f64) -> NumSpec {
         max,
         default,
         scale: 1.0,
+        whole: false,
     }
 }
 
@@ -367,7 +388,7 @@ fn global_defs(config: &Config) -> Vec<Def> {
             NET,
             "daily_xfer_period_days",
             "... every",
-            num("days", 0.0, 9_999_999.0, 0.0),
+            num("days", 0.0, 9_999_999.0, 0.0).whole(),
         ),
     ]);
     d.extend(hours(
@@ -443,7 +464,11 @@ fn project_defs(project: &Project) -> Vec<Def> {
             d.push(b(PROJECT, tag, label, false, true));
         }
     }
-    if project.catalog.apps.iter().any(|a| a.beta != 0) {
+    // `project_has_beta`: the scheduler asks for `allow_beta_work` when the
+    // application or the version is beta.
+    if project.catalog.apps.iter().any(|a| a.beta != 0)
+        || project.catalog.app_versions.iter().any(|av| av.beta != 0)
+    {
         d.push(b(
             PROJECT,
             "allow_beta_work",
@@ -458,7 +483,7 @@ fn project_defs(project: &Project) -> Vec<Def> {
             PROJECT,
             "max_jobs",
             "Most tasks in progress (0 for no limit)",
-            num("tasks", 0.0, 1000.0, 0.0),
+            num("tasks", 0.0, 1000.0, 0.0).whole(),
         )
     });
     d
@@ -654,6 +679,14 @@ impl PrefsForm {
             let v = match d.kind {
                 // `PREF_BOOL::xml_parse`: anything but "0" is true.
                 Kind::Bool { .. } => f64::from(u8::from(text != "0")),
+                Kind::Num { spec, .. } if spec.whole => {
+                    // As `line::parse_int`, which the readers use: the
+                    // leading integer, so "0.5" is 0.
+                    match cb_proto::xml::line::parse_int(text, "") {
+                        Some(v) => f64::from(v),
+                        None => continue,
+                    }
+                }
                 _ => match text.parse::<f64>() {
                     Ok(v) if v.is_finite() => v,
                     _ => continue,
@@ -822,58 +855,109 @@ impl PrefsForm {
         out
     }
 
-    /// Form fields for one set, as table rows. `bad` lists the tags whose
-    /// submitted values were refused; those keep the text that was sent.
+    /// Form fields for one set, as table rows. With `sent`, the fields show
+    /// what a browser submitted, whether or not it was accepted, so a page
+    /// that reports an error keeps every edit; `bad` lists the tags (and
+    /// [`APPS_FIELD`]) that were refused, which get a mark.
+    ///
+    /// Each control has an ID, `pref_<tag>`, and a `<label>`. A control that
+    /// is one of several with the same caption (the "not in use" limits
+    /// repeat the "in use" ones, and three disk fields start "Use no more
+    /// than") is also named by its group heading and its unit, through
+    /// `aria-labelledby`. The two selects of an hour range have a label each,
+    /// hidden from sight, for the start and the end.
     pub fn form(&self, s: &PrefSet, sent: Option<&crate::site::Params>, bad: &[&str]) -> String {
         let mut out = String::new();
         let mut group = "";
+        let mut group_id = String::new();
+        let mut groups = 0;
         for d in &self.defs {
             if d.group != group && self.subset == Subset::Global {
                 group = d.group;
+                groups += 1;
+                group_id = format!("pref_group_{groups}");
                 out.push_str(&format!(
-                    "<tr><th colspan=\"2\">{}</th></tr>\n",
+                    "<tr><th colspan=\"2\" id=\"{group_id}\">{}</th></tr>\n",
                     html_escape(group)
                 ));
             }
+            let id = format!("pref_{}", d.tag);
+            let label_id = format!("{id}_label");
             let v = s.get(d.tag).unwrap_or(0.0);
-            let mark = if bad.contains(&d.tag) {
-                " <strong>(not accepted)</strong>"
+            let sent_text = sent.and_then(|q| q.get(d.tag));
+            let refused = |tag: &str| bad.contains(&tag);
+            let (mark, invalid) = if refused(d.tag) {
+                (
+                    format!(" <strong id=\"{id}_error\">(not accepted)</strong>"),
+                    format!(" aria-invalid=\"true\" aria-describedby=\"{id}_error\""),
+                )
             } else {
-                ""
+                (String::new(), String::new())
             };
-            let field = match d.kind {
-                Kind::Bool { invert, .. } => format!(
-                    "<input type=\"checkbox\" name=\"{}\" value=\"1\"{}>",
-                    d.tag,
-                    if (v != 0.0) != invert { " checked" } else { "" }
-                ),
+            let name_of = |parts: &[&str]| {
+                let ids: Vec<&str> = parts.iter().copied().filter(|p| !p.is_empty()).collect();
+                format!(" aria-labelledby=\"{}\"", ids.join(" "))
+            };
+            let caption = html_escape(d.label);
+            let (label, field) = match d.kind {
+                Kind::Bool { invert, .. } => {
+                    let on = match sent {
+                        Some(q) => q.get(d.tag).is_some_and(|x| !x.is_empty()),
+                        None => (v != 0.0) != invert,
+                    };
+                    (
+                        format!("<label id=\"{label_id}\" for=\"{id}\">{caption}</label>"),
+                        format!(
+                            "<input type=\"checkbox\" id=\"{id}\"{} name=\"{}\" value=\"1\"{}>{mark}",
+                            name_of(&[&group_id, &label_id]),
+                            d.tag,
+                            if on { " checked" } else { "" }
+                        ),
+                    )
+                }
                 Kind::Num { spec, optional } => {
-                    let text = match sent
-                        .and_then(|q| q.get(d.tag))
-                        .filter(|_| bad.contains(&d.tag))
-                    {
+                    let text = match sent_text {
                         Some(t) => t.clone(),
                         None if optional && v == 0.0 => String::new(),
                         None => num_str(v / spec.scale),
                     };
-                    format!(
-                        "<input type=\"text\" size=\"8\" name=\"{}\" value=\"{}\"> {}{}",
-                        d.tag,
-                        html_escape(&text),
-                        html_escape(spec.unit),
-                        if optional {
-                            " (blank for no limit)"
-                        } else {
-                            ""
-                        }
+                    let unit_id = format!("{id}_unit");
+                    let unit = if spec.unit.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" <span id=\"{unit_id}\">{}</span>", html_escape(spec.unit))
+                    };
+                    let unit_ref = if spec.unit.is_empty() { "" } else { &unit_id };
+                    (
+                        format!("<label id=\"{label_id}\" for=\"{id}\">{caption}</label>"),
+                        format!(
+                            "<input type=\"text\" size=\"8\" id=\"{id}\"{}{invalid} name=\"{}\" value=\"{}\">{unit}{}{mark}",
+                            name_of(&[&group_id, &label_id, unit_ref]),
+                            d.tag,
+                            html_escape(&text),
+                            if optional {
+                                " (blank for no limit)"
+                            } else {
+                                ""
+                            }
+                        ),
                     )
                 }
                 Kind::Hour { other, start } => {
                     if !start {
                         continue;
                     }
-                    let select = |tag: &str, cur: f64| {
-                        let mut x = format!("<select name=\"{tag}\">");
+                    let hour = |tag: &str, current: f64| {
+                        sent.and_then(|q| q.get(tag))
+                            .and_then(|t| t.trim().parse::<u8>().ok())
+                            .filter(|h| *h < 24)
+                            .map_or(current, f64::from)
+                    };
+                    let select = |tag: &str, cur: f64, which: &str| {
+                        let mut x = format!(
+                            "<label for=\"pref_{tag}\" style=\"{HIDDEN}\">{caption}: {which} hour</label>\
+                             <select id=\"pref_{tag}\" name=\"{tag}\">"
+                        );
                         for h in 0..24 {
                             let sel = if f64::from(h) == cur { " selected" } else { "" };
                             x.push_str(&format!("<option value=\"{h}\"{sel}>{h}:00</option>"));
@@ -881,30 +965,44 @@ impl PrefsForm {
                         x.push_str("</select>");
                         x
                     };
-                    format!(
-                        "{} and {} <small>(the same hour for no restriction)</small>",
-                        select(d.tag, v),
-                        select(other, s.get(other).unwrap_or(0.0))
+                    let mark = if refused(d.tag) || refused(other) {
+                        " <strong>(not accepted)</strong>".to_string()
+                    } else {
+                        String::new()
+                    };
+                    (
+                        caption.clone(),
+                        format!(
+                            "{} and {} <small>(the same hour for no restriction)</small>{mark}",
+                            select(d.tag, hour(d.tag, v), "start"),
+                            select(other, hour(other, s.get(other).unwrap_or(0.0)), "end")
+                        ),
                     )
                 }
             };
-            out.push_str(&format!(
-                "<tr><td>{}</td><td>{field}{mark}</td></tr>\n",
-                html_escape(d.label)
-            ));
+            out.push_str(&format!("<tr><td>{label}</td><td>{field}</td></tr>\n"));
         }
         if self.subset == Subset::Project && !self.apps.is_empty() {
             let mut boxes = String::new();
             for (id, name) in &self.apps {
-                let on = s.apps.as_ref().is_none_or(|ids| ids.contains(id));
+                let on = match sent {
+                    Some(q) => q.contains_key(&format!("app_id_{id}")),
+                    None => s.apps.as_ref().is_none_or(|ids| ids.contains(id)),
+                };
                 boxes.push_str(&format!(
                     "<label><input type=\"checkbox\" name=\"app_id_{id}\" value=\"1\"{}> {}</label><br>",
                     if on { " checked" } else { "" },
                     html_escape(name)
                 ));
             }
+            let mark = if bad.contains(&APPS_FIELD) {
+                " <strong>(not accepted: choose at least one application)</strong>"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "<tr><td>Run only the selected applications</td><td>{boxes}</td></tr>\n"
+                "<tr><td id=\"pref_apps_label\">Run only the selected applications</td>\
+                 <td><div role=\"group\" aria-labelledby=\"pref_apps_label\">{boxes}</div>{mark}</td></tr>\n"
             ));
         }
         out
@@ -962,7 +1060,10 @@ impl PrefsForm {
                     let text = q.get(d.tag).map(|t| t.trim()).unwrap_or_default();
                     let text = if text.is_empty() { "0" } else { text };
                     match text.parse::<f64>() {
-                        Ok(x) if (spec.min..=spec.max).contains(&x) => {
+                        Ok(x)
+                            if (spec.min..=spec.max).contains(&x)
+                                && (!spec.whole || x.fract() == 0.0) =>
+                        {
                             s.vals.insert(d.tag, x * spec.scale);
                         }
                         _ => bad.push(d.tag),
@@ -983,6 +1084,11 @@ impl PrefsForm {
                 .map(|(id, _)| *id)
                 .filter(|id| q.contains_key(&format!("app_id_{id}")))
                 .collect();
+            if chosen.is_empty() {
+                // No `<app_id>` means every application to the scheduler (and
+                // to upstream's form), so "none" cannot be stored.
+                bad.push(APPS_FIELD);
+            }
             // As upstream, a selection of every application is no selection.
             s.apps = (chosen.len() < self.apps.len()).then_some(chosen);
         }
@@ -1245,6 +1351,119 @@ mod tests {
             )
             .unwrap();
         assert_eq!(all.apps, None);
+    }
+
+    #[test]
+    fn beta_work_is_offered_for_a_beta_application_or_version() {
+        let offered =
+            |p: &Project| PrefsForm::new(Subset::Project, p).form(&PrefSet::default(), None, &[]);
+        assert!(!offered(&project(2, false)).contains("allow_beta_work"));
+        assert!(offered(&project(2, true)).contains("name=\"allow_beta_work\""));
+        // A version that is beta under an application that is not.
+        let mut p = project(2, false);
+        p.catalog.app_versions[1].beta = 1;
+        assert!(offered(&p).contains("name=\"allow_beta_work\""));
+    }
+
+    #[test]
+    fn whole_number_fields_refuse_fractions() {
+        let project_form = PrefsForm::new(Subset::Project, &project(1, false));
+        let base = project_form.defaults();
+        let sent = |v: &str| q(&[("resource_share", "100"), ("max_jobs", v)]);
+        for bad in ["0.5", "2.5", "1e-1", "-1", "1001", "x", "nan"] {
+            assert_eq!(
+                project_form.parse_form(&base, &sent(bad)),
+                Err(vec!["max_jobs"]),
+                "{bad}"
+            );
+        }
+        for (good, stored) in [
+            ("0", "0"),
+            ("", "0"),
+            ("3", "3"),
+            (" 3.0 ", "3"),
+            ("1e2", "100"),
+        ] {
+            let s = project_form.parse_form(&base, &sent(good)).unwrap();
+            assert_eq!(
+                s.get("max_jobs").map(num_str).as_deref(),
+                Some(stored),
+                "{good}"
+            );
+        }
+        // The scheduler reads the leading integer of what is stored, and so
+        // does the form: a stored fraction is not shown as one.
+        let xml = "<project_preferences>\n<project_specific>\n<max_jobs>0.5</max_jobs>\n</project_specific>\n</project_preferences>\n";
+        assert_eq!(project_form.parse(xml).main.get("max_jobs"), Some(0.0));
+        let xml = xml.replace("0.5", "7.9");
+        assert_eq!(project_form.parse(&xml).main.get("max_jobs"), Some(7.0));
+
+        // `max_cpus` (read as an integer by the client) is not offered;
+        // `daily_xfer_period_days` is, and is whole.
+        let global = PrefsForm::new(Subset::Global, &project(1, false));
+        assert!(global.defs.iter().all(|d| d.tag != "max_cpus"));
+        let mut fields = global.form_values(&global.defaults());
+        fields.insert("daily_xfer_period_days".into(), "1.5".into());
+        assert_eq!(
+            global.parse_form(&global.defaults(), &fields),
+            Err(vec!["daily_xfer_period_days"])
+        );
+        fields.insert("daily_xfer_period_days".into(), "2".into());
+        assert!(global.parse_form(&global.defaults(), &fields).is_ok());
+    }
+
+    #[test]
+    fn no_application_chosen_is_refused() {
+        let form = PrefsForm::new(Subset::Project, &project(3, false));
+        let base = form.defaults();
+        let none = q(&[("resource_share", "100"), ("max_jobs", "0")]);
+        assert_eq!(form.parse_form(&base, &none), Err(vec![APPS_FIELD]));
+        let html = form.form(&base, Some(&none), &[APPS_FIELD]);
+        assert!(html.contains("choose at least one application"));
+        assert!(!html.contains(" checked"), "what was sent is shown: {html}");
+        let mut one = none.clone();
+        one.insert("app_id_2".into(), "1".into());
+        assert_eq!(form.parse_form(&base, &one).unwrap().apps, Some(vec![2]));
+        // What the form writes for a selection is what the scheduler reads.
+        let mut next = form.parse("");
+        next.main = form.parse_form(&base, &one).unwrap();
+        let xml = form.write(&next, 0);
+        assert!(xml.contains("<apps_selected>\n<app_id>2</app_id>\n</apps_selected>"));
+    }
+
+    #[test]
+    fn controls_have_ids_and_labels() {
+        let form = PrefsForm::new(Subset::Global, &project(1, false));
+        let html = form.form(&form.defaults(), None, &[]);
+        assert!(html.contains(
+            "<label id=\"pref_work_buf_min_days_label\" for=\"pref_work_buf_min_days\">Store at least</label>"
+        ));
+        assert!(html.contains(
+            "id=\"pref_work_buf_min_days\" aria-labelledby=\"pref_group_3 pref_work_buf_min_days_label pref_work_buf_min_days_unit\""
+        ));
+        // Three disk fields start "Use no more than": the unit tells them apart.
+        assert!(html.contains("id=\"pref_disk_max_used_gb_unit\">GB</span>"));
+        assert!(html.contains("id=\"pref_disk_max_used_pct_unit\">% of total</span>"));
+        assert!(html.contains("aria-labelledby=\"pref_group_4 pref_disk_max_used_gb_label pref_disk_max_used_gb_unit\""));
+        // An hour range: one label for each end.
+        assert!(html.contains("<label for=\"pref_start_hour\" style=\""));
+        assert!(html.contains("Compute only between: start hour</label><select id=\"pref_start_hour\" name=\"start_hour\">"));
+        assert!(html.contains(
+            "Compute only between: end hour</label><select id=\"pref_end_hour\" name=\"end_hour\">"
+        ));
+        // A refused value is tied to its message.
+        let mut sent = form.form_values(&form.defaults());
+        sent.insert("cpu_usage_limit".into(), "500".into());
+        let html = form.form(&form.defaults(), Some(&sent), &["cpu_usage_limit"]);
+        assert!(
+            html.contains("aria-invalid=\"true\" aria-describedby=\"pref_cpu_usage_limit_error\"")
+        );
+        assert!(html.contains("<strong id=\"pref_cpu_usage_limit_error\">(not accepted)</strong>"));
+
+        let form = PrefsForm::new(Subset::Project, &project(2, false));
+        let html = form.form(&form.defaults(), None, &[]);
+        assert!(html.contains("<div role=\"group\" aria-labelledby=\"pref_apps_label\">"));
+        assert!(html.contains("<td id=\"pref_apps_label\">Run only the selected applications</td>"));
     }
 
     #[test]

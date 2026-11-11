@@ -637,8 +637,15 @@ preference documents with upstream's `bad_xml` test and a 64 KB limit. Project p
 without a `<project_specific>` part keep the stored one, as upstream. A new email address is
 refused with `ERR_DB_NOT_UNIQUE` when another account has it, by the `WHERE` clause of the one
 `UPDATE`; as upstream, it does not rehash the password, so an account manager sends
-`password_hash` with it. `teamid` is accepted and ignored until there are teams, and the consent
-fields are ignored. Two statements: the account, then the update.
+`password_hash` with it. The stored hash depends on the address, so a request that names the
+address or gives a hash writes only if the address and hash are still the ones read with the
+account (as the site's password and email actions do); if a site request changed them meanwhile,
+nothing is written and the reply is `ERR_RETRY`. `teamid` is accepted and ignored until there are
+teams, and the consent fields are ignored. Two statements: the account, then the update (a
+refused update costs a third, which tells a taken address from a changed account). The web
+Worker reads a form body of at most `MAX_FORM_BYTES` (in `cloud/crates/cb-core/src/web.rs`): both
+preference documents at their 64 KB limit with every byte URL-encoded to three, and the other
+fields. A longer body is not from a BOINC client, and its fields are ignored.
 
 These RPCs, `show_user.php?format=xml&auth=` and the site login accept the account key only: a
 weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream's
@@ -747,11 +754,28 @@ computers is the account's `venue`, edited with the main project preferences. Fi
   client reads from the account file; `no_apple_gpu`, `allow_beta_work`, the application
   selection (`<app_id>` in `<apps_selected>`) and `max_jobs`, which the scheduler reads
   (`ProjectPrefs` in `scheduler.rs`). A GPU flag is offered only when the project has an app
-  version of that GPU type, `allow_beta_work` only when an application is marked beta, and the
-  selection only when there is more than one application, as upstream. The selection and
+  version of that GPU type, `allow_beta_work` only when an application or an application version
+  is marked beta (`project_has_beta` upstream; the scheduler asks for it for either), and the
+  selection only when there is more than one application, as upstream. A selection of no
+  application is refused with a message on the field: the scheduler reads a document with no
+  `<app_id>` as every application, and upstream's form does too, so saving "none" would enable
+  them all. The selection and
   `max_jobs` are written inside `<project_specific>`, as upstream's form does; anything else in
   that element is kept. `allow_non_preferred_apps` and `max_cpus` are not offered, because the
-  scheduler does not act on them.
+  scheduler does not act on them. A field that a reader takes as an integer (`max_jobs` in the
+  scheduler, `daily_xfer_period_days` in the client) accepts whole numbers only, so a fraction is
+  refused instead of being shown and then read as something else; a stored fraction is shown as
+  the integer the reader gets.
+
+The forms are written to be usable with a screen reader. Every control has an ID and a
+`<label>`: the account-details and preference forms put each caption in a `<label for>`, and the
+sign-up, password, email and login forms wrap each control in its label. A preference whose
+caption is not unique (the "not in use" limits repeat the "in use" ones, and three disk fields
+begin "Use no more than") is also named by its group heading and its unit with
+`aria-labelledby`; the two selects of an hour range have a label each, for the start and the
+end hour, hidden from sight. When a save is refused, the page is shown again with every value as
+it was submitted (numbers, checkboxes, the application selection and the account settings
+beside the project preferences), the refused ones marked, and nothing is stored.
 
 A computing-preferences save keeps only the fields above, as upstream's form does; anything else
 a client stored in the document is dropped.

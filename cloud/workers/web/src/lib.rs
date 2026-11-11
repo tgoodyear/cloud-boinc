@@ -9,6 +9,7 @@ use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_PATHS};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
     project_config, server_status, server_status_page, server_status_xml, NewAccount,
+    MAX_FORM_BYTES,
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
@@ -22,10 +23,6 @@ use worker::{
 /// How long the edge cache keeps the master page and the project config.
 /// Both change only when the settings do.
 const PAGE_CACHE_SECS: u32 = 30;
-/// Largest form read. `am_set_info.php` can carry both preference
-/// documents (up to 64 KB each), URL-encoded.
-const MAX_FORM_BYTES: usize = 192 * 1024;
-
 fn html(body: String) -> Result<Response> {
     Ok(Response::builder()
         .with_header("Content-Type", "text/html; charset=utf-8")?

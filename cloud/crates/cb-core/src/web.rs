@@ -310,6 +310,13 @@ pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
     ))
 }
 
+/// Largest form body read, for `am_set_info.php`, which can carry both
+/// preference documents (up to [`crate::prefs::MAX_PREFS_BYTES`] each) with
+/// every byte URL-encoded to three, plus the account key, name, URL and the
+/// other fields. A longer body is not from a BOINC client; its fields are
+/// ignored.
+pub const MAX_FORM_BYTES: usize = 2 * 3 * crate::prefs::MAX_PREFS_BYTES + 64 * 1024;
+
 /// `am_set_info.php`: an account manager changes an account. Upstream
 /// switched this RPC off ("This probably shouldn't exist") but its
 /// code is still there; this follows that code. Parameters come from the
@@ -327,7 +334,12 @@ pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
 /// address, so the password stops working until it is set again.
 ///
 /// Two statements: the account by key, then one `UPDATE` whose `WHERE`
-/// clause refuses an email address another account has.
+/// clause refuses an email address another account has. The stored hash
+/// depends on the address, so a write of either (or a request that names the
+/// address) is also conditional on the address and hash read with the
+/// account; when the account changed meanwhile, nothing is written and the
+/// reply is `ERR_RETRY`; a refused write costs one more statement, to tell
+/// that from a taken address.
 pub async fn am_set_info(
     db: &dyn Db,
     config: &Config,
@@ -443,23 +455,53 @@ pub async fn am_set_info(
 
     if !sets.is_empty() {
         let assignments: Vec<String> = sets.iter().map(|c| format!("{c} = ?")).collect();
+        let target = if new_email {
+            email.as_str()
+        } else {
+            user.email_addr.as_str()
+        };
+        // `password_hash` was made for an address, and the address and the
+        // hash are what this RPC compared with. If a site request changed
+        // either since, the pair written would not match.
+        let credentials = !password_hash.is_empty() || !email.is_empty();
+        let guard = if credentials {
+            " AND email_addr = ? AND passwd_hash = ?"
+        } else {
+            ""
+        };
         update.sql = format!(
-            "UPDATE user SET {} WHERE id = ? AND NOT EXISTS \
+            "UPDATE user SET {} WHERE id = ?{guard} AND NOT EXISTS \
              (SELECT 1 FROM user WHERE email_addr = ? AND id != ?) RETURNING id",
             assignments.join(", ")
         );
-        update = update
-            .bind(user.id)
-            .bind(if new_email {
-                email.as_str()
-            } else {
-                user.email_addr.as_str()
-            })
-            .bind(user.id);
+        update = update.bind(user.id);
+        if credentials {
+            update = update
+                .bind(user.email_addr.as_str())
+                .bind(user.passwd_hash.as_str());
+        }
+        update = update.bind(target).bind(user.id);
         if db.run(update).await?.rows.is_empty() {
+            // Refused: the address is taken, or the account changed since it
+            // was read. Only this path asks which.
+            let taken = db
+                .run(stmt!(
+                    "SELECT count(*) AS n FROM user WHERE email_addr = ? AND id != ?",
+                    target,
+                    user.id
+                ))
+                .await?
+                .scalar_i64()
+                .unwrap_or(0);
+            if taken > 0 {
+                return Ok(write_error(
+                    err::ERR_DB_NOT_UNIQUE,
+                    Some("There's already an account with that email address."),
+                ));
+            }
             return Ok(write_error(
-                err::ERR_DB_NOT_UNIQUE,
-                Some("There's already an account with that email address."),
+                err::ERR_RETRY,
+                Some("The account changed meanwhile; please try again."),
             ));
         }
     }

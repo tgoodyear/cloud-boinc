@@ -18,8 +18,8 @@ use crate::model::User;
 use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
 use crate::site::{
-    error_page, layout, local_url, login_cookie, logout_cookie, row2, str_param, to_login, viewer,
-    Params, SiteCtx, SitePage,
+    error_page, label_row, layout, local_url, login_cookie, logout_cookie, row2, str_param,
+    to_login, viewer, Params, SiteCtx, SitePage,
 };
 use crate::web::{
     account_creation_refusal, html_escape, is_valid_email, is_valid_postal_code,
@@ -89,7 +89,8 @@ fn passwd_error(passwd: &str) -> Option<String> {
 }
 
 fn country_select(selected: &str) -> String {
-    let mut out = String::from("<select name=\"country\">\n<option value=\"\">---</option>\n");
+    let mut out =
+        String::from("<select id=\"country\" name=\"country\">\n<option value=\"\">---</option>\n");
     for c in COUNTRIES {
         let sel = if *c == selected { " selected" } else { "" };
         out.push_str(&format!(
@@ -283,32 +284,35 @@ pub async fn edit_user_info_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
         "<form method=\"post\" action=\"edit_user_info_action.php\">\n{}<table>\n",
         token_fields(&user, ctx.now)
     );
-    row2(
+    label_row(
         &mut b,
+        "user_name",
         "Name",
         &format!(
-            "<input type=\"text\" name=\"user_name\" maxlength=\"254\" value=\"{}\">",
+            "<input type=\"text\" id=\"user_name\" name=\"user_name\" maxlength=\"254\" value=\"{}\">",
             html_escape(&user.name)
         ),
     );
     if project.config.user_url {
-        row2(
+        label_row(
             &mut b,
+            "url",
             "URL",
             &format!(
-                "<input type=\"text\" name=\"url\" maxlength=\"254\" value=\"{}\">",
+                "<input type=\"text\" id=\"url\" name=\"url\" maxlength=\"254\" value=\"{}\">",
                 html_escape(&user.url)
             ),
         );
     }
     if project.config.user_country {
-        row2(&mut b, "Country", &country_select(&user.country));
+        label_row(&mut b, "country", "Country", &country_select(&user.country));
     }
-    row2(
+    label_row(
         &mut b,
+        "postal_code",
         "Postal code",
         &format!(
-            "<input type=\"text\" name=\"postal_code\" maxlength=\"64\" value=\"{}\">",
+            "<input type=\"text\" id=\"postal_code\" name=\"postal_code\" maxlength=\"64\" value=\"{}\">",
             html_escape(&user.postal_code)
         ),
     );
@@ -723,7 +727,8 @@ fn venue_title(subset: Subset, venue: Option<usize>) -> String {
     }
 }
 
-/// The form of `prefs_edit.php`, with the values given.
+/// The form of `prefs_edit.php`, with the values given; with `sent`, the ones a
+/// browser submitted, for a page that reports an error.
 #[allow(clippy::too_many_arguments)]
 fn prefs_form_page(
     ctx: &SiteCtx<'_>,
@@ -739,8 +744,10 @@ fn prefs_form_page(
     let mut b = String::new();
     if !bad.is_empty() {
         b.push_str(
-            "<p><strong>Unable to update preferences.</strong> The values marked below were out \
-             of range or not numeric.</p>\n",
+            "<p><strong>Unable to update preferences.</strong> The values marked below were not \
+             accepted: a number out of range, not numeric or not whole where a whole number is \
+             needed, or no application chosen. Nothing was saved; what you entered is shown, so \
+             correct the marked values and send it again.</p>\n",
         );
     }
     b.push_str(&format!(
@@ -758,31 +765,44 @@ fn prefs_form_page(
     b.push_str("<table>\n");
     b.push_str(&form.form(set, sent, bad));
     if subset == Subset::Project && venue.is_none() {
-        let checked = |x: i32| if x != 0 { " checked" } else { "" };
-        row2(
+        // What was submitted stays on an error page, as the preference fields.
+        let flag = |k: &str, stored: i32| match sent {
+            Some(q) => q.get(k).is_some_and(|v| !v.is_empty()),
+            None => stored != 0,
+        };
+        let checked = |on: bool| if on { " checked" } else { "" };
+        label_row(
             &mut b,
+            "send_email",
             "Is it OK for this project to email you?",
             &format!(
-                "<input type=\"checkbox\" name=\"send_email\" value=\"1\"{}>",
-                checked(user.send_email)
+                "<input type=\"checkbox\" id=\"send_email\" name=\"send_email\" value=\"1\"{}>",
+                checked(flag("send_email", user.send_email))
             ),
         );
-        row2(
+        label_row(
             &mut b,
+            "show_hosts",
             "Should this project show your computers on its web site?",
             &format!(
-                "<input type=\"checkbox\" name=\"show_hosts\" value=\"1\"{}>",
-                checked(user.show_hosts)
+                "<input type=\"checkbox\" id=\"show_hosts\" name=\"show_hosts\" value=\"1\"{}>",
+                checked(flag("show_hosts", user.show_hosts))
             ),
         );
-        let mut select = String::from("<select name=\"default_venue\">");
+        let venue_now = sent.map_or(user.venue.as_str(), |q| str_param(q, "default_venue"));
+        let mut select = String::from("<select id=\"default_venue\" name=\"default_venue\">");
         for v in ["", "home", "school", "work"] {
-            let sel = if user.venue == v { " selected" } else { "" };
+            let sel = if venue_now == v { " selected" } else { "" };
             let label = if v.is_empty() { "---" } else { v };
             select.push_str(&format!("<option value=\"{v}\"{sel}>{label}</option>"));
         }
         select.push_str("</select>");
-        row2(&mut b, "Default computer location", &select);
+        label_row(
+            &mut b,
+            "default_venue",
+            "Default computer location",
+            &select,
+        );
     }
     b.push_str(&format!(
         "</table>\n<p><input type=\"submit\" value=\"Update preferences\"></p>\n</form>\n\

@@ -2,15 +2,16 @@
 //! what, escaping of values that came from clients, paging, and how many
 //! statements each page runs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
+use async_trait::async_trait;
 use cb_core::project::{put_setting, Project, SETTING_CONFIG};
 use cb_core::site::{
     site_page, Params, SiteCtx, SitePage, RESULTS_FILTER_WINDOW, RESULTS_PER_PAGE,
 };
 use cb_core::web::{am_get_info, am_set_host_info, make_user, weak_account_key, NewAccount};
 use cb_crypto::account::passwd_hash;
-use cb_db::{stmt, Db};
+use cb_db::{stmt, Db, DbResult, Rows, Stmt};
 use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
 
@@ -1600,4 +1601,441 @@ fn preferences_are_edited_per_venue_and_reach_clients() {
             .status,
         400
     );
+}
+
+/// A database that, before the first write to `user`, runs one statement of
+/// another request: that request and this one start from the same read.
+struct ChangedMeanwhile<'a> {
+    inner: &'a SqliteDb,
+    other: RefCell<Option<Stmt>>,
+}
+
+#[async_trait(?Send)]
+impl Db for ChangedMeanwhile<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if stmts.iter().any(|s| s.sql.starts_with("UPDATE user SET")) {
+            let other = self.other.borrow_mut().take();
+            if let Some(other) = other {
+                self.inner.run(other).await?;
+            }
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let stale = passwd_hash("newer", "ada@example.com");
+    let q = |pairs: &[(&str, &str)]| -> Params {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    // The site changes the address (and so the hash) after the RPC read the
+    // account and before it wrote.
+    let site_hash = passwd_hash("secret", "ada@site.example");
+    let racing = ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(Some(stmt!(
+            "UPDATE user SET email_addr = 'ada@site.example', passwd_hash = ? WHERE id = ?",
+            site_hash.as_str(),
+            ada.id
+        ))),
+    };
+    let params = q(&[
+        ("account_key", &ada.auth),
+        ("name", "Ada L"),
+        ("password_hash", &stale),
+    ]);
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        &params,
+    ))
+    .unwrap();
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    let u = w.user(ada.id);
+    // Nothing was written: not the hash, and not the name beside it.
+    assert_eq!(u.email_addr, "ada@site.example");
+    assert_eq!(u.name, "Ada");
+    assert_eq!(u.passwd_hash, site_hash);
+
+    // A new address with its hash, against a hash changed meanwhile.
+    let racing = ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(Some(stmt!(
+            "UPDATE user SET passwd_hash = 'changed' WHERE id = ?",
+            ada.id
+        ))),
+    };
+    let params = q(&[
+        ("account_key", &ada.auth),
+        ("email_addr", "ada@new.example"),
+        ("password_hash", &passwd_hash("newer", "ada@new.example")),
+    ]);
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        &params,
+    ))
+    .unwrap();
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    assert_eq!(w.user(ada.id).email_addr, "ada@site.example");
+
+    // A change that does not touch the credentials is not held up by one.
+    let racing = ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(Some(stmt!(
+            "UPDATE user SET passwd_hash = 'again' WHERE id = ?",
+            ada.id
+        ))),
+    };
+    let params = q(&[("account_key", &ada.auth), ("name", "Ada L")]);
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        &params,
+    ))
+    .unwrap();
+    assert!(reply.contains("<success/>"), "{reply}");
+    assert_eq!(w.user(ada.id).name, "Ada L");
+}
+
+/// What a form encoder sends for `text`: every byte but a few becomes `%XX`.
+fn percent_encode(text: &str) -> String {
+    text.bytes().map(|b| format!("%{b:02X}")).collect()
+}
+
+#[test]
+fn am_set_info_takes_two_preference_documents_of_the_largest_size() {
+    use cb_core::prefs::MAX_PREFS_BYTES;
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let fill = |root: &str, extra: usize| {
+        let (open, close) = (format!("<{root}>\n"), format!("</{root}>"));
+        let pad = "<".repeat(MAX_PREFS_BYTES - open.len() - close.len() + extra);
+        format!("{open}{pad}{close}")
+    };
+    let global = fill("global_preferences", 0);
+    let project = fill("project_preferences", 0);
+    assert_eq!(
+        (global.len(), project.len()),
+        (MAX_PREFS_BYTES, MAX_PREFS_BYTES)
+    );
+
+    // The Worker reads a form of at most `MAX_FORM_BYTES`, and drops the
+    // body of a longer one: the largest valid request must fit.
+    let body = format!(
+        "account_key={}&global_prefs={}&project_prefs={}&name=Ada+L&url=https%3A%2F%2Fada.example%2F&postal_code=N1+9GU&email_addr={}",
+        ada.auth,
+        percent_encode(&global),
+        percent_encode(&project),
+        percent_encode("ada@example.com"),
+    );
+    assert!(
+        body.len() <= cb_core::web::MAX_FORM_BYTES,
+        "{} > {}",
+        body.len(),
+        cb_core::web::MAX_FORM_BYTES
+    );
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            ("global_prefs", &global),
+            ("project_prefs", &project),
+        ],
+    );
+    assert!(reply.contains("<success/>"), "{reply}");
+    assert_eq!(w.user(ada.id).global_prefs.len(), MAX_PREFS_BYTES);
+    // One byte more is refused.
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            ("global_prefs", &fill("global_preferences", 1)),
+        ],
+    );
+    assert_eq!(error_num(&reply), Some(-118), "{reply}");
+}
+
+/// Whether every control of a form page has a name: a `<label for>` for its
+/// ID, `aria-labelledby`, or a `<label>` around it. Returns the ones that
+/// have none.
+fn unnamed_controls(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = html[at..].find(['<']) {
+        let start = at + i;
+        let end = start + html[start..].find('>').unwrap();
+        let tag = &html[start..=end];
+        at = end;
+        let is_control = tag.starts_with("<select")
+            || tag.starts_with("<textarea")
+            || (tag.starts_with("<input")
+                && !tag.contains("type=\"hidden\"")
+                && !tag.contains("type=\"submit\""));
+        if !is_control {
+            continue;
+        }
+        let attr = |name: &str| {
+            let key = format!(" {name}=\"");
+            let a = tag.find(&key)? + key.len();
+            Some(&tag[a..a + tag[a..].find('"')?])
+        };
+        let before = &html[..start];
+        let inside_label = before
+            .rfind("<label")
+            .is_some_and(|o| before[o..].find("</label>").is_none());
+        let by_for = attr("id").is_some_and(|id| {
+            html.contains(&format!("<label for=\"{id}\""))
+                || html.contains(&format!(" for=\"{id}\""))
+        });
+        if !(inside_label || by_for || attr("aria-labelledby").is_some()) {
+            out.push(tag.to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn form_controls_have_names() {
+    let w = World::with_config(
+        &OPEN_CONFIG.replace("<user_country>1", "<user_url>1</user_url>\n<user_country>1"),
+    );
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let mut pages = vec![
+        ("login", w.get("/login_form.php", None, &[])),
+        ("sign-up", w.get("/create_account_form.php", None, &[])),
+        ("account", w.get("/edit_user_info_form.php", auth, &[])),
+        ("password", w.get("/edit_passwd_form.php", auth, &[])),
+        ("email", w.get("/edit_email_form.php", auth, &[])),
+        ("home", w.get("/home.php", auth, &[])),
+        (
+            "global prefs",
+            w.get("/prefs_edit.php", auth, &[("subset", "global")]),
+        ),
+        (
+            "project prefs",
+            w.get("/prefs_edit.php", auth, &[("subset", "project")]),
+        ),
+        (
+            "venue prefs",
+            w.get(
+                "/prefs_edit.php",
+                auth,
+                &[("subset", "project"), ("venue", "work")],
+            ),
+        ),
+        (
+            "remove",
+            w.get(
+                "/prefs_remove.php",
+                auth,
+                &[("subset", "project"), ("venue", "work")],
+            ),
+        ),
+    ];
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "project")]);
+    pages.push((
+        "refused prefs",
+        w.submit(&form, "/prefs_edit.php", auth, &[("resource_share", "x")])
+            .0,
+    ));
+    for (name, page) in &pages {
+        assert!(page.body.contains("<form"), "{name}");
+        assert_eq!(unnamed_controls(&page.body), Vec::<String>::new(), "{name}");
+    }
+    let account = &pages[2].1.body;
+    for id in ["user_name", "url", "country", "postal_code"] {
+        assert!(
+            account.contains(&format!("<label for=\"{id}\">"))
+                && account.contains(&format!("id=\"{id}\"")),
+            "{id}"
+        );
+    }
+    let prefs = &pages[7].1.body;
+    for id in ["send_email", "show_hosts", "default_venue"] {
+        assert!(prefs.contains(&format!("<label for=\"{id}\">")), "{id}");
+    }
+    // The two hour selectors have a label each.
+    let global = &pages[6].1.body;
+    assert!(global.contains("for=\"pref_start_hour\""));
+    assert!(global.contains("for=\"pref_end_hour\""));
+    assert!(global.contains("Compute only between: start hour"));
+    assert!(global.contains("Compute only between: end hour"));
+    assert!(global.contains("Transfer files only between: end hour"));
+    // Fields with the same caption in two groups are told apart.
+    assert!(global.contains(
+        "id=\"pref_max_ncpus_pct\" aria-labelledby=\"pref_group_1 pref_max_ncpus_pct_label pref_max_ncpus_pct_unit\""
+    ));
+    assert!(global.contains(
+        "id=\"pref_niu_max_ncpus_pct\" aria-labelledby=\"pref_group_2 pref_niu_max_ncpus_pct_label pref_niu_max_ncpus_pct_unit\""
+    ));
+}
+
+#[test]
+fn preferences_refused_for_one_field_keep_the_others() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let before = w.user(ada.id);
+
+    // Computing: one valid edit beside one refused value.
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "global")]);
+    let (page, _) = w.submit(
+        &form,
+        "/prefs_edit.php",
+        auth,
+        &[
+            ("subset", "global"),
+            ("max_ncpus_pct", "60"),
+            ("cpu_usage_limit", "500"),
+            ("run_on_batteries", "1"),
+            ("start_hour", "8"),
+            ("end_hour", "17"),
+            ("max_bytes_sec_down", "250"),
+        ],
+    );
+    assert_eq!(page.status, 400);
+    assert!(page.body.contains("(not accepted)"));
+    assert!(page.body.contains("name=\"cpu_usage_limit\" value=\"500\""));
+    assert!(page.body.contains("name=\"max_ncpus_pct\" value=\"60\""));
+    assert!(page
+        .body
+        .contains("name=\"max_bytes_sec_down\" value=\"250\""));
+    assert!(page
+        .body
+        .contains("name=\"run_on_batteries\" value=\"1\" checked"));
+    // The other checkboxes were not sent, so they are not ticked.
+    assert!(!page
+        .body
+        .contains("name=\"leave_apps_in_memory\" value=\"1\" checked"));
+    assert!(page
+        .body
+        .contains("<option value=\"8\" selected>8:00</option>"));
+    assert!(page
+        .body
+        .contains("<option value=\"17\" selected>17:00</option>"));
+    assert_eq!(w.user(ada.id).global_prefs, before.global_prefs);
+
+    // Project: the account's settings, the applications and the flags too.
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "project")]);
+    let (page, _) = w.submit(
+        &form,
+        "/prefs_edit.php",
+        auth,
+        &[
+            ("subset", "project"),
+            ("resource_share", "300"),
+            ("max_jobs", "0.5"),
+            ("no_cpu", "1"),
+            ("app_id_2", "1"),
+            ("show_hosts", "1"),
+            ("default_venue", "school"),
+        ],
+    );
+    assert_eq!(page.status, 400);
+    assert!(page.body.contains("name=\"max_jobs\" value=\"0.5\""));
+    assert!(page.body.contains("name=\"resource_share\" value=\"300\""));
+    assert!(page.body.contains("name=\"no_cpu\" value=\"1\" checked"));
+    assert!(page.body.contains("name=\"app_id_2\" value=\"1\" checked"));
+    assert!(!page.body.contains("name=\"app_id_1\" value=\"1\" checked"));
+    assert!(page
+        .body
+        .contains("name=\"show_hosts\" value=\"1\" checked"));
+    assert!(!page
+        .body
+        .contains("name=\"send_email\" value=\"1\" checked"));
+    assert!(page.body.contains("<option value=\"school\" selected>"));
+    assert_eq!(w.user(ada.id).project_prefs, before.project_prefs);
+    assert_eq!(w.user(ada.id).venue, before.venue);
+}
+
+#[test]
+fn preferences_read_as_integers_are_whole_numbers() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "project")]);
+    for bad in ["0.5", "2.5", "1e-1", "abc"] {
+        let (page, _) = w.submit(
+            &form,
+            "/prefs_edit.php",
+            auth,
+            &[("max_jobs", bad), ("app_id_1", "1"), ("app_id_2", "1")],
+        );
+        assert_eq!(page.status, 400, "{bad}");
+        assert!(page.body.contains("(not accepted)"), "{bad}");
+    }
+    assert_eq!(w.user(ada.id).project_prefs, "");
+    let (page, _) = w.submit(
+        &form,
+        "/prefs_edit.php",
+        auth,
+        &[("max_jobs", "3"), ("app_id_1", "1"), ("app_id_2", "1")],
+    );
+    assert_eq!(page.status, 303);
+    assert!(w
+        .user(ada.id)
+        .project_prefs
+        .contains("<max_jobs>3</max_jobs>"));
+
+    // `daily_xfer_period_days` is read as an integer by the client.
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "global")]);
+    let global = cb_core::prefs::PrefsForm::new(cb_core::prefs::Subset::Global, &w.project);
+    let mut fields: Vec<(String, String)> =
+        global.form_values(&global.defaults()).into_iter().collect();
+    fields.retain(|(k, _)| k != "daily_xfer_period_days");
+    for (value, status) in [("1.5", 400), ("2", 303)] {
+        let mut sent = fields.clone();
+        sent.push(("daily_xfer_period_days".into(), value.into()));
+        let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let (page, _) = w.submit(&form, "/prefs_edit.php", auth, &pairs);
+        assert_eq!(page.status, status, "{value}");
+    }
+}
+
+#[test]
+fn clearing_every_application_is_refused() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "project")]);
+    // A browser sends no field for an unticked box; resource_share and
+    // max_jobs stay as the form had them.
+    let (page, _) = w.submit(
+        &form,
+        "/prefs_edit.php",
+        auth,
+        &[("resource_share", "400"), ("max_jobs", "")],
+    );
+    assert_eq!(page.status, 400);
+    assert!(page.body.contains("choose at least one application"));
+    assert!(page.body.contains("name=\"resource_share\" value=\"400\""));
+    assert!(!page.body.contains("name=\"app_id_1\" value=\"1\" checked"));
+    assert_eq!(w.user(ada.id).project_prefs, "");
+    // One application is a selection.
+    let (page, _) = w.submit(
+        &form,
+        "/prefs_edit.php",
+        auth,
+        &[
+            ("resource_share", "400"),
+            ("max_jobs", ""),
+            ("app_id_1", "1"),
+        ],
+    );
+    assert_eq!(page.status, 303);
+    assert!(w
+        .user(ada.id)
+        .project_prefs
+        .contains("<apps_selected>\n<app_id>1</app_id>\n</apps_selected>"));
 }
