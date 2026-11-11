@@ -52,7 +52,11 @@ fn site_response(page: SitePage) -> Result<Response> {
         .with_status(page.status)
         .with_header("Content-Type", page.content_type)?
         .with_header("Cache-Control", "private, no-store")?
-        .with_header("X-Content-Type-Options", "nosniff")?;
+        .with_header("X-Content-Type-Options", "nosniff")?
+        // The pages hold forms that change the account; no other site may
+        // put them in a frame.
+        .with_header("Content-Security-Policy", "frame-ancestors 'none'")?
+        .with_header("X-Frame-Options", "DENY")?;
     if let Some(location) = &page.location {
         builder = builder.with_header("Location", location)?;
     }
