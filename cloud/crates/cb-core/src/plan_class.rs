@@ -525,7 +525,7 @@ fn coproc_perf(s1: f64, s2: f64, frac: f64) -> (f64, f64) {
 
 /// Peak FLOPS of a GPU, with the default in place of a value that cannot be
 /// right (`COPROC::bad_gpu_peak_flops`).
-fn gpu_peak_flops(cp: &Coproc) -> f64 {
+pub(crate) fn gpu_peak_flops(cp: &Coproc) -> f64 {
     if cp.peak_flops <= 0.0 || cp.peak_flops > GPU_MAX_PEAK_FLOPS {
         GPU_DEFAULT_PEAK_FLOPS
     } else {

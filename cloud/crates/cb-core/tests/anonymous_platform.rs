@@ -40,10 +40,11 @@ fn signer() -> &'static Signer {
 /// An entry of the client's `<app_versions>`.
 #[derive(Clone)]
 struct Cav {
-    app: &'static str,
+    /// Text as it goes into the request's XML, entities and all.
+    app: String,
     version: i32,
-    platform: &'static str,
-    plan_class: &'static str,
+    platform: String,
+    plan_class: String,
     ncpus: f64,
     flops: f64,
     /// `(coprocessor type name, instances)`
@@ -51,12 +52,12 @@ struct Cav {
 }
 
 impl Cav {
-    fn new(app: &'static str, version: i32) -> Cav {
+    fn new(app: &str, version: i32) -> Cav {
         Cav {
-            app,
+            app: app.into(),
             version,
-            platform: LINUX,
-            plan_class: "",
+            platform: LINUX.into(),
+            plan_class: String::new(),
             ncpus: 1.0,
             flops: 0.0,
             coproc: None,
@@ -73,13 +74,13 @@ impl Cav {
         self
     }
 
-    fn platform(mut self, p: &'static str) -> Cav {
-        self.platform = p;
+    fn platform(mut self, p: &str) -> Cav {
+        self.platform = p.into();
         self
     }
 
-    fn plan_class(mut self, c: &'static str) -> Cav {
-        self.plan_class = c;
+    fn plan_class(mut self, c: &str) -> Cav {
+        self.plan_class = c.into();
         self
     }
 
@@ -1007,4 +1008,457 @@ fn apps_with_work_and_no_client_version_cost_one_statement() {
     assert!(!has_message(&out, "usable version of App D."));
     assert!(!has_message(&out, "Project has no tasks available"));
     assert!(used <= 12, "{used} statements");
+}
+
+#[test]
+fn a_resent_result_is_recorded_with_the_version_it_is_resent_with() {
+    // `resend_lost_work` calls `add_result_to_reply`, which sets the
+    // result's `app_version_id` and `flops_estimate` again.
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    let wu = w.submit("j1", 1000);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).flops(2e9)]),
+        2000,
+    );
+    assert_eq!(out.n_sent, 1);
+    let host = out.host_id;
+    assert_eq!(w.results(wu)[0].app_version_id, ANON_PLATFORM_CPU);
+    assert_eq!(w.results(wu)[0].flops_estimate, 2e9);
+    assert_eq!(w.havs(host), vec![1_000_002]);
+
+    // The user drops the CPU version and keeps a GPU one. The client lists
+    // no tasks, so the result is sent again, now as a GPU job.
+    let mut again =
+        Req::anon(host).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)]);
+    again.seqno = 2;
+    again.cpu_secs = 0.0;
+    again.gpu = Some((1000.0, 5e12));
+    again.other = Some(Vec::new());
+    let out2 = w.rpc(&again, 2100);
+    assert_eq!(out2.n_resent, 1, "{:?}", out2.reply.messages);
+    let r = &w.results(wu)[0];
+    assert_eq!(r.app_version_id, ANON_PLATFORM_NVIDIA);
+    assert_eq!(r.flops_estimate, 2e9 + 5e12);
+    // The new row exists, and the resend did not count against the day.
+    assert_eq!(w.havs(host), vec![1_000_002, 1_000_003]);
+    assert_eq!(w.hav(host, 1_000_003).unwrap().n_jobs_today, 0);
+    assert_eq!(w.hav(host, 1_000_002).unwrap().n_jobs_today, 1);
+
+    // Reporting a failure now lowers the GPU row's limit, not the CPU row's.
+    let mut report = Req::anon(host).versions(again.versions.clone());
+    report.seqno = 3;
+    report.cpu_secs = 0.0;
+    report.reports = vec![("j1_0".into(), RESULT_COMPUTE_ERROR, 195)];
+    w.rpc(&report, 2200);
+    assert_eq!(w.hav(host, 1_000_003).unwrap().max_jobs_per_day, 99);
+    assert_eq!(w.hav(host, 1_000_002).unwrap().max_jobs_per_day, 100);
+}
+
+#[test]
+fn a_resend_past_its_deadline_and_a_new_resource_share_one_statement() {
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    let wu = w.submit("j1", 1000);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).flops(2e9)]),
+        2000,
+    );
+    let host = out.host_id;
+    // Past the deadline (36000 s after the send) and sent as a GPU job.
+    let mut again =
+        Req::anon(host).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)]);
+    again.seqno = 2;
+    again.cpu_secs = 0.0;
+    again.gpu = Some((1000.0, 5e12));
+    again.other = Some(Vec::new());
+    let late = 2000 + 36000 + 100;
+    let before = w.db.statements();
+    let out2 = w.rpc(&again, late);
+    let used = w.db.statements() - before;
+    assert_eq!(out2.n_resent, 1);
+    let r = &w.results(wu)[0];
+    assert_eq!(r.app_version_id, ANON_PLATFORM_NVIDIA);
+    assert!(r.report_deadline > late);
+
+    // The same without the change of resource: one statement fewer for the
+    // row, none for the result's record.
+    let mut w2 = World::new();
+    w2.config.resend_lost_results = true;
+    w2.submit("j1", 1000);
+    let out = w2.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).flops(2e9)]),
+        2000,
+    );
+    let mut same = Req::anon(out.host_id).versions(vec![Cav::new("a", 100).flops(2e9)]);
+    same.seqno = 2;
+    same.other = Some(Vec::new());
+    same.cpu_secs = 1000.0;
+    let before = w2.db.statements();
+    assert_eq!(w2.rpc(&same, late).n_resent, 1);
+    let used_same = w2.db.statements() - before;
+    assert_eq!(used, used_same + 1, "{used} {used_same}");
+}
+
+/// The first result sent in a world with one job.
+fn first_sent(w: &World) -> JobResult {
+    block_on(query_one(
+        &w.db,
+        stmt!("SELECT * FROM result WHERE server_state = 4 ORDER BY id"),
+    ))
+    .unwrap()
+    .expect("a result was sent")
+}
+
+#[test]
+fn what_the_client_states_cannot_inflate_the_speed_a_result_is_credited_for() {
+    // CPUs: bounded by the host's four.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let req = Req::anon(0).versions(vec![Cav::new("a", 100).ncpus(1e6).flops(1e9)]);
+    assert_eq!(w.rpc(&req, 2000).n_sent, 1);
+    assert_eq!(first_sent(&w).flops_estimate, 4.0 * 2e9);
+
+    // GPU count: bounded by the host's one GPU.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let mut req = Req::anon(0).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1e6).flops(1e11)]);
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 5e12));
+    assert_eq!(w.rpc(&req, 2000).n_sent, 1);
+    assert_eq!(first_sent(&w).flops_estimate, 2e9 + 5e12);
+
+    // GPU speed: a figure that cannot be right is replaced as the plan class
+    // path replaces it (`COPROC::bad_gpu_peak_flops`).
+    let w = World::new();
+    w.submit("j1", 1000);
+    let mut req = Req::anon(0).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)]);
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 1e20));
+    assert_eq!(w.rpc(&req, 2000).n_sent, 1);
+    assert_eq!(first_sent(&w).flops_estimate, 2e9 + 100e9);
+
+    // A fraction of a GPU stays a fraction.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let mut req = Req::anon(0).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 0.5).flops(1e11)]);
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 4e12));
+    assert_eq!(w.rpc(&req, 2000).n_sent, 1);
+    assert_eq!(first_sent(&w).flops_estimate, 2e9 + 2e12);
+
+    // The stated speed does not enter it at all.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let req = Req::anon(0).versions(vec![Cav::new("a", 100).flops(1e17)]);
+    assert_eq!(w.rpc(&req, 2000).n_sent, 1);
+    assert_eq!(first_sent(&w).flops_estimate, 2e9);
+}
+
+#[test]
+fn the_sizes_sent_stay_positive_and_finite_for_any_stated_speed() {
+    // Stated speeds from absurdly small to absurdly large, with elapsed-time
+    // history from absurdly fast to absurdly slow.
+    let stated = [1e-300, 1e-9, 1.0, 1e9, 1e300, f64::MAX];
+    let history = [1e-300, 1e-15, 1e-8, 1.0, 1e30, 1e300];
+    for s in stated {
+        for et_avg in history {
+            let mut w = World::new();
+            // A stated speed of 1e-300 is a very slow job: not one for the
+            // deadline check to turn away here.
+            w.config.ignore_delay_bound = true;
+            w.submit("j1", 1000);
+            let first = w.rpc(
+                &Req::anon(0).versions(vec![Cav::new("a", 100).flops(s)]),
+                1500,
+            );
+            let host = first.host_id;
+            // Give the one job back, and the host some history.
+            w.sql(
+                "UPDATE result SET server_state = 2, hostid = 0, userid = 0 WHERE server_state = 4",
+            );
+            w.sql(&format!(
+                "UPDATE host_app_version SET et_n = 20, et_avg = {et_avg:e} WHERE host_id = {host}"
+            ));
+            let mut req = Req::anon(host).versions(vec![Cav::new("a", 100).flops(s)]);
+            req.seqno = 2;
+            let out = w.rpc(&req, 2000);
+            assert_eq!(out.n_sent, 1, "stated {s:e} history {et_avg:e}");
+            for tag in ["rsc_fpops_est", "rsc_fpops_bound"] {
+                let x = wu_number(&out, tag);
+                assert!(
+                    x.is_finite() && x > 0.0,
+                    "{tag} {x} for stated {s:e} history {et_avg:e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_negative_version_number_is_not_usable() {
+    // `cav.version_num < app.min_version`, and the minimum is 0 by default.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let req = Req::anon(0).versions(vec![Cav::new("a", -5)]);
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(has_message(&out, "doesn't have a usable version of App A."));
+}
+
+#[test]
+fn a_client_with_only_a_cpu_version_asking_for_gpu_work_is_told_only_no_tasks_sent() {
+    let w = World::new();
+    w.submit("j1", 1000);
+    let mut req = Req::anon(0).versions(vec![Cav::new("a", 100)]);
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 5e12));
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(has_message(&out, "No tasks sent"));
+    assert!(!has_message(&out, "Project has no tasks available"));
+    assert!(!has_message(&out, "app_info.xml"));
+    // Only "No tasks sent" and what the request itself earns.
+    let texts: Vec<&str> = out
+        .reply
+        .messages
+        .iter()
+        .map(|m| m.message.as_str())
+        .collect();
+    assert_eq!(texts, vec!["No tasks sent"]);
+}
+
+#[test]
+fn versions_sharing_a_row_share_its_quota_within_one_request() {
+    // Two CPU versions of one app share the row of the app and the resource.
+    // Quota 3 for one CPU; the fast version fills it, and the slow one must
+    // not be offered the same jobs again.
+    let versions = vec![
+        Cav::new("a", 101).flops(1e10),
+        Cav::new("a", 100).flops(5e9),
+    ];
+    let run = |versions: Vec<Cav>| {
+        let mut w = World::new();
+        w.config.daily_result_quota = 3;
+        for i in 0..8 {
+            w.submit(&format!("j{i}"), 1000);
+        }
+        let mut req = Req::anon(0).versions(versions);
+        req.ncpus = 1;
+        // 100 s a job with the fast version: room for five by the request.
+        req.cpu_secs = 450.0;
+        let before = w.db.statements();
+        let out = w.rpc(&req, 2000);
+        let used = w.db.statements() - before;
+        let today = w.hav(out.host_id, 1_000_002).unwrap().n_jobs_today;
+        (out.n_sent, used, today, w.havs(out.host_id))
+    };
+    let (sent, used, today, rows) = run(versions.clone());
+    assert_eq!(sent, 3);
+    assert_eq!(today, 3);
+    assert_eq!(rows, vec![1_000_002]);
+    // No more statements than with the fast version alone: one insert for
+    // the row, and claims only for what the quota allows.
+    let (sent_alone, used_alone, _, _) = run(versions[..1].to_vec());
+    assert_eq!(sent_alone, 3);
+    assert_eq!(used, used_alone);
+
+    // Both versions out of quota: the message names the limit once.
+    let mut w = World::new();
+    w.config.daily_result_quota = 3;
+    for i in 0..8 {
+        w.submit(&format!("j{i}"), 1000);
+    }
+    let mut req = Req::anon(0).versions(versions);
+    req.ncpus = 1;
+    req.cpu_secs = 450.0;
+    let out = w.rpc(&req, 2000);
+    req.hostid = out.host_id;
+    req.seqno = 2;
+    let out = w.rpc(&req, 2100);
+    assert_eq!(out.n_sent, 0);
+    let limits = out
+        .reply
+        .messages
+        .iter()
+        .filter(|m| m.message.contains("Daily job limit (3) has been reached"))
+        .count();
+    assert_eq!(limits, 1);
+}
+
+#[test]
+fn strings_from_the_client_are_escaped_and_bounded() {
+    let w = World::new();
+    w.submit("j1", 1000);
+    // Entities the request parser undoes, to become markup if echoed as is.
+    let nasty = Cav::new("a", 100)
+        .platform("p&lt;/platform&gt;&lt;injected/&gt;&amp;")
+        .plan_class("c&lt;/plan_class&gt;&lt;also/&gt;");
+    let out = w.rpc(&Req::anon(0).versions(vec![nasty]), 2000);
+    assert_eq!(out.n_sent, 1);
+    let xml = out.reply.write().unwrap();
+    assert!(!xml.contains("<injected/>"), "{xml}");
+    assert!(!xml.contains("<also/>"), "{xml}");
+    assert!(
+        xml.contains("<platform>p&lt;/platform>&lt;injected/>&amp;</platform>"),
+        "{xml}"
+    );
+    assert!(
+        xml.contains("<plan_class>c&lt;/plan_class>&lt;also/></plan_class>"),
+        "{xml}"
+    );
+
+    // An unknown app name is echoed in a message, escaped too.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("x&lt;/message&gt;&lt;y/&gt;", 1)]),
+        2000,
+    );
+    let xml = out.reply.write().unwrap();
+    assert!(!xml.contains("<y/>"), "{xml}");
+    assert!(xml.contains("Unknown app name x&lt;/message>&lt;y/> in app_info.xml"));
+
+    // Megabyte strings: kept to 256 bytes each, so the reply stays small.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let huge = "p".repeat(1 << 20);
+    let long = Cav::new("a", 100).platform(&huge).plan_class(&huge);
+    let unknown = Cav::new(&huge, 1);
+    let out = w.rpc(&Req::anon(0).versions(vec![long, unknown]), 2000);
+    assert_eq!(out.n_sent, 1);
+    let xml = out.reply.write().unwrap();
+    assert!(xml.len() < 20_000, "{} bytes", xml.len());
+    assert!(xml.contains(&format!("<platform>{}</platform>", "p".repeat(256))));
+    assert!(xml.contains(&format!(
+        "Unknown app name {} in app_info.xml",
+        "p".repeat(256)
+    )));
+
+    // Multi-byte characters are cut between characters and escaped whole.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let euros = "\u{20ac}".repeat(300);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).platform(&euros)]),
+        2000,
+    );
+    let xml = out.reply.write().unwrap();
+    assert_eq!(out.n_sent, 1);
+    assert!(xml.len() < 20_000);
+    // 85 characters of three bytes each, each byte a reference
+    assert!(xml.contains(&format!(
+        "<platform>{}</platform>",
+        "&#226;&#130;&#172;".repeat(85)
+    )));
+}
+
+#[test]
+fn more_than_a_hundred_apps_without_a_client_version_are_probed_in_one_statement() {
+    let w = World::new();
+    let mut values = Vec::new();
+    for id in 10..170 {
+        values.push(format!("({id}, 0, 'app{id}', 'App {id}', 'trivial')"));
+    }
+    w.sql(&format!(
+        "INSERT INTO app (id, create_time, name, user_friendly_name, validator) VALUES {}",
+        values.join(", ")
+    ));
+    w.submit("j1", 1000);
+    w.submit_app("app77", "j77", 1000, None);
+    w.submit_app("app160", "j160", 1000, None);
+    let mut req = Req::anon(0).versions(vec![Cav::new("b", 1)]);
+    req.cpu_secs = 0.0;
+    let host = w.rpc(&req, 1500).host_id;
+    req.hostid = host;
+    req.seqno = 2;
+    req.cpu_secs = 1000.0;
+    let before = w.db.statements();
+    let out = w.rpc(&req, 2000);
+    let used = w.db.statements() - before;
+    assert_eq!(out.n_sent, 0);
+    for name in ["App A", "App 77", "App 160"] {
+        assert!(
+            has_message(&out, &format!("usable version of {name}.")),
+            "{name}: {:?}",
+            out.reply.messages
+        );
+    }
+    assert!(!has_message(&out, "usable version of App 78."));
+    assert!(used <= 12, "{used} statements");
+}
+
+#[test]
+fn an_app_the_user_deselected_or_a_beta_app_is_not_sent_without_the_preference() {
+    let w = World::new();
+    w.submit("j1", 1000);
+    let req = |host: i64, seqno: i32| {
+        let mut r = Req::anon(host).versions(vec![Cav::new("a", 100), Cav::new("b", 100)]);
+        r.seqno = seqno;
+        r
+    };
+
+    // The user selected app b only: no work from a, and no complaint about it.
+    w.sql("UPDATE user SET project_prefs = '<project_preferences><app_id>2</app_id></project_preferences>'");
+    let out = w.rpc(&req(0, 1), 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(!has_message(&out, "app_info.xml"));
+    let host = out.host_id;
+    // Selecting a lets it through.
+    w.sql("UPDATE user SET project_prefs = '<project_preferences><app_id>1</app_id></project_preferences>'");
+    let out = w.rpc(&req(host, 2), 2100);
+    assert_eq!(out.n_sent, 1);
+
+    // A beta app goes only to users who allow beta work.
+    let w = World::new();
+    w.submit("j1", 1000);
+    w.sql("UPDATE app SET beta = 1 WHERE id = 1");
+    let out = w.rpc(&req(0, 1), 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(!has_message(&out, "app_info.xml"));
+    let host = out.host_id;
+    w.sql("UPDATE user SET project_prefs = '<project_preferences><allow_beta_work>1</allow_beta_work></project_preferences>'");
+    let out = w.rpc(&req(host, 2), 2100);
+    assert_eq!(out.n_sent, 1);
+}
+
+/// Statements one request runs when it is sent `jobs` jobs.
+fn statements_with_jobs(jobs: usize, anonymous: bool) -> (u64, usize) {
+    let mut w = World::new();
+    w.config.max_wus_to_send = 50;
+    for i in 0..jobs {
+        w.submit(&format!("j{i}"), 1000);
+    }
+    let mut req = Req::anon(0).versions(vec![Cav::new("a", 100).flops(1e11)]);
+    if !anonymous {
+        req.platform = LINUX.into();
+    }
+    req.ncpus = 16;
+    req.cpu_secs = 1e9;
+    let mut first = req.clone();
+    first.cpu_secs = 0.0;
+    let host = w.rpc(&first, 1500).host_id;
+    req.hostid = host;
+    req.seqno = 2;
+    let before = w.db.statements();
+    let out = w.rpc(&req, 2000);
+    (w.db.statements() - before, out.n_sent)
+}
+
+#[test]
+fn a_request_sent_many_jobs_costs_the_same_per_job_as_for_a_normal_client() {
+    // The claims of a request go in one write batch, three statements a job
+    // (claim, row counter, workunit); that is how the scheduler is built for
+    // every client, and is no different on the anonymous platform.
+    let (few, n_few) = statements_with_jobs(2, true);
+    let (many, n_many) = statements_with_jobs(40, true);
+    assert_eq!((n_few, n_many), (2, 40));
+    assert_eq!((many - few) / 38, 3, "{few} {many}");
+    let (normal_few, _) = statements_with_jobs(2, false);
+    let (normal_many, n_normal) = statements_with_jobs(40, false);
+    assert_eq!(n_normal, 40);
+    // The one statement more is the probe for apps with work that the client
+    // has no version of (app b has none here).
+    assert_eq!(few, normal_few + 1);
+    assert_eq!(many, normal_many + 1);
 }

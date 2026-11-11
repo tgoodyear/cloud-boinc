@@ -38,14 +38,14 @@ use cb_proto::sched_reply::{
 };
 use cb_proto::sched_request::{self, ClientAppVersion, ReportedResult, SchedulerRequest};
 use cb_proto::web_rpc::err::EXIT_ABORTED_BY_PROJECT;
-use cb_proto::xml::{extract_venue, line};
+use cb_proto::xml::{extract_venue, line, xml_escape};
 use serde::Deserialize;
 
 use crate::model::{
     anon_gavid, anon_platform_id, anon_uses_gpu, generalized_app_version_id, App, AppVersion, Host,
     HostAppVersion, Platform, User, Workunit,
 };
-use crate::plan_class::{HostUsage, PlanClassSpecs, PlanHost};
+use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost};
 use crate::{Config, CoreError, CoreResult};
 
 /// Number of processor types the work request distinguishes.
@@ -70,6 +70,13 @@ const MAX_CLIENT_VERSIONS: usize = 256;
 /// `ET_RATIO_LIMIT` in `sched/sched_version.cpp`: how far above the speed
 /// the client states the speed estimated from elapsed times may go.
 const ET_RATIO_LIMIT: f64 = 250.0;
+/// Bounds on the speed a client may state for one of its own versions, and
+/// on the speed taken from its history. They keep the ratio between the two,
+/// which scales the workunit's size in the reply, between 1e-11 and 1e11, so
+/// that it can never make that size zero, negative or infinite. Real CPUs and
+/// GPUs, even several GPUs in one version, lie well within them.
+const MIN_ANON_FLOPS: f64 = 1e6;
+const MAX_ANON_FLOPS: f64 = 1e17;
 /// Daily limit used when the project sets no `daily_result_quota`.
 const NO_QUOTA: i32 = 1_000_000;
 const GIGA: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -188,6 +195,7 @@ struct InProgressRow {
     name: String,
     workunitid: i64,
     app_version_id: i64,
+    flops_estimate: f64,
 }
 
 /// Why a job was passed over, for the message when nothing is sent.
@@ -289,15 +297,22 @@ struct Version<'a> {
     hu: HostUsage,
     /// Counts against the GPU limit on jobs in progress.
     gpu: bool,
-    /// Jobs of this version sent to the host today, including this reply.
-    n_today: i32,
-    /// The host's daily limit for this version.
-    quota: i32,
-    consecutive_valid: i32,
-    /// Whether the host has a `host_app_version` row for it.
-    has_row: bool,
     /// Sort key: projected speed with the selection noise applied.
     score: f64,
+}
+
+/// What a request keeps for one `host_app_version` row. Several versions of
+/// the client can share a row (one app, one resource), and a job sent with
+/// any of them counts against it.
+struct RowState {
+    /// Jobs sent to the host today with versions of the row, including this
+    /// reply.
+    n_today: i32,
+    /// The host's daily limit for the row, scaled by the processors.
+    quota: i32,
+    consecutive_valid: i32,
+    /// Whether the row exists, or an insert for it is in this request.
+    has_row: bool,
 }
 
 impl Version<'_> {
@@ -309,6 +324,8 @@ impl Version<'_> {
     fn sending(&self) -> Sending {
         Sending {
             av_id: self.av.map_or(0, |a| a.id),
+            result_av_id: self.result_av_id,
+            gavid: self.gavid,
             anon: self.anonymous(),
             version_num: self.version_num,
             plan_class: self.plan_class.to_string(),
@@ -323,6 +340,10 @@ impl Version<'_> {
 struct Sending {
     /// The project's app version; 0 on the anonymous platform.
     av_id: i64,
+    /// What the result stores as `app_version_id`.
+    result_av_id: i64,
+    /// The key of the `host_app_version` row.
+    gavid: i64,
     anon: bool,
     version_num: i32,
     plan_class: String,
@@ -622,21 +643,33 @@ fn usage_for<'a>(
 /// (`CLIENT_APP_VERSION::parse`, `HOST_USAGE` of `sched/sched_types.h`).
 /// `projected_flops` is the client's `<flops>`, or the host's benchmark speed
 /// when it gave none (`estimate_flops_anon_platform`).
-fn anon_usage(cav: &ClientAppVersion, req: &SchedulerRequest, p_fpops: f64) -> HostUsage {
-    // These come from the client's file; keep them finite.
+///
+/// What the client states drives what the result is credited for (its peak
+/// speed is the result's `flops_estimate`), so it is bound by what the host
+/// reports: CPUs by the host's, GPU instances by the host's count of that
+/// GPU, and GPU speed by the host's figure for it, sanitised as the plan
+/// class path does. The stated `<flops>` only sets the client's runtime
+/// estimate and is bound by `MIN_ANON_FLOPS` and `MAX_ANON_FLOPS`.
+fn anon_usage(
+    cav: &ClientAppVersion,
+    req: &SchedulerRequest,
+    p_fpops: f64,
+    ncpus: i32,
+) -> HostUsage {
     let avg_ncpus = if cav.avg_ncpus.is_finite() && cav.avg_ncpus > 0.0 {
-        cav.avg_ncpus
+        cav.avg_ncpus.min(f64::from(ncpus.max(1)))
     } else {
         1.0
     };
-    let gpu_usage = clean(cav.gpu_usage);
+    let mut gpu_usage = 0.0;
     let mut peak_flops = avg_ncpus * p_fpops;
     if cav.proc_type != PROC_TYPE_CPU {
         if let Some(c) = req.coprocs.proc_type(cav.proc_type) {
-            peak_flops += gpu_usage * clean(c.peak_flops);
+            gpu_usage = clean(cav.gpu_usage).min(f64::from(c.count.clamp(0, 8)));
+            peak_flops += gpu_usage * gpu_peak_flops(c);
         }
     }
-    let projected_flops = if cav.flops.is_finite() && cav.flops > 0.0 {
+    let stated = if cav.flops.is_finite() && cav.flops > 0.0 {
         cav.flops
     } else {
         p_fpops
@@ -648,8 +681,8 @@ fn anon_usage(cav: &ClientAppVersion, req: &SchedulerRequest, p_fpops: f64) -> H
         avg_ncpus,
         mem_usage: 0.0,
         // A host whose benchmark failed has no speed to fall back on.
-        projected_flops: if projected_flops > 0.0 {
-            projected_flops
+        projected_flops: if stated > 0.0 {
+            stated.clamp(MIN_ANON_FLOPS, MAX_ANON_FLOPS)
         } else {
             1e9
         },
@@ -666,14 +699,29 @@ fn anon_usage(cav: &ClientAppVersion, req: &SchedulerRequest, p_fpops: f64) -> H
 ///
 /// Given the speed the client stated, with enough elapsed-time history for
 /// this host and resource type the estimate is the one that history implies,
-/// capped at `ET_RATIO_LIMIT` times the stated speed.
+/// capped at `ET_RATIO_LIMIT` times the stated speed and kept within
+/// `MIN_ANON_FLOPS` and `MAX_ANON_FLOPS`. The stated speed is within them
+/// already (`anon_usage`), so the factor is finite and positive.
 fn anon_projected_flops(stated: f64, hav: Option<&HostAppVersion>) -> (f64, f64) {
     match hav {
         Some(h) if h.et_n > MIN_HOST_SAMPLES && h.et_avg > 0.0 => {
-            let new_flops = (1.0 / h.et_avg).min(ET_RATIO_LIMIT * stated);
+            let new_flops = (1.0 / h.et_avg)
+                .min(ET_RATIO_LIMIT * stated)
+                .clamp(MIN_ANON_FLOPS, MAX_ANON_FLOPS);
             (new_flops, stated / new_flops)
         }
         _ => (stated, 1.0),
+    }
+}
+
+/// A workunit size multiplied by the factor of `anon_projected_flops`; the
+/// size itself if the product would not be a positive finite number.
+fn scaled_size(size: f64, scale: f64) -> f64 {
+    let x = size * scale;
+    if x.is_finite() && (x > 0.0 || size <= 0.0) {
+        x
+    } else {
+        size
     }
 }
 
@@ -697,6 +745,7 @@ struct AnonPick {
 /// which `needed` says the client wants work (`need_this_resource`).
 fn pick_anonymous(
     versions: &[Version<'_>],
+    rows: &HashMap<i64, RowState>,
     app: &App,
     need_64b: bool,
     needed: &dyn Fn(usize) -> bool,
@@ -714,9 +763,10 @@ fn pick_anonymous(
         if need_64b && !v.platform.contains("64") {
             continue;
         }
-        if v.n_today >= v.quota {
-            if !pick.quota_hit.contains(&v.quota) {
-                pick.quota_hit.push(v.quota);
+        let row = &rows[&v.gavid];
+        if row.n_today >= row.quota {
+            if !pick.quota_hit.contains(&row.quota) {
+                pick.quota_hit.push(row.quota);
             }
             continue;
         }
@@ -1037,7 +1087,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         kinds.push(Read::Reported);
     }
     reads.push(stmt!(
-        "SELECT id, name, workunitid, app_version_id FROM result \
+        "SELECT id, name, workunitid, app_version_id, flops_estimate FROM result \
          WHERE hostid = ? AND server_state = 4",
         host.id
     ));
@@ -1310,6 +1360,19 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             .max(1);
         base.saturating_mul(scale)
     };
+    // What this request keeps for each `host_app_version` row, by key.
+    let mut rows: HashMap<i64, RowState> = HashMap::new();
+    let mut row_of = |gavid: i64, hav: Option<&HostAppVersion>, gpu: bool, pt: usize| {
+        rows.entry(gavid).or_insert_with(|| RowState {
+            n_today: match hav {
+                Some(h) if !new_day => h.n_jobs_today,
+                _ => 0,
+            },
+            quota: quota_of(hav, gpu, pt),
+            consecutive_valid: hav.map_or(0, |h| h.consecutive_valid),
+            has_row: hav.is_some(),
+        });
+    };
 
     // App versions the host can be sent, fastest first.
     let mut versions: Vec<Version<'_>> = Vec::new();
@@ -1333,8 +1396,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 continue;
             }
             let Some(app) = apps_by_name.get(cav.app_name.as_str()).copied() else {
+                // The name is the client's text, and messages are not escaped
+                // when written.
                 out.reply.messages.push(UserMessage::new(
-                    format!("Unknown app name {} in app_info.xml", cav.app_name),
+                    format!(
+                        "Unknown app name {} in app_info.xml",
+                        xml_escape(&cav.app_name)
+                    ),
                     "notice",
                 ));
                 continue;
@@ -1345,11 +1413,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if app.beta != 0 && !prefs.allow_beta_work {
                 continue;
             }
-            let hu = anon_usage(cav, &req, p_fpops);
+            let hu = anon_usage(cav, &req, p_fpops, ncpus);
             let gavid = anon_gavid(app.id, cav.proc_type);
             let hav = havs.get(&gavid);
             let (projected_flops, fpops_scale) = anon_projected_flops(hu.projected_flops, hav);
             let gpu = pt != 0;
+            row_of(gavid, hav, gpu, pt);
             versions.push(Version {
                 av: None,
                 appid: app.id,
@@ -1364,13 +1433,6 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     ..hu
                 },
                 gpu,
-                n_today: match hav {
-                    Some(h) if !new_day => h.n_jobs_today,
-                    _ => 0,
-                },
-                quota: quota_of(hav, gpu, pt),
-                consecutive_valid: hav.map_or(0, |h| h.consecutive_valid),
-                has_row: hav.is_some(),
                 score: projected_flops,
             });
         }
@@ -1410,6 +1472,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if config.version_select_random_factor > 0.0 {
                 score *= 1.0 + 0.1 * config.version_select_random_factor * normal(ctx.random);
             }
+            row_of(av.id, hav, gpu, pt);
             versions.push(Version {
                 av: Some(av),
                 appid: av.appid,
@@ -1421,13 +1484,6 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 fpops_scale: 1.0,
                 hu,
                 gpu,
-                n_today: match hav {
-                    Some(h) if !new_day => h.n_jobs_today,
-                    _ => 0,
-                },
-                quota: quota_of(hav, gpu, pt),
-                consecutive_valid: hav.map_or(0, |h| h.consecutive_valid),
-                has_row: hav.is_some(),
                 score,
             });
         }
@@ -1650,16 +1706,14 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             fetch
         ));
     }
+    let probe_ids: HashSet<i64> = probe_apps.iter().map(|a| a.id).collect();
     if !probe_apps.is_empty() {
-        let mut s = Stmt::new(format!(
-            "SELECT a.id AS workunitid FROM app a WHERE a.id IN ({}) AND EXISTS \
+        // No bound parameters, so the number of apps cannot reach D1's limit
+        // on them; the list is filtered here.
+        reads.push(Stmt::new(
+            "SELECT a.id AS workunitid FROM app a WHERE EXISTS \
              (SELECT 1 FROM result r WHERE r.server_state = 2 AND r.appid = a.id)",
-            in_list(probe_apps.len())
         ));
-        for a in &probe_apps {
-            s = s.bind(a.id);
-        }
-        reads.push(s);
     }
     let mut lost_rows: Vec<Candidate> = Vec::new();
     let mut assigned_rows: Vec<Candidate> = Vec::new();
@@ -1680,11 +1734,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
         if !probe_apps.is_empty() {
             let found: Vec<WuIdRow> = rows.next().unwrap_or_default().decode()?;
-            apps_with_work = found.into_iter().map(|r| r.workunitid).collect();
+            apps_with_work = found
+                .into_iter()
+                .map(|r| r.workunitid)
+                .filter(|id| probe_ids.contains(id))
+                .collect();
         }
     }
 
     let mut outgoing: Vec<Outgoing> = Vec::new();
+    // Lost results recorded again: (result ID, new `app_version_id`).
+    let mut reclassed: Vec<(i64, i64)> = Vec::new();
 
     // Lost results (`resend_lost_work`).
     for c in lost_rows {
@@ -1692,13 +1752,15 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             continue;
         };
         let usable: Option<Sending> = if anonymous {
-            // Upstream picks a version afresh with `get_app_version`, from the
-            // client's, whatever the lost result was sent with: one for a
-            // resource it wants work for, with daily quota left.
+            // `resend_lost_work` calls `get_app_version` for the job, which
+            // scans the client's versions whatever the lost result was sent
+            // with: one for a resource it wants work for, with daily quota
+            // left. The result is then recorded with that version
+            // (`add_result_to_reply`), below.
             catalog.app(c.wu.appid).and_then(|app| {
                 let needed = |pt: usize| need_secs[pt] > 0.0 || need_inst[pt] > 0.0;
                 let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
-                let pick = pick_anonymous(&versions, app, need_64b, &needed);
+                let pick = pick_anonymous(&versions, &rows, app, need_64b, &needed);
                 pick.chosen.map(|i| versions[i].sending())
             })
         } else {
@@ -1714,6 +1776,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 .ok()
                 .map(|(hu, platform)| Sending {
                     av_id: av.id,
+                    result_av_id: av.id,
+                    gavid: av.id,
                     anon: false,
                     version_num: av.version_num,
                     plan_class: av.plan_class.clone(),
@@ -1748,17 +1812,53 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             continue;
         };
         let mut deadline = c.report_deadline;
-        if deadline <= now {
+        let new_deadline = deadline <= now;
+        if new_deadline {
             // Past its deadline: allow half the original time again.
             deadline = (now + ((c.report_deadline - c.sent_time) / 2).max(60))
                 .min(now + c.wu.delay_bound.max(60));
-            writes.push(stmt!(
-                "UPDATE result SET report_deadline = ?, mod_time = ? \
-                 WHERE id = ? AND server_state = 4",
-                deadline,
-                now,
-                c.result_id
-            ));
+        }
+        // Sent again with the version chosen now, the result is recorded with
+        // it as `add_result_to_reply` does: the resource type it uses and its
+        // peak speed. On the anonymous platform the client's versions can
+        // have changed since, and the statistics and limits follow the
+        // result's row. One statement with the deadline's.
+        let rerecord = version.anon
+            && (ip.app_version_id != version.result_av_id
+                || ip.flops_estimate != version.hu.peak_flops);
+        if new_deadline || rerecord {
+            let mut sql = String::from("UPDATE result SET ");
+            let mut params: Vec<cb_db::Value> = Vec::new();
+            if new_deadline {
+                sql.push_str("report_deadline = ?, ");
+                params.push(deadline.into());
+            }
+            if rerecord {
+                sql.push_str("app_version_id = ?, flops_estimate = ?, ");
+                params.push(version.result_av_id.into());
+                params.push(version.hu.peak_flops.into());
+                reclassed.push((c.result_id, version.result_av_id));
+                // A row for the new resource may not exist yet.
+                if let Some(row) = rows.get_mut(&version.gavid) {
+                    if !row.has_row {
+                        row.has_row = true;
+                        writes.push(stmt!(
+                            "INSERT INTO host_app_version (host_id, app_version_id, \
+                             max_jobs_per_day, n_jobs_today) VALUES (?, ?, ?, 0) \
+                             ON CONFLICT DO NOTHING",
+                            host.id,
+                            version.gavid,
+                            daily_quota
+                        ));
+                    }
+                }
+            }
+            sql.push_str("mod_time = ? WHERE id = ? AND server_state = 4");
+            params.push(now.into());
+            params.push(c.result_id.into());
+            writes.push(Stmt { sql, params });
+        }
+        if new_deadline {
             writes.push(stmt!(
                 "UPDATE workunit SET transition_time = min(transition_time, ?), rev = rev + 1 \
                  WHERE id = ?",
@@ -1779,6 +1879,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             claim: None,
             assigned: false,
         });
+    }
+
+    for (id, av) in reclassed {
+        if let Some(r) = in_progress.iter_mut().find(|r| r.id == id) {
+            r.app_version_id = av;
+        }
     }
 
     // Interleave the apps' candidates in proportion to app weight.
@@ -1944,7 +2050,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 };
                 let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
                 let pick = if c.wu.app_version_id == 0 {
-                    pick_anonymous(&versions, app, need_64b, &needed)
+                    pick_anonymous(&versions, &rows, app, need_64b, &needed)
                 } else {
                     AnonPick {
                         chosen: None,
@@ -2019,7 +2125,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     if need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0 {
                         continue;
                     }
-                    if v.n_today >= v.quota {
+                    let row = &rows[&v.gavid];
+                    if row.n_today >= row.quota {
                         skipped.quota = true;
                         continue;
                     }
@@ -2059,7 +2166,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let Some((i, pt, est)) = chosen else {
                 continue;
             };
-            let v = &mut versions[i];
+            let v = &versions[i];
+            let row = rows.get_mut(&v.gavid).expect("a row for every version");
             let usage = if pt == 0 {
                 v.hu.avg_ncpus
             } else {
@@ -2070,7 +2178,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             need_inst[pt] -= usage;
             est_delay[pt] += est * usage / ninstances[pt].max(1.0);
             disk -= c.wu.rsc_disk_bound;
-            v.n_today += 1;
+            row.n_today += 1;
             if v.gpu {
                 n_gpu += 1;
             } else {
@@ -2082,8 +2190,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             }
             sent_wus.insert(c.wu.id);
 
-            if !v.has_row {
-                v.has_row = true;
+            if !row.has_row {
+                row.has_row = true;
                 writes.push(stmt!(
                     "INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day, \
                      n_jobs_today) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
@@ -2116,7 +2224,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     gpu: v.gpu,
                     gpu_ids: &gpu_ids,
                     total: total_limit,
-                    quota: v.quota,
+                    quota: row.quota,
                 }),
                 // Upstream sends at most one instance of an assigned job to
                 // a host, whatever the replica rule says.
@@ -2146,8 +2254,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             // A job sent unreplicated to a host that has not earned it gets
             // the app's replication after all. Not an assigned job: its
             // extra results could go nowhere but its own host or user.
-            let trusted = v.consecutive_valid >= CONS_VALID_UNREPLICATED
-                && unit(ctx.random) > 1.0 / f64::from(v.consecutive_valid);
+            let trusted = row.consecutive_valid >= CONS_VALID_UNREPLICATED
+                && unit(ctx.random) > 1.0 / f64::from(row.consecutive_valid);
             if !assigned && app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
                 writes.push(stmt!(
                     format!(
@@ -2244,8 +2352,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 &WuTags {
                     // Scaled for the client's own idea of the version's speed
                     // (`rsc_fpops_scale`); 1 for the project's versions.
-                    rsc_fpops_est: o.wu.rsc_fpops_est * version.fpops_scale,
-                    rsc_fpops_bound: o.wu.rsc_fpops_bound * version.fpops_scale,
+                    rsc_fpops_est: scaled_size(o.wu.rsc_fpops_est, version.fpops_scale),
+                    rsc_fpops_bound: scaled_size(o.wu.rsc_fpops_bound, version.fpops_scale),
                     rsc_memory_bound: o.wu.rsc_memory_bound,
                     rsc_disk_bound: o.wu.rsc_disk_bound,
                     name: &o.wu.name,
@@ -2285,7 +2393,11 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if plan_messages.is_empty() && !anonymous {
                 why.push("No app version is available for this computer".into());
             }
-        } else if n_candidates == 0 && apps_with_work.is_empty() {
+        } else if send && n_candidates == 0 && apps_with_work.is_empty() {
+            // Not when the search never ran: a client on the anonymous
+            // platform with no version for a resource it asks work for is
+            // told only "No tasks sent", as upstream's `work_needed` stops
+            // the search.
             why.push("Project has no tasks available".into());
         }
         why.extend(plan_messages.iter().map(|m| m.to_string()));
@@ -2381,12 +2493,26 @@ mod tests {
                 cmdline: String::new(),
             },
             gpu: pt != 0,
-            n_today: 0,
-            quota: 10,
-            consecutive_valid: 0,
-            has_row: false,
             score: flops,
         }
+    }
+
+    /// One row per key, with room for 10 jobs a day.
+    fn rows(versions: &[Version<'_>]) -> HashMap<i64, RowState> {
+        versions
+            .iter()
+            .map(|v| {
+                (
+                    v.gavid,
+                    RowState {
+                        n_today: 0,
+                        quota: 10,
+                        consecutive_valid: 0,
+                        has_row: false,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn all_needed(_: usize) -> bool {
@@ -2427,7 +2553,7 @@ mod tests {
             anon(1, 101, PROC_TYPE_CPU, 2e9, "p"),
             anon(1, 102, PROC_TYPE_CPU, 2e9, "p"),
         ];
-        let pick = pick_anonymous(&versions, &a, false, &all_needed);
+        let pick = pick_anonymous(&versions, &rows(&versions), &a, false, &all_needed);
         assert_eq!(pick.chosen, Some(2));
         assert!(pick.found);
     }
@@ -2435,7 +2561,7 @@ mod tests {
     #[test]
     fn versions_are_skipped_for_quota_age_resource_and_address_space() {
         let a = app(1, 105);
-        let mut versions = vec![
+        let versions = vec![
             anon(1, 110, PROC_TYPE_CPU, 5e9, "windows_intelx86"),
             anon(1, 110, PROC_TYPE_CPU, 4e9, "windows_x86_64"),
             anon(1, 104, PROC_TYPE_CPU, 9e9, "windows_x86_64"),
@@ -2444,24 +2570,50 @@ mod tests {
         // The GPU is not wanted, the 104 is below the app's minimum, and the
         // 32-bit version cannot take a job that needs 64 bits.
         let cpu_only = |pt: usize| pt == 0;
-        let pick = pick_anonymous(&versions, &a, true, &cpu_only);
+        let pick = pick_anonymous(&versions, &rows(&versions), &a, true, &cpu_only);
         assert_eq!(pick.chosen, Some(1));
-        let pick = pick_anonymous(&versions, &a, false, &cpu_only);
+        let pick = pick_anonymous(&versions, &rows(&versions), &a, false, &cpu_only);
         assert_eq!(pick.chosen, Some(0));
 
         // A version whose quota is used up is not "found" either.
-        for v in &mut versions {
-            v.n_today = v.quota;
+        let mut full = rows(&versions);
+        for row in full.values_mut() {
+            row.n_today = row.quota;
         }
-        let pick = pick_anonymous(&versions, &a, false, &cpu_only);
+        let pick = pick_anonymous(&versions, &full, &a, false, &cpu_only);
         assert_eq!(pick.chosen, None);
         assert!(!pick.found);
         assert_eq!(pick.quota_hit, vec![10]);
 
         // Found, but not for a resource the client wants work for.
         let versions = vec![anon(1, 110, PROC_TYPE_NVIDIA_GPU, 8e9, "p")];
-        let pick = pick_anonymous(&versions, &a, false, &cpu_only);
+        let pick = pick_anonymous(&versions, &rows(&versions), &a, false, &cpu_only);
         assert_eq!(pick.chosen, None);
         assert!(pick.found);
+    }
+
+    #[test]
+    fn the_size_factor_is_always_a_positive_finite_number() {
+        let hav = |et_avg: f64| HostAppVersion {
+            et_n: 50.0,
+            et_avg,
+            ..Default::default()
+        };
+        for stated in [MIN_ANON_FLOPS, 1e9, MAX_ANON_FLOPS] {
+            for et_avg in [1e-300, 1e-30, 1e-9, 1.0, 1e30, 1e300, f64::MIN_POSITIVE] {
+                let (flops, scale) = anon_projected_flops(stated, Some(&hav(et_avg)));
+                assert!((MIN_ANON_FLOPS..=MAX_ANON_FLOPS).contains(&flops));
+                assert!(scale.is_finite() && scale > 0.0, "{stated} {et_avg}");
+                assert!(
+                    (1e-11..=1e11).contains(&scale),
+                    "{stated} {et_avg}: {scale}"
+                );
+            }
+        }
+        // A size the factor would carry out of range stays as it was.
+        assert_eq!(scaled_size(1e12, 1e11), 1e23);
+        assert_eq!(scaled_size(1e300, 1e11), 1e300);
+        assert_eq!(scaled_size(1e-300, 1e-30), 1e-300);
+        assert_eq!(scaled_size(0.0, 5.0), 0.0);
     }
 }

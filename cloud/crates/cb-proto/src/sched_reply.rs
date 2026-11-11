@@ -164,9 +164,11 @@ pub struct ReplyResult {
     /// The stored XML of the result after [`insert_name_tags`] and
     /// [`insert_deadline_tag`], ending in `</result>`.
     pub xml_doc_in: String,
-    /// Platform of the app version the job was assigned to.
+    /// Platform of the app version the job was assigned to. On the
+    /// anonymous platform it is the client's own text, so it is escaped.
     pub platform: String,
     pub version_num: i32,
+    /// Escaped on output, like the platform.
     pub plan_class: String,
 }
 
@@ -181,7 +183,9 @@ impl ReplyResult {
         let _ = write!(
             out,
             "    <platform>{}</platform>\n    <version_num>{}</version_num>\n    <plan_class>{}</plan_class>\n</result>\n",
-            self.platform, self.version_num, self.plan_class
+            xml_escape(&self.platform),
+            self.version_num,
+            xml_escape(&self.plan_class)
         );
         Ok(())
     }
@@ -1085,5 +1089,24 @@ mod tests {
         let cut = &text[..text.len() - "</scheduler_reply>\n".len()];
         assert_eq!(client_parse(cut).unwrap_err(), "no end tag");
         assert_eq!(client_parse("<html></html>").unwrap_err(), "no start tag");
+    }
+
+    #[test]
+    fn result_platform_and_plan_class_are_escaped() {
+        // On the anonymous platform both are text from the client.
+        let r = ReplyResult {
+            xml_doc_in: "<result>\n</result>".to_string(),
+            platform: "p</platform><evil/>&".to_string(),
+            version_num: 1,
+            plan_class: "c<d>".to_string(),
+        };
+        let mut o = String::new();
+        r.write(&mut o).unwrap();
+        assert!(
+            o.contains("<platform>p&lt;/platform>&lt;evil/>&amp;</platform>"),
+            "{o}"
+        );
+        assert!(o.contains("<plan_class>c&lt;d></plan_class>"), "{o}");
+        assert!(!o.contains("<evil/>"));
     }
 }

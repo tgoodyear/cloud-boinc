@@ -353,15 +353,26 @@ ignored.
   entry for an app the project does not have is ignored, with the message "Unknown app name
   NAME in app_info.xml". What a version uses comes from the request (`CLIENT_APP_VERSION::parse`):
   `avg_ncpus` (1 if absent), the coprocessor type and count, and `flops`, which is the host's
-  benchmark speed when absent. Its peak speed is `avg_ncpus` times the host's benchmark speed,
-  plus the GPU count times the peak speed of the host's GPU of that type. No plan class is
+  benchmark speed when absent, or 1e9 when that is zero too. Its peak speed, which becomes the
+  result's `flops_estimate` and so what the result is credited on, is `avg_ncpus` times the host's
+  benchmark speed, plus the GPU count times the peak speed of the host's GPU of that type. The
+  client's figures are bound by what the host reports (`anon_usage`): `avg_ncpus` by the host's
+  CPU count, the GPU count by the number of GPUs of that type the host reports, and the GPU's peak
+  speed is the host's figure with the plan class path's correction (`gpu_peak_flops`, 100 GFLOPS in
+  place of a figure that is zero, negative or above 1e15). The stated `flops` is not part of the
+  peak speed; it only sets the client's runtime estimate, and is kept between 1e6 and 1e17 so that
+  the scale factor described under "Speed" stays between 1e-11 and 1e11. No plan class is
   evaluated: the client's plan class string is passed back as it came, and the plan class gates
-  on workunit ID and batch do not apply.
+  on workunit ID and batch do not apply. The app name, platform and plan class are cut to 256
+  bytes when the request is read, and the platform and plan class are escaped when written into
+  the reply, as is the app name in a message.
 - **Choice.** For each job, `pick_anonymous` takes the client's versions of the job's app and
   skips a version for a platform whose name has no `64` when the job needs more than 2 GiB of
   address space, one whose daily quota is used up, one older than the app's `min_version`, and one
   for a resource the client asks no work for or whose limit on jobs in progress is reached. Of the
-  rest it takes the highest projected speed, the earlier entry when two are equal. The memory,
+  rest it takes the highest projected speed, the earlier entry when two are equal. The choice is
+  made again for each job, not kept per app as upstream does (the outcome is the same, because the
+  inputs change only as quota and requests are used up). The memory,
   disk and deadline checks then run on that version alone; a job that fails them is not offered
   with a slower version. A GPU version is therefore used only when the host reports a GPU of that
   type and asks for work for it, and its jobs count against the request for that GPU.
@@ -369,7 +380,8 @@ ignored.
   resource, the speed is the one the average elapsed time per FLOP gives, at most 250 times the
   speed the client stated (`estimate_flops_anon_platform`). The reply carries the workunit's
   `rsc_fpops_est` and `rsc_fpops_bound` multiplied by the stated speed over the estimated one, so
-  the client's runtime estimate and time limit come out as ours.
+  the client's runtime estimate and time limit come out as ours. The speed is kept between 1e6
+  and 1e17 FLOPS before the ratio is taken, so the factor is finite and positive.
 - **Reply.** The reply has the workunit and the result and no `<app>`, `<app_version>` or version
   `<file_info>`. The result's `<platform>`, `<version_num>` and `<plan_class>` are the client's
   entry, as written.
@@ -377,7 +389,11 @@ ignored.
   AMD, -5 Intel, -6 Apple (`ANON_PLATFORM_*`, written by `anon_platform_id` in
   `crates/cb-core/src/model.rs`). The `host_app_version` row is keyed by `appid * 1000000 - id`,
   for example `appid * 1000000 + 2` for CPU (`generalized_app_version_id`, `anon_gavid`), so all of
-  a client's versions of one app for one resource share a row. The daily quota and its changes on
+  a client's versions of one app for one resource share a row, and the count of jobs sent today
+  is kept per row within a request, so that two versions sharing a row cannot both spend the same
+  quota. A lost result sent again is recorded again with the version it is sent with now, its
+  `app_version_id` and `flops_estimate`, in the statement that moves its deadline, and the row
+  for a new resource is created if missing. The daily quota and its changes on
   report and timeout, the in-progress limits, the elapsed-time and turnaround statistics and the
   streak of valid results all use that row. The in-progress counts treat a result whose
   `app_version_id` is -3 or lower as a GPU job. Credit is granted as for any result, from the
@@ -388,12 +404,32 @@ ignored.
   usable gets "Your app_info.xml file doesn't have a usable version of NAME." and a version cut
   by its daily quota gets "Daily job limit (N) has been reached", both as notices. There is no
   feeder to show which apps have work, so one statement asks the unsent-result index about all the
-  apps the client has no version of. A client with no version for a resource it asks work for is
-  told only "No tasks sent", as upstream's `work_needed` stops the search.
+  apps in the table, with no bound parameters, and the list is filtered in the scheduler. A client
+  none of whose versions is for a resource it asks work for, for example one with only a CPU
+  version that asks for GPU work, is told only "No tasks sent", because the search does not run,
+  as upstream's `work_needed` stops it; "Project has no tasks available" is said only when it did.
 
 Differences from upstream:
 
-- At most 256 entries of the version list are read, so that one request's work is bounded.
+- At most 256 entries of the version list are read, so that one request's work is bounded. The
+  scheduler Worker refuses a request body over 4 MiB.
+- A client's app name, platform and plan class are cut to 256 bytes, on a character boundary.
+  Upstream reads them into 256-byte buffers and ignores an element that does not fit.
+- The peak speed differs from upstream's. `CLIENT_APP_VERSION::parse` computes it from
+  `g_reply->host.p_fpops`, but `handle_request` in `sched/handle_request.cpp` parses the request
+  before the host record is loaded, so that field is still zero (`SCHEDULER_REPLY::SCHEDULER_REPLY`
+  clears it) and a CPU version's peak speed, and so its `flops_estimate`, is zero upstream; the GPU
+  part uses the coprocessor figures the request carries, which a client writes before its app
+  versions. `get_pfc` in `sched/credit.cpp` replaces a zero estimate with `AVG_CPU_FPOPS` and
+  excludes the result from the statistics. Here the host's benchmark speed from the request is
+  used, with the bounds above; upstream does not bound the client's CPU or GPU counts either. The
+  client's stated `flops` is not used for credit upstream or here.
+- A zero or missing benchmark and no stated speed give 1e9 FLOPS for the client's estimate;
+  upstream divides by zero.
+- Beta apps (`app.beta`) go to a user who allows beta work, as for the project's own versions.
+  Upstream does that for jobs in `quick_check` of `sched/sched_array.cpp`, for every platform; what
+  the anonymous path lacks upstream is the per-version `beta` flag, which a client's own version
+  has no equivalent of.
 - A lost result is resent with the version chosen now from the client's list, as `get_app_version`
   does upstream, and is dropped (`Didn't resend lost task ... (expired)`) when none qualifies,
   daily quota included.
