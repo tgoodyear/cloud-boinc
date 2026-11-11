@@ -528,12 +528,58 @@ pub struct OutputFile {
     pub name: String,
     pub optional: bool,
     pub no_validate: bool,
+    /// The client is told to upload it: its `<file_info>` has an upload
+    /// URL (`FILE_INFO::uploadable` in `client/client_types.cpp`). A file
+    /// without one stays on the client, which reports the result without
+    /// it (`RESULT::is_upload_done`), so no object is ever stored for it.
+    pub uploadable: bool,
+}
+
+/// The names of the `<file_info>` elements that carry an upload URL: a
+/// `<url>` that contains `file_upload_handler`, or an `<upload_url>`
+/// (`FILE_INFO::parse`).
+fn uploadable_names(xml: &str) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let mut xp = XmlParser::new(xml);
+    while xp.get_tag() {
+        if !xp.is_tag() || !xp.match_tag("file_info") {
+            continue;
+        }
+        let mut name = String::new();
+        let mut upload = false;
+        while xp.get_tag() {
+            if !xp.is_tag() {
+                continue;
+            }
+            if xp.match_tag("/file_info") {
+                break;
+            }
+            if let Some(n) = xp.parse_str("name") {
+                name = n;
+                continue;
+            }
+            if let Some(u) = xp.parse_str("url") {
+                upload |= u.contains("file_upload_handler");
+                continue;
+            }
+            if xp.parse_str("upload_url").is_some() {
+                upload = true;
+                continue;
+            }
+            xp.skip_unexpected();
+        }
+        if upload && !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    names
 }
 
 /// The output files of a result, from its `xml_doc_in`
 /// (`get_output_file_infos`).
 pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
     let mut v = Vec::new();
+    let uploadable = uploadable_names(xml_doc_in);
     let mut xp = XmlParser::new(xml_doc_in);
     while xp.get_tag() {
         if !xp.is_tag() || !xp.match_tag("file_ref") {
@@ -543,6 +589,7 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
             name: String::new(),
             optional: false,
             no_validate: false,
+            uploadable: false,
         };
         while xp.get_tag() {
             if !xp.is_tag() {
@@ -566,6 +613,7 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
             xp.skip_unexpected();
         }
         if !f.name.is_empty() {
+            f.uploadable = uploadable.contains(&f.name);
             v.push(f);
         }
     }
@@ -597,12 +645,42 @@ mod tests {
             vec![OutputFile {
                 name: "wu1_0_r123_0".into(),
                 optional: true,
-                no_validate: false
+                no_validate: false,
+                uploadable: true
             }]
         );
         let fis = file_infos(&doc);
         assert_eq!(fis.len(), 1);
         assert_eq!(fis[0].max_nbytes, 5000000.0);
+    }
+
+    #[test]
+    fn only_files_with_an_upload_url_are_uploadable() {
+        let doc = "<file_info><name>a</name><url>https://x.example/upload/file_upload_handler</url></file_info>\
+<file_info><name>b</name><generated_locally/></file_info>\
+<file_info><name>c</name><url>https://x.example/download/c</url></file_info>\
+<file_info><name>d</name><upload_url>https://x.example/u</upload_url></file_info>\
+<result>\
+<file_ref><file_name>a</file_name></file_ref>\
+<file_ref><file_name>b</file_name></file_ref>\
+<file_ref><file_name>c</file_name></file_ref>\
+<file_ref><file_name>d</file_name><optional/></file_ref>\
+<file_ref><file_name>e</file_name></file_ref>\
+</result>";
+        let up: Vec<(String, bool)> = output_files(doc)
+            .into_iter()
+            .map(|f| (f.name, f.uploadable))
+            .collect();
+        assert_eq!(
+            up,
+            [
+                ("a".to_string(), true),
+                ("b".to_string(), false),
+                ("c".to_string(), false),
+                ("d".to_string(), true),
+                ("e".to_string(), false),
+            ]
+        );
     }
 
     #[test]

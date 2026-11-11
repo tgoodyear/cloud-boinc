@@ -534,9 +534,15 @@ repeats the deletes, which is harmless because an R2 delete of a missing object 
 ### Validation
 
 Whatever the validator, a result is accepted only if every required output file (a `<file_ref>`
-not marked `<optional/>`, whether or not it is `<no_validate/>`) is stored under `upload/`
-(`output_stats` in `crates/cb-core/src/pipeline.rs`, called from `fingerprints`). A result with
-a required output missing is a validate error and the work is issued again; an output marked
+not marked `<optional/>`, whether or not it is `<no_validate/>`) that the client is told to
+upload is stored under `upload/` (`output_stats` in `crates/cb-core/src/pipeline.rs`, called
+from `fingerprints`). The client is told to upload a file when its `<file_info>` has an upload
+URL (`FILE_INFO::uploadable`: a `<url>` containing `file_upload_handler`, or an `<upload_url>`);
+a file without one stays on the client, which reports the result without it
+(`RESULT::is_upload_done`), so no object exists for it and it is not looked up
+(`uploadable` in `OutputFile`, `crates/cb-core/src/template.rs`). Assimilation lists, and clean-up
+deletes, outputs by name and treat a missing object as nothing to do, so they need no change. A result with
+a required, uploadable output missing is a validate error and the work is issued again; an output marked
 optional may be absent. This matters because a client counts an upload as done when the
 server's size answer is at least its file's size (see "Upload"), so a result can arrive whose
 output was never stored. The check is one head per required output of each result not yet

@@ -628,6 +628,71 @@ fn only_required_outputs_must_be_stored() {
 }
 
 #[test]
+fn local_only_outputs_are_not_required_in_storage() {
+    // out0 is uploaded; out1 is required but has no upload URL, so it stays
+    // on the client, and so does out2, which is also not validated. out3 is
+    // uploaded and not validated: it must still be stored.
+    const TEMPLATE: &str = "<output_template>\n\
+<file_info><name><OUTFILE_0/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_1/></name><generated_locally/></file_info>\n\
+<file_info><name><OUTFILE_2/></name><generated_locally/></file_info>\n\
+<file_info><name><OUTFILE_3/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<result>\n\
+<file_ref><file_name><OUTFILE_0/></file_name><open_name>a</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_1/></file_name><open_name>b</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_2/></file_name><open_name>c</open_name><no_validate/></file_ref>\n\
+<file_ref><file_name><OUTFILE_3/></file_name><open_name>d</open_name><no_validate/></file_ref>\n\
+</result>\n</output_template>\n";
+    for validator in ["trivial", "bitwise"] {
+        // (stored outputs, accepted)
+        for (stored, accepted) in [
+            (vec![0usize, 3], true),
+            (vec![0, 1, 2, 3], true),
+            (vec![0], false),
+            (vec![3], false),
+            (vec![1, 2], false),
+        ] {
+            let w = World::new(validator);
+            let wu = w.submit_job_with(
+                JobSpec {
+                    name: "j12".into(),
+                    min_quorum: Some(1),
+                    target_nresults: Some(1),
+                    ..Default::default()
+                },
+                TEMPLATE,
+                1000,
+            );
+            let rs = w.results(wu);
+            w.dispatch(&rs[0], 1, 1100);
+            w.report(&rs[0], 1200, Some("x"), 0);
+            w.files.objects.borrow_mut().clear();
+            let outs = cb_core::template::output_files(&rs[0].xml_doc_in);
+            let uploadable: Vec<bool> = outs.iter().map(|o| o.uploadable).collect();
+            assert_eq!(uploadable, [true, false, false, true]);
+            for i in &stored {
+                w.files.objects.borrow_mut().insert(
+                    (FileKind::Upload, outs[*i].name.clone()),
+                    FileStat {
+                        nbytes: 1,
+                        md5: "m".into(),
+                    },
+                );
+            }
+            let rep = w.transition(wu, 1200);
+            assert_eq!(
+                rep.canonical_resultid != 0,
+                accepted,
+                "{validator} with outputs {stored:?}"
+            );
+            if accepted {
+                assert_eq!(rep.results_valid, 1, "{validator}");
+            }
+        }
+    }
+}
+
+#[test]
 fn cancel_withdraws_unsent_results() {
     let w = World::new("trivial");
     let wu = w.submit("j8", 1000, 1, 1);

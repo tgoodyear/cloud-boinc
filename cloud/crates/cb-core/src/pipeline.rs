@@ -885,15 +885,20 @@ struct OutputStat {
 }
 
 /// Looks up the stored output files of a result. `Err(Fp::Invalid)` when a
-/// required output (one not marked `<optional/>`) is not stored, whatever
-/// the validator: a client that counts an upload as done without sending it
-/// (a size query that answered at least its file's size) reports a result
-/// with no finished object, and no result is accepted without its data.
-/// `Err(Fp::Transient)` when the store cannot be read. Files marked
-/// `<no_validate/>` are looked up but left out of the list.
+/// required output (one not marked `<optional/>`) that the client is told to
+/// upload is not stored, whatever the validator: a client that counts an
+/// upload as done without sending it (a size query that answered at least
+/// its file's size) reports a result with no finished object, and no result
+/// is accepted without its data. An output whose `<file_info>` has no
+/// upload URL stays on the client, which reports the result without it, so
+/// it is not looked up. `Err(Fp::Transient)` when the store cannot be read.
+/// Files marked `<no_validate/>` are looked up but left out of the list.
 async fn output_stats(r: &JobResult, files: &dyn Files) -> Result<Vec<OutputStat>, Fp> {
     let mut v = Vec::new();
     for f in output_files(&r.xml_doc_in) {
+        if !f.uploadable {
+            continue;
+        }
         match files.stat(FileKind::Upload, &f.name).await {
             Ok(Some(s)) => {
                 if !f.no_validate {
