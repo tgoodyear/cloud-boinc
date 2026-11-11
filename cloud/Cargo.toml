@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/tgoodyear/cloud-boinc"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
