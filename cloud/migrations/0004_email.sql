@@ -26,3 +26,15 @@ CREATE TABLE token (
 CREATE UNIQUE INDEX token_hash ON token (token_hash);
 CREATE INDEX token_user ON token (userid, type, create_time);
 CREATE INDEX token_created ON token (create_time);
+
+-- An address an account has changed away from stays reserved for it while its
+-- undo link works (a week): sign-up and address changes refuse it. The query
+-- repeats `previous_email_addr != ''` so that it can use this index.
+CREATE INDEX user_previous_email ON user (previous_email_addr) WHERE previous_email_addr != '';
+
+-- Messages sent per UTC day (`day` is the Unix time divided by 86400), for the
+-- project-wide cap `email_max_per_day`.
+CREATE TABLE mail_day (
+    day INTEGER PRIMARY KEY,
+    n INTEGER NOT NULL
+);

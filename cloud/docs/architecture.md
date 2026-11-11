@@ -828,8 +828,10 @@ account (as the site's password and email actions do); if a site request changed
 nothing is written and the reply is `ERR_RETRY`. Project preferences without a `<project_specific>`
 part inherit the stored one, so that write is conditional on `project_prefs` being still what was
 read; a site save of the application selection or task limit in between is not undone. `teamid` is accepted and ignored until there are
-teams, and the consent fields are ignored. Two statements: the account, then the update (a
-refused update costs a third, which tells a taken address from a changed account). The web
+teams, and the consent fields are ignored. A new address is also refused when it is another
+account's previous address within the seven days of an undo link (see Email), and a change of
+address or password ends the account's unused login links. Two statements: the account, then the
+update (a refused update costs a third, which tells a taken address from a changed account). The web
 Worker reads a form body of at most `MAX_FORM_BYTES` (in `cloud/crates/cb-core/src/web.rs`): both
 preference documents at their 64 KB limit with every byte URL-encoded to three, and the other
 fields. A longer body is not from a BOINC client, and its fields are ignored.
@@ -874,9 +876,10 @@ The pages that change an account are in `cloud/crates/cb-core/src/site_account.r
 | `edit_user_info_form.php` | GET | |
 | `edit_user_info_action.php` | POST | `name`, `url`, `country`, `postal_code` |
 | `edit_passwd_form.php` | GET | |
-| `edit_passwd_action.php` | POST | `passwd_hash`, given the current password or the account key |
+| `edit_passwd_action.php` | POST | `passwd_hash`, given the current password or the account key; the account's unused login links end |
+| `reset_account_key.php` | GET, POST | `authenticator` (and with it the weak key), given only the session and the form token; see Email |
 | `edit_email_form.php` | GET | |
-| `edit_email_action.php` | POST | `email_addr` and `passwd_hash`, given the password (the account key for an account without one); `email_validated` back to 0; with email also `previous_email_addr` and `email_addr_change_time` (see Email) |
+| `edit_email_action.php` | POST | `email_addr` and `passwd_hash`, given the password (the account key for an account without one); `email_validated` back to 0; the account's unused login links end; with email also `previous_email_addr` and `email_addr_change_time`, and the undo token (see Email) |
 | `prefs.php?subset=global\|project` | GET | |
 | `prefs_edit.php?subset=...&venue=...` | GET form, POST to save | `global_prefs`, or `project_prefs` and, for the main set, `send_email`, `show_hosts` and `venue` |
 | `prefs_remove.php?subset=...&venue=...` | GET to confirm, POST to remove | one venue's set from `global_prefs` or `project_prefs` |
@@ -908,12 +911,14 @@ them: as upstream's `logout.php` checks tokens, it clears the cookie only for a 
 logged-in account with a valid token, so the "Log out" form on `home.php` carries the token
 fields and a plain link or a GET does nothing but answer 403. With no login it redirects to the
 master URL without setting a cookie. The `SameSite=Lax` cookie already keeps other sites' POSTs
-from carrying the login. Sign-up has no token, as upstream. Each page runs at most two round trips: the account by
-cookie, then one write (the email change sends its write as a batch of two statements).
+from carrying the login. Sign-up has no token, as upstream. Each page runs the account by
+cookie, then one write or one batch (see Round trips under Email).
 
 Every site page is sent with `Content-Security-Policy: frame-ancestors 'none'` and
-`X-Frame-Options: DENY` (`site_response` in `cloud/workers/web/src/lib.rs`), so another site
-cannot show a form inside a frame.
+`X-Frame-Options: DENY`, so another site cannot show a form inside a frame, and with
+`Referrer-Policy: no-referrer`, so the address of a page that carries a token in its query (the
+links in mail) is not sent to a site it links to. The list is `SITE_HEADERS` in
+`cloud/crates/cb-core/src/site.rs`; `site_response` in `cloud/workers/web/src/lib.rs` sets them.
 
 The preference documents are read and written by `cloud/crates/cb-core/src/prefs.rs` in
 upstream's formats (`html/inc/prefs.inc`, `prefs_project.inc`), and they are what the scheduler
@@ -994,9 +999,9 @@ pub trait Mailer {
 
 A `MailMessage` has one sender (`from_addr`, `from_name`), one recipient (`to`), a `subject` and a
 plain-text `body`, read through accessors. It is built only by `MailMessage::new`, which is the
-check at the boundary: the two addresses must be a single plain `local@domain` (the form
-`is_valid_email` accepts), so a space, comma, angle bracket, quote or line break refuses the
-message; the subject and the sender name lose every control character and line or paragraph
+check at the boundary: the two addresses must be a single well-formed `local@domain` (the
+`is_strict_email` test in `cloud/crates/cb-core/src/web.rs`), so a space, comma, angle bracket,
+quote, `%` or line break refuses the message; the subject and the sender name lose every control character and line or paragraph
 separator, and the sender name also the characters that delimit a mailbox (`<>"\,;:@()[]`); the body
 loses CR and control characters other than LF and tab. `SiteCtx` has `mailer:
 Option<&dyn Mailer>`.
@@ -1016,13 +1021,14 @@ contain an address. The pages treat any failure as "not sent". How to turn it on
 `deploy.md`.
 
 **Settings.** `email_from` and `email_from_name` in the project config, named as upstream's
-`EMAIL_FROM` and `EMAIL_FROM_NAME` (`html/inc/email.inc`; upstream sets them in `project.inc`).
-`put_setting` refuses an `email_from` that is not one plain address. A mailer with no `email_from`
-counts as no mailer (`SiteCtx::mail`). With none, `get_passwd.php`, `mail_passwd.php`,
-`validate_email_addr.php`, `recover_email.php` and the login-link form of `login_action.php`
-answer with a plain page that the project does not send email, and every other page is as it was:
-the account page has no verify button, the login page no reset link, and `edit_email_action.php`
-changes the address with no notice and no wait.
+`EMAIL_FROM` and `EMAIL_FROM_NAME` (`html/inc/email.inc`; upstream sets them in `project.inc`),
+and `email_max_per_day` (default 200; 0 sends no mail), which has no upstream counterpart.
+`put_setting` refuses an `email_from` that is not one well-formed address. A mailer counts only
+with an `email_from` and an `email_max_per_day` above 0 (`SiteCtx::mail`). With none,
+`get_passwd.php`, `mail_passwd.php`, `validate_email_addr.php`, `recover_email.php` and the
+login-link form of `login_action.php` answer with a plain page that the project does not send
+email, and every other page is as it was: the account page has no verify button, the login page
+no reset link, and `edit_email_action.php` changes the address with no notice and no wait.
 
 | Page | Method | Does |
 | --- | --- | --- |
@@ -1030,80 +1036,145 @@ changes the address with no notice and no wait.
 | `mail_passwd.php` | POST | mails the account a login link |
 | `login_action.php?id=&t=` | GET, POST | the login link: a GET shows a button, the POST logs in |
 | `validate_email_addr.php` | GET, POST | logged in: a button, and the POST sends the verification message |
-| `validate_email_addr.php?validate=1&u=&x=` | GET | the verification link: sets `email_validated` |
+| `validate_email_addr.php?validate=1&u=&x=` | GET, POST | the verification link: a GET shows a button, the POST sets `email_validated` |
 | `recover_email.php?id=&token=` | GET, POST | the undo link of an address change: a GET shows a button, the POST undoes the change |
 
 **Links.** Every link in a message is `master_url` of the config plus a page and a query of an
 account ID and a token. Nothing from the request goes into a link, and a link is the only thing
 in a message that is not text the project wrote or an address a page has already validated. A
-message never carries a user's name.
+message never carries a user's name. Site pages are sent with `Referrer-Policy: no-referrer`, so
+the address of a link page does not reach a site that page links to.
 
 **Tokens.** Each link carries 256 random bits from the same source as account keys. The
 database holds only their SHA-256 (`token_hash` in `cloud/crates/cb-crypto/src/account.rs`) in
 the `token` table (`cloud/migrations/0004_email.sql`), with the account, a type (`L` login, `V`
 verification, `E` undo), when it was made, when it expires and when it was used. Upstream's
-`token` table, which holds the token as made, is used for undo links only. A login or undo
-token is used by one `UPDATE ... WHERE used_time = 0 AND expire_time > now RETURNING id`, so two
-requests cannot both use it. A newer login or undo token ends the older unused ones; a
-verification link may be used again until it expires, and is good only while the account has the
-address it was sent to. A message the transport refuses removes its token. Whatever makes the
-next token removes up to twenty rows older than eight days.
+`token` table, which holds the token as made, is used for undo links only. A token is used by
+one `UPDATE ... WHERE used_time = 0 AND expire_time > now`, so two requests cannot both use it,
+and it works only on the page of its type (a login token on the undo page, say, is refused).
+Login links (a day) and verification links (a day) are single use, and several of either can be
+live: asking for a link for an account must not be a way to cancel the one its holder has not
+used. An undo token (a week) is replaced by the next one. A verification token is good only
+while the account has the address it was sent to. A message the transport refuses keeps its
+token and its place in the limit, since it may have got there. Whatever makes the next token
+removes up to twenty rows older than eight days.
 
 **Limits.** An account gets at most one login-link message and at most one verification message
 in any ten minutes (`MAIL_INTERVAL_SECS`). The limit is part of the statement that adds the
 token (`INSERT ... SELECT ... WHERE NOT EXISTS` over the account's earlier tokens of the type),
-so concurrent requests cannot both pass it, and a used token still counts. A request inside the
-limit sends nothing and is answered as one outside it. A change of address needs a week since
-the last one (`EMAIL_CHANGE_WAIT_SECS`). An address is the address of one account at a time,
-which bounds the notices a third party can cause to an address. There is no limit per client
-address or per request; a Cloudflare rate-limiting rule on these paths does that, as for login.
+so concurrent requests cannot both pass it, and a used or failed token still counts. A request
+inside the limit sends nothing and is answered as one outside it. A change of address needs a
+week since the last one (`EMAIL_CHANGE_WAIT_SECS`), which also runs from an undo. All mail
+together is capped per UTC day by `email_max_per_day`, counted in the `mail_day` table with one
+`INSERT ... ON CONFLICT DO UPDATE ... WHERE n < cap RETURNING` before each send; over the cap
+the pages answer as for a send that failed, and a message that fails still counts. These bound
+what one account, and the project as a whole, can be made to send. What the site does not have:
+a limit per client address, a CAPTCHA on sign-up or recovery (a Cloudflare rate-limiting rule on
+these paths can do the first), and any link between accounts whose addresses are variants of one
+mailbox (plus tags, dots): each is a separate account with its own limits. A third party can
+therefore still make the site mail an address that is not theirs, one message per account per
+ten minutes, up to the daily cap.
 
 **Password recovery.** `mail_passwd.php` looks the account up by address, makes a login token
 (a day), and mails `login_action.php?id=&t=`. The link logs in for a year, as upstream's link
-does, and goes to `home.php`, where the account key can stand in for the current password on
-`edit_passwd_form.php`.
+does, and goes to `home.php`. A person who logged in this way and does not know the password can
+change it: `edit_passwd_action.php` takes the account key, which `home.php` shows, in place of
+the current password (upstream's asks for neither, only the login and a token), and the mail says
+so. Changing the email address needs the password, so the password comes first. The answer of
+`mail_passwd.php` is the same whether or not an account has the address, was sent a message, or
+is blocked. That does not hide whether an address has an account: `lookup_account.php` and
+sign-up already say so, as upstream's do; the point is only that this page does not add a third
+oracle.
 
 **Verification.** `home.php` offers a button when the site sends email and the address is not
-verified; sign-up sends the message when it makes an account (or logs in to one with that
+verified; sign-up now sends the message when it makes an account (or logs in to one with that
 address and password, if that is not verified), and ignores a failure to send. The link works
-without a login, as upstream's.
+without a login, as upstream's, and once.
 
 **Address change.** With email, `edit_email_action.php` refuses a change within seven days of the
-last, stores `previous_email_addr` and `email_addr_change_time` in the same `UPDATE`, then
-sends the new address a notice (both addresses and when the next change may be made) and the
-previous address the undo link, an `E` token valid for seven days and bound to that previous
-address. If either message cannot be sent, the page says so, as upstream's does, and the change
-stands. `recover_email.php` puts the previous address back, clears `previous_email_addr` and
-`email_addr_change_time`, sets `email_validated` to 0 and replaces the password hash with the
-peppered hash of a random value nobody knows, as upstream does with `password_hash`. It also
-ends the account's unused login and verification links, which the holder of the new address
-may have asked for. It does nothing when another account has the previous address, and then does
-not use the link up. The browser is logged out.
+last, and one to an address another account has or changed away from in the last seven days (see
+below). One batch checks that, changes the address, stores `previous_email_addr` and
+`email_addr_change_time`, ends the account's unused login links and stores the undo token, an `E`
+token valid for seven days and bound to the previous address, so a crash cannot leave a change
+without its link. Mail follows: a notice to the new address that says only that the address was
+set on an account at the project (the address changed from is not named, since anyone can have
+the site mail an address they do not own), and to the previous address both addresses and the
+undo link. If either message cannot be sent, the page says so, as upstream's does, and the change
+stands. `recover_email.php` puts the previous address back, clears `previous_email_addr`,
+sets `email_addr_change_time` to now (so whoever made the change cannot repeat it at once),
+sets `email_validated` to 0 and replaces the password hash with the peppered hash of a random
+value nobody knows, as upstream does with `password_hash`. It also ends the account's unused
+login and verification links, which the holder of the new address may have asked for. It does
+nothing when another account has the previous address, and then does not use the link up. The
+browser is logged out. Undo does not end other sessions by itself: the session is the account
+key, and `reset_account_key.php` replaces it.
+
+**Reserved address.** An address an account has changed away from stays reserved for it for the
+week of the undo link: sign-up and the `create_account.php` RPC (through `make_user`), address
+changes on the site and `am_set_info` refuse it as they refuse an address another account has,
+inside the same `INSERT` or `UPDATE` (`WHERE NOT EXISTS ... previous_email_addr`), with a partial
+index `user_previous_email`. Without this, whoever changed an address could take the old one for
+a new account and the undo would never work. A change made without email, or through
+`am_set_info`, clears `previous_email_addr` and `email_addr_change_time`, so an undo link from an
+earlier change cannot revive when email is switched on again.
+
+**Account key.** `reset_account_key.php` is not in upstream. A GET says what it does; a POST with
+the form token replaces `authenticator` with a new random key and logs the browser in with it. The
+weak key changes with it (it is derived from the key and the password hash). Computers and account
+managers that hold the old key stop working until they are attached again, which the page says.
+The account's unused login and verification links end; the undo link of an address change does
+not, because whoever has the key could otherwise end it. The page asks for the session and the
+token only, since after an undo the password is unknown. Because an address someone else
+registered first can receive recovery mail for that account (as upstream), this is also the
+remedy for it.
+
+**Round trips.** The account pages run the account by cookie and one write, except where this
+section says otherwise: a password change and an address change run a batch (up to five
+statements for an address change with email); each send is preceded by one statement for the
+daily cap; `mail_passwd.php` runs the account lookup, the token batch (three statements) and one
+statement for the cap; `login_action.php?id=&t=` runs the token, then the account; sign-up with
+email adds the account lookup, the token batch and the cap statement. Each batch is one round
+trip on D1.
 
 **Differences from upstream.**
 
 - The login link is `id` and `t`, where `t` is a random token that works once and the database
   holds its hash. Upstream's has `t` as a time and `h` as an MD5 prefix of the account ID,
   account key and time, works for a day any number of times, and stores nothing.
-- A GET of a login link or an undo link shows a button; the POST of the button acts. Upstream acts
-  on the GET, which lets a mail scanner that fetches links use the token up or, for an undo
-  link, undo a change nobody meant to undo.
+- A GET of a login link, a verification link or an undo link shows a button; the POST of the
+  button acts. Upstream acts on the GET, which lets a mail scanner that fetches links use the
+  token up, verify an address, or undo a change nobody meant to undo.
 - `mail_passwd.php` gives one answer whether or not an account has the address (upstream says
   "No such user" and prints the address), whether or not the message was sent, and for a blocked
-  account. The time it takes still differs, since only a known account sends a message.
-- At most one recovery message and one verification message per account per ten minutes.
-  Upstream has no limit.
+  account.
+- At most one recovery message and one verification message per account per ten minutes, and a
+  daily cap on all mail. Upstream has neither.
+- Sign-up now sends the verification message when the site sends email; upstream's sign-up page
+  only links to validation.
 - The verification token is a random one-per-message token in the `token` table. Upstream's is
   `login_token` of the `user` row, reused for a day and shared with other uses; the fork has no
   such column. The page that sends the message is a POST with the form token, not a GET, so a
   link on another site cannot make it send.
 - The page is `validate_email_addr.php`, the name upstream's file has.
-- An undo link is bound to the previous address and is replaced by the next change's link;
-  `recover_email.php` also ends the account's other unused links, and does not say whether the
-  token was bad or the previous address is taken, beyond one message that names both.
+- The seven-day wait page shows `previous_email_addr` to the session holder.
+- An undo link is bound to the previous address and is replaced by the next change's link. It is
+  honoured for seven days for whoever can read the previous mailbox, as upstream's is, and the
+  account cannot cancel it; `recover_email.php` also ends the account's other unused links, and
+  does not say whether the token was bad or the previous address is taken, beyond one message
+  that names both. Undo does not end other sessions; replacing the account key does.
+- The address changed away from is reserved for the week of the undo link (see above), and an
+  undo sets the change time to now.
+- Replacing the account key (`reset_account_key.php`) is not in upstream.
+- An address someone else registered first can receive recovery mail for that account, as in
+  upstream; replacing the account key is the remedy.
 - The seven-day wait and the notices exist only with email, so the same page changes the
   address at once when the site sends none. The account is not asked to verify a new address
   automatically after a change; the account page has the button.
+- Site sign-up and address changes use a stricter address check than the RPCs and than accounts
+  that already exist (`is_strict_email`): at most 64 characters in the local part and no `%`, no
+  leading `-` or `.`, no `..` or trailing `.`; domain labels that are not empty or longer than 63
+  or edged with a hyphen, and a last label with a letter; at most 254 characters. An existing
+  account with a looser address keeps working and is not mailed.
 - `SHOW_NONVALIDATED_EMAIL_ADDR`, HTML mail, `EMAIL_USE_CMD`, PHPMailer settings, banned and
   `stopforumspam.com` address checks, and the account deletion mail are not implemented.
 

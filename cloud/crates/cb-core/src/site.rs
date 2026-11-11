@@ -128,17 +128,18 @@ pub struct SiteCtx<'a> {
     pub random: &'a dyn Fn() -> u32,
     /// How the site sends email; `None` for a deployment without a
     /// transport. The pages that need email say so, and the others do not
-    /// change. A mailer counts only when the config has `email_from`; see
-    /// [`SiteCtx::mail`].
+    /// change. A mailer counts only when the config has `email_from` and an
+    /// `email_max_per_day` above 0; see [`SiteCtx::mail`].
     pub mailer: Option<&'a dyn Mailer>,
 }
 
 impl<'a> SiteCtx<'a> {
     /// The mailer with the project's sender settings, or `None` when the
-    /// site sends no email: no mailer, or no `email_from` in the config.
+    /// site sends no email: no mailer, no `email_from` in the config, or
+    /// `email_max_per_day` of 0.
     pub fn mail(&self) -> Option<Mail<'a>> {
         let config = &self.project.config;
-        if config.email_from.is_empty() {
+        if config.email_from.is_empty() || config.email_max_per_day <= 0 {
             return None;
         }
         self.mailer
@@ -147,7 +148,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 26] = [
+pub const SITE_PATHS: [&str; 27] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -174,6 +175,18 @@ pub const SITE_PATHS: [&str; 26] = [
     "/mail_passwd.php",
     "/validate_email_addr.php",
     "/recover_email.php",
+    "/reset_account_key.php",
+];
+
+/// Headers every site page is sent with: no framing by another site (the
+/// pages hold forms that change the account), no content sniffing, and no
+/// `Referer`, so that the address of a page that carries a token in its query
+/// (the links in mail) does not reach a site it links to.
+pub const SITE_HEADERS: [(&str, &str); 4] = [
+    ("Content-Security-Policy", "frame-ancestors 'none'"),
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
 ];
 
 /// Answers one of [`SITE_PATHS`]; `None` for any other path.
@@ -206,6 +219,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/mail_passwd.php" => site_email::mail_passwd(ctx, q).await?,
         "/validate_email_addr.php" => site_email::validate_email_addr(ctx, q).await?,
         "/recover_email.php" => site_email::recover_email(ctx, q).await?,
+        "/reset_account_key.php" => site_account::reset_account_key(ctx, q).await?,
         _ => return Ok(None),
     }))
 }
@@ -639,6 +653,7 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
          <li><a href=\"edit_user_info_form.php\">Account information</a></li>\n\
          <li><a href=\"edit_email_form.php\">Email address</a></li>\n\
          <li><a href=\"edit_passwd_form.php\">Password</a></li>\n\
+         <li><a href=\"reset_account_key.php\">Replace the account key</a></li>\n\
          <li><a href=\"prefs.php?subset=global\">Computing preferences</a></li>\n\
          <li><a href=\"prefs.php?subset=project\">Project preferences</a></li>\n</ul>\n\
          <form method=\"post\" action=\"logout.php\">\n",

@@ -134,6 +134,10 @@ A database created before `migrations/0002_purge.sql` existed needs
 Likewise, `migrations/0003_user_tasks.sql` adds the index behind an account's task list
 (`results.php?userid=`); apply it before the web Worker that serves that page is deployed.
 
+`migrations/0004_email.sql` must be applied before the web or admin Worker of this build is
+deployed, whether or not the deployment sends email: those Workers write columns and tables it
+adds (see step 4 under Email).
+
 ## Email
 
 The site's password recovery, address verification and address-change notices
@@ -184,16 +188,22 @@ site is unchanged. To turn email on:
    The binding does not restrict the recipients, which is right: the recipients are the
    project's users. The address in `allowed_sender_addresses` has to be the config's
    `email_from`; the binding is not updated when the config is.
-4. **Migration.** `migrations/0004_email.sql` adds the `token` table and two columns of
-   `user`. Apply it (`wrangler d1 migrations apply cloud-boinc-dev --remote`, as above) before
-   the Worker with the email pages is deployed; the pages query those tables as soon as the
-   binding and `email_from` are both there.
+4. **Migration.** `migrations/0004_email.sql` adds the `token` and `mail_day` tables, two
+   columns of `user` and an index. It is a prerequisite of this build, with or without email,
+   not only of the email pages: sign-up and the `create_account.php` RPC, address changes,
+   password changes, `am_set_info` and the account-key page of the web Worker, and the admin
+   Worker's account creation, name the new columns and tables. Apply it
+   (`wrangler d1 migrations apply cloud-boinc-dev --remote`, as above) before deploying the web
+   or admin Worker. The scheduler, files and pipeline Workers read `user` rows by `SELECT *`
+   and do not name the new columns, so they work before and after.
 5. **Config.** Set the sender in the project config (through the admin API, as the other
-   settings), the address on the sending domain and optionally a name:
+   settings), the address on the sending domain and optionally a name, and if the default of
+   200 messages a day (all kinds, UTC days; 0 sends none) does not suit, the cap:
 
    ```xml
    <email_from>boinc@<sending domain></email_from>
    <email_from_name>Project name</email_from_name>
+   <email_max_per_day>200</email_max_per_day>
    ```
 
 6. **Deploy and check.** Deploy the web Worker (`cd workers/web && npx wrangler deploy`).

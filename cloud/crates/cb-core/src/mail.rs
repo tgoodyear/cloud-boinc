@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 
-use crate::web::is_valid_email;
+use crate::web::is_strict_email;
 
 /// Longest subject sent, in characters.
 const MAX_SUBJECT_CHARS: usize = 200;
@@ -46,8 +46,9 @@ impl MailMessage {
     /// Checks and cleans the parts of a message.
     ///
     /// - `from_addr` and `to` must be a single address of the site's
-    ///   `is_valid_email` form: no space, comma, angle bracket, quote or
-    ///   control character. Anything else is refused.
+    ///   `is_strict_email` form: no space, comma, angle bracket, quote,
+    ///   `%` or control character, and a well-formed domain. Anything else
+    ///   is refused.
     /// - `from_name` and `subject` lose control characters (CR and LF
     ///   included) and line and paragraph separators, which become a space;
     ///   `from_name` also loses the characters that delimit a mailbox in a
@@ -60,10 +61,10 @@ impl MailMessage {
         subject: &str,
         body: &str,
     ) -> Result<MailMessage, MailError> {
-        if !is_valid_email(from_addr) {
+        if !is_strict_email(from_addr) {
             return Err(MailError::Invalid("sender address".into()));
         }
-        if !is_valid_email(to) {
+        if !is_strict_email(to) {
             return Err(MailError::Invalid("recipient address".into()));
         }
         let body: String = body
@@ -255,6 +256,52 @@ mod tests {
         ] {
             assert_eq!(error_class(bad), "unknown", "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_recipient_is_a_well_formed_address() {
+        let long_local = format!("{}@example.org", "a".repeat(65));
+        let long_label = format!("a@{}.org", "b".repeat(64));
+        let long_all = format!(
+            "a@{}.{}.{}.{}.org",
+            "c".repeat(63),
+            "d".repeat(63),
+            "e".repeat(63),
+            "f".repeat(63)
+        );
+        assert!(is_strict_email("a.b+c-d@example.org"));
+        assert!(is_strict_email(&format!("{}@example.org", "a".repeat(64))));
+        assert!(is_strict_email(&format!("a@{}.org", "b".repeat(63))));
+        for bad in [
+            "a%b@example.org",
+            "-a@example.org",
+            ".a@example.org",
+            "a.@example.org",
+            "a..b@example.org",
+            "a@.example.org",
+            "a@example..org",
+            "a@example.org.",
+            "a@-example.org",
+            "a@example-.org",
+            "a@example.-org",
+            "a@example",
+            "a@127.0.0.1",
+            "a@1.2",
+            "a@example.123",
+            "@example.org",
+            "a@b@example.org",
+            long_local.as_str(),
+            long_label.as_str(),
+            long_all.as_str(),
+        ] {
+            assert!(!is_strict_email(bad), "{bad:?}");
+            assert!(
+                MailMessage::new("boinc@example.org", "", bad, "s", "b").is_err(),
+                "{bad:?}"
+            );
+        }
+        // The sender is held to the same rule.
+        assert!(MailMessage::new("a%b@example.org", "", "a@example.org", "s", "b").is_err());
     }
 
     #[test]

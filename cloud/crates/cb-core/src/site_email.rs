@@ -11,7 +11,7 @@
 //! random token; the database keeps its SHA-256 (the `token` table).
 
 use cb_crypto::account::{pepper_passwd_hash, random_hex_string, token_hash};
-use cb_db::stmt;
+use cb_db::{stmt, Stmt};
 
 use crate::mail::Mail;
 use crate::model::User;
@@ -20,6 +20,7 @@ use crate::site::{
     SiteCtx, SitePage,
 };
 use crate::site_account::{token_fields, token_ok, TIMED_OUT};
+pub use crate::web::EMAIL_CHANGE_WAIT_SECS;
 use crate::web::{html_escape, is_valid_email, random_bytes};
 use crate::CoreResult;
 
@@ -29,10 +30,6 @@ pub const MAIL_INTERVAL_SECS: i64 = 600;
 /// How long a login link and a verification link work, as upstream's
 /// "valid for 1 day".
 pub const LINK_SECS: i64 = 86400;
-/// How long the previous address can undo an address change, and the wait
-/// before the next change (`TOKEN_DURATION_ONE_WEEK`, and the `604800` in
-/// upstream's `edit_email_action.php`).
-pub const EMAIL_CHANGE_WAIT_SECS: i64 = 604800;
 /// Rows of the `token` table are kept this long after they were made, then
 /// removed by whatever issues the next token.
 const TOKEN_KEEP_SECS: i64 = EMAIL_CHANGE_WAIT_SECS + 86400;
@@ -49,12 +46,13 @@ pub(crate) struct TokenKind {
     supersede: bool,
 }
 
-/// A login link.
+/// A login link. Several can be live: a request for a link must not be able
+/// to end the one the account holder has not used yet.
 pub(crate) const LOGIN: TokenKind = TokenKind {
     code: "L",
     lifetime: LINK_SECS,
     interval: MAIL_INTERVAL_SECS,
-    supersede: true,
+    supersede: false,
 };
 /// An address verification link. Opening it twice does no harm, so an older
 /// link keeps working.
@@ -138,16 +136,71 @@ pub(crate) async fn issue_token(
     Ok(issued.then_some(token))
 }
 
-/// Removes a token whose message could not be sent, so that the account is
-/// not held to the limit for a message it never got.
-async fn revoke_token(ctx: &SiteCtx<'_>, token: &str) -> CoreResult<()> {
-    ctx.db
+/// The undo token of an address change, with the statements that store it,
+/// for the batch that makes the change: they add the token only if the change
+/// happened (the account has the new address, set at `ctx.now`), and end the
+/// older undo tokens. A crash after the batch leaves the change with its
+/// link; mail is sent afterwards.
+pub(crate) fn change_token_stmts(
+    ctx: &SiteCtx<'_>,
+    userid: i64,
+    previous: &str,
+    new: &str,
+) -> (String, Vec<Stmt>) {
+    let token = new_token(ctx.random);
+    let hash = token_hash(&token);
+    let stmts = vec![
+        stmt!(
+            "INSERT INTO token (userid, type, token_hash, data, create_time, expire_time) \
+             SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS \
+             (SELECT 1 FROM user WHERE id = ? AND email_addr = ? AND email_addr_change_time = ?)",
+            userid,
+            CHANGE.code,
+            hash.as_str(),
+            previous,
+            ctx.now,
+            ctx.now + CHANGE.lifetime,
+            userid,
+            new,
+            ctx.now
+        ),
+        stmt!(
+            "UPDATE token SET used_time = ? WHERE userid = ? AND type = ? AND used_time = 0 \
+             AND token_hash != ? AND EXISTS (SELECT 1 FROM token WHERE token_hash = ?)",
+            ctx.now,
+            userid,
+            CHANGE.code,
+            hash.as_str(),
+            hash.as_str()
+        ),
+    ];
+    (token, stmts)
+}
+
+/// Counts one message against the day's cap (`email_max_per_day`, all kinds
+/// together, one statement that cannot let two requests past the last one)
+/// and sends it. `false` when the cap is reached or the transport failed;
+/// callers treat both as "not sent". A message that fails still counts.
+async fn deliver(
+    ctx: &SiteCtx<'_>,
+    mail: &Mail<'_>,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> CoreResult<bool> {
+    let counted = ctx
+        .db
         .run(stmt!(
-            "DELETE FROM token WHERE token_hash = ?",
-            token_hash(token).as_str()
+            "INSERT INTO mail_day (day, n) VALUES (?, 1) \
+             ON CONFLICT (day) DO UPDATE SET n = n + 1 WHERE n < ? RETURNING n",
+            ctx.now.div_euclid(86400),
+            ctx.project.config.email_max_per_day
         ))
         .await?;
-    Ok(())
+    if counted.rows.is_empty() {
+        return Ok(false);
+    }
+    Ok(mail.send(to, subject, body).await.is_ok())
 }
 
 fn no_mail_page(ctx: &SiteCtx<'_>) -> SitePage {
@@ -247,21 +300,27 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
                 "This email was sent in response to a request on the {n} web site.\n\n\
                  To log in to your {n} account, visit:\n\
                  {master}login_action.php?id={id}&t={token}\n\
-                 (This link is valid for 1 day and works once.)\n\
-                 After logging in, you can change your account's password or email address.\n\n\
+                 (This link is valid for 1 day and works once.)\n\n\
+                 After logging in, your account page shows your account key. To set a new \
+                 password, use the account key in place of the current password on the \
+                 password page. Once the account has a password you can change its email \
+                 address.\n\n\
                  If you did not ask for this, you can ignore this message: nobody can log in \
                  without the link.\n\n\
                  For further information and assistance with {n}, visit\n{master}\n",
                 master = project.config.master_url,
                 id = user.id,
             );
-            if mail
-                .send(&user.email_addr, &format!("{n} account information"), &body)
-                .await
-                .is_err()
-            {
-                revoke_token(ctx, &token).await?;
-            }
+            // A message that cannot be sent is not told: the answer is the
+            // same, and the limit stays used.
+            deliver(
+                ctx,
+                &mail,
+                &user.email_addr,
+                &format!("{n} account information"),
+                &body,
+            )
+            .await?;
         }
     }
     Ok(page(
@@ -394,15 +453,20 @@ pub(crate) async fn send_verification(
     let body = format!(
         "Please visit the following link to validate the email address of your {n} account:\n\
          {}validate_email_addr.php?validate=1&u={}&x={token}\n\
-         (This link is valid for 1 day.)\n",
+         (This link is valid for 1 day and works once.)\n",
         ctx.project.config.master_url, user.id
     );
-    if mail
-        .send(&user.email_addr, "Validate BOINC email address", &body)
-        .await
-        .is_err()
+    if !deliver(
+        ctx,
+        mail,
+        &user.email_addr,
+        "Validate BOINC email address",
+        &body,
+    )
+    .await?
     {
-        revoke_token(ctx, &token).await?;
+        // The limit stays used, and so does the link if the message did get
+        // there after all.
         return Ok(Sent::Failed);
     }
     Ok(Sent::Delivered)
@@ -410,9 +474,11 @@ pub(crate) async fn send_verification(
 
 /// `validate_email_addr.php`. Logged in, a GET shows the button and a POST
 /// with the form token sends the message (upstream sends on a GET). The link
-/// in the message, `?validate=1&u=&x=`, needs no login, as upstream; it sets
+/// in the message, `?validate=1&u=&x=`, needs no login, as upstream; like the
+/// other links, a GET only shows a button (if the link is still good), so a
+/// mail scanner does not verify an address, and the POST of it sets
 /// `email_validated` while the account still has the address the message went
-/// to, and works again until it expires.
+/// to, and uses the link up.
 pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let Some(mail) = ctx.mail() else {
         return Ok(no_mail_page(ctx));
@@ -431,26 +497,73 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
                 "Error in URL data - can't validate email address",
             ));
         };
-        let done = ctx
-            .db
-            .run(stmt!(
-                "UPDATE user SET email_validated = 1 WHERE id = ? AND email_addr = \
-                 (SELECT data FROM token WHERE token_hash = ? AND userid = ? AND type = ? \
-                 AND used_time = 0 AND expire_time > ?) RETURNING id",
-                u,
-                token_hash(x).as_str(),
-                u,
-                VERIFY.code,
-                ctx.now
-            ))
-            .await?;
-        if done.rows.is_empty() {
-            return Ok(error_page(
+        let hash = token_hash(x);
+        let refused = || {
+            error_page(
                 project,
                 403,
-                "This link is not valid, has expired, or is for an address the account no \
-                 longer has. Log in and ask for a new message.",
+                "This link is not valid, has expired or been used, or is for an address the \
+                 account no longer has. Log in and ask for a new message.",
+            )
+        };
+        if !ctx.post {
+            let live = ctx
+                .db
+                .run(stmt!(
+                    "SELECT id FROM token WHERE token_hash = ? AND userid = ? AND type = ? \
+                     AND used_time = 0 AND expire_time > ?",
+                    hash.as_str(),
+                    u,
+                    VERIFY.code,
+                    ctx.now
+                ))
+                .await?;
+            if live.rows.is_empty() {
+                return Ok(refused());
+            }
+            return Ok(page(
+                ctx,
+                200,
+                "Validate email address",
+                &format!(
+                    "<form method=\"post\" action=\"validate_email_addr.php\">\n\
+                     <input type=\"hidden\" name=\"validate\" value=\"1\">\n\
+                     <input type=\"hidden\" name=\"u\" value=\"{u}\">\n\
+                     <input type=\"hidden\" name=\"x\" value=\"{}\">\n\
+                     <p>Validate the email address of your account.</p>\n\
+                     <p><input type=\"submit\" value=\"Validate\"></p>\n</form>\n",
+                    html_escape(x)
+                ),
             ));
+        }
+        let out = ctx
+            .db
+            .batch(vec![
+                stmt!(
+                    "UPDATE user SET email_validated = 1 WHERE id = ? AND email_addr = \
+                     (SELECT data FROM token WHERE token_hash = ? AND userid = ? AND type = ? \
+                     AND used_time = 0 AND expire_time > ?) RETURNING id",
+                    u,
+                    hash.as_str(),
+                    u,
+                    VERIFY.code,
+                    ctx.now
+                ),
+                stmt!(
+                    "UPDATE token SET used_time = ? WHERE token_hash = ? AND userid = ? \
+                     AND type = ? AND used_time = 0 \
+                     AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_validated = 1 \
+                     AND email_addr = token.data)",
+                    ctx.now,
+                    hash.as_str(),
+                    u,
+                    VERIFY.code,
+                    u
+                ),
+            ])
+            .await?;
+        if !out.first().is_some_and(|r| !r.rows.is_empty()) {
+            return Ok(refused());
         }
         return Ok(page(
             ctx,
@@ -520,46 +633,47 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
 // ---------------------------------------------------------------------------
 // Address change.
 
-/// The messages of an address change that `edit_email_action.php` has made:
-/// a notice to the new address, and to the previous one the link that undoes
-/// the change. `true` when both were sent.
+/// The messages of an address change that `edit_email_action.php` has made
+/// (the undo `token` was stored by the change itself): to the new address a
+/// notice that does not name the previous one, since anyone can have the site
+/// mail an address they do not own; to the previous address both addresses and
+/// the link that undoes the change. `true` when both were sent.
 pub(crate) async fn send_change_notices(
     ctx: &SiteCtx<'_>,
     mail: &Mail<'_>,
+    token: &str,
     userid: i64,
     previous: &str,
     new: &str,
 ) -> CoreResult<bool> {
     let n = name(ctx);
+    let master = &ctx.project.config.master_url;
     let subject = format!("{n} email address change.");
     let to_new = format!(
-        "Your email address was changed from {previous} to {new} on {}. You will not be able to \
-         change your email address again until {}. If you need to undo this immediately, \
-         please look for an email from us at your {previous} address.\n",
+        "This email address was set on an account at {n} ({master}) on {}. If that was not \
+         you, you can ignore this message.\n",
         time_str(ctx.now),
-        time_str(ctx.now + EMAIL_CHANGE_WAIT_SECS)
     );
-    let sent_new = mail.send(new, &subject, &to_new).await.is_ok();
-    let Some(token) = issue_token(ctx, userid, &CHANGE, previous).await? else {
-        return Ok(false);
-    };
+    let sent_new = deliver(ctx, mail, new, &subject, &to_new).await?;
     let to_old = format!(
-        "Your email address has been changed. If you did not take this action,\n\
+        "The email address of your {n} account was changed from {previous} to {new} on {}. \
+         If you did not take this action,\n\
          then please visit the link below to reverse this process and change your password.\n\n\
-         {}recover_email.php?id={userid}&token={token}\n\n\
-         Note: Your password will need to be recovered after using this link.\n\
+         {master}recover_email.php?id={userid}&token={token}\n\n\
+         Note: Your password will need to be recovered after using this link. Whoever \
+         changed the address may also have your account key; after you log in again, replace \
+         it on the account key page ({master}reset_account_key.php).\n\
          (This link is valid for 7 days and works once.)\n",
-        ctx.project.config.master_url
+        time_str(ctx.now),
     );
-    let sent_old = mail.send(previous, &subject, &to_old).await.is_ok();
-    if !sent_old {
-        revoke_token(ctx, &token).await?;
-    }
+    let sent_old = deliver(ctx, mail, previous, &subject, &to_old).await?;
     Ok(sent_new && sent_old)
 }
 
 /// `recover_email.php?id=&token=`: puts the previous address back, within
-/// seven days of a change. As upstream, the password becomes one nobody knows
+/// seven days of a change; the wait before the next change then runs from the
+/// undo, so whoever made the change cannot repeat it at once. As upstream, the
+/// password becomes one nobody knows
 /// (the account is then used through a login link, which asks nothing, or its
 /// account key) and the address is not verified. A GET only shows a button (if the
 /// link is still good) and the POST of it makes the change, so that a program fetching the links in a
@@ -623,12 +737,13 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
         .batch(vec![
             stmt!(
                 "UPDATE user SET email_addr = previous_email_addr, previous_email_addr = '', \
-                 email_addr_change_time = 0, passwd_hash = ?, email_validated = 0 \
+                 email_addr_change_time = ?, passwd_hash = ?, email_validated = 0 \
                  WHERE id = ? AND previous_email_addr != '' \
                  AND NOT EXISTS (SELECT 1 FROM user o WHERE o.email_addr = user.previous_email_addr) \
                  AND EXISTS (SELECT 1 FROM token t WHERE t.token_hash = ? AND t.userid = ? \
                  AND t.type = ? AND t.used_time = 0 AND t.expire_time > ? \
                  AND t.data = user.previous_email_addr) RETURNING id",
+                ctx.now,
                 unusable.as_str(),
                 id,
                 hash.as_str(),
@@ -678,7 +793,10 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
         200,
         "Recover email address",
         "<p>Email address has been reverted.</p>\n\
-         <p>You need to reset your password: <a href=\"get_passwd.php\">get a login link by email</a>.</p>\n",
+         <p>You need to reset your password: <a href=\"get_passwd.php\">get a login link by email</a>.</p>\n\
+         <p>Whoever changed the address may have your account key too. After you log in, \
+         <a href=\"reset_account_key.php\">replace the account key</a>; computers attached \
+         with the old key have to be attached again.</p>\n",
     );
     done.set_cookie = Some(logout_cookie(project));
     Ok(done)

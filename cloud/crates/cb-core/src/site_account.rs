@@ -5,11 +5,13 @@
 //!
 //! Every page that changes something takes a POST only, and every one used
 //! while logged in also needs the form token its form page put in the form
-//! (`form_tokens` and `check_tokens` upstream). Each page runs at most two
-//! statements: the account by cookie, then one write (or one batch).
+//! (`form_tokens` and `check_tokens` upstream). Each page runs the account by
+//! cookie, then one write or one batch (the address change, which also ends
+//! login links and stores the undo token, runs a batch of up to five).
 
 use cb_crypto::account::{
-    constant_time_eq, form_token, passwd_hash, pepper_passwd_hash, verify_peppered_passwd_hash,
+    constant_time_eq, form_token, passwd_hash, pepper_passwd_hash, random_hex_string,
+    verify_peppered_passwd_hash,
 };
 use cb_db::stmt;
 
@@ -23,8 +25,8 @@ use crate::site::{
 };
 use crate::site_email::{self, EMAIL_CHANGE_WAIT_SECS};
 use crate::web::{
-    account_creation_refusal, html_escape, is_valid_email, is_valid_postal_code,
-    is_valid_user_name, is_valid_user_url, make_user, NewAccount,
+    account_creation_refusal, html_escape, is_strict_email, is_valid_postal_code,
+    is_valid_user_name, is_valid_user_url, make_user, random_bytes, NewAccount,
 };
 use crate::CoreResult;
 
@@ -210,7 +212,7 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
         return Ok(error_page(project, 400, e));
     }
     let email = str_param(q, "new_email_addr").to_lowercase();
-    if !is_valid_email(&email) {
+    if !is_strict_email(&email) {
         return Ok(error_page(
             project,
             400,
@@ -470,18 +472,29 @@ pub async fn edit_passwd_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
     let stored = pepper_passwd_hash(pepper, &passwd_hash(passwd, &user.email_addr));
     // Conditional on the row read, so a change made meanwhile (a new email
     // address, which the hash depends on) is not overwritten.
-    let updated = ctx
+    // The login links mailed before the change stop working with it.
+    let out = ctx
         .db
-        .run(stmt!(
-            "UPDATE user SET passwd_hash = ? WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
-             RETURNING id",
-            stored.as_str(),
-            user.id,
-            user.email_addr.as_str(),
-            user.passwd_hash.as_str()
-        ))
+        .batch(vec![
+            stmt!(
+                "UPDATE user SET passwd_hash = ? WHERE id = ? AND email_addr = ? \
+                 AND passwd_hash = ? RETURNING id",
+                stored.as_str(),
+                user.id,
+                user.email_addr.as_str(),
+                user.passwd_hash.as_str()
+            ),
+            stmt!(
+                "UPDATE token SET used_time = ? WHERE userid = ? AND type = 'L' AND used_time = 0 \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND passwd_hash = ?)",
+                ctx.now,
+                user.id,
+                user.id,
+                stored.as_str()
+            ),
+        ])
         .await?;
-    if updated.rows.is_empty() {
+    if !out.first().is_some_and(|r| !r.rows.is_empty()) {
         return Ok(error_page(
             project,
             409,
@@ -560,7 +573,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         ));
     };
     let email = str_param(q, "email_addr").to_lowercase();
-    if !is_valid_email(&email) {
+    if !is_strict_email(&email) {
         return Ok(error_page(
             project,
             400,
@@ -601,45 +614,79 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         }
         pepper_passwd_hash(pepper, &passwd_hash(passwd, &email))
     };
-    let update = if mail.is_some() {
+    // One batch: whether the address is taken, the change, the end of the
+    // login links mailed to the old address, and with email the undo token.
+    // The change is refused for an address another account has or has just
+    // changed away from (its undo link has to find it free). Without email
+    // nothing remembers the previous address, and a link from an earlier
+    // change must not come back to life when email is switched on again.
+    let mut batch = vec![
         stmt!(
-            "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0, \
-             previous_email_addr = ?, email_addr_change_time = ? \
-             WHERE id = ? AND email_addr = ? AND passwd_hash = ? AND email_addr_change_time = ? \
-             AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) RETURNING id",
+            "SELECT (SELECT count(*) FROM user WHERE email_addr = ?) + \
+             (SELECT count(*) FROM user WHERE previous_email_addr = ? \
+             AND previous_email_addr != '' AND email_addr_change_time > ? AND id != ?) AS n",
             email.as_str(),
-            new_hash.as_str(),
-            user.email_addr.as_str(),
+            email.as_str(),
+            ctx.now - EMAIL_CHANGE_WAIT_SECS,
+            user.id
+        ),
+        if mail.is_some() {
+            stmt!(
+                "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0, \
+                 previous_email_addr = ?, email_addr_change_time = ? \
+                 WHERE id = ? AND email_addr = ? AND passwd_hash = ? AND email_addr_change_time = ? \
+                 AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) \
+                 AND NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
+                 AND previous_email_addr != '' AND email_addr_change_time > ? AND id != ?) \
+                 RETURNING id",
+                email.as_str(),
+                new_hash.as_str(),
+                user.email_addr.as_str(),
+                ctx.now,
+                user.id,
+                user.email_addr.as_str(),
+                user.passwd_hash.as_str(),
+                user.email_addr_change_time,
+                email.as_str(),
+                email.as_str(),
+                ctx.now - EMAIL_CHANGE_WAIT_SECS,
+                user.id
+            )
+        } else {
+            stmt!(
+                "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0, \
+                 previous_email_addr = '', email_addr_change_time = 0 \
+                 WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
+                 AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) \
+                 AND NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
+                 AND previous_email_addr != '' AND email_addr_change_time > ? AND id != ?) \
+                 RETURNING id",
+                email.as_str(),
+                new_hash.as_str(),
+                user.id,
+                user.email_addr.as_str(),
+                user.passwd_hash.as_str(),
+                email.as_str(),
+                email.as_str(),
+                ctx.now - EMAIL_CHANGE_WAIT_SECS,
+                user.id
+            )
+        },
+        stmt!(
+            "UPDATE token SET used_time = ? WHERE userid = ? AND type = 'L' AND used_time = 0 \
+             AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ?)",
             ctx.now,
             user.id,
-            user.email_addr.as_str(),
-            user.passwd_hash.as_str(),
-            user.email_addr_change_time,
-            email.as_str()
-        )
-    } else {
-        stmt!(
-            "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0 \
-             WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
-             AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) RETURNING id",
-            email.as_str(),
-            new_hash.as_str(),
             user.id,
-            user.email_addr.as_str(),
-            user.passwd_hash.as_str(),
             email.as_str()
-        )
-    };
-    let out = ctx
-        .db
-        .batch(vec![
-            stmt!(
-                "SELECT count(*) AS n FROM user WHERE email_addr = ?",
-                email.as_str()
-            ),
-            update,
-        ])
-        .await?;
+        ),
+    ];
+    let undo_token = mail.as_ref().map(|_| {
+        let (token, stmts) = site_email::change_token_stmts(ctx, user.id, &user.email_addr, &email);
+        batch.extend(stmts);
+        token
+    });
+    let out = ctx.db.batch(batch).await?;
     let taken = out.first().and_then(|r| r.scalar_i64()).unwrap_or(0) > 0;
     let updated = out.get(1).is_some_and(|r| !r.rows.is_empty());
     if taken {
@@ -657,9 +704,10 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         ));
     }
     let mut msg = format!("The email address of your account is now {email}.");
-    if let Some(mail) = &mail {
+    if let (Some(mail), Some(token)) = (&mail, &undo_token) {
         let sent =
-            site_email::send_change_notices(ctx, mail, user.id, &user.email_addr, &email).await?;
+            site_email::send_change_notices(ctx, mail, token, user.id, &user.email_addr, &email)
+                .await?;
         if !sent {
             msg.push_str(&format!(
                 " The address was changed, but we were unable to send the confirmation \
@@ -669,6 +717,80 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         }
     }
     Ok(done(project, "Change email address", &msg))
+}
+
+// ---------------------------------------------------------------------------
+// Account key.
+
+/// `reset_account_key.php`, not in upstream: replaces the account key, which
+/// is also what the login cookie holds, so it is the way to put out someone
+/// else who has the key or a session. A GET shows what it does; a POST with
+/// the form token makes a new random key, which changes the weak key too (it
+/// is derived from the key), ends the account's unused login and verification
+/// links, and logs this browser in with the new key. It asks for the session
+/// and the token only, since after an address undo the password is not known.
+/// The undo link of an address change is left alone: whoever has the key could
+/// otherwise end it. Computers attached with the old key stop working until
+/// they are attached again, and so do account managers that hold it.
+pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
+    let project = ctx.project;
+    let Some(user) = viewer(ctx).await? else {
+        return Ok(to_login(project, "reset_account_key.php"));
+    };
+    if !ctx.post {
+        return Ok(page(
+            project,
+            "Replace the account key",
+            &format!(
+                "<p>Your account key is what logs this browser in and what the computers \
+                 attached to your account use. Replace it if someone else may have it: the \
+                 old key and every session with it stop working, and so does the weak \
+                 account key. <strong>Every computer attached with the old key has to be \
+                 attached again</strong>, with the new key shown on your account page, and \
+                 so does every account manager that has it.</p>\n\
+                 <form method=\"post\" action=\"reset_account_key.php\">\n{}\
+                 <p><input type=\"submit\" value=\"Replace the account key\"></p>\n</form>\n",
+                token_fields(&user, ctx.now)
+            ),
+        ));
+    }
+    if !token_ok(ctx, &user, q) {
+        return Ok(error_page(project, 403, TIMED_OUT));
+    }
+    let new_key = random_hex_string(&random_bytes(ctx.random));
+    let out = ctx
+        .db
+        .batch(vec![
+            stmt!(
+                "UPDATE user SET authenticator = ? WHERE id = ? AND authenticator = ? RETURNING id",
+                new_key.as_str(),
+                user.id,
+                user.authenticator.as_str()
+            ),
+            stmt!(
+                "UPDATE token SET used_time = ? WHERE userid = ? AND type != 'E' AND used_time = 0 \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND authenticator = ?)",
+                ctx.now,
+                user.id,
+                user.id,
+                new_key.as_str()
+            ),
+        ])
+        .await?;
+    if !out.first().is_some_and(|r| !r.rows.is_empty()) {
+        return Ok(error_page(
+            project,
+            409,
+            "The account changed meanwhile; please try again.",
+        ));
+    }
+    let mut out = done(
+        project,
+        "Replace the account key",
+        "Your account key has been replaced. Attach your computers again with the new key shown on your account page.",
+    );
+    out.set_cookie = Some(login_cookie(project, &new_key, true));
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
