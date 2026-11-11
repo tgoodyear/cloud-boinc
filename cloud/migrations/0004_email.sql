@@ -33,8 +33,10 @@ CREATE INDEX token_created ON token (create_time);
 CREATE INDEX user_previous_email ON user (previous_email_addr) WHERE previous_email_addr != '';
 
 -- Messages sent per UTC day (`day` is the Unix time divided by 86400), for the
--- project-wide cap `email_max_per_day`.
+-- project-wide cap `email_max_per_day`. `signup` counts the part of `n` that is
+-- verification mail sent at sign-up, which may use half of the cap.
 CREATE TABLE mail_day (
     day INTEGER PRIMARY KEY,
-    n INTEGER NOT NULL
+    n INTEGER NOT NULL,
+    signup INTEGER NOT NULL DEFAULT 0
 );

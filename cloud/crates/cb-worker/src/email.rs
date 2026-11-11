@@ -3,6 +3,8 @@
 //! decided by `MailMessage::fields` in `cb-core`; this file only makes the
 //! call and turns a failure into a [`MailError`] that is safe to log.
 
+use std::cell::Cell;
+
 use async_trait::async_trait;
 use cb_core::mail::{error_class, MailError, MailMessage, Mailer};
 use worker::console_error;
@@ -14,11 +16,34 @@ use worker::Env;
 /// Name of the `send_email` binding. A Worker without it sends no email.
 pub const EMAIL: &str = "EMAIL";
 
+thread_local! {
+    static WARNED: Cell<bool> = const { Cell::new(false) };
+}
+
 /// The email binding, when the Worker has one. Absent (`undefined` in `env`)
 /// means the deployment sends no email, and the site behaves as it does with
-/// no mailer.
+/// no mailer; that is silent. A value that is there but has no `send`
+/// function is not a send binding: the site then sends no email either, and
+/// one line says so, once for each isolate.
 pub fn mailer(env: &Env) -> Option<EmailBinding> {
-    env.get_binding::<SendEmail>(EMAIL).ok().map(EmailBinding)
+    let value = Reflect::get(env, &JsValue::from_str(EMAIL)).ok()?;
+    if value.is_undefined() || value.is_null() {
+        return None;
+    }
+    let usable = Reflect::get(&value, &JsValue::from_str("send"))
+        .map(|f| f.is_function())
+        .unwrap_or(false);
+    match env.get_binding::<SendEmail>(EMAIL) {
+        Ok(binding) if usable => Some(EmailBinding(binding)),
+        _ => {
+            if !WARNED.with(|w| w.replace(true)) {
+                console_error!(
+                    "email: binding {EMAIL} is not a send_email binding; sending no email"
+                );
+            }
+            None
+        }
+    }
 }
 
 pub struct EmailBinding(SendEmail);

@@ -274,7 +274,9 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
         // ask for the message again.
         if let Ok(Some(user)) = user_by_auth(ctx.db, &authenticator).await {
             if user.email_validated == 0 {
-                let _ = site_email::send_verification(ctx, &mail, &user).await;
+                let _ =
+                    site_email::send_verification(ctx, &mail, &user, site_email::Budget::Signup)
+                        .await;
             }
         }
     }
@@ -528,19 +530,25 @@ pub async fn edit_email_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     };
     b.push_str(&passwd_input("passwd", label, "current-password"));
     b.push_str("<p><input type=\"submit\" value=\"Change email address\"></p>\n</form>\n");
+    // The weak account key is made from the stored password hash, which the
+    // change makes again; an account with no password has none to change.
+    let changes = if user.passwd_hash.is_empty() {
+        "your cross-project ID"
+    } else {
+        "your cross-project ID and weak account key"
+    };
     if ctx.mail().is_some() {
-        b.push_str(
+        b.push_str(&format!(
             "<p>A message about the change is sent to both addresses; the one to the previous \
              address has a link that undoes the change for seven days. You cannot change the \
              address again for seven days. The new address is not verified until you ask for \
-             a verification message on your account page. The change also changes your \
-             cross-project ID and weak account key.</p>\n",
-        );
+             a verification message on your account page. The change also changes {changes}.</p>\n"
+        ));
     } else {
-        b.push_str(
+        b.push_str(&format!(
             "<p>No message is sent to either address, and the new address is not verified. \
-             The change also changes your cross-project ID and weak account key.</p>\n",
-        );
+             The change also changes {changes}.</p>\n"
+        ));
     }
     Ok(page(project, "Change email address", &b))
 }
@@ -618,8 +626,10 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
     // login links mailed to the old address, and with email the undo token.
     // The change is refused for an address another account has or has just
     // changed away from (its undo link has to find it free). Without email
-    // nothing remembers the previous address, and a link from an earlier
-    // change must not come back to life when email is switched on again.
+    // nothing new is remembered, and the undo links of an earlier change end
+    // (they are bound to the previous address, which this change makes
+    // stale); the earlier state itself is left, so that it still reserves its
+    // address for the rest of its week.
     let mut batch = vec![
         stmt!(
             "SELECT (SELECT count(*) FROM user WHERE email_addr = ?) + \
@@ -654,8 +664,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
             )
         } else {
             stmt!(
-                "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0, \
-                 previous_email_addr = '', email_addr_change_time = 0 \
+                "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0 \
                  WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
                  AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) \
                  AND NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
@@ -673,10 +682,12 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
             )
         },
         stmt!(
-            "UPDATE token SET used_time = ? WHERE userid = ? AND type = 'L' AND used_time = 0 \
-             AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ?)",
+            "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
+             AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ?)",
             ctx.now,
             user.id,
+            // With email the new undo token replaces the old ones itself.
+            if mail.is_some() { "L" } else { "E" },
             user.id,
             email.as_str()
         ),
@@ -789,7 +800,9 @@ pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         "Replace the account key",
         "Your account key has been replaced. Attach your computers again with the new key shown on your account page.",
     );
-    out.set_cookie = Some(login_cookie(project, &new_key, true));
+    // The server does not know how long the cookie it replaces was meant to
+    // last (it only gets the value), so this one ends with the browser.
+    out.set_cookie = Some(login_cookie(project, &new_key, false));
     Ok(out)
 }
 

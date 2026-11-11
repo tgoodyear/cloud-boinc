@@ -495,12 +495,22 @@ pub async fn am_set_info(
                 Some("Invalid email address"),
             ));
         }
+        // The week's wait of the site's change applies here too: this call
+        // needs only the account key, and must not get round the window in
+        // which the previous address can undo a change.
+        if user.email_addr_change_time + EMAIL_CHANGE_WAIT_SECS > now {
+            return Ok(write_error(
+                -1,
+                Some("The email address was changed within the past 7 days"),
+            ));
+        }
         set("email_addr", email.as_str().into());
         set("email_validated", 0.into());
-        // A change here has no undo link: forget an earlier one, so that it
-        // cannot undo this change, and the reservation that went with it.
-        set("previous_email_addr", "".into());
-        set("email_addr_change_time", 0.into());
+        // Recorded as the site's change records it, so the old address stays
+        // reserved; no undo mail goes from here (there is no mailer in this
+        // call), so no undo token is made.
+        set("previous_email_addr", user.email_addr.as_str().into());
+        set("email_addr_change_time", now.into());
     }
     let password_hash = get("password_hash").trim().to_lowercase();
     if !password_hash.is_empty() {
@@ -514,6 +524,11 @@ pub async fn am_set_info(
     }
 
     let credentials_changed = new_email || !password_hash.is_empty();
+    let new_stored_hash = if password_hash.is_empty() {
+        String::new()
+    } else {
+        pepper_passwd_hash(pepper, &password_hash)
+    };
     if !sets.is_empty() {
         let assignments: Vec<String> = sets.iter().map(|c| format!("{c} = ?")).collect();
         let target = if new_email {
@@ -552,7 +567,30 @@ pub async fn am_set_info(
             .bind(target)
             .bind(now - EMAIL_CHANGE_WAIT_SECS)
             .bind(user.id);
-        if db.run(update).await?.rows.is_empty() {
+        // The update and, for a change of credentials, the end of the login
+        // links mailed before it (and of undo links, for an address) go in
+        // one batch.
+        let mut batch = vec![update];
+        if credentials_changed {
+            batch.push(stmt!(
+                "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
+                 AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
+                 AND (? = '' OR passwd_hash = ?))",
+                now,
+                user.id,
+                if new_email { "E" } else { "L" },
+                user.id,
+                target,
+                new_stored_hash.as_str(),
+                new_stored_hash.as_str()
+            ));
+        }
+        if !db
+            .batch(batch)
+            .await?
+            .first()
+            .is_some_and(|r| !r.rows.is_empty())
+        {
             // Refused: the address is taken, or the account changed since it
             // was read. Only this path asks which.
             let taken = db
@@ -580,15 +618,6 @@ pub async fn am_set_info(
                 err::ERR_RETRY,
                 Some("The account changed meanwhile; please try again."),
             ));
-        }
-        if credentials_changed {
-            // Login links mailed before the change stop working.
-            db.run(stmt!(
-                "UPDATE token SET used_time = ? WHERE userid = ? AND type = 'L' AND used_time = 0",
-                now,
-                user.id
-            ))
-            .await?;
         }
     }
     Ok(format!(

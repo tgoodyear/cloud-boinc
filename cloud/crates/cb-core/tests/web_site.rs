@@ -435,6 +435,18 @@ fn am_set_info_changes_the_account() {
     let (reply, _) = am_set_info(&w, &[("account_key", &ada.auth), ("name", "")]);
     assert!(reply.contains("<success/>"));
     assert_eq!(w.user(ada.id).name, "Ada L");
+    // The address was just changed: another change is refused for a week,
+    // and after it the checks of the address itself are what refuse.
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            ("email_addr", "ada@again.example"),
+        ],
+    );
+    assert_eq!(error_num(&reply), Some(-1), "{reply}");
+    assert_eq!(w.user(ada.id).email_addr, "ada@new.example");
+    w.at(604_800);
     for (field, value, num) in [
         ("country", "Atlantis", -1),
         ("name", "<b>", -1),
@@ -1718,6 +1730,7 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
         &racing,
         &w.project.config,
         PEPPER,
+        NOW,
         &params,
     ))
     .unwrap();
@@ -1745,6 +1758,7 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
         &racing,
         &w.project.config,
         PEPPER,
+        NOW,
         &params,
     ))
     .unwrap();
@@ -1764,6 +1778,7 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
         &racing,
         &w.project.config,
         PEPPER,
+        NOW,
         &params,
     ))
     .unwrap();
@@ -2236,6 +2251,7 @@ fn am_set_info_keeps_a_site_change_to_the_stored_project_specific_part() {
         &racing,
         &w.project.config,
         PEPPER,
+        NOW,
         &params,
     ))
     .unwrap();
@@ -2262,6 +2278,7 @@ fn am_set_info_keeps_a_site_change_to_the_stored_project_specific_part() {
         &racing,
         &w.project.config,
         PEPPER,
+        NOW,
         &own,
     ))
     .unwrap();
@@ -3530,14 +3547,28 @@ fn an_old_undo_link_does_not_come_back_when_mail_is_switched_on() {
         w.change_email(&ada.auth, "ada@c.example", "secret").status,
         200
     );
+    // The state of the first change is left (it still reserves its address
+    // for its week), and its undo link is ended instead.
     let u = w.user(ada.id);
     assert_eq!(
         (u.previous_email_addr.as_str(), u.email_addr_change_time),
-        ("", 0)
+        ("ada@example.com", NOW)
     );
     w.use_mail.set(true);
     assert_eq!(w.follow(&old, None, true).status, 403);
     assert_eq!(w.user(ada.id).email_addr, "ada@c.example");
+    let signup = [
+        ("new_name", "Mallory"),
+        ("new_email_addr", "ada@example.com"),
+        ("passwd", "secret1"),
+        ("passwd2", "secret1"),
+        ("country", "United Kingdom"),
+        ("postal_code", ""),
+    ];
+    assert_eq!(
+        w.post("/create_account_action.php", None, &signup).status,
+        409
+    );
 }
 
 #[test]
@@ -3659,4 +3690,246 @@ fn a_token_works_only_on_the_page_of_its_kind() {
     assert_eq!(w.user(ada.id).email_validated, 1);
     assert_eq!(w.follow(&undo, None, true).status, 200);
     assert_eq!(w.user(ada.id).email_addr, "ada@example.com");
+}
+
+#[test]
+fn am_set_info_keeps_the_window_of_an_address_change() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    assert_eq!(
+        w.change_email(&ada.auth, "ada@b.example", "secret").status,
+        200
+    );
+    let undo = w.last_link("ada@example.com", "recover_email.php");
+    // Inside the week the key alone cannot change the address again.
+    for secs in [1, 604_799] {
+        w.at(secs);
+        let (reply, _) = am_set_info(
+            &w,
+            &[("account_key", &ada.auth), ("email_addr", "ada@c.example")],
+        );
+        assert!(reply.contains("<error_num>"), "{reply}");
+        let u = w.user(ada.id);
+        assert_eq!(
+            (
+                u.email_addr.as_str(),
+                u.previous_email_addr.as_str(),
+                u.email_addr_change_time
+            ),
+            ("ada@b.example", "ada@example.com", NOW),
+            "{secs}"
+        );
+    }
+    // A change of password through it leaves the state and the undo link,
+    // and ends the login links.
+    w.at(700);
+    w.request_login_link("ada@b.example");
+    let login = w.last_link("ada@b.example", "login_action.php");
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            ("password_hash", &passwd_hash("best12", "ada@b.example")),
+        ],
+    );
+    assert!(reply.contains("<success/>"), "{reply}");
+    refused_with_403(&w.follow(&login, None, true));
+    assert_eq!(w.user(ada.id).previous_email_addr, "ada@example.com");
+    assert_eq!(w.token_rows("E"), 1);
+    assert_eq!(
+        w.follow(&undo, None, false).status,
+        200,
+        "the undo link still works"
+    );
+
+    // Outside the week it changes the address, records what the site records
+    // (the old address stays reserved), and ends the undo links.
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.change_email(&ada.auth, "ada@b.example", "secret");
+    let undo = w.last_link("ada@example.com", "recover_email.php");
+    w.at(604_800);
+    let (reply, _) = am_set_info(
+        &w,
+        &[("account_key", &ada.auth), ("email_addr", "ada@c.example")],
+    );
+    assert!(reply.contains("<success/>"), "{reply}");
+    let u = w.user(ada.id);
+    assert_eq!(
+        (
+            u.email_addr.as_str(),
+            u.previous_email_addr.as_str(),
+            u.email_addr_change_time
+        ),
+        ("ada@c.example", "ada@b.example", NOW + 604_800)
+    );
+    refused_with_403(&w.follow(&undo, None, true));
+    let signup = [
+        ("new_name", "Mallory"),
+        ("new_email_addr", "ada@b.example"),
+        ("passwd", "secret1"),
+        ("passwd2", "secret1"),
+        ("country", "United Kingdom"),
+        ("postal_code", ""),
+    ];
+    assert_eq!(
+        w.post("/create_account_action.php", None, &signup).status,
+        409
+    );
+}
+
+#[test]
+fn the_notices_go_first_to_the_previous_address_and_are_outside_the_cap() {
+    // A cap of 1 is used up by one login-link message; the notices still go.
+    let w = World::with_config(&MAIL_CONFIG.replace(
+        "<email_from_name>",
+        "<email_max_per_day>1</email_max_per_day>\n<email_from_name>",
+    ));
+    w.use_mail.set(true);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.account("bob@example.com", "secret", "Bob");
+    w.request_login_link("bob@example.com");
+    assert_eq!(w.mails().len(), 1);
+    w.request_login_link("ada@example.com");
+    assert_eq!(w.mails().len(), 1, "the cap is used");
+    let page = w.change_email(&ada.auth, "ada@new.example", "secret");
+    assert!(!page.body.contains("unable to send"));
+    let mails = w.mails();
+    assert_eq!(mails.len(), 3);
+    assert_eq!(mails[1].to(), "ada@example.com");
+    assert!(mails[1].body().contains("recover_email.php"));
+    assert_eq!(mails[2].to(), "ada@new.example");
+}
+
+#[test]
+fn sign_up_mail_may_use_half_of_the_cap() {
+    let cap4 = |n: i32| {
+        let w = World::with_config(&MAIL_CONFIG.replace(
+            "<email_from_name>",
+            &format!("<email_max_per_day>{n}</email_max_per_day>\n<email_from_name>"),
+        ));
+        w.use_mail.set(true);
+        w
+    };
+    let w = cap4(4);
+    let mut accounts = 0;
+    for who in ["a", "b", "c", "d"] {
+        let page = w.post(
+            "/create_account_action.php",
+            None,
+            &[
+                ("new_name", who),
+                ("new_email_addr", &format!("{who}@example.com")),
+                ("passwd", "secret1"),
+                ("passwd2", "secret1"),
+                ("country", "United Kingdom"),
+                ("postal_code", ""),
+            ],
+        );
+        assert_eq!(page.status, 303);
+        accounts += 1;
+    }
+    assert_eq!((accounts, w.mails().len()), (4, 2), "two of four sign-ups");
+    // What is left of the cap is for recovery mail.
+    w.at(700);
+    w.request_login_link("a@example.com");
+    w.request_login_link("b@example.com");
+    w.request_login_link("c@example.com");
+    assert_eq!(w.mails().len(), 4);
+    // A cap of 1 leaves no share for sign-up mail.
+    let w = cap4(1);
+    w.post(
+        "/create_account_action.php",
+        None,
+        &[
+            ("new_name", "a"),
+            ("new_email_addr", "a@example.com"),
+            ("passwd", "secret1"),
+            ("passwd2", "secret1"),
+            ("country", "United Kingdom"),
+            ("postal_code", ""),
+        ],
+    );
+    assert!(w.mails().is_empty());
+    w.request_login_link("a@example.com");
+    assert_eq!(w.mails().len(), 1);
+}
+
+#[test]
+fn a_stale_undo_token_ends_nothing_when_the_undo_is_refused() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.request_login_link("ada@example.com");
+    let login = w.last_link("ada@example.com", "login_action.php");
+    // An unused undo token the account's state does not match.
+    let stale = "ab".repeat(32);
+    w.sql(&format!(
+        "INSERT INTO token (userid, type, token_hash, data, create_time, expire_time) \
+         VALUES ({}, 'E', '{}', 'old@example.com', 1, {})",
+        ada.id,
+        cb_crypto::account::token_hash(&stale),
+        NOW + 1000
+    ));
+    let undo: Link = (
+        "/recover_email.php".into(),
+        vec![("id".into(), ada.id.to_string()), ("token".into(), stale)],
+    );
+    refused_with_403(&w.follow(&undo, None, true));
+    assert_eq!(
+        w.count(
+            "SELECT count(*) AS n FROM token WHERE type = ? AND used_time = 0",
+            "E"
+        ),
+        1,
+        "not used up"
+    );
+    assert!(
+        logged_in_as(&w.follow(&login, None, true), &ada),
+        "the login link is not ended"
+    );
+}
+
+#[test]
+fn an_address_the_site_would_not_mail_gets_no_token_and_no_cap() {
+    let w = World::with_mail();
+    let loose = w.account("a%b@example.com", "secret", "Loose");
+    let page = w.request_login_link("a%b@example.com");
+    assert_eq!(page.status, 200);
+    let home = w.get("/home.php", Some(&loose.auth), &[]);
+    let (failed, _) = w.submit(&home, "/validate_email_addr.php", Some(&loose.auth), &[]);
+    assert_eq!(failed.status, 503);
+    assert_eq!(w.token_rows("L") + w.token_rows("V"), 0);
+    assert_eq!(
+        w.count("SELECT count(*) AS n FROM mail_day WHERE day > ?", "0"),
+        0
+    );
+    assert!(w.mails().is_empty());
+}
+
+#[test]
+fn the_new_account_key_cookie_is_for_the_session() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let form = w.get("/reset_account_key.php", Some(&ada.auth), &[]);
+    let (done, _) = w.submit(&form, "/reset_account_key.php", Some(&ada.auth), &[]);
+    let cookie = done.set_cookie.unwrap();
+    assert!(
+        !cookie.contains("Max-Age") && !cookie.contains("Expires"),
+        "{cookie}"
+    );
+    assert!(cookie.contains("HttpOnly") && cookie.contains("Secure"));
+}
+
+#[test]
+fn the_address_form_says_only_what_the_change_changes() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let with_password = w.get("/edit_email_form.php", Some(&ada.auth), &[]);
+    assert!(with_password
+        .body
+        .contains("cross-project ID and weak account key"));
+    w.sql("UPDATE user SET passwd_hash = ''");
+    let without = w.get("/edit_email_form.php", Some(&ada.auth), &[]);
+    assert!(without.body.contains("your cross-project ID."));
+    assert!(!without.body.contains("weak account key"));
 }

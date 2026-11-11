@@ -21,7 +21,7 @@ use crate::site::{
 };
 use crate::site_account::{token_fields, token_ok, TIMED_OUT};
 pub use crate::web::EMAIL_CHANGE_WAIT_SECS;
-use crate::web::{html_escape, is_valid_email, random_bytes};
+use crate::web::{html_escape, is_strict_email, is_valid_email, random_bytes};
 use crate::CoreResult;
 
 /// Seconds between two messages of one kind to one account (login links,
@@ -138,9 +138,13 @@ pub(crate) async fn issue_token(
 
 /// The undo token of an address change, with the statements that store it,
 /// for the batch that makes the change: they add the token only if the change
-/// happened (the account has the new address, set at `ctx.now`), and end the
-/// older undo tokens. A crash after the batch leaves the change with its
-/// link; mail is sent afterwards.
+/// happened (the account has the new address, set at `ctx.now`) and no undo
+/// token of the account was made at `ctx.now` yet, and end the older undo
+/// tokens. The second condition is for a duplicate of the same request that
+/// ran at the same time: its own change matched nothing, but the first's
+/// state looks like its own, and it must neither add a token nobody holds nor
+/// end the one the first request mails. A crash after the batch leaves the
+/// change with its link; mail is sent afterwards.
 pub(crate) fn change_token_stmts(
     ctx: &SiteCtx<'_>,
     userid: i64,
@@ -153,7 +157,9 @@ pub(crate) fn change_token_stmts(
         stmt!(
             "INSERT INTO token (userid, type, token_hash, data, create_time, expire_time) \
              SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS \
-             (SELECT 1 FROM user WHERE id = ? AND email_addr = ? AND email_addr_change_time = ?)",
+             (SELECT 1 FROM user WHERE id = ? AND email_addr = ? AND email_addr_change_time = ?) \
+             AND NOT EXISTS \
+             (SELECT 1 FROM token WHERE userid = ? AND type = ? AND create_time = ?)",
             userid,
             CHANGE.code,
             hash.as_str(),
@@ -162,6 +168,9 @@ pub(crate) fn change_token_stmts(
             ctx.now + CHANGE.lifetime,
             userid,
             new,
+            ctx.now,
+            userid,
+            CHANGE.code,
             ctx.now
         ),
         stmt!(
@@ -177,27 +186,71 @@ pub(crate) fn change_token_stmts(
     (token, stmts)
 }
 
-/// Counts one message against the day's cap (`email_max_per_day`, all kinds
-/// together, one statement that cannot let two requests past the last one)
-/// and sends it. `false` when the cap is reached or the transport failed;
-/// callers treat both as "not sent". A message that fails still counts.
+/// Which part of the day's allowance a message uses.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Budget {
+    /// Login-link and verification mail from the account page: all of the
+    /// cap (`email_max_per_day`).
+    Counted,
+    /// Verification mail at sign-up: counted, but at most half of the cap, so
+    /// that sign-ups cannot use up the allowance recovery mail needs.
+    Signup,
+    /// The notices of an address change: not counted. One address change per
+    /// account per seven days bounds them, and an account holder whose
+    /// address was changed must get the undo link whatever else was sent.
+    Exempt,
+}
+
+/// Sends a message to `to`: nowhere unless it is a well-formed address, and
+/// counted against the day's allowance (`Budget`) in one statement that cannot
+/// let two requests past the last one. `false` when the address is refused,
+/// the allowance is used or the transport failed; callers treat all of them as
+/// "not sent". A message that fails still counts.
 async fn deliver(
     ctx: &SiteCtx<'_>,
     mail: &Mail<'_>,
     to: &str,
     subject: &str,
     body: &str,
+    budget: Budget,
 ) -> CoreResult<bool> {
-    let counted = ctx
-        .db
-        .run(stmt!(
-            "INSERT INTO mail_day (day, n) VALUES (?, 1) \
-             ON CONFLICT (day) DO UPDATE SET n = n + 1 WHERE n < ? RETURNING n",
-            ctx.now.div_euclid(86400),
-            ctx.project.config.email_max_per_day
-        ))
-        .await?;
-    if counted.rows.is_empty() {
+    if !is_strict_email(to) {
+        return Ok(false);
+    }
+    let cap = ctx.project.config.email_max_per_day;
+    let day = ctx.now.div_euclid(86400);
+    let counted = match budget {
+        Budget::Exempt => true,
+        Budget::Counted => !ctx
+            .db
+            .run(stmt!(
+                "INSERT INTO mail_day (day, n) VALUES (?, 1) \
+                 ON CONFLICT (day) DO UPDATE SET n = n + 1 WHERE n < ? RETURNING n",
+                day,
+                cap
+            ))
+            .await?
+            .rows
+            .is_empty(),
+        Budget::Signup => {
+            let share = cap / 2;
+            share > 0
+                && !ctx
+                    .db
+                    .run(stmt!(
+                        "INSERT INTO mail_day (day, n, signup) VALUES (?, 1, 1) \
+                         ON CONFLICT (day) DO UPDATE SET n = n + 1, signup = signup + 1 \
+                         WHERE n < ? AND signup < ? RETURNING n",
+                        day,
+                        cap,
+                        share
+                    ))
+                    .await?
+                    .rows
+                    .is_empty()
+        }
+    };
+    if !counted {
         return Ok(false);
     }
     Ok(mail.send(to, subject, body).await.is_ok())
@@ -293,7 +346,9 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
         ))
         .await?
         .first()?;
-    if let Some(user) = user {
+    // An address the site would not mail (an account made under the looser
+    // rule) gets no token either: it would use the account's slot for nothing.
+    if let Some(user) = user.filter(|u| is_strict_email(&u.email_addr)) {
         if let Some(token) = issue_token(ctx, user.id, &LOGIN, "").await? {
             let n = name(ctx);
             let body = format!(
@@ -303,8 +358,8 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
                  (This link is valid for 1 day and works once.)\n\n\
                  After logging in, your account page shows your account key. To set a new \
                  password, use the account key in place of the current password on the \
-                 password page. Once the account has a password you can change its email \
-                 address.\n\n\
+                 password page. Changing the email address on the site asks for the \
+                 password, so set one first.\n\n\
                  If you did not ask for this, you can ignore this message: nobody can log in \
                  without the link.\n\n\
                  For further information and assistance with {n}, visit\n{master}\n",
@@ -319,6 +374,7 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
                 &user.email_addr,
                 &format!("{n} account information"),
                 &body,
+                Budget::Counted,
             )
             .await?;
         }
@@ -445,7 +501,11 @@ pub(crate) async fn send_verification(
     ctx: &SiteCtx<'_>,
     mail: &Mail<'_>,
     user: &User,
+    budget: Budget,
 ) -> CoreResult<Sent> {
+    if !is_strict_email(&user.email_addr) {
+        return Ok(Sent::Failed);
+    }
     let Some(token) = issue_token(ctx, user.id, &VERIFY, &user.email_addr).await? else {
         return Ok(Sent::Recent);
     };
@@ -462,6 +522,7 @@ pub(crate) async fn send_verification(
         &user.email_addr,
         "Validate BOINC email address",
         &body,
+        budget,
     )
     .await?
     {
@@ -600,7 +661,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
     }
-    Ok(match send_verification(ctx, &mail, &user).await? {
+    Ok(match send_verification(ctx, &mail, &user, Budget::Counted).await? {
         Sent::Delivered => page(
             ctx,
             200,
@@ -649,24 +710,27 @@ pub(crate) async fn send_change_notices(
     let n = name(ctx);
     let master = &ctx.project.config.master_url;
     let subject = format!("{n} email address change.");
-    let to_new = format!(
-        "This email address was set on an account at {n} ({master}) on {}. If that was not \
-         you, you can ignore this message.\n",
-        time_str(ctx.now),
-    );
-    let sent_new = deliver(ctx, mail, new, &subject, &to_new).await?;
+    // The previous address first: its message has the undo link. Neither
+    // counts against the day's allowance (see `Budget::Exempt`).
     let to_old = format!(
         "The email address of your {n} account was changed from {previous} to {new} on {}. \
          If you did not take this action,\n\
          then please visit the link below to reverse this process and change your password.\n\n\
          {master}recover_email.php?id={userid}&token={token}\n\n\
-         Note: Your password will need to be recovered after using this link. Whoever \
-         changed the address may also have your account key; after you log in again, replace \
-         it on the account key page ({master}reset_account_key.php).\n\
+         Note: Your password will need to be recovered after using this link. The account key \
+         does not change with it, so whoever made the change may still have a session or the \
+         key; after you log in again, replace the account key on the account key page \
+         ({master}reset_account_key.php).\n\
          (This link is valid for 7 days and works once.)\n",
         time_str(ctx.now),
     );
-    let sent_old = deliver(ctx, mail, previous, &subject, &to_old).await?;
+    let sent_old = deliver(ctx, mail, previous, &subject, &to_old, Budget::Exempt).await?;
+    let to_new = format!(
+        "This email address was set on an account at {n} ({master}) on {}. If that was not \
+         you, you can ignore this message.\n",
+        time_str(ctx.now),
+    );
+    let sent_new = deliver(ctx, mail, new, &subject, &to_new, Budget::Exempt).await?;
     Ok(sent_new && sent_old)
 }
 
@@ -752,16 +816,22 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
                 ctx.now
             ),
             // The links that other types of token made stay valid only if the
-            // change was not undone; this runs while the token is unused.
+            // change was not undone; this runs while the token is unused. Both
+            // this and the next statement run only if the first one made the
+            // change in this request: it leaves the time of the undo and a
+            // password hash nobody has seen, which nothing else can match.
             stmt!(
                 "UPDATE token SET used_time = ? WHERE userid = ? AND used_time = 0 AND type != ? \
-                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND previous_email_addr = '') \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND previous_email_addr = '' \
+                 AND email_addr_change_time = ? AND passwd_hash = ?) \
                  AND EXISTS (SELECT 1 FROM token t WHERE t.token_hash = ? AND t.userid = ? \
                  AND t.type = ? AND t.used_time = 0 AND t.expire_time > ?)",
                 ctx.now,
                 id,
                 CHANGE.code,
                 id,
+                ctx.now,
+                unusable.as_str(),
                 hash.as_str(),
                 id,
                 CHANGE.code,
@@ -770,13 +840,16 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
             stmt!(
                 "UPDATE token SET used_time = ? WHERE token_hash = ? AND userid = ? AND type = ? \
                  AND used_time = 0 AND expire_time > ? \
-                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND previous_email_addr = '')",
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND previous_email_addr = '' \
+                 AND email_addr_change_time = ? AND passwd_hash = ?)",
                 ctx.now,
                 hash.as_str(),
                 id,
                 CHANGE.code,
                 ctx.now,
-                id
+                id,
+                ctx.now,
+                unusable.as_str()
             ),
         ])
         .await?;
@@ -800,4 +873,64 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
     );
     done.set_cookie = Some(logout_cookie(project));
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use cb_db::Db;
+    use cb_sqlite::SqliteDb;
+    use futures_lite::future::block_on;
+
+    use super::*;
+    use crate::project::Project;
+
+    const NOW: i64 = 2_000_000_000;
+
+    /// Two copies of the same address change that ran at the same moment: the
+    /// first one's change took effect and its token must stay usable; the
+    /// second one's own update matched nothing, and it must not add a token
+    /// nobody holds or end the first one's.
+    #[test]
+    fn a_duplicate_address_change_does_not_end_the_first_undo_token() {
+        let db = SqliteDb::with_schema().unwrap();
+        // The state both requests see after the first one's update.
+        block_on(db.run(stmt!(
+            "INSERT INTO user (id, create_time, email_addr, name, authenticator, \
+             previous_email_addr, email_addr_change_time) \
+             VALUES (1, 1, 'new@x.example', 'U', 'k1', 'old@x.example', ?)",
+            NOW
+        )))
+        .unwrap();
+        let project = Project::default();
+        let seq = Cell::new(1u32);
+        let random = || {
+            seq.set(seq.get().wrapping_mul(2_654_435_761).wrapping_add(12_345));
+            seq.get()
+        };
+        let ctx = SiteCtx {
+            db: &db,
+            project: &project,
+            auth: None,
+            post: true,
+            pepper: None,
+            now: NOW,
+            random: &random,
+            mailer: None,
+        };
+        let (first, first_stmts) = change_token_stmts(&ctx, 1, "old@x.example", "new@x.example");
+        let (second, second_stmts) = change_token_stmts(&ctx, 1, "old@x.example", "new@x.example");
+        assert_ne!(first, second);
+        block_on(db.batch(first_stmts)).unwrap();
+        block_on(db.batch(second_stmts)).unwrap();
+        let rows = block_on(db.run(stmt!(
+            "SELECT token_hash, used_time FROM token WHERE type = 'E'"
+        )))
+        .unwrap();
+        assert_eq!(rows.rows.len(), 1, "the second request stores no token");
+        let row = &rows.rows[0];
+        assert_eq!(row["token_hash"], token_hash(&first));
+        assert_eq!(row["used_time"], 0, "and the first one is still usable");
+    }
 }

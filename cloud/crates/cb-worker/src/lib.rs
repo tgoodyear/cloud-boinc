@@ -44,11 +44,13 @@ pub fn now_ms() -> u64 {
     Date::now().as_millis()
 }
 
-/// 32 bits from the runtime's cryptographic generator.
+/// 32 bits from the runtime's cryptographic generator. These become account
+/// keys and the tokens in mail, so a failure must not return a constant: it
+/// ends the request (a panic in a Worker is an error response). In practice
+/// `crypto.getRandomValues` does not fail.
 pub fn random_u32() -> u32 {
     let mut b = [0u8; 4];
-    // `crypto.getRandomValues` does not fail in a Worker.
-    let _ = getrandom::getrandom(&mut b);
+    getrandom::getrandom(&mut b).expect("no source of random numbers");
     u32::from_le_bytes(b)
 }
 
