@@ -471,11 +471,23 @@ fn lost_results_are_resent() {
     assert_eq!(out.n_sent, 1);
     let host = out.host_id;
 
-    // The client holds nothing.
+    // The client holds nothing but asks for no work: upstream looks for lost
+    // results only when it may send work, so this leaves the result be.
     let mut req = Req::new(host);
     req.seqno = 2;
     req.work_secs = 0.0;
     req.other = Some(Vec::new());
+    let out = w.rpc(&req, 2050);
+    assert_eq!(out.n_resent, 0);
+    assert!(!has_message(&out, "lost task"));
+    assert_eq!(
+        w.results(wu)[0].server_state,
+        RESULT_SERVER_STATE_IN_PROGRESS
+    );
+
+    // Asking for work, it is resent.
+    req.seqno = 3;
+    req.work_secs = 1000.0;
     let out = w.rpc(&req, 2100);
     assert_eq!(out.n_resent, 1);
     assert_eq!(out.n_sent, 0);
@@ -489,7 +501,7 @@ fn lost_results_are_resent() {
     );
 
     // The client holds it: nothing to resend.
-    req.seqno = 3;
+    req.seqno = 4;
     req.other = Some(vec!["j1_0".into()]);
     let out = w.rpc(&req, 2200);
     assert_eq!(out.n_resent, 0);
@@ -502,7 +514,7 @@ fn lost_results_are_resent() {
         wu
     )))
     .unwrap();
-    req.seqno = 4;
+    req.seqno = 5;
     req.other = Some(Vec::new());
     let out = w.rpc(&req, 2300);
     assert_eq!(out.n_resent, 0);

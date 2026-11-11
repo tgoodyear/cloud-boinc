@@ -51,7 +51,7 @@ const GPU_DEFAULT_PEAK_FLOPS: f64 = 100e9;
 /// `BOINC_WSL_DISTRO_NAME` in `lib/wslinfo.h`.
 const BOINC_WSL_DISTRO_NAME: &str = "boinc-buda-runner";
 /// Benchmark assumed when the host reports none (`sequential_app`).
-const DEFAULT_FPOPS: f64 = 1e9;
+pub(crate) const DEFAULT_FPOPS: f64 = 1e9;
 
 /// Resource usage of an app version on a host (upstream `HOST_USAGE`).
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +78,7 @@ impl HostUsage {
     /// One CPU, running at the host's benchmark speed
     /// (`HOST_USAGE::sequential_app`).
     pub fn sequential(p_fpops: f64) -> Self {
-        let flops = if p_fpops <= 0.0 {
+        let flops = if !(p_fpops.is_finite() && p_fpops > 0.0) {
             DEFAULT_FPOPS
         } else {
             p_fpops
@@ -507,7 +507,7 @@ fn usable_ram(req: &SchedulerRequest) -> f64 {
 /// gets the same default as a sequential app.
 fn host_fpops(req: &SchedulerRequest) -> f64 {
     let x = req.host_info.p_fpops;
-    if x <= 0.0 {
+    if !(x.is_finite() && x > 0.0) {
         DEFAULT_FPOPS
     } else {
         x
@@ -1882,6 +1882,10 @@ mod tests {
         assert!(!hu.uses_gpu());
         // A host without a benchmark is assumed to do 1 GFLOPS.
         assert_eq!(HostUsage::sequential(0.0).projected_flops, 1e9);
+        // A host that reports nonsense gets the same default.
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(HostUsage::sequential(bad).peak_flops, 1e9);
+        }
         // No spec file at all still serves plain CPU apps.
         let none = PlanClassSpecs::default();
         assert!(none.check("", &plan_host(&req)).is_some());

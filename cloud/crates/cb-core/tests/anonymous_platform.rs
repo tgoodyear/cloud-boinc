@@ -112,6 +112,8 @@ struct Req {
     platform: String,
     ncpus: i32,
     cpu_secs: f64,
+    /// The host's `<p_fpops>`, as text.
+    fpops: String,
     /// `(request seconds, peak FLOPS)` of one NVIDIA GPU.
     gpu: Option<(f64, f64)>,
     versions: Vec<Cav>,
@@ -128,6 +130,7 @@ impl Req {
             platform: "anonymous".into(),
             ncpus: 4,
             cpu_secs: 1000.0,
+            fpops: "2e9".into(),
             gpu: None,
             versions: Vec::new(),
             reports: Vec::new(),
@@ -137,6 +140,11 @@ impl Req {
 
     fn versions(mut self, v: Vec<Cav>) -> Req {
         self.versions = v;
+        self
+    }
+
+    fn fpops(mut self, text: &str) -> Req {
+        self.fpops = text.into();
         self
     }
 
@@ -150,8 +158,8 @@ impl Req {
             w = self.cpu_secs,
         );
         s.push_str(&format!(
-            "<host_info>\n<domain_name>box</domain_name>\n<host_cpid>c0ffee</host_cpid>\n<p_ncpus>{}</p_ncpus>\n<p_vendor>GenuineIntel</p_vendor>\n<p_model>cpu</p_model>\n<p_fpops>2e9</p_fpops>\n<m_nbytes>8e9</m_nbytes>\n<d_total>1e11</d_total>\n<d_free>5e10</d_free>\n<os_name>Linux</os_name>\n<os_version>6.1</os_version>\n</host_info>\n",
-            self.ncpus
+            "<host_info>\n<domain_name>box</domain_name>\n<host_cpid>c0ffee</host_cpid>\n<p_ncpus>{}</p_ncpus>\n<p_vendor>GenuineIntel</p_vendor>\n<p_model>cpu</p_model>\n<p_fpops>{}</p_fpops>\n<m_nbytes>8e9</m_nbytes>\n<d_total>1e11</d_total>\n<d_free>5e10</d_free>\n<os_name>Linux</os_name>\n<os_version>6.1</os_version>\n</host_info>\n",
+            self.ncpus, self.fpops
         ));
         if let Some((secs, peak)) = self.gpu {
             s.push_str(&format!(
@@ -1461,4 +1469,258 @@ fn a_request_sent_many_jobs_costs_the_same_per_job_as_for_a_normal_client() {
     // has no version of (app b has none here).
     assert_eq!(few, normal_few + 1);
     assert_eq!(many, normal_many + 1);
+}
+
+#[test]
+fn a_host_with_no_benchmark_gets_a_positive_peak_speed_and_is_credited() {
+    // `HostUsage::sequential` gives a missing benchmark 1e9 for an ordinary
+    // client; the anonymous path does the same for the CPU part of the peak
+    // speed, which is the result's `flops_estimate`.
+    for bad in ["0", "-5", "nan", "inf"] {
+        let w = World::new();
+        let wu = w.submit("j1", 1000);
+        let versions = vec![Cav::new("a", 100)];
+        let out = w.rpc(&Req::anon(0).fpops(bad).versions(versions.clone()), 2000);
+        assert_eq!(out.n_sent, 1, "{bad}");
+        assert_eq!(first_sent(&w).flops_estimate, 1e9, "{bad}");
+        assert_eq!(wu_number(&out, "rsc_fpops_est"), 1e12, "{bad}");
+
+        let mut report = Req::anon(out.host_id).fpops(bad).versions(versions);
+        report.seqno = 2;
+        report.cpu_secs = 0.0;
+        report.reports = vec![("j1_0".into(), RESULT_FILES_UPLOADED, 0)];
+        w.rpc(&report, 2500);
+        w.transition(wu, 2500);
+        let r = &w.results(wu)[0];
+        assert_eq!(r.validate_state, VALIDATE_STATE_VALID, "{bad}");
+        // 1e9 is read as an unknown speed, and credited on the average CPU.
+        let credit = 4.3e9 * 100.0 * 200.0 / 86400e9;
+        assert!(
+            (r.granted_credit - credit).abs() < 1e-9,
+            "{bad}: {}",
+            r.granted_credit
+        );
+    }
+
+    // A GPU version on such a host: the GPU part is its own figure, the CPU
+    // part the default.
+    let w = World::new();
+    w.submit("j1", 1000);
+    let mut req = Req::anon(0)
+        .fpops("0")
+        .versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)]);
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 5e12));
+    assert_eq!(w.rpc(&req, 2000).n_sent, 1);
+    assert_eq!(first_sent(&w).flops_estimate, 1e9 + 5e12);
+}
+
+#[test]
+fn lost_results_are_left_alone_by_a_request_that_asks_for_no_work() {
+    // Upstream looks for lost results only when it may send work
+    // (`ok_to_send_work` in `process_request`), so a request that reports
+    // and asks for nothing neither resends nor times out a lost result.
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    let wu = w.submit("j1", 1000);
+    let versions = vec![Cav::new("a", 100).flops(2e9)];
+    let out = w.rpc(&Req::anon(0).versions(versions.clone()), 2000);
+    assert_eq!(out.n_sent, 1);
+    let host = out.host_id;
+    let deadline = w.results(wu)[0].report_deadline;
+
+    let mut quiet = Req::anon(host).versions(versions.clone());
+    quiet.seqno = 2;
+    quiet.cpu_secs = 0.0;
+    quiet.other = Some(Vec::new());
+    let out = w.rpc(&quiet, 2100);
+    assert_eq!(out.n_resent, 0);
+    assert!(out.transition.is_empty(), "{:?}", out.transition);
+    assert!(!has_message(&out, "lost task"), "{:?}", out.reply.messages);
+    let r = &w.results(wu)[0];
+    assert_eq!(r.server_state, RESULT_SERVER_STATE_IN_PROGRESS);
+    assert_eq!(r.report_deadline, deadline);
+
+    // The same when the client wants work for a resource it has no version
+    // of, which is a request for work: the result is not resent on one it
+    // has no version for, and times out as upstream does.
+    let mut gpu_only = Req::anon(host).versions(versions.clone());
+    gpu_only.seqno = 3;
+    gpu_only.cpu_secs = 0.0;
+    gpu_only.gpu = Some((1000.0, 5e12));
+    gpu_only.other = Some(Vec::new());
+    let out = w.rpc(&gpu_only, 2200);
+    assert_eq!(out.n_resent, 0);
+    assert!(has_message(&out, "Didn't resend lost task j1_0 (expired)"));
+
+    // And once it asks for work for the resource, a lost result is resent.
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    w.submit("j1", 1000);
+    let out = w.rpc(&Req::anon(0).versions(versions.clone()), 2000);
+    let mut again = Req::anon(out.host_id).versions(versions);
+    again.seqno = 2;
+    again.other = Some(Vec::new());
+    assert_eq!(w.rpc(&again, 2100).n_resent, 1);
+}
+
+/// Two results in progress for a client with a GPU limit of one: `j1` sent
+/// as a CPU job, then `j2` as a GPU job. The CPU version is then dropped
+/// and `j1` is lost.
+fn lost_cpu_result_and_a_gpu_job_in_progress(gpu_limit: i32) -> (World, i64, SchedOutcome) {
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    w.config.max_wus_in_progress_gpu = gpu_limit;
+    let wu = w.submit("j1", 1000);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).flops(2e9)]),
+        2000,
+    );
+    assert_eq!(out.n_sent, 1);
+    let host = out.host_id;
+    w.submit("j2", 2000);
+    let gpu = vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)];
+    let mut req = Req::anon(host).versions(gpu.clone());
+    req.seqno = 2;
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 5e12));
+    assert_eq!(w.rpc(&req, 2100).n_sent, 1);
+    assert_eq!(w.results(wu)[0].app_version_id, ANON_PLATFORM_CPU);
+
+    // The client holds j2 only.
+    req.seqno = 3;
+    req.other = Some(vec!["j2_0".into()]);
+    let out = w.rpc(&req, 2200);
+    (w, wu, out)
+}
+
+#[test]
+fn a_lost_cpu_result_is_not_moved_to_a_gpu_that_is_at_its_limit() {
+    // One GPU task per GPU: the lost result may not become a second.
+    let (w, wu, out) = lost_cpu_result_and_a_gpu_job_in_progress(1);
+    assert_eq!(out.n_resent, 0, "{:?}", out.reply.messages);
+    assert!(has_message(&out, "Didn't resend lost task j1_0 (expired)"));
+    assert_eq!(w.results(wu)[0].app_version_id, ANON_PLATFORM_CPU);
+    let on_gpu =
+        w.scalar("SELECT count(*) FROM result WHERE server_state = 4 AND app_version_id <= -3");
+    assert_eq!(on_gpu, 1.0);
+}
+
+#[test]
+fn a_lost_cpu_result_moves_to_a_gpu_that_has_room() {
+    let (w, wu, out) = lost_cpu_result_and_a_gpu_job_in_progress(2);
+    assert_eq!(out.n_resent, 1, "{:?}", out.reply.messages);
+    assert_eq!(w.results(wu)[0].app_version_id, ANON_PLATFORM_NVIDIA);
+    let on_gpu =
+        w.scalar("SELECT count(*) FROM result WHERE server_state = 4 AND app_version_id <= -3");
+    assert_eq!(on_gpu, 2.0);
+
+    // The moves in one request count: two lost CPU results and one free GPU
+    // slot make one resend, and the other times out.
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    w.config.max_wus_in_progress_gpu = 1;
+    w.submit("j1", 1000);
+    w.submit("j2", 1000);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).flops(2e9)]),
+        2000,
+    );
+    assert_eq!(out.n_sent, 2);
+    let mut req =
+        Req::anon(out.host_id).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)]);
+    req.seqno = 2;
+    req.cpu_secs = 0.0;
+    req.gpu = Some((1000.0, 5e12));
+    req.other = Some(Vec::new());
+    let out = w.rpc(&req, 2100);
+    assert_eq!(out.n_resent, 1, "{:?}", out.reply.messages);
+    assert_eq!(
+        w.scalar("SELECT count(*) FROM result WHERE server_state = 4 AND app_version_id <= -3"),
+        1.0
+    );
+    assert_eq!(
+        w.scalar("SELECT count(*) FROM result WHERE server_state = 4 AND app_version_id = -2"),
+        1.0
+    );
+    assert_eq!(out.transition.len(), 1);
+}
+
+#[test]
+fn a_lost_result_stays_on_the_resource_it_was_recorded_on() {
+    // The client has a CPU and a faster GPU version and wants work for both:
+    // the lost CPU result is sent again as a CPU job, with its record as it
+    // was, not moved to the GPU because that version is faster.
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    let wu = w.submit("j1", 1000);
+    let out = w.rpc(
+        &Req::anon(0).versions(vec![Cav::new("a", 100).flops(2e9)]),
+        2000,
+    );
+    assert_eq!(out.n_sent, 1);
+    let both = vec![
+        Cav::new("a", 100).flops(2e9),
+        Cav::new("a", 101).gpu("NVIDIA", 1.0).flops(1e11),
+    ];
+    let mut req = Req::anon(out.host_id).versions(both);
+    req.seqno = 2;
+    req.gpu = Some((1000.0, 5e12));
+    req.other = Some(Vec::new());
+    let out = w.rpc(&req, 2100);
+    assert_eq!(out.n_resent, 1, "{:?}", out.reply.messages);
+    let r = &w.results(wu)[0];
+    assert_eq!(r.app_version_id, ANON_PLATFORM_CPU);
+    assert_eq!(r.flops_estimate, 2e9);
+    assert!(out
+        .reply
+        .write()
+        .unwrap()
+        .contains("<version_num>100</version_num>"));
+    assert_eq!(w.havs(out.host_id), vec![1_000_002]);
+}
+
+#[test]
+fn a_friendly_app_name_with_markup_is_escaped_in_the_notices() {
+    let w = World::new();
+    w.sql("UPDATE app SET user_friendly_name = 'A & B <x>' WHERE id = 1");
+
+    // The client has no version of the app, which has work.
+    w.submit("j1", 1000);
+    let mut req = Req::anon(0).versions(vec![Cav::new("b", 1)]);
+    req.cpu_secs = 0.0;
+    let host = w.rpc(&req, 1500).host_id;
+    req.hostid = host;
+    req.seqno = 2;
+    req.cpu_secs = 1000.0;
+    let out = w.rpc(&req, 2000);
+    assert!(has_message(&out, "usable version of A & B <x>."));
+    let xml = out.reply.write().unwrap();
+    assert!(
+        xml.contains("doesn't have a usable version of A &amp; B &lt;x>."),
+        "{xml}"
+    );
+    assert!(!xml.contains("A & B"), "{xml}");
+
+    // The client has a version of it, but not one that can run the job.
+    let w = World::new();
+    w.sql("UPDATE app SET user_friendly_name = 'A & B <x>' WHERE id = 1");
+    w.submit_app("a", "big", 1000, Some(3e9));
+    let req = Req::anon(0).versions(vec![Cav::new("a", 100).platform("windows_intelx86")]);
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 0);
+    let xml = out.reply.write().unwrap();
+    assert!(
+        xml.contains("doesn't have a usable version of A &amp; B &lt;x>."),
+        "{xml}"
+    );
+    assert!(!xml.contains("A & B"), "{xml}");
+
+    // A name the client sends is escaped once, not twice.
+    let out = w.rpc(&Req::anon(0).versions(vec![Cav::new("x&amp;y", 1)]), 2100);
+    let xml = out.reply.write().unwrap();
+    assert!(
+        xml.contains("Unknown app name x&amp;y in app_info.xml"),
+        "{xml}"
+    );
 }

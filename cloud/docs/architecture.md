@@ -355,9 +355,10 @@ ignored.
   `avg_ncpus` (1 if absent), the coprocessor type and count, and `flops`, which is the host's
   benchmark speed when absent, or 1e9 when that is zero too. Its peak speed, which becomes the
   result's `flops_estimate` and so what the result is credited on, is `avg_ncpus` times the host's
-  benchmark speed, plus the GPU count times the peak speed of the host's GPU of that type. The
-  client's figures are bound by what the host reports (`anon_usage`): `avg_ncpus` by the host's
-  CPU count, the GPU count by the number of GPUs of that type the host reports, and the GPU's peak
+  benchmark speed (1e9 when that is missing, zero or not a number, as for an ordinary client's
+  sequential app, so that the estimate is positive), plus the GPU count times the peak speed of
+  the host's GPU of that type. The client's figures are bound by what the host reports
+  (`anon_usage`): `avg_ncpus` by the host's CPU count, the GPU count by the number of GPUs of that type the host reports, and the GPU's peak
   speed is the host's figure with the plan class path's correction (`gpu_peak_flops`, 100 GFLOPS in
   place of a figure that is zero, negative or above 1e15). The stated `flops` is not part of the
   peak speed; it only sets the client's runtime estimate, and is kept between 1e6 and 1e17 so that
@@ -393,7 +394,10 @@ ignored.
   is kept per row within a request, so that two versions sharing a row cannot both spend the same
   quota. A lost result sent again is recorded again with the version it is sent with now, its
   `app_version_id` and `flops_estimate`, in the statement that moves its deadline, and the row
-  for a new resource is created if missing. The daily quota and its changes on
+  for a new resource is created if missing. As upstream, lost results are looked for only in a
+  request that may get work: the project sends jobs, the client has not said `dont_send_work`
+  and it asks for some. A request that only reports leaves them alone. Which version it is sent
+  with is described under "Differences from upstream". The daily quota and its changes on
   report and timeout, the in-progress limits, the elapsed-time and turnaround statistics and the
   streak of valid results all use that row. The in-progress counts treat a result whose
   `app_version_id` is -3 or lower as a GPU job. Credit is granted as for any result, from the
@@ -408,6 +412,9 @@ ignored.
   none of whose versions is for a resource it asks work for, for example one with only a CPU
   version that asks for GPU work, is told only "No tasks sent", because the search does not run,
   as upstream's `work_needed` stops it; "Project has no tasks available" is said only when it did.
+  Message text is plain text, such as an app's friendly name or a name the client sent, and
+  `write_messages` in `crates/cb-proto/src/sched_reply.rs` escapes it when the reply is written,
+  as it does for every message of the scheduler reply; code that builds a message does not.
 
 Differences from upstream:
 
@@ -424,15 +431,23 @@ Differences from upstream:
   excludes the result from the statistics. Here the host's benchmark speed from the request is
   used, with the bounds above; upstream does not bound the client's CPU or GPU counts either. The
   client's stated `flops` is not used for credit upstream or here.
-- A zero or missing benchmark and no stated speed give 1e9 FLOPS for the client's estimate;
+- A zero or missing benchmark gives 1e9 FLOPS both for the CPU part of the peak speed, so for the
+  result's `flops_estimate`, and, when the client states no speed, for the client's estimate;
   upstream is left with a speed of zero.
 - Beta apps (`app.beta`) go to a user who allows beta work, as for the project's own versions.
   Upstream does that for jobs in `quick_check` of `sched/sched_array.cpp`, for every platform; what
   the anonymous path lacks upstream is the per-version `beta` flag, which a client's own version
   has no equivalent of.
-- A lost result is resent with the version chosen now from the client's list, as `get_app_version`
+- A lost result is resent with a version chosen now from the client's list, as `get_app_version`
   does upstream, and is dropped (`Didn't resend lost task ... (expired)`) when none qualifies,
-  daily quota included.
+  daily quota included. Upstream takes the fastest version the client wants work for, and stops
+  using a resource whose limit on jobs in progress is reached (`work_needed` clears its request),
+  counting the tasks the client lists plus those resent in the request, which leaves the lost ones
+  out. Here the counts come from the database, so a lost result counts on the resource it is
+  recorded on. The result stays there when the client has a usable version for that resource and
+  wants work for it, which needs no room, since the result is counted already; only otherwise does
+  it move to the fastest other version, and then only to a kind of resource (CPU or GPU) whose
+  limit has room, counting the results already moved in the request.
 - A workunit committed to a project app version (`workunit.app_version_id` other than 0) is not
   sent to an anonymous client. Upstream does this for apps with homogeneous app version, which is
   not built here, so nothing sets that field today.

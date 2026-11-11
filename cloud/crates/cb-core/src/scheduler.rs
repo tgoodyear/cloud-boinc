@@ -38,14 +38,14 @@ use cb_proto::sched_reply::{
 };
 use cb_proto::sched_request::{self, ClientAppVersion, ReportedResult, SchedulerRequest};
 use cb_proto::web_rpc::err::EXIT_ABORTED_BY_PROJECT;
-use cb_proto::xml::{extract_venue, line, xml_escape};
+use cb_proto::xml::{extract_venue, line};
 use serde::Deserialize;
 
 use crate::model::{
-    anon_gavid, anon_platform_id, anon_uses_gpu, generalized_app_version_id, App, AppVersion, Host,
-    HostAppVersion, Platform, User, Workunit,
+    anon_gavid, anon_platform_id, anon_proc_type, anon_uses_gpu, generalized_app_version_id, App,
+    AppVersion, Host, HostAppVersion, Platform, User, Workunit,
 };
-use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost};
+use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost, DEFAULT_FPOPS};
 use crate::{Config, CoreError, CoreResult};
 
 /// Number of processor types the work request distinguishes.
@@ -642,7 +642,9 @@ fn usage_for<'a>(
 /// What a version from the client's `app_info.xml` uses on this host
 /// (`CLIENT_APP_VERSION::parse`, `HOST_USAGE` of `sched/sched_types.h`).
 /// `projected_flops` is the client's `<flops>`, or the host's benchmark speed
-/// when it gave none (`estimate_flops_anon_platform`).
+/// when it gave none (`estimate_flops_anon_platform`). `p_fpops` is that
+/// benchmark speed, already positive: the caller replaces a missing or zero
+/// one with `DEFAULT_FPOPS`.
 ///
 /// What the client states drives what the result is credited for (its peak
 /// speed is the result's `flops_estimate`), so it is bound by what the host
@@ -680,12 +682,7 @@ fn anon_usage(
         gpu_ram: 0.0,
         avg_ncpus,
         mem_usage: 0.0,
-        // A host whose benchmark failed has no speed to fall back on.
-        projected_flops: if stated > 0.0 {
-            stated.clamp(MIN_ANON_FLOPS, MAX_ANON_FLOPS)
-        } else {
-            1e9
-        },
+        projected_flops: stated.clamp(MIN_ANON_FLOPS, MAX_ANON_FLOPS),
         peak_flops,
         cmdline: String::new(),
     }
@@ -1385,7 +1382,14 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         // order: ties in speed go to the earlier one, as upstream's scan.
         let apps_by_name: HashMap<&str, &App> =
             catalog.apps.iter().map(|a| (a.name.as_str(), a)).collect();
-        let p_fpops = clean(req.host_info.p_fpops);
+        // A host whose benchmark is missing or zero gets the same default
+        // as for a sequential app, so that its CPU version has a positive
+        // peak speed, and so a result a positive `flops_estimate` to be
+        // credited on (`HostUsage::sequential`, `host_fpops`).
+        let p_fpops = match clean(req.host_info.p_fpops) {
+            x if x > 0.0 => x,
+            _ => DEFAULT_FPOPS,
+        };
         for cav in req.client_app_versions.iter().take(MAX_CLIENT_VERSIONS) {
             let pt = proc_index(cav.proc_type);
             client_has[pt] = true;
@@ -1396,13 +1400,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 continue;
             }
             let Some(app) = apps_by_name.get(cav.app_name.as_str()).copied() else {
-                // The name is the client's text, and messages are not escaped
-                // when written.
                 out.reply.messages.push(UserMessage::new(
-                    format!(
-                        "Unknown app name {} in app_info.xml",
-                        xml_escape(&cav.app_name)
-                    ),
+                    format!("Unknown app name {} in app_info.xml", cav.app_name),
                     "notice",
                 ));
                 continue;
@@ -1608,8 +1607,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
 
     // Batch 3: results the client lost, and candidates to send.
     let other_names: HashSet<&str> = req.other_results.iter().map(|o| o.name.as_str()).collect();
+    // Upstream looks for lost results only when it may send work
+    // (`ok_to_send_work` in `process_request`: the project sends jobs and the
+    // request asks for work), so a request that only reports results leaves
+    // them be.
+    let may_send_work = work_requested && !config.dont_send_jobs && !req.dont_send_work;
     let lost: Vec<&InProgressRow> =
-        if config.resend_lost_results && req.have_other_results_list && key_ok {
+        if config.resend_lost_results && req.have_other_results_list && key_ok && may_send_work {
             in_progress
                 .iter()
                 .filter(|r| !other_names.contains(r.name.as_str()))
@@ -1743,25 +1747,61 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     }
 
     let mut outgoing: Vec<Outgoing> = Vec::new();
-    // Lost results recorded again: (result ID, new `app_version_id`).
-    let mut reclassed: Vec<(i64, i64)> = Vec::new();
+    // Jobs in progress on CPU and on GPU, and their limits. A lost result
+    // recorded again for the other kind of resource moves from one count to
+    // the other.
+    let cpu_limit = i64::from(config.max_wus_in_progress.max(0)) * i64::from(ncpus);
+    let gpu_limit = i64::from(config.max_wus_in_progress_gpu.max(0)) * i64::from(ngpus.max(1));
+    let mut n_gpu = in_progress
+        .iter()
+        .filter(|r| is_gpu_version(r.app_version_id))
+        .count() as i64;
+    let mut n_cpu = in_progress.len() as i64 - n_gpu;
+    let total_limit = i64::from(prefs.max_jobs_in_progress);
 
     // Lost results (`resend_lost_work`).
     for c in lost_rows {
         let Some(ip) = in_progress.iter().find(|r| r.id == c.result_id) else {
             continue;
         };
+        let was_gpu = is_gpu_version(ip.app_version_id);
         let usable: Option<Sending> = if anonymous {
             // `resend_lost_work` calls `get_app_version` for the job, which
             // scans the client's versions whatever the lost result was sent
             // with: one for a resource it wants work for, with daily quota
             // left. The result is then recorded with that version
             // (`add_result_to_reply`), below.
+            //
+            // Unlike upstream, which takes the fastest and counts the jobs in
+            // progress from the client's list, so without the lost ones, a
+            // result stays on the resource it is recorded on when the client
+            // still has a usable version for it; only otherwise does it move,
+            // and then to a kind of resource that has room under its limit
+            // on jobs in progress.
             catalog.app(c.wu.appid).and_then(|app| {
-                let needed = |pt: usize| need_secs[pt] > 0.0 || need_inst[pt] > 0.0;
+                let wanted = |pt: usize| need_secs[pt] > 0.0 || need_inst[pt] > 0.0;
                 let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
-                let pick = pick_anonymous(&versions, &rows, app, need_64b, &needed);
-                pick.chosen.map(|i| versions[i].sending())
+                let recorded = anon_proc_type(ip.app_version_id).map(proc_index);
+                let same = recorded.and_then(|r| {
+                    pick_anonymous(&versions, &rows, app, need_64b, &|pt| pt == r && wanted(pt))
+                        .chosen
+                });
+                let room = |pt: usize| {
+                    let gpu = pt != 0;
+                    let (count, limit) = if gpu {
+                        (n_gpu, gpu_limit)
+                    } else {
+                        (n_cpu, cpu_limit)
+                    };
+                    gpu == was_gpu || limit <= 0 || count < limit
+                };
+                same.or_else(|| {
+                    pick_anonymous(&versions, &rows, app, need_64b, &|pt| {
+                        wanted(pt) && room(pt)
+                    })
+                    .chosen
+                })
+                .map(|i| versions[i].sending())
             })
         } else {
             catalog.app_version(ip.app_version_id).and_then(|av| {
@@ -1837,7 +1877,16 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 sql.push_str("app_version_id = ?, flops_estimate = ?, ");
                 params.push(version.result_av_id.into());
                 params.push(version.hu.peak_flops.into());
-                reclassed.push((c.result_id, version.result_av_id));
+                let now_gpu = version.hu.proc_type != PROC_TYPE_CPU;
+                if now_gpu != was_gpu {
+                    let (to, from) = if now_gpu {
+                        (&mut n_gpu, &mut n_cpu)
+                    } else {
+                        (&mut n_cpu, &mut n_gpu)
+                    };
+                    *to += 1;
+                    *from -= 1;
+                }
                 // A row for the new resource may not exist yet.
                 if let Some(row) = rows.get_mut(&version.gavid) {
                     if !row.has_row {
@@ -1879,12 +1928,6 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             claim: None,
             assigned: false,
         });
-    }
-
-    for (id, av) in reclassed {
-        if let Some(r) = in_progress.iter_mut().find(|r| r.id == id) {
-            r.app_version_id = av;
-        }
     }
 
     // Interleave the apps' candidates in proportion to app weight.
@@ -1930,14 +1973,6 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             .collect::<Vec<_>>()
             .join(",")
     };
-    let cpu_limit = i64::from(config.max_wus_in_progress.max(0)) * i64::from(ncpus);
-    let gpu_limit = i64::from(config.max_wus_in_progress_gpu.max(0)) * i64::from(ngpus.max(1));
-    let mut n_gpu = in_progress
-        .iter()
-        .filter(|r| is_gpu_version(r.app_version_id))
-        .count() as i64;
-    let mut n_cpu = in_progress.len() as i64 - n_gpu;
-    let total_limit = i64::from(prefs.max_jobs_in_progress);
     let mut disk = disk_available(&req, config);
     let ram = usable_ram(&req);
     let est_secs = |wu: &Workunit, hu: &HostUsage, pt: usize| {

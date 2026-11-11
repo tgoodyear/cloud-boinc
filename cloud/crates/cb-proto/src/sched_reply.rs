@@ -206,6 +206,8 @@ pub struct SchedulerReply {
     /// positive. The caller applies `min_sendwork_interval` and
     /// [`crate::consts::DELAY_MAX`].
     pub request_delay: f64,
+    /// Plain text: escaped when written, so a message may carry a name or any
+    /// other text as it is.
     pub messages: Vec<UserMessage>,
     /// The project's display name; not escaped, as upstream.
     pub project_name: String,
@@ -441,13 +443,12 @@ impl SchedulerReply {
             let mut msg = String::new();
             let mut pri = "low";
             for m in &self.messages {
-                msg.push_str(&m.message);
+                msg.push_str(&xml_escape(&m.message.replace('\n', " ")));
                 msg.push(' ');
                 if m.priority == "notice" {
                     pri = "notice";
                 }
             }
-            let msg = msg.replace('\n', " ");
             let _ = writeln!(o, "<message priority=\"{pri}\">{msg}</message>");
             return;
         }
@@ -457,7 +458,11 @@ impl SchedulerReply {
             } else {
                 m.priority.as_str()
             };
-            let _ = writeln!(o, "<message priority=\"{pri}\">{}</message>", m.message);
+            let _ = writeln!(
+                o,
+                "<message priority=\"{pri}\">{}</message>",
+                xml_escape(&m.message)
+            );
         }
     }
 }
@@ -466,6 +471,7 @@ impl SchedulerReply {
 /// (`send_message` in `sched/sched_main.cpp`). `extra` is appended raw
 /// before the end tag and may be empty.
 pub fn write_project_down(message: &str, delay: i32, extra: &str) -> String {
+    let message = xml_escape(message);
     format!(
         "<scheduler_reply>\n    <message priority=\"low\">{message}</message>\n    <request_delay>{delay}</request_delay>\n    <project_is_down/>\n{extra}</scheduler_reply>\n"
     )
@@ -1066,6 +1072,31 @@ mod tests {
             insert_wu_tags("<result>\n</result>", &WuTags::default()),
             Err(ProtoError::MarkerNotFound(_))
         ));
+    }
+
+    #[test]
+    fn messages_are_plain_text_escaped_when_written() {
+        use crate::xml::xml_unescape;
+        // Names and other text go in as they are, whatever they hold.
+        let text = "Your app_info.xml file doesn't have a usable version of A & B <x>.\nSecond line, caf\u{e9}";
+        let mut r = full_reply();
+        r.messages = vec![UserMessage::new(text, "notice")];
+        let out = r.write().unwrap();
+        assert!(!out.contains("A & B"), "{out}");
+        assert!(out.contains("version of A &amp; B &lt;x>."), "{out}");
+        let v = client_parse(&out).unwrap();
+        assert_eq!(v.messages.len(), 1);
+        assert_eq!(xml_unescape(&v.messages[0].1), text);
+
+        // The old clients' single message, and a project that is down.
+        r.core_client_version = 41000;
+        let out = r.write().unwrap();
+        assert!(
+            out.contains("version of A &amp; B &lt;x>. Second line"),
+            "{out}"
+        );
+        let out = write_project_down("a & b", 1, "");
+        assert!(out.contains(">a &amp; b</message>"), "{out}");
     }
 
     #[test]

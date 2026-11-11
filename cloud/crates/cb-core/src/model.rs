@@ -305,6 +305,20 @@ pub fn anon_platform_id(proc_type: i32) -> i64 {
     }
 }
 
+/// The processor type an anonymous-platform result's `app_version_id` names;
+/// `None` for anything else (a real version, or the unknown type).
+pub fn anon_proc_type(app_version_id: i64) -> Option<i32> {
+    use cb_proto::consts::*;
+    match app_version_id {
+        ANON_PLATFORM_CPU => Some(PROC_TYPE_CPU),
+        ANON_PLATFORM_NVIDIA => Some(PROC_TYPE_NVIDIA_GPU),
+        ANON_PLATFORM_ATI => Some(PROC_TYPE_AMD_GPU),
+        ANON_PLATFORM_INTEL_GPU => Some(PROC_TYPE_INTEL_GPU),
+        ANON_PLATFORM_APPLE_GPU => Some(PROC_TYPE_APPLE_GPU),
+        _ => None,
+    }
+}
+
 /// `host_usage_to_gavid` in `sched/sched_version.cpp`: the
 /// `host_app_version.app_version_id` of an app for anonymous-platform
 /// clients, by the processor type their version uses.
@@ -331,6 +345,17 @@ mod tests {
         assert_eq!(anon_platform_id(PROC_TYPE_AMD_GPU), -4);
         assert_eq!(anon_platform_id(PROC_TYPE_INTEL_GPU), -5);
         assert_eq!(anon_platform_id(PROC_TYPE_APPLE_GPU), -6);
+        for pt in [
+            PROC_TYPE_CPU,
+            PROC_TYPE_NVIDIA_GPU,
+            PROC_TYPE_AMD_GPU,
+            PROC_TYPE_INTEL_GPU,
+            PROC_TYPE_APPLE_GPU,
+        ] {
+            assert_eq!(anon_proc_type(anon_platform_id(pt)), Some(pt));
+        }
+        assert_eq!(anon_proc_type(ANON_PLATFORM_UNKNOWN), None);
+        assert_eq!(anon_proc_type(7), None);
         // `appid * 1000000 - app_version_id`; what `av_desc` in
         // `html/user/host_app_versions.php` takes apart again.
         assert_eq!(anon_gavid(3, PROC_TYPE_CPU), 3_000_002);
