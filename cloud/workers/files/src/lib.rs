@@ -230,8 +230,10 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // The upload runs under `wait_until`: if the client drops the
         // connection while the body streams in, the runtime cancels the
         // request's own work but lets this finish, so a piece whose bytes
-        // all arrived is still stored. With the zone's default request body
-        // buffering, a dropped request never reaches the Worker.
+        // all arrived is still stored. This only applies when the zone's
+        // `request_body_buffering` is `none` for the upload path; by default
+        // the edge holds the whole body first, so a dropped request never
+        // reaches the Worker.
         Method::Post if path == UPLOAD_PATH => {
             let (tx, rx) = futures_channel::oneshot::channel();
             ctx.wait_until(async move {

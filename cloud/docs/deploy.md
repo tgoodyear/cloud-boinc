@@ -70,6 +70,23 @@ start.
 The hostname needs a proxied DNS record in the zone. An `AAAA` record pointing at `100::` is
 enough, since the routes answer every path.
 
+Add a Configuration Rule so that an upload that is cut off part-way can resume. By default
+Cloudflare holds a whole request body before it starts the Worker, so a request whose
+connection drops never runs and nothing is kept. The rule makes the body stream to the Worker.
+In the dashboard it is under Rules > Configuration Rules. As a ruleset in the zone's
+`http_config_settings` phase it is:
+
+```
+expression: (http.host eq "<hostname>" and starts_with(http.request.uri.path, "/upload/"))
+action:     set_config
+action_parameters: { "request_body_buffering": "none" }
+```
+
+The Free plan accepts this rule. Cloudflare notes that products that inspect request bodies,
+such as the WAF, do not see the bodies of requests that match. The upload bodies here are
+checked by the upload certificate signature, the size limit and the MD5. Without the rule,
+uploads work, but after a dropped connection they restart from byte 0.
+
 ## Workers
 
 ```
@@ -145,10 +162,12 @@ put checks the MD5 of the whole file, so a success means the stored file is byte
 
 In `abort` mode the request announces the length of the whole file, as a client does;
 `--cut-pause-ms` waits that long after the last byte before dropping the connection, and
-`--resume-wait-ms` waits before the size query. With the zone's default request body
-buffering, the Worker never sees a dropped request, so `abort` mode reports 0 and the whole
-file is sent again; `short` mode reports 8388608 (see "Upload" in
-[architecture.md](architecture.md)).
+`--resume-wait-ms` waits before the size query. In `abort` mode `resumed_from_bytes` is
+8388608 with the request body buffering rule above and 0 without it, because without the rule
+the Worker never sees a dropped request and the whole file is sent again. A size query sent
+immediately after the drop can be too early: the Worker may not have stored the piece yet, and
+it reports 0. Use `--resume-wait-ms` to leave a few seconds. `short` mode reports 8388608 either
+way (see "Upload" in [architecture.md](architecture.md)).
 
 ## Plan limits
 

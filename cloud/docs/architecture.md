@@ -607,7 +607,7 @@ disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receiv
   file size: the client counts an upload as done when the server reports at least its size
   (`FILE_XFER_SET::poll`), and it never hears that for a file that is not stored. A request
   whose data stops early keeps the pieces it finished; the bytes of the piece in flight are
-  lost and sent again. A dropped connection is different; see below.
+  lost and sent again. A dropped connection keeps pieces only with a zone rule; see below.
 - A file of 8 MiB or less has no pieces: its upload is one head and one put, as before.
 
 Offsets follow `copy_socket_to_file` in `sched/file_upload_handler.cpp`. An offset beyond the
@@ -633,19 +633,35 @@ some requests stopped for exceeding the CPU limit), and 46 to 53 ms for the last
 60 MB upload. That is about 1 ms per MB moved, so the Free plan's CPU limit is not what bounds
 the size of an upload.
 
-What a dropped connection keeps: nothing, on a zone with default settings. A real client
-announces the length of its request (`HTTP_OP::libcurl_exec` in `client/http_curl.cpp`), and
-the edge holds the whole body before it starts the Worker: on the dev deployment a 4 MB and a
-30 MB request sent over 10 seconds each started the Worker only when their last byte had
-arrived, and an upload whose connection was dropped after 12,000,000 bytes, at once or after
-a 5-second pause, never started the Worker at all; `<get_file_size>` then reports 0 and the
-client sends the file again from the start. Resume from a cut-off connection therefore needs
-the zone to stream request bodies to the Worker (the Configuration Rules setting
-`request_body_buffering`, set to `none` for the upload path), which has not been tried. If the
-body does stream, the upload runs under `wait_until` (`fetch` in `workers/files/src/lib.rs`),
-so that a piece whose bytes all arrived before the disconnect is still stored. A complete
-request whose data stops early (a client that hit its own error) keeps its finished pieces
-either way.
+What a dropped connection keeps depends on one zone setting. By default Cloudflare holds the
+whole request body before it starts the Worker. A real client announces the length of its
+request (`HTTP_OP::libcurl_exec` in `client/http_curl.cpp`), and on the dev deployment a 4 MB
+and a 30 MB request sent over 10 seconds each started the Worker only when their last byte had
+arrived. A request whose connection drops never runs: there was no Worker invocation for the
+dropped requests, so nothing is kept, `<get_file_size>` reports 0, and the client sends the
+file again from the start.
+
+A Configuration Rule with `request_body_buffering` set to `none`, matched to the deployment's
+hostname and to paths that start with `/upload/`, makes the body stream to the Worker (setup in
+`docs/deploy.md`). The Free plan accepted the rule. Cloudflare's caution is that with `none`,
+products that inspect request bodies, such as the WAF, do not see them for matching requests.
+Upload bodies here are checked by the upload certificate signature, the size limit and the MD5.
+
+With the rule on, the upload runs under `wait_until` (`fetch` in `workers/files/src/lib.rs`),
+so a piece whose bytes all arrived before the disconnect is still stored. Measured on the dev
+deployment: a 20 MB upload cut by dropping the connection at 12 MB, then a size query 3
+seconds later, reported 8388608 bytes held, and the client resumed from there (4 of 4 uploads;
+every result reported, no errors). The dropped requests appear in Worker telemetry with outcome
+`canceled` and 15 to 19 ms of CPU. A size query sent immediately after the drop got 0, and the
+file was sent again whole and stored. An immediate query can be too early, because the Worker
+is still storing the piece. The stock client waits before it retries a transfer.
+
+CPU time per request with the rule on: 3 to 5 ms for a 1 MB upload, 14 to 38 ms for a 20 MB
+upload from offset 0, and 22 to 28 ms for a resumed 20 MB upload. No request stopped for
+exceeding the CPU limit.
+
+A complete request whose data stops early (a client that hit its own error) keeps its finished
+pieces with or without the rule.
 
 Every request passes the same checks before any byte is stored, whatever its offset
 (`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
@@ -693,6 +709,8 @@ Alternatives not taken:
   the common small ones.
 - Buffering the body in the Worker and writing on a cut. Work started after the disconnect
   can only run under `wait_until`, which has a time limit, and memory is limited to 128 MB.
+  The streamed pieces already run under `wait_until`, so this adds nothing once the zone
+  rule is on.
 
 Limits:
 
@@ -701,6 +719,9 @@ Limits:
   need the client's `gzip_when_done` or a higher plan.
 - A file over 8 MiB is read back from R2 once more when it is finished. That costs R2 reads
   and wall time, but little CPU time (see the figures above).
+- Resume after a dropped connection needs the `request_body_buffering` rule. Without it,
+  uploads work but restart from byte 0. A size query sent right after a drop can report less
+  than the Worker goes on to store.
 
 ## Keys and secrets
 
