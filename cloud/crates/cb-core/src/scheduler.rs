@@ -13,10 +13,19 @@
 //! by work submission and the pipeline, and a request claims one for its host
 //! as it claims an unsent result; see `crates/cb-core/src/pipeline.rs`.
 //!
-//! Not done here: anonymous platform, assigned jobs for teams and broadcast
-//! (`multi`) assignments, homogeneous redundancy and homogeneous app version,
-//! locality scheduling, and the client workload simulation behind upstream's
-//! deadline check.
+//! A client on the anonymous platform (`<platform_name>anonymous</platform_name>`,
+//! with an `app_info.xml`) lists its own app versions in the request. For it
+//! the versions to choose among are the client's, as in
+//! `get_app_version_anonymous` of `sched/sched_version.cpp`; the reply carries
+//! no `<app>` or `<app_version>`; and the result is recorded with the
+//! negative `app_version_id` of the resource type it uses and a
+//! `host_app_version` row keyed by `anon_gavid`. See "Anonymous platform" in
+//! `docs/architecture.md`.
+//!
+//! Not done here: assigned jobs for teams and broadcast (`multi`)
+//! assignments, homogeneous redundancy and homogeneous app version, locality
+//! scheduling, and the client workload simulation behind upstream's deadline
+//! check.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,12 +36,15 @@ use cb_proto::sched_reply::{
     insert_deadline_tag, insert_name_tags, insert_wu_tags, ReplyApp, ReplyAppVersion, ReplyHost,
     ReplyResult, ReplyUser, SchedulerReply, UserMessage, WuTags,
 };
-use cb_proto::sched_request::{self, ReportedResult, SchedulerRequest};
+use cb_proto::sched_request::{self, ClientAppVersion, ReportedResult, SchedulerRequest};
 use cb_proto::web_rpc::err::EXIT_ABORTED_BY_PROJECT;
 use cb_proto::xml::{extract_venue, line};
 use serde::Deserialize;
 
-use crate::model::{App, AppVersion, Host, HostAppVersion, Platform, User, Workunit};
+use crate::model::{
+    anon_gavid, anon_platform_id, anon_uses_gpu, generalized_app_version_id, App, AppVersion, Host,
+    HostAppVersion, Platform, User, Workunit,
+};
 use crate::plan_class::{HostUsage, PlanClassSpecs, PlanHost};
 use crate::{Config, CoreError, CoreResult};
 
@@ -51,10 +63,21 @@ const MAX_ASSIGNED: usize = 20;
 const MAX_REPORTED: usize = 500;
 /// Longest stderr text and output description stored for a result.
 const MAX_BLOB: usize = 64 * 1024;
+/// Most entries of the client's `<app_versions>` list looked at on the
+/// anonymous platform. Upstream has no limit; this keeps the work on one
+/// request bounded.
+const MAX_CLIENT_VERSIONS: usize = 256;
+/// `ET_RATIO_LIMIT` in `sched/sched_version.cpp`: how far above the speed
+/// the client states the speed estimated from elapsed times may go.
+const ET_RATIO_LIMIT: f64 = 250.0;
 /// Daily limit used when the project sets no `daily_result_quota`.
 const NO_QUOTA: i32 = 1_000_000;
 const GIGA: f64 = 1024.0 * 1024.0 * 1024.0;
 const MEGA: f64 = 1024.0 * 1024.0;
+
+/// The platform name of a client with an `app_info.xml`
+/// (`is_anonymous` in `sched/sched_send.h`).
+pub const ANONYMOUS_PLATFORM: &str = "anonymous";
 
 const DELAY_MISSING_KEY: f64 = 3600.0;
 const DELAY_BAD_CLIENT_VERSION: f64 = 86400.0;
@@ -155,6 +178,7 @@ struct ReportedRow {
     received_time: i64,
     sent_time: i64,
     app_version_id: i64,
+    appid: i64,
     name: String,
 }
 
@@ -245,10 +269,23 @@ impl ProjectPrefs {
     }
 }
 
-/// An app version this host can run, with what it would use.
+/// An app version this host can run, with what it would use. On the
+/// anonymous platform it is one of the client's own versions.
 struct Version<'a> {
-    av: &'a AppVersion,
+    /// The project's app version; `None` for one of the client's.
+    av: Option<&'a AppVersion>,
+    appid: i64,
+    /// What a result sent with this version stores as `app_version_id`: the
+    /// version's ID, or the negative resource type for the anonymous platform.
+    result_av_id: i64,
+    /// The key of the version's `host_app_version` row.
+    gavid: i64,
+    version_num: i32,
+    plan_class: &'a str,
     platform: &'a str,
+    /// For an anonymous-platform version, how far the client's estimate of
+    /// its speed is from ours (`CLIENT_APP_VERSION::rsc_fpops_scale`).
+    fpops_scale: f64,
     hu: HostUsage,
     /// Counts against the GPU limit on jobs in progress.
     gpu: bool,
@@ -263,14 +300,43 @@ struct Version<'a> {
     score: f64,
 }
 
+impl Version<'_> {
+    fn anonymous(&self) -> bool {
+        self.av.is_none()
+    }
+
+    /// What the reply needs to know about the version.
+    fn sending(&self) -> Sending {
+        Sending {
+            av_id: self.av.map_or(0, |a| a.id),
+            anon: self.anonymous(),
+            version_num: self.version_num,
+            plan_class: self.plan_class.to_string(),
+            platform: self.platform.to_string(),
+            fpops_scale: self.fpops_scale,
+            hu: self.hu.clone(),
+        }
+    }
+}
+
+/// The app version a result is sent with.
+struct Sending {
+    /// The project's app version; 0 on the anonymous platform.
+    av_id: i64,
+    anon: bool,
+    version_num: i32,
+    plan_class: String,
+    platform: String,
+    fpops_scale: f64,
+    hu: HostUsage,
+}
+
 /// A result going into the reply.
 struct Outgoing {
     result_name: String,
     xml_doc_in: String,
     wu: Workunit,
-    av_id: i64,
-    platform: String,
-    hu: HostUsage,
+    version: Sending,
     deadline: i64,
     /// Index of the claim statement in the write batch; `None` for a resend.
     claim: Option<usize>,
@@ -301,7 +367,13 @@ struct Claim<'a> {
     team_id: i64,
     now: i64,
     deadline: i64,
-    av: &'a AppVersion,
+    /// Stored as `result.app_version_id`.
+    result_av_id: i64,
+    /// Stored as `result.app_version_num`; 0 on the anonymous platform, as
+    /// upstream's `mark_as_sent` leaves it.
+    version_num: i32,
+    /// The key of the `host_app_version` row the daily quota is read from.
+    gavid: i64,
     peak_flops: f64,
     /// The state the result must still be in: unsent, or reserved for an
     /// assignment.
@@ -325,8 +397,8 @@ impl Claim<'_> {
             self.team_id.into(),
             self.now.into(),
             self.deadline.into(),
-            self.av.id.into(),
-            self.av.version_num.into(),
+            self.result_av_id.into(),
+            self.version_num.into(),
             self.peak_flops.into(),
             self.now.into(),
             self.result_id.into(),
@@ -334,11 +406,16 @@ impl Claim<'_> {
         ];
         if let Some(l) = &self.limits {
             if l.resource > 0 {
+                // An anonymous-platform result runs on the GPU when its
+                // negative version ID names one (`anon_uses_gpu`).
                 sql.push_str(&format!(
                     " AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4 \
-                     AND app_version_id {} ({})) < ?",
-                    if l.gpu { "IN" } else { "NOT IN" },
-                    l.gpu_ids
+                     AND {}) < ?",
+                    if l.gpu {
+                        format!("(app_version_id IN ({}) OR app_version_id <= {ANON_PLATFORM_NVIDIA})", l.gpu_ids)
+                    } else {
+                        format!("(app_version_id NOT IN ({}) AND app_version_id > {ANON_PLATFORM_NVIDIA})", l.gpu_ids)
+                    }
                 ));
                 params.push(self.host_id.into());
                 params.push(l.resource.into());
@@ -355,7 +432,7 @@ impl Claim<'_> {
                  WHERE host_id = ? AND app_version_id = ?), 0) < ?",
             );
             params.push(self.host_id.into());
-            params.push(self.av.id.into());
+            params.push(self.gavid.into());
             params.push(l.quota.into());
         }
         if let Some((column, who)) = self.one_per {
@@ -539,6 +616,125 @@ fn usage_for<'a>(
         hu.projected_flops = 1e9;
     }
     Ok((hu, platform.name.as_str()))
+}
+
+/// What a version from the client's `app_info.xml` uses on this host
+/// (`CLIENT_APP_VERSION::parse`, `HOST_USAGE` of `sched/sched_types.h`).
+/// `projected_flops` is the client's `<flops>`, or the host's benchmark speed
+/// when it gave none (`estimate_flops_anon_platform`).
+fn anon_usage(cav: &ClientAppVersion, req: &SchedulerRequest, p_fpops: f64) -> HostUsage {
+    // These come from the client's file; keep them finite.
+    let avg_ncpus = if cav.avg_ncpus.is_finite() && cav.avg_ncpus > 0.0 {
+        cav.avg_ncpus
+    } else {
+        1.0
+    };
+    let gpu_usage = clean(cav.gpu_usage);
+    let mut peak_flops = avg_ncpus * p_fpops;
+    if cav.proc_type != PROC_TYPE_CPU {
+        if let Some(c) = req.coprocs.proc_type(cav.proc_type) {
+            peak_flops += gpu_usage * clean(c.peak_flops);
+        }
+    }
+    let projected_flops = if cav.flops.is_finite() && cav.flops > 0.0 {
+        cav.flops
+    } else {
+        p_fpops
+    };
+    HostUsage {
+        proc_type: cav.proc_type,
+        gpu_usage,
+        gpu_ram: 0.0,
+        avg_ncpus,
+        mem_usage: 0.0,
+        // A host whose benchmark failed has no speed to fall back on.
+        projected_flops: if projected_flops > 0.0 {
+            projected_flops
+        } else {
+            1e9
+        },
+        peak_flops,
+        cmdline: String::new(),
+    }
+}
+
+/// The speed to use for a version from the client's `app_info.xml`, and the
+/// factor by which the workunit's `rsc_fpops_est` and `rsc_fpops_bound` are
+/// scaled in the reply so that the client's own estimate (workunit size over
+/// the speed it stated) comes out as ours
+/// (`estimate_flops_anon_platform` in `sched/sched_version.cpp`).
+///
+/// Given the speed the client stated, with enough elapsed-time history for
+/// this host and resource type the estimate is the one that history implies,
+/// capped at `ET_RATIO_LIMIT` times the stated speed.
+fn anon_projected_flops(stated: f64, hav: Option<&HostAppVersion>) -> (f64, f64) {
+    match hav {
+        Some(h) if h.et_n > MIN_HOST_SAMPLES && h.et_avg > 0.0 => {
+            let new_flops = (1.0 / h.et_avg).min(ET_RATIO_LIMIT * stated);
+            (new_flops, stated / new_flops)
+        }
+        _ => (stated, 1.0),
+    }
+}
+
+/// What `get_app_version_anonymous` found among the client's versions.
+struct AnonPick {
+    /// The version to use: the one with the highest projected speed that
+    /// passes the checks, the earlier of two equal ones.
+    chosen: Option<usize>,
+    /// Some version of the app passed the checks other than the one for the
+    /// resource the client wants work for; without one the client gets the
+    /// message that its `app_info.xml` has no usable version.
+    found: bool,
+    /// Daily limits that stopped a version.
+    quota_hit: Vec<i32>,
+}
+
+/// `get_app_version_anonymous`: scan the client's versions for the best one
+/// for `app`. Skips versions for a 32-bit platform when the job needs more
+/// address space than that allows, whose daily quota is used up, or that are
+/// older than the app's minimum version; of the rest, takes the fastest for
+/// which `needed` says the client wants work (`need_this_resource`).
+fn pick_anonymous(
+    versions: &[Version<'_>],
+    app: &App,
+    need_64b: bool,
+    needed: &dyn Fn(usize) -> bool,
+) -> AnonPick {
+    let mut pick = AnonPick {
+        chosen: None,
+        found: false,
+        quota_hit: Vec::new(),
+    };
+    for (i, v) in versions.iter().enumerate() {
+        if v.appid != app.id || !v.anonymous() {
+            continue;
+        }
+        // `is_64b_platform` in `sched/sched_types.h`
+        if need_64b && !v.platform.contains("64") {
+            continue;
+        }
+        if v.n_today >= v.quota {
+            if !pick.quota_hit.contains(&v.quota) {
+                pick.quota_hit.push(v.quota);
+            }
+            continue;
+        }
+        if v.version_num < app.min_version {
+            continue;
+        }
+        pick.found = true;
+        if !needed(proc_index(v.hu.proc_type)) {
+            continue;
+        }
+        let faster = pick
+            .chosen
+            .is_none_or(|b| v.hu.projected_flops > versions[b].hu.projected_flops);
+        if faster {
+            pick.chosen = Some(i);
+        }
+    }
+    pick
 }
 
 /// Shuffle each run of equal priority, so that hosts asking at the same
@@ -757,11 +953,22 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         project_prefs: user.project_prefs.clone(),
     };
 
-    // Platforms the host runs that the project has.
+    // Platforms the host runs that the project has. On the anonymous
+    // platform the alternate platforms are ignored (`process_request` in
+    // `sched/handle_request.cpp`). The project must list a platform named
+    // `anonymous` to serve such clients, as upstream's `project.xml` does.
+    let alternates: &[String] = if req.platform_name == ANONYMOUS_PLATFORM {
+        &[]
+    } else {
+        &req.alt_platforms
+    };
     let host_platforms: Vec<&Platform> = std::iter::once(&req.platform_name)
-        .chain(req.alt_platforms.iter())
+        .chain(alternates.iter())
         .filter_map(|n| catalog.platforms.iter().find(|p| &p.name == n))
         .collect();
+    let anonymous = host_platforms
+        .first()
+        .is_some_and(|p| p.name == ANONYMOUS_PLATFORM);
     if host_platforms.is_empty() {
         refuse(
             &mut out,
@@ -820,7 +1027,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     for chunk in reported.chunks(MAX_IN_LIST) {
         let mut s = Stmt::new(format!(
             "SELECT id, workunitid, server_state, outcome, userid, received_time, sent_time, \
-             app_version_id, name FROM result WHERE name IN ({})",
+             app_version_id, appid, name FROM result WHERE name IN ({})",
             in_list(chunk.len())
         ));
         for r in chunk {
@@ -960,14 +1167,18 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             row.id
         ));
         // The daily limit doubles on success and drops by one on failure.
-        if row.app_version_id > 0 {
+        // An anonymous-platform result (negative `app_version_id`) counts
+        // against the row of its app and resource type
+        // (`got_good_result`, `got_bad_result` in `sched/sched_result.cpp`).
+        let gavid = generalized_app_version_id(row.app_version_id, row.appid);
+        if gavid > 0 {
             if success {
                 writes.push(stmt!(
                     "UPDATE host_app_version SET max_jobs_per_day = min(max_jobs_per_day * 2, ?) \
                      WHERE host_id = ? AND app_version_id = ?",
                     daily_quota,
                     host.id,
-                    row.app_version_id
+                    gavid
                 ));
             } else if rr.exit_status != EXIT_ABORTED_BY_PROJECT {
                 writes.push(stmt!(
@@ -976,7 +1187,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                      consecutive_valid = 0 WHERE host_id = ? AND app_version_id = ?",
                     daily_quota,
                     host.id,
-                    row.app_version_id
+                    gavid
                 ));
             }
         }
@@ -1072,7 +1283,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         })
         .map(|v| v.id)
         .collect();
-    let is_gpu_version = |id: i64| gpu_version_ids.contains(&id);
+    // A result runs on a GPU when its version has a GPU plan class, or, on
+    // the anonymous platform, when its negative ID names a GPU.
+    let is_gpu_version = |id: i64| gpu_version_ids.contains(&id) || anon_uses_gpu(id);
 
     let plan_host = PlanHost {
         request: &req,
@@ -1084,39 +1297,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     };
     let mut plan_messages: Vec<&'static str> = Vec::new();
 
-    // App versions the host can be sent, fastest first.
-    let mut versions: Vec<Version<'_>> = Vec::new();
-    for av in &catalog.app_versions {
-        let Some(app) = catalog.app(av.appid) else {
-            continue;
-        };
-        if catalog.superseded(av) || av.version_num < app.min_version {
-            continue;
-        }
-        if !prefs.app_ids.is_empty() && !prefs.app_ids.contains(&app.id) {
-            continue;
-        }
-        if (app.beta != 0 || av.beta != 0) && !prefs.allow_beta_work {
-            continue;
-        }
-        let hav = havs.get(&av.id);
-        let (hu, platform) =
-            match usage_for(av, &host_platforms, &req, ctx.plan_classes, &plan_host, hav) {
-                Ok(x) => x,
-                Err(message) => {
-                    if let Some(m) = message {
-                        if !plan_messages.contains(&m) {
-                            plan_messages.push(m);
-                        }
-                    }
-                    continue;
-                }
-            };
-        let pt = proc_index(hu.proc_type);
-        if prefs.no_proc[pt] {
-            continue;
-        }
-        let gpu = is_gpu_version(av.id);
+    // The daily limit of a (host, app version): the host's row, scaled by the
+    // processors the version uses (`scaled_max_jobs_per_day`).
+    let quota_of = |hav: Option<&HostAppVersion>, gpu: bool, pt: usize| {
         let scale = if gpu {
             (ninstances[pt].max(1.0) as i32).saturating_mul(config.gpu_multiplier.max(1))
         } else {
@@ -1125,24 +1308,129 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         let base = hav
             .map_or(daily_quota, |h| h.max_jobs_per_day.min(daily_quota))
             .max(1);
-        let mut score = hu.projected_flops;
-        if config.version_select_random_factor > 0.0 {
-            score *= 1.0 + 0.1 * config.version_select_random_factor * normal(ctx.random);
+        base.saturating_mul(scale)
+    };
+
+    // App versions the host can be sent, fastest first.
+    let mut versions: Vec<Version<'_>> = Vec::new();
+    // Resource types for which the client's `app_info.xml` has a version
+    // (`client_has_apps_for_proc_type`).
+    let mut client_has = [false; NPROC];
+    if anonymous {
+        // The client's own versions (`estimate_flops_anon_platform` and
+        // `CLIENT_APP_VERSION::parse`). Entries are kept in the client's
+        // order: ties in speed go to the earlier one, as upstream's scan.
+        let apps_by_name: HashMap<&str, &App> =
+            catalog.apps.iter().map(|a| (a.name.as_str(), a)).collect();
+        let p_fpops = clean(req.host_info.p_fpops);
+        for cav in req.client_app_versions.iter().take(MAX_CLIENT_VERSIONS) {
+            let pt = proc_index(cav.proc_type);
+            client_has[pt] = true;
+            if !cav.parsed {
+                out.reply
+                    .messages
+                    .push(UserMessage::new("Syntax error in app_info.xml", "notice"));
+                continue;
+            }
+            let Some(app) = apps_by_name.get(cav.app_name.as_str()).copied() else {
+                out.reply.messages.push(UserMessage::new(
+                    format!("Unknown app name {} in app_info.xml", cav.app_name),
+                    "notice",
+                ));
+                continue;
+            };
+            if !prefs.app_ids.is_empty() && !prefs.app_ids.contains(&app.id) {
+                continue;
+            }
+            if app.beta != 0 && !prefs.allow_beta_work {
+                continue;
+            }
+            let hu = anon_usage(cav, &req, p_fpops);
+            let gavid = anon_gavid(app.id, cav.proc_type);
+            let hav = havs.get(&gavid);
+            let (projected_flops, fpops_scale) = anon_projected_flops(hu.projected_flops, hav);
+            let gpu = pt != 0;
+            versions.push(Version {
+                av: None,
+                appid: app.id,
+                result_av_id: anon_platform_id(cav.proc_type),
+                gavid,
+                version_num: cav.version_num,
+                plan_class: &cav.plan_class,
+                platform: &cav.platform,
+                fpops_scale,
+                hu: HostUsage {
+                    projected_flops,
+                    ..hu
+                },
+                gpu,
+                n_today: match hav {
+                    Some(h) if !new_day => h.n_jobs_today,
+                    _ => 0,
+                },
+                quota: quota_of(hav, gpu, pt),
+                consecutive_valid: hav.map_or(0, |h| h.consecutive_valid),
+                has_row: hav.is_some(),
+                score: projected_flops,
+            });
         }
-        versions.push(Version {
-            av,
-            platform,
-            hu,
-            gpu,
-            n_today: match hav {
-                Some(h) if !new_day => h.n_jobs_today,
-                _ => 0,
-            },
-            quota: base.saturating_mul(scale),
-            consecutive_valid: hav.map_or(0, |h| h.consecutive_valid),
-            has_row: hav.is_some(),
-            score,
-        });
+    } else {
+        for av in &catalog.app_versions {
+            let Some(app) = catalog.app(av.appid) else {
+                continue;
+            };
+            if catalog.superseded(av) || av.version_num < app.min_version {
+                continue;
+            }
+            if !prefs.app_ids.is_empty() && !prefs.app_ids.contains(&app.id) {
+                continue;
+            }
+            if (app.beta != 0 || av.beta != 0) && !prefs.allow_beta_work {
+                continue;
+            }
+            let hav = havs.get(&av.id);
+            let (hu, platform) =
+                match usage_for(av, &host_platforms, &req, ctx.plan_classes, &plan_host, hav) {
+                    Ok(x) => x,
+                    Err(message) => {
+                        if let Some(m) = message {
+                            if !plan_messages.contains(&m) {
+                                plan_messages.push(m);
+                            }
+                        }
+                        continue;
+                    }
+                };
+            let pt = proc_index(hu.proc_type);
+            if prefs.no_proc[pt] {
+                continue;
+            }
+            let gpu = is_gpu_version(av.id);
+            let mut score = hu.projected_flops;
+            if config.version_select_random_factor > 0.0 {
+                score *= 1.0 + 0.1 * config.version_select_random_factor * normal(ctx.random);
+            }
+            versions.push(Version {
+                av: Some(av),
+                appid: av.appid,
+                result_av_id: av.id,
+                gavid: av.id,
+                version_num: av.version_num,
+                plan_class: &av.plan_class,
+                platform,
+                fpops_scale: 1.0,
+                hu,
+                gpu,
+                n_today: match hav {
+                    Some(h) if !new_day => h.n_jobs_today,
+                    _ => 0,
+                },
+                quota: quota_of(hav, gpu, pt),
+                consecutive_valid: hav.map_or(0, |h| h.consecutive_valid),
+                has_row: hav.is_some(),
+                score,
+            });
+        }
     }
     versions.sort_by(|a, b| {
         b.score
@@ -1161,12 +1449,20 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             ));
         }
     }
+    // Upstream's `work_needed` asks for a resource the client needs work for
+    // and has an app for: on the anonymous platform that is a resource of one
+    // of the client's versions, even one this project has no app for.
+    let has_versions = if anonymous {
+        (0..NPROC).any(|pt| client_has[pt] && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0))
+    } else {
+        !versions.is_empty()
+    };
     let send = work_requested
         && key_ok
         && !config.dont_send_jobs
         && !req.dont_send_work
         && !too_recent
-        && !versions.is_empty();
+        && has_versions;
 
     // The host's record of itself.
     let nsame_ip = if !req.host_info.last_ip_addr.is_empty()
@@ -1272,11 +1568,27 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let mut app_ids: Vec<i64> = Vec::new();
     if send {
         for v in &versions {
-            if !app_ids.contains(&v.av.appid) {
-                app_ids.push(v.av.appid);
+            if !app_ids.contains(&v.appid) {
+                app_ids.push(v.appid);
             }
         }
         app_ids.sort_unstable();
+    }
+    // On the anonymous platform, the apps the client has no version of that
+    // may have work: the client is told its `app_info.xml` lacks one
+    // (`get_app_version_anonymous` is reached for every job upstream scans).
+    // One existence probe each on the index of unsent results.
+    let mut probe_apps: Vec<&App> = Vec::new();
+    if send && anonymous {
+        probe_apps = catalog
+            .apps
+            .iter()
+            .filter(|a| {
+                !app_ids.contains(&a.id)
+                    && (prefs.app_ids.is_empty() || prefs.app_ids.contains(&a.id))
+                    && (a.beta == 0 || prefs.allow_beta_work)
+            })
+            .collect();
     }
     let mut reads = Vec::new();
     if !lost.is_empty() {
@@ -1300,7 +1612,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     };
     let assigned_apps = id_list(&mut app_ids.iter().copied());
-    let assigned_versions = id_list(&mut versions.iter().map(|v| v.av.id));
+    // Versions a workunit may be pinned to; the client's own are none.
+    let assigned_versions =
+        id_list(&mut std::iter::once(0).chain(versions.iter().filter_map(|v| v.av.map(|a| a.id))));
     if want_assigned {
         reads.push(stmt!(
             format!(
@@ -1312,7 +1626,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                  OR (a.target_type = ? AND a.target_id = ?)) \
                  AND w.error_mask = 0 AND w.canonical_resultid = 0 \
                  AND w.appid IN ({assigned_apps}) \
-                 AND w.app_version_id IN (0,{assigned_versions}) \
+                 AND w.app_version_id IN ({assigned_versions}) \
                  AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = a.workunitid \
                  AND r2.hostid = ?) \
                  ORDER BY a.id LIMIT ?"
@@ -1336,8 +1650,20 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             fetch
         ));
     }
+    if !probe_apps.is_empty() {
+        let mut s = Stmt::new(format!(
+            "SELECT a.id AS workunitid FROM app a WHERE a.id IN ({}) AND EXISTS \
+             (SELECT 1 FROM result r WHERE r.server_state = 2 AND r.appid = a.id)",
+            in_list(probe_apps.len())
+        ));
+        for a in &probe_apps {
+            s = s.bind(a.id);
+        }
+        reads.push(s);
+    }
     let mut lost_rows: Vec<Candidate> = Vec::new();
     let mut assigned_rows: Vec<Candidate> = Vec::new();
+    let mut apps_with_work: Vec<i64> = Vec::new();
     let mut queues: Vec<(i64, std::collections::VecDeque<Candidate>)> = Vec::new();
     if !reads.is_empty() {
         let mut rows = ctx.db.batch(reads).await?.into_iter();
@@ -1352,6 +1678,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             shuffle_within_priority(&mut c, ctx.random);
             queues.push((*id, c.into()));
         }
+        if !probe_apps.is_empty() {
+            let found: Vec<WuIdRow> = rows.next().unwrap_or_default().decode()?;
+            apps_with_work = found.into_iter().map(|r| r.workunitid).collect();
+        }
     }
 
     let mut outgoing: Vec<Outgoing> = Vec::new();
@@ -1361,22 +1691,42 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         let Some(ip) = in_progress.iter().find(|r| r.id == c.result_id) else {
             continue;
         };
-        let usable = catalog.app_version(ip.app_version_id).and_then(|av| {
-            usage_for(
-                av,
-                &host_platforms,
-                &req,
-                ctx.plan_classes,
-                &plan_host,
-                havs.get(&av.id),
-            )
-            .ok()
-            .map(|(hu, platform)| (av, hu, platform))
-        });
+        let usable: Option<Sending> = if anonymous {
+            // Upstream picks a version afresh with `get_app_version`, from the
+            // client's, whatever the lost result was sent with: one for a
+            // resource it wants work for, with daily quota left.
+            catalog.app(c.wu.appid).and_then(|app| {
+                let needed = |pt: usize| need_secs[pt] > 0.0 || need_inst[pt] > 0.0;
+                let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
+                let pick = pick_anonymous(&versions, app, need_64b, &needed);
+                pick.chosen.map(|i| versions[i].sending())
+            })
+        } else {
+            catalog.app_version(ip.app_version_id).and_then(|av| {
+                usage_for(
+                    av,
+                    &host_platforms,
+                    &req,
+                    ctx.plan_classes,
+                    &plan_host,
+                    havs.get(&av.id),
+                )
+                .ok()
+                .map(|(hu, platform)| Sending {
+                    av_id: av.id,
+                    anon: false,
+                    version_num: av.version_num,
+                    plan_class: av.plan_class.clone(),
+                    platform: platform.to_string(),
+                    fpops_scale: 1.0,
+                    hu,
+                })
+            })
+        };
         let wanted = c.wu.error_mask == 0
             && c.wu.canonical_resultid == 0
             && c.wu.assimilate_state == ASSIMILATE_INIT;
-        let Some((av, hu, platform)) = usable.filter(|_| wanted) else {
+        let Some(version) = usable.filter(|_| wanted) else {
             // Nothing to gain from sending it again: let it time out now.
             writes.push(stmt!(
                 "UPDATE result SET report_deadline = ?, mod_time = ? \
@@ -1424,9 +1774,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             result_name: c.result_name,
             xml_doc_in: c.xml_doc_in,
             wu: c.wu,
-            av_id: av.id,
-            platform: platform.to_string(),
-            hu,
+            version,
             deadline,
             claim: None,
             assigned: false,
@@ -1494,6 +1842,11 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         wu.rsc_fpops_est / hu.projected_flops / avail.max(0.1)
     };
     let mut skipped = Skipped::default();
+    // Messages for a client that gets no work, `add_no_work_message`.
+    let mut no_work_messages: Vec<String> = Vec::new();
+    // Anonymous platform: apps already found to have no usable client
+    // version, by whether the job needs a 64-bit version.
+    let mut no_usable: HashSet<(i64, bool)> = HashSet::new();
     let mut sent_wus: HashSet<i64> = outgoing.iter().map(|o| o.wu.id).collect();
     let n_candidates = merged.len() + assigned_rows.len();
     let mut n_new = 0;
@@ -1548,14 +1901,100 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 continue;
             };
             let admitted = |v: &Version<'_>| {
-                v.av.appid == c.wu.appid
-                    && (c.wu.app_version_id == 0 || c.wu.app_version_id == v.av.id)
-                    && ctx
-                        .plan_classes
-                        .admits_workunit(&v.av.plan_class, c.wu.id, c.wu.batch)
+                v.appid == c.wu.appid
+                    && match v.av {
+                        Some(av) => {
+                            (c.wu.app_version_id == 0 || c.wu.app_version_id == av.id)
+                                && ctx.plan_classes.admits_workunit(
+                                    &av.plan_class,
+                                    c.wu.id,
+                                    c.wu.batch,
+                                )
+                        }
+                        // A job committed to one of the project's versions
+                        // is not for the client's own.
+                        None => c.wu.app_version_id == 0,
+                    }
             };
             let mut chosen: Option<(usize, usize, f64)> = None;
-            if assigned {
+            if anonymous {
+                // The client's own versions: the fastest one that passes
+                // `get_app_version_anonymous`, with no fall back to a slower
+                // one when the job does not fit it (`wu_is_infeasible_fast`
+                // runs on the one version chosen). Assigned jobs skip the
+                // feasibility checks. A resource whose limit on jobs in
+                // progress is reached is one the client no longer needs work
+                // for (`work_needed` clears its request).
+                let at_limit = |pt: usize| {
+                    let (count, limit) = if pt != 0 {
+                        (n_gpu, gpu_limit)
+                    } else {
+                        (n_cpu, cpu_limit)
+                    };
+                    (limit > 0 && count >= limit)
+                        || (total_limit > 0 && n_cpu + n_gpu >= total_limit)
+                };
+                for pt in 0..NPROC {
+                    if !assigned && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && at_limit(pt) {
+                        skipped.in_progress_limit = true;
+                    }
+                }
+                let needed = |pt: usize| {
+                    (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && (assigned || !at_limit(pt))
+                };
+                let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
+                let pick = if c.wu.app_version_id == 0 {
+                    pick_anonymous(&versions, app, need_64b, &needed)
+                } else {
+                    AnonPick {
+                        chosen: None,
+                        found: true,
+                        quota_hit: Vec::new(),
+                    }
+                };
+                for q in &pick.quota_hit {
+                    skipped.quota = true;
+                    let m = format!("Daily job limit ({q}) has been reached");
+                    if !no_work_messages.contains(&m) {
+                        no_work_messages.push(m);
+                    }
+                }
+                if !pick.found && no_usable.insert((app.id, need_64b)) {
+                    no_work_messages.push(format!(
+                        "Your app_info.xml file doesn't have a usable version of {}.",
+                        app.user_friendly_name
+                    ));
+                }
+                if let Some(i) = pick.chosen {
+                    let v = &versions[i];
+                    let pt = proc_index(v.hu.proc_type);
+                    let est = est_secs(&c.wu, &v.hu, pt);
+                    let fits = assigned || {
+                        let mem = if v.hu.mem_usage > 0.0 {
+                            v.hu.mem_usage
+                        } else {
+                            c.wu.rsc_memory_bound
+                        };
+                        if ram > 0.0 && mem > ram {
+                            skipped.memory = true;
+                            false
+                        } else if c.wu.rsc_disk_bound > disk {
+                            skipped.disk = true;
+                            false
+                        } else if !config.ignore_delay_bound
+                            && est_delay[pt] + est > c.wu.delay_bound as f64
+                        {
+                            skipped.speed = true;
+                            false
+                        } else {
+                            true
+                        }
+                    };
+                    if fits {
+                        chosen = Some((i, pt, est));
+                    }
+                }
+            } else if assigned {
                 // The fastest version, preferring one for a resource the
                 // client asks for (upstream's `get_app_version` does not
                 // look at the request for an assigned job).
@@ -1649,7 +2088,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     "INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day, \
                      n_jobs_today) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
                     host.id,
-                    v.av.id,
+                    v.gavid,
                     daily_quota
                 ));
             }
@@ -1663,7 +2102,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 team_id: user.teamid,
                 now,
                 deadline,
-                av: v.av,
+                result_av_id: v.result_av_id,
+                version_num: if v.anonymous() { 0 } else { v.version_num },
+                gavid: v.gavid,
                 peak_flops: v.hu.peak_flops,
                 from_state: if assigned {
                     RESULT_SERVER_STATE_INACTIVE
@@ -1697,7 +2138,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                      WHERE host_id = ? AND app_version_id = ? AND {CLAIMED}"
                 ),
                 host.id,
-                v.av.id,
+                v.gavid,
                 c.result_id,
                 host.id,
                 now
@@ -1738,9 +2179,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 result_name: c.result_name,
                 xml_doc_in: c.xml_doc_in,
                 wu: c.wu,
-                av_id: v.av.id,
-                platform: v.platform.to_string(),
-                hu: v.hu.clone(),
+                version: v.sending(),
                 deadline,
                 claim: Some(claim_at),
                 assigned,
@@ -1764,37 +2203,49 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             }
             None => out.n_resent += 1,
         }
-        let (Some(av), Some(app)) = (catalog.app_version(o.av_id), catalog.app(o.wu.appid)) else {
+        let Some(app) = catalog.app(o.wu.appid) else {
             continue;
         };
-        if !out.reply.apps.iter().any(|a| a.name == app.name) {
-            out.reply.apps.push(ReplyApp {
-                name: app.name.clone(),
-                user_friendly_name: app.user_friendly_name.clone(),
-                non_cpu_intensive: app.non_cpu_intensive != 0,
-                fraction_done_exact: app.fraction_done_exact != 0,
-            });
-        }
-        if !sent_versions.contains(&av.id) {
-            sent_versions.push(av.id);
-            out.reply.app_versions.push(ReplyAppVersion {
-                xml_doc: av.xml_doc.clone(),
-                platform: o.platform.clone(),
-                plan_class: av.plan_class.clone(),
-                avg_ncpus: o.hu.avg_ncpus,
-                flops: o.hu.projected_flops,
-                cmdline: o.hu.cmdline.clone(),
-                proc_type: o.hu.proc_type,
-                gpu_usage: o.hu.gpu_usage,
-                gpu_ram: o.hu.gpu_ram,
-            });
+        let version = &o.version;
+        // The client of the anonymous platform has its own apps and app
+        // versions: the reply carries neither `<app>` nor `<app_version>`
+        // for them (`add_wu_to_reply` in `sched/sched_send.cpp`), and no
+        // version files.
+        if !version.anon {
+            let Some(av) = catalog.app_version(version.av_id) else {
+                continue;
+            };
+            if !out.reply.apps.iter().any(|a| a.name == app.name) {
+                out.reply.apps.push(ReplyApp {
+                    name: app.name.clone(),
+                    user_friendly_name: app.user_friendly_name.clone(),
+                    non_cpu_intensive: app.non_cpu_intensive != 0,
+                    fraction_done_exact: app.fraction_done_exact != 0,
+                });
+            }
+            if !sent_versions.contains(&av.id) {
+                sent_versions.push(av.id);
+                out.reply.app_versions.push(ReplyAppVersion {
+                    xml_doc: av.xml_doc.clone(),
+                    platform: version.platform.clone(),
+                    plan_class: av.plan_class.clone(),
+                    avg_ncpus: version.hu.avg_ncpus,
+                    flops: version.hu.projected_flops,
+                    cmdline: version.hu.cmdline.clone(),
+                    proc_type: version.hu.proc_type,
+                    gpu_usage: version.hu.gpu_usage,
+                    gpu_ram: version.hu.gpu_ram,
+                });
+            }
         }
         out.reply.wus.push(
             insert_wu_tags(
                 &o.wu.xml_doc,
                 &WuTags {
-                    rsc_fpops_est: o.wu.rsc_fpops_est,
-                    rsc_fpops_bound: o.wu.rsc_fpops_bound,
+                    // Scaled for the client's own idea of the version's speed
+                    // (`rsc_fpops_scale`); 1 for the project's versions.
+                    rsc_fpops_est: o.wu.rsc_fpops_est * version.fpops_scale,
+                    rsc_fpops_bound: o.wu.rsc_fpops_bound * version.fpops_scale,
                     rsc_memory_bound: o.wu.rsc_memory_bound,
                     rsc_disk_bound: o.wu.rsc_disk_bound,
                     name: &o.wu.name,
@@ -1807,9 +2258,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         let xml = insert_name_tags(&o.xml_doc_in, &o.result_name, &o.wu.name).map_err(proto)?;
         out.reply.results.push(ReplyResult {
             xml_doc_in: insert_deadline_tag(&xml, o.deadline).map_err(proto)?,
-            platform: o.platform,
-            version_num: av.version_num,
-            plan_class: av.plan_class.clone(),
+            platform: version.platform.clone(),
+            version_num: version.version_num,
+            plan_class: version.plan_class.clone(),
         });
         if o.claim.is_some() && !o.assigned && app.target_nresults > 1 && o.wu.target_nresults == 1
         {
@@ -1830,10 +2281,11 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         } else if req.dont_send_work {
             why.push("Tasks are not being requested from this project".into());
         } else if versions.is_empty() {
-            if plan_messages.is_empty() {
+            // On the anonymous platform it is the client that has no version.
+            if plan_messages.is_empty() && !anonymous {
                 why.push("No app version is available for this computer".into());
             }
-        } else if n_candidates == 0 {
+        } else if n_candidates == 0 && apps_with_work.is_empty() {
             why.push("Project has no tasks available".into());
         }
         why.extend(plan_messages.iter().map(|m| m.to_string()));
@@ -1855,6 +2307,22 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         for w in why {
             out.reply.messages.push(UserMessage::new(w, "low"));
         }
+        // Anonymous platform: apps with work that the client has no version
+        // of, then what `get_app_version_anonymous` said while scanning.
+        // These are `notice`s, as `add_no_work_message` makes them.
+        for id in &apps_with_work {
+            if let Some(app) = catalog.app(*id) {
+                no_work_messages.push(format!(
+                    "Your app_info.xml file doesn't have a usable version of {}.",
+                    app.user_friendly_name
+                ));
+            }
+        }
+        for m in no_work_messages {
+            if !out.reply.messages.iter().any(|x| x.message == m) {
+                out.reply.messages.push(UserMessage::new(m, "notice"));
+            }
+        }
     }
 
     if config.min_sendwork_interval > 0 {
@@ -1872,4 +2340,128 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         user.id, host.id, out.n_reported, out.n_sent, out.n_resent
     );
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(id: i64, min_version: i32) -> App {
+        App {
+            id,
+            min_version,
+            ..Default::default()
+        }
+    }
+
+    fn anon<'a>(
+        appid: i64,
+        version_num: i32,
+        pt: i32,
+        flops: f64,
+        platform: &'a str,
+    ) -> Version<'a> {
+        Version {
+            av: None,
+            appid,
+            result_av_id: anon_platform_id(pt),
+            gavid: anon_gavid(appid, pt),
+            version_num,
+            plan_class: "",
+            platform,
+            fpops_scale: 1.0,
+            hu: HostUsage {
+                proc_type: pt,
+                gpu_usage: 0.0,
+                gpu_ram: 0.0,
+                avg_ncpus: 1.0,
+                mem_usage: 0.0,
+                projected_flops: flops,
+                peak_flops: flops,
+                cmdline: String::new(),
+            },
+            gpu: pt != 0,
+            n_today: 0,
+            quota: 10,
+            consecutive_valid: 0,
+            has_row: false,
+            score: flops,
+        }
+    }
+
+    fn all_needed(_: usize) -> bool {
+        true
+    }
+
+    #[test]
+    fn projected_speed_follows_history_only_with_enough_samples() {
+        // The client's figure stands without a row, or with few samples.
+        assert_eq!(anon_projected_flops(1e9, None), (1e9, 1.0));
+        let mut hav = HostAppVersion {
+            et_n: MIN_HOST_SAMPLES,
+            et_avg: 1e-8,
+            ..Default::default()
+        };
+        assert_eq!(anon_projected_flops(1e9, Some(&hav)), (1e9, 1.0));
+        // More than MIN_HOST_SAMPLES: 1 / average elapsed time per FLOP.
+        hav.et_n = MIN_HOST_SAMPLES + 1.0;
+        let (flops, scale) = anon_projected_flops(1e9, Some(&hav));
+        assert!((flops - 1e8).abs() < 1.0);
+        assert!((scale - 10.0).abs() < 1e-9);
+        // No average yet.
+        hav.et_avg = 0.0;
+        assert_eq!(anon_projected_flops(1e9, Some(&hav)), (1e9, 1.0));
+        // Capped at ET_RATIO_LIMIT times the stated speed.
+        hav.et_avg = 1e-15;
+        let (flops, scale) = anon_projected_flops(1e9, Some(&hav));
+        assert_eq!(flops, 250.0 * 1e9);
+        assert!((scale - 1.0 / 250.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_fastest_passing_version_is_chosen_and_the_first_of_equals() {
+        let a = app(1, 0);
+        let versions = vec![
+            anon(1, 100, PROC_TYPE_CPU, 1e9, "p"),
+            anon(2, 100, PROC_TYPE_CPU, 9e9, "p"),
+            anon(1, 101, PROC_TYPE_CPU, 2e9, "p"),
+            anon(1, 102, PROC_TYPE_CPU, 2e9, "p"),
+        ];
+        let pick = pick_anonymous(&versions, &a, false, &all_needed);
+        assert_eq!(pick.chosen, Some(2));
+        assert!(pick.found);
+    }
+
+    #[test]
+    fn versions_are_skipped_for_quota_age_resource_and_address_space() {
+        let a = app(1, 105);
+        let mut versions = vec![
+            anon(1, 110, PROC_TYPE_CPU, 5e9, "windows_intelx86"),
+            anon(1, 110, PROC_TYPE_CPU, 4e9, "windows_x86_64"),
+            anon(1, 104, PROC_TYPE_CPU, 9e9, "windows_x86_64"),
+            anon(1, 110, PROC_TYPE_NVIDIA_GPU, 8e9, "windows_x86_64"),
+        ];
+        // The GPU is not wanted, the 104 is below the app's minimum, and the
+        // 32-bit version cannot take a job that needs 64 bits.
+        let cpu_only = |pt: usize| pt == 0;
+        let pick = pick_anonymous(&versions, &a, true, &cpu_only);
+        assert_eq!(pick.chosen, Some(1));
+        let pick = pick_anonymous(&versions, &a, false, &cpu_only);
+        assert_eq!(pick.chosen, Some(0));
+
+        // A version whose quota is used up is not "found" either.
+        for v in &mut versions {
+            v.n_today = v.quota;
+        }
+        let pick = pick_anonymous(&versions, &a, false, &cpu_only);
+        assert_eq!(pick.chosen, None);
+        assert!(!pick.found);
+        assert_eq!(pick.quota_hit, vec![10]);
+
+        // Found, but not for a resource the client wants work for.
+        let versions = vec![anon(1, 110, PROC_TYPE_NVIDIA_GPU, 8e9, "p")];
+        let pick = pick_anonymous(&versions, &a, false, &cpu_only);
+        assert_eq!(pick.chosen, None);
+        assert!(pick.found);
+    }
 }

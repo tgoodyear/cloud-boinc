@@ -339,6 +339,74 @@ admission by editing workunit-ID and batch bounds on live plan classes; here tha
 API call that bumps the config version, and every isolate picks it up within its cache
 lifetime (30 seconds).
 
+### Anonymous platform
+
+A client with an `app_info.xml` reports the platform name `anonymous` and lists the app versions it
+has in `<app_versions>`. `handle_request` in `crates/cb-core/src/scheduler.rs` serves it as
+`sched/sched_version.cpp` and `sched/sched_send.cpp` do. As upstream, the project must have a
+platform named `anonymous` (upstream's `tools/project.xml` lists it; here
+`cboinc platform-put --name anonymous --user-friendly-name anonymous`). Without one the client is
+refused like any unknown platform, and the alternate platforms an anonymous client lists are
+ignored.
+
+- **Versions.** The versions to choose among are the client's, not the `app_version` table. An
+  entry for an app the project does not have is ignored, with the message "Unknown app name
+  NAME in app_info.xml". What a version uses comes from the request (`CLIENT_APP_VERSION::parse`):
+  `avg_ncpus` (1 if absent), the coprocessor type and count, and `flops`, which is the host's
+  benchmark speed when absent. Its peak speed is `avg_ncpus` times the host's benchmark speed,
+  plus the GPU count times the peak speed of the host's GPU of that type. No plan class is
+  evaluated: the client's plan class string is passed back as it came, and the plan class gates
+  on workunit ID and batch do not apply.
+- **Choice.** For each job, `pick_anonymous` takes the client's versions of the job's app and
+  skips a version for a platform whose name has no `64` when the job needs more than 2 GiB of
+  address space, one whose daily quota is used up, one older than the app's `min_version`, and one
+  for a resource the client asks no work for or whose limit on jobs in progress is reached. Of the
+  rest it takes the highest projected speed, the earlier entry when two are equal. The memory,
+  disk and deadline checks then run on that version alone; a job that fails them is not offered
+  with a slower version. A GPU version is therefore used only when the host reports a GPU of that
+  type and asks for work for it, and its jobs count against the request for that GPU.
+- **Speed.** With more than 10 samples in the host's `host_app_version` row for the app and the
+  resource, the speed is the one the average elapsed time per FLOP gives, at most 250 times the
+  speed the client stated (`estimate_flops_anon_platform`). The reply carries the workunit's
+  `rsc_fpops_est` and `rsc_fpops_bound` multiplied by the stated speed over the estimated one, so
+  the client's runtime estimate and time limit come out as ours.
+- **Reply.** The reply has the workunit and the result and no `<app>`, `<app_version>` or version
+  `<file_info>`. The result's `<platform>`, `<version_num>` and `<plan_class>` are the client's
+  entry, as written.
+- **Records.** `result.app_version_id` is the negative resource type: -2 for CPU, -3 NVIDIA, -4
+  AMD, -5 Intel, -6 Apple (`ANON_PLATFORM_*`, written by `anon_platform_id` in
+  `crates/cb-core/src/model.rs`). The `host_app_version` row is keyed by `appid * 1000000 - id`,
+  for example `appid * 1000000 + 2` for CPU (`generalized_app_version_id`, `anon_gavid`), so all of
+  a client's versions of one app for one resource share a row. The daily quota and its changes on
+  report and timeout, the in-progress limits, the elapsed-time and turnaround statistics and the
+  streak of valid results all use that row. The in-progress counts treat a result whose
+  `app_version_id` is -3 or lower as a GPU job. Credit is granted as for any result, from the
+  result's `flops_estimate`, which is the version's peak speed; the scaling that `get_pfc` in
+  `sched/credit.cpp` applies to anonymous results belongs to the full PFC model, which is not
+  ported. The task pages show "Anonymous platform" and the resource, as `html/inc/result.inc` does.
+- **Messages.** When no work is sent, an app that has work and none of the client's versions
+  usable gets "Your app_info.xml file doesn't have a usable version of NAME." and a version cut
+  by its daily quota gets "Daily job limit (N) has been reached", both as notices. There is no
+  feeder to show which apps have work, so one statement asks the unsent-result index about all the
+  apps the client has no version of. A client with no version for a resource it asks work for is
+  told only "No tasks sent", as upstream's `work_needed` stops the search.
+
+Differences from upstream:
+
+- At most 256 entries of the version list are read, so that one request's work is bounded.
+- A lost result is resent with the version chosen now from the client's list, as `get_app_version`
+  does upstream, and is dropped (`Didn't resend lost task ... (expired)`) when none qualifies,
+  daily quota included.
+- A workunit committed to a project app version (`workunit.app_version_id` other than 0) is not
+  sent to an anonymous client. Upstream does this for apps with homogeneous app version, which is
+  not built here, so nothing sets that field today.
+- A missing `host_app_version` row is created when the job is sent. Upstream's `hav_lookup` also
+  creates one when a result is validated or times out; here those steps leave a missing row alone.
+- The project preferences that switch a resource off do not apply to the client's own versions,
+  as upstream's `get_app_version_anonymous` does not check them.
+- The limits on jobs in progress are the ones described above for the project's versions, counted
+  from the database by CPU and GPU, not from the client's list of tasks by processor type.
+
 ## Job pipeline
 
 The upstream state machine is kept: `server_state`, `outcome`, `validate_state`,
@@ -670,9 +738,9 @@ certificates are checked.
 
 Not implemented yet:
 
-- In the scheduler: anonymous platform, assigned jobs for teams and broadcast (`multi`)
-  assignments, homogeneous redundancy and homogeneous app version, locality scheduling, size
-  classes, and the client workload simulation behind upstream's deadline check.
+- In the scheduler: assigned jobs for teams and broadcast (`multi`) assignments, homogeneous
+  redundancy and homogeneous app version, locality scheduling, size classes, and the client
+  workload simulation behind upstream's deadline check.
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
