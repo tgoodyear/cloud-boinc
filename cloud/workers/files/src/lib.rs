@@ -270,6 +270,11 @@ async fn upload(mut req: Request, env: &Env) -> Result<Response> {
             xml(reply_file_size(size))
         }
         UploadRequest::FileUpload(header) => {
+            // A header that arrived whole in one large chunk is held to the
+            // same limit as one read piece by piece.
+            if header.data_offset > MAX_HEADER_BYTES {
+                return refuse(UploadError::permanent("the request header is too long"));
+            }
             let db = db(env)?;
             let project = match project(&db).await {
                 Ok(p) => p,
