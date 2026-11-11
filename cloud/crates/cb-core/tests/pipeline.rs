@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use cb_core::model::{JobResult, Workunit};
 use cb_core::pipeline::{due_workunits, transition, Ctx};
-use cb_core::purge::purge_pass;
+use cb_core::purge::{commit_purge, plan_purge, purge_pass};
 use cb_core::work::{
     acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, CancelTarget,
     JobSpec, Submission,
@@ -586,4 +586,63 @@ fn purge_archives_then_deletes_finished_workunits() {
     assert_eq!(count("SELECT count(*) FROM result"), 2);
     let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
     assert_eq!(rep, Default::default());
+}
+
+#[test]
+fn purge_leaves_changed_pending_and_highest_workunits() {
+    let mut w = World::new("trivial");
+    w.config.purge_days = 2.0;
+    let day = 86400;
+    let only = finished_job(&w, "q1");
+    let count = |sql: &str| w.scalar(sql) as i64;
+
+    // The newest workunit keeps its ID in use.
+    assert!(block_on(plan_purge(&w.db, &w.config, 3 * day, 10))
+        .unwrap()
+        .is_none());
+    let second = finished_job(&w, "q2");
+    let _newest = w.submit("q3", 1000, 1, 1);
+
+    // A change between the archive read and the delete keeps the workunit.
+    let plan = block_on(plan_purge(&w.db, &w.config, 3 * day, 10))
+        .unwrap()
+        .unwrap();
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET rev = rev + 1 WHERE id = ?",
+        only
+    )))
+    .unwrap();
+    let rep = block_on(commit_purge(&w.db, &plan)).unwrap();
+    assert_eq!((rep.workunits, rep.results), (1, 1));
+    assert_eq!(count("SELECT count(*) FROM workunit"), 2);
+    assert_eq!(
+        count(&format!(
+            "SELECT count(*) FROM result WHERE workunitid = {only}"
+        )),
+        1
+    );
+    assert_eq!(
+        count(&format!(
+            "SELECT count(*) FROM workunit WHERE id = {second}"
+        )),
+        0
+    );
+
+    // A workunit with a transition pending waits for the pipeline.
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET transition_time = 5000 WHERE id = ?",
+        only
+    )))
+    .unwrap();
+    assert!(block_on(plan_purge(&w.db, &w.config, 3 * day, 10))
+        .unwrap()
+        .is_none());
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET transition_time = ? WHERE id = ?",
+        NEVER,
+        only
+    )))
+    .unwrap();
+    let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
+    assert_eq!((rep.workunits, rep.results), (1, 1));
 }

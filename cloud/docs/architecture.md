@@ -558,6 +558,10 @@ With `purge_days` set, a second cron trigger in the `pipeline` Worker removes wo
 files are deleted and that have not changed for that many days, together with their results
 and assignments (`purge_pass` in `crates/cb-core/src/purge.rs`). The rows go to the bucket
 under `archive/` first. A workunit with `nodelete` in its name is kept, as `db_purge` keeps it.
+So are the workunit with the highest ID and the one holding the result with the highest ID,
+so that no ID is given out twice; they go once newer jobs exist. A workunit that changes
+between the archive write and the delete stays and is archived again later, so the archive can
+hold a workunit more than once, and the latest copy is the final one.
 With `purge_days` at 0, the default, nothing is purged and the database grows until rows are
 removed by hand.
 

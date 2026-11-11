@@ -20,7 +20,8 @@ const SWEEP_LIMIT: i64 = 500;
 /// trigger runs the sweep. The purge has an invocation of its own so that
 /// its queries do not come out of the sweep's allowance.
 const PURGE_CRON: &str = "*/5 * * * *";
-/// Purge passes in one run; a pass costs three database round trips.
+/// Purge passes in one run; a pass costs three database round trips and
+/// holds at most `cb_core::purge::MAX_PURGE_BYTES` of rows.
 const PURGE_PASSES: usize = 8;
 
 struct Runner {
