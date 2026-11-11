@@ -8,6 +8,7 @@ use cb_core::admin::{
     add_app_version, job_status, list_catalog, put_app, put_platform, set_app_version_deprecated,
     NewApp, NewAppVersion, NewPlatform, VersionFile,
 };
+use cb_core::model::User;
 use cb_core::project::{
     get_setting, put_setting, Project, SETTING_CODE_SIGN_KEY, SETTING_CONFIG, SETTING_UPLOAD_KEY,
 };
@@ -20,7 +21,6 @@ use cb_core::work::{create_work, register_job_file, JobSpec, Submission};
 use cb_core::CoreError;
 use cb_crypto::account::passwd_hash;
 use cb_crypto::{md5_hex, PrivateKey, PublicKey, Signer};
-use cb_core::model::User;
 use cb_db::{query_one, stmt, Db};
 use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
@@ -113,7 +113,9 @@ fn settings_are_checked_and_loaded() {
     block_on(put_setting(&w.db, SETTING_UPLOAD_KEY, &public, 2)).unwrap();
     block_on(put_setting(&w.db, SETTING_CODE_SIGN_KEY, &public, 2)).unwrap();
     assert_eq!(
-        block_on(get_setting(&w.db, SETTING_CONFIG)).unwrap().as_deref(),
+        block_on(get_setting(&w.db, SETTING_CONFIG))
+            .unwrap()
+            .as_deref(),
         Some(CONFIG)
     );
     let p = w.project();
@@ -142,7 +144,10 @@ fn accounts_are_created_and_looked_up() {
     assert!(!stored.is_empty());
 
     assert_eq!(
-        element(&w.lookup("ada@example.com", Some("secret")), "authenticator"),
+        element(
+            &w.lookup("ada@example.com", Some("secret")),
+            "authenticator"
+        ),
         Some(auth.as_str())
     );
     assert!(w.lookup("ada@example.com", None).contains("<success/>"));
@@ -346,9 +351,7 @@ fn a_registered_version_is_sent_to_a_client() {
     let out = block_on(handle_request(&ctx, &request)).unwrap();
     assert_eq!(out.n_sent, 1);
     let xml = out.reply.write().unwrap();
-    assert!(xml.contains(&format!(
-        "<url>https://p.example/download/{file}</url>"
-    )));
+    assert!(xml.contains(&format!("<url>https://p.example/download/{file}</url>")));
     assert!(xml.contains("<executable/>"));
     assert!(xml.contains("<main_program/>"));
     assert!(xml.contains("<code_sign_key>"));

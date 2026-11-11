@@ -189,12 +189,10 @@ pub async fn create_account(
     if account.passwd_hash.is_empty() {
         return Ok(AccountError::BadPasswdHashLength.reply());
     }
-    Ok(
-        match make_user(db, pepper, now, random, account).await? {
-            Ok(authenticator) => write_create_account(&authenticator),
-            Err(e) => e.reply(),
-        },
-    )
+    Ok(match make_user(db, pepper, now, random, account).await? {
+        Ok(authenticator) => write_create_account(&authenticator),
+        Err(e) => e.reply(),
+    })
 }
 
 /// `am_get_info.php` is not offered; clients that ask get the stock
