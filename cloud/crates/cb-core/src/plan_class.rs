@@ -705,6 +705,23 @@ impl PlanClassSpec {
     }
 
     /// Host-dependent checks only. None when the host cannot use the class.
+    /// The processor type a version of this class uses, from the spelling
+    /// of `gpu_type` as upstream; `PROC_TYPE_CPU` for anything else.
+    pub fn proc_type(&self) -> i32 {
+        let gpu_type = self.gpu_type.as_str();
+        if gpu_type == "amd" || gpu_type == "ati" {
+            PROC_TYPE_AMD_GPU
+        } else if gpu_type == "nvidia" {
+            PROC_TYPE_NVIDIA_GPU
+        } else if gpu_type.starts_with("intel") {
+            PROC_TYPE_INTEL_GPU
+        } else if gpu_type.starts_with("apple_gpu") {
+            PROC_TYPE_APPLE_GPU
+        } else {
+            PROC_TYPE_CPU
+        }
+    }
+
     pub fn check(&self, host: &PlanHost<'_>) -> Option<HostUsage> {
         self.evaluate(host).ok()
     }
@@ -1358,18 +1375,7 @@ impl PlanClassSpec {
         // As upstream, the type is taken from the spelling of gpu_type. A
         // type that is none of these leaves a CPU app with the speed
         // estimates above; "apple" is among them, only "apple_gpu" counts.
-        let gpu_type = self.gpu_type.as_str();
-        let proc_type = if gpu_type == "amd" || gpu_type == "ati" {
-            PROC_TYPE_AMD_GPU
-        } else if gpu_type == "nvidia" {
-            PROC_TYPE_NVIDIA_GPU
-        } else if gpu_type.starts_with("intel") {
-            PROC_TYPE_INTEL_GPU
-        } else if gpu_type.starts_with("apple_gpu") {
-            PROC_TYPE_APPLE_GPU
-        } else {
-            PROC_TYPE_CPU
-        };
+        let proc_type = self.proc_type();
         if proc_type != PROC_TYPE_CPU {
             hu.proc_type = proc_type;
             hu.gpu_usage = gpu_usage;

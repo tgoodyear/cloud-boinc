@@ -33,10 +33,10 @@ In scope, because the reference deployment uses it:
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
 | Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits and checksums |
 | Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
-| Site | project home (master URL), apps, server status, account, hosts and tasks pages |
+| Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
 
-Out of scope for now: forums, teams, profiles, preference editing, locality scheduling,
+Out of scope for now: forums, teams, profiles, locality scheduling,
 homogeneous redundancy, adaptive replication, trickle messages, BUDA, the XML stats export,
 and the full PFC credit model (see "Credit").
 
@@ -626,18 +626,40 @@ them built in.
 The account manager RPCs are in `cloud/crates/cb-core/src/web.rs`. `am_get_info` returns the
 account a key belongs to, in the upstream reply shape. `am_set_host_info` sets a computer's venue;
 one `UPDATE` whose `WHERE` clause checks both the key and that the computer belongs to it.
-`am_set_info` answers "not supported" with error -1, as upstream has done since it switched
-that RPC off. These RPCs, `show_user.php?format=xml&auth=` and the site login accept the account
-key only: a weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream's
+`am_set_info` changes the account. Upstream has switched it off and answers "not supported",
+but its code is still in `html/user/am_set_info.php`, and that code is what `am_set_info` follows:
+`name`, `country`, `postal_code`, `global_prefs`, `project_prefs`, `url`, `send_email`,
+`show_hosts`, `venue`, `email_addr` and `password_hash`, each changed only when given and not
+empty. Every value is checked before anything is written: names, countries (upstream's list,
+`cloud/crates/cb-core/src/countries.rs`), URLs and postal codes as on the site, venues as for
+`am_set_host_info`, and the two
+preference documents with upstream's `bad_xml` test and a 64 KB limit. Project preferences
+without a `<project_specific>` part keep the stored one, as upstream. A new email address is
+refused with `ERR_DB_NOT_UNIQUE` when another account has it, by the `WHERE` clause of the one
+`UPDATE`; as upstream, it does not rehash the password, so an account manager sends
+`password_hash` with it. The stored hash depends on the address, so a request that names the
+address or gives a hash writes only if the address and hash are still the ones read with the
+account (as the site's password and email actions do); if a site request changed them meanwhile,
+nothing is written and the reply is `ERR_RETRY`. Project preferences without a `<project_specific>`
+part inherit the stored one, so that write is conditional on `project_prefs` being still what was
+read; a site save of the application selection or task limit in between is not undone. `teamid` is accepted and ignored until there are
+teams, and the consent fields are ignored. Two statements: the account, then the update (a
+refused update costs a third, which tells a taken address from a changed account). The web
+Worker reads a form body of at most `MAX_FORM_BYTES` (in `cloud/crates/cb-core/src/web.rs`): both
+preference documents at their 64 KB limit with every byte URL-encoded to three, and the other
+fields. A longer body is not from a BOINC client, and its fields are ignored.
+
+These RPCs, `show_user.php?format=xml&auth=` and the site login accept the account key only: a
+weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream's
 `BoincUser::lookup_auth` does. A blocked account is treated as unknown.
 
 The site pages are in `cloud/crates/cb-core/src/site.rs`, reached through `site_page`:
 `login_form.php`, `login_action.php`, `logout.php`, `home.php`, `hosts_user.php`,
-`show_host_detail.php`, `results.php`, `result.php`, `workunit.php` and `show_user.php`.
-Logging in, with the account key or with email address and password, sets the `auth` cookie
+`show_host_detail.php`, `results.php`, `result.php`, `workunit.php` and `show_user.php`, and
+the account and preference pages listed below. Logging in, with the account key or with email address and password, sets the `auth` cookie
 to the account key as upstream does, with `HttpOnly`, `Secure` and `SameSite=Lax`. It lasts a
 year when "stay logged in" is ticked, and for the browser session otherwise. A password is
-taken from a POST only. Private fields follow upstream: the account page, the IP address,
+taken from a POST only. Logging out is a POST with the form token, as described under the account pages below. Private fields follow upstream: the account page, the IP address,
 domain name, disk and activity fractions of a computer, and an account's task list are shown
 to the account holder only. Another account's computers are listed only when it has
 `show_hosts` set, and then without names. A computer's task list, a task (with its stderr) and
@@ -655,6 +677,119 @@ of contact for 30 days in the query, before the limit, and counts them separatel
 does not show upstream's per-state counts, which would count every
 task of the computer or account. A computer page links to its tasks without counting them for
 the same reason.
+
+### Account and preference pages
+
+The pages that change an account are in `cloud/crates/cb-core/src/site_account.rs`:
+
+| Page | Method | Changes |
+| --- | --- | --- |
+| `create_account_form.php`, `signup.php` | GET | |
+| `create_account_action.php` | POST | a new `user` row (name, email address, password, country, postal code), then the `auth` cookie |
+| `edit_user_info_form.php` | GET | |
+| `edit_user_info_action.php` | POST | `name`, `url`, `country`, `postal_code` |
+| `edit_passwd_form.php` | GET | |
+| `edit_passwd_action.php` | POST | `passwd_hash`, given the current password or the account key |
+| `edit_email_form.php` | GET | |
+| `edit_email_action.php` | POST | `email_addr` and `passwd_hash`, given the password (the account key for an account without one); `email_validated` back to 0 |
+| `prefs.php?subset=global\|project` | GET | |
+| `prefs_edit.php?subset=...&venue=...` | GET form, POST to save | `global_prefs`, or `project_prefs` and, for the main set, `send_email`, `show_hosts` and `venue` |
+| `prefs_remove.php?subset=...&venue=...` | GET to confirm, POST to remove | one venue's set from `global_prefs` or `project_prefs` |
+
+Sign-up and the `create_account.php` RPC share `make_user` and `account_creation_refusal` in
+`cloud/crates/cb-core/src/web.rs`, so the `account_creation` setting closes both. Upstream's
+invitation codes (`INVITE_CODES`) have no setting here yet. The site asks for a password of at
+least six ASCII characters (`MIN_PASSWD_LENGTH`), which the RPC cannot check because it gets
+only the hash. A sign-up for an address that has an account with the same password logs in to
+it, as the RPC does; any other sign-up for a known address is refused. The account gets the
+`auth` cookie for a year, as upstream's sign-up gives it.
+
+Passwords are stored as everywhere else here: the client-side `md5(password + email)` under the
+pepper (`pepper_passwd_hash`). The hash depends on the email address, so an address change
+makes it again from the password given. A password or address change also changes the weak
+account key, which is derived from the stored hash, and an address change changes the
+cross-project ID; the pages say so. No email is sent and a new address is not verified. Upstream
+sends a message to both addresses on a change and refuses a second change within seven days, so
+that the old address can undo it; with no email, neither is done. Upstream refuses a name
+another account has when the details are edited; names are not unique here, and checking would
+scan the `user` table.
+
+Every page that changes an account takes a POST only, and every one used while logged in checks
+a form token as well: the form page puts `tnow` and `ttok = HMAC-SHA-256(account key, "form " +
+tnow)` (`form_token` in `cloud/crates/cb-crypto/src/account.rs`) in hidden fields, and the action
+accepts the token for a day (`FORM_TOKEN_SECS`), as upstream's `form_tokens` and `check_tokens`
+do with an MD5. `logout.php` (`logout` in `cloud/crates/cb-core/src/site_account.rs`) is one of
+them: as upstream's `logout.php` checks tokens, it clears the cookie only for a POST from a
+logged-in account with a valid token, so the "Log out" form on `home.php` carries the token
+fields and a plain link or a GET does nothing but answer 403. With no login it redirects to the
+master URL without setting a cookie. The `SameSite=Lax` cookie already keeps other sites' POSTs
+from carrying the login. Sign-up has no token, as upstream. Each page runs at most two round trips: the account by
+cookie, then one write (the email change sends its write as a batch of two statements).
+
+Every site page is sent with `Content-Security-Policy: frame-ancestors 'none'` and
+`X-Frame-Options: DENY` (`site_response` in `cloud/workers/web/src/lib.rs`), so another site
+cannot show a form inside a frame.
+
+The preference documents are read and written by `cloud/crates/cb-core/src/prefs.rs` in
+upstream's formats (`html/inc/prefs.inc`, `prefs_project.inc`), and they are what the scheduler
+already sends: a save of computing preferences sets `<mod_time>` to the current time, so the
+scheduler's comparison with the client's copy (`handle_request` in
+`cloud/crates/cb-core/src/scheduler.rs`) sends the new set on the next request; project
+preferences go out in every reply. Each document has a main set and optional sets for the
+venues `home`, `school` and `work`; a computer whose venue matches uses that set. A new venue set
+starts as a copy of the main one, as upstream's `add_venue.php`. The default venue for new
+computers is the account's `venue`, edited with the main project preferences. Fields offered:
+
+- Computing: all of upstream's form, each read by the client (`GLOBAL_PREFS::parse_override` in
+  `lib/prefs.cpp`): when in use (`idle_time_to_run`, `run_if_user_active`,
+  `run_gpu_if_user_active`, `max_ncpus_pct`, `cpu_usage_limit`, `suspend_cpu_usage`,
+  `ram_max_used_busy_pct`), when not in use (`niu_max_ncpus_pct`, `niu_cpu_usage_limit`,
+  `niu_suspend_cpu_usage`, `ram_max_used_idle_pct`, `suspend_if_no_recent_input`), general
+  (`run_on_batteries`, `cpu_scheduling_period_minutes`, `disk_interval`, `leave_apps_in_memory`,
+  `work_buf_min_days`, `work_buf_additional_days`, `start_hour` and `end_hour`), disk
+  (`disk_max_used_gb`, `disk_min_free_gb`, `disk_max_used_pct`, `vm_max_used_pct`) and network
+  (`max_bytes_sec_down`, `max_bytes_sec_up`, `daily_xfer_limit_mb`, `daily_xfer_period_days`,
+  `net_start_hour` and `net_end_hour`, `dont_verify_images`, `confirm_before_connecting`,
+  `hangup_if_dialed`). Ranges and defaults are upstream's; the default for `disk_min_free_gb`
+  is the project's `default_disk_min_free_gb`.
+- Project: `resource_share`, and `no_cpu`, `no_cuda`, `no_ati` and `no_intel_gpu`, which the
+  client reads from the account file; `no_apple_gpu`, `allow_beta_work`, the application
+  selection (`<app_id>` in `<apps_selected>`) and `max_jobs`, which the scheduler reads
+  (`ProjectPrefs` in `scheduler.rs`). A GPU flag is offered only when the project has an app
+  version of that GPU type, `allow_beta_work` only when an application or an application version
+  is marked beta (`project_has_beta` upstream; the scheduler asks for it for either), and the
+  selection only when there is more than one application, as upstream. A selection of no
+  application is refused with a message on the field: the scheduler reads a document with no
+  `<app_id>` as every application, and upstream's form does too, so saving "none" would enable
+  them all. The selection and
+  `max_jobs` are written inside `<project_specific>`, as upstream's form does; anything else in
+  that element is kept. `allow_non_preferred_apps` and `max_cpus` are not offered, because the
+  scheduler does not act on them. A field that a reader takes as an integer (`max_jobs` in the
+  scheduler, `daily_xfer_period_days` in the client) accepts whole numbers only, so a fraction is
+  refused instead of being shown and then read as something else; a stored fraction is shown as
+  the integer the reader gets.
+
+The forms are written to be usable with a screen reader. Every control has an ID and a
+`<label>`: the account-details and preference forms put each caption in a `<label for>`, and the
+sign-up, password, email and login forms wrap each control in its label. A preference whose
+caption is not unique (the "not in use" limits repeat the "in use" ones, and three disk fields
+begin "Use no more than") is also named by its group heading and its unit with
+`aria-labelledby`; the two selects of an hour range have a label each, for the start and the
+end hour, hidden from sight. When a save is refused, the page is shown again with every value as
+it was submitted (numbers, checkboxes, the application selection and the account settings
+beside the project preferences), the refused ones marked, and nothing is stored.
+
+A preferences save replaces a whole document (all the venues' sets are in one column), built from
+the document read with the account, so each save (`prefs_edit.php`, `prefs_remove.php`) is one
+`UPDATE` conditional on the column still being what was read (`IS`, so it is NULL-safe). If
+another request saved meanwhile, nothing is written and the page is a 409 saying to reload and try
+again, rather than reverting the other edit (another venue's set, say). The documents are read as
+the client reads them: a not-in-use CPU limit that the document has stays as it is, a 0 included
+(`niu_suspend_cpu_usage` of 0 is "no limit" and stays blank in the form), and one it does not
+have takes the in-use value; an empty `<tag></tag>` number is 0.
+
+A computing-preferences save keeps only the fields above, as upstream's form does; anything else
+a client stored in the document is dropped.
 
 ## Admin API and CLI
 
@@ -799,9 +934,12 @@ Not implemented yet:
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
 - Upload resume, as described under Upload.
-- On the site: account creation, password reset and email login links, editing account
-  details and preferences, merging and deleting computers, per-app details of a computer,
-  cross-project statistics links and certificates, and anything that sends email.
+- On the site: password reset and email login links, email address verification and change
+  notices, invitation codes, consent records, merging and deleting computers, per-app details of
+  a computer, cross-project statistics links and certificates, and anything that sends email.
+- Rate limiting. Nothing limits how often an address may try to log in, sign up or call
+  `lookup_account.php`; upstream sleeps after a failed login (`LOGIN_FAIL_SLEEP_SEC`). A
+  deployment can put a Cloudflare rate-limiting rule on those paths.
 
 ## Isolation from other deployments
 

@@ -9,6 +9,7 @@ use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_PATHS};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
     project_config, server_status, server_status_page, server_status_xml, NewAccount,
+    MAX_FORM_BYTES,
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
@@ -22,8 +23,6 @@ use worker::{
 /// How long the edge cache keeps the master page and the project config.
 /// Both change only when the settings do.
 const PAGE_CACHE_SECS: u32 = 30;
-const MAX_FORM_BYTES: usize = 16 * 1024;
-
 fn html(body: String) -> Result<Response> {
     Ok(Response::builder()
         .with_header("Content-Type", "text/html; charset=utf-8")?
@@ -50,7 +49,11 @@ fn site_response(page: SitePage) -> Result<Response> {
         .with_status(page.status)
         .with_header("Content-Type", page.content_type)?
         .with_header("Cache-Control", "private, no-store")?
-        .with_header("X-Content-Type-Options", "nosniff")?;
+        .with_header("X-Content-Type-Options", "nosniff")?
+        // The pages hold forms that change the account; no other site may
+        // put them in a frame.
+        .with_header("Content-Security-Policy", "frame-ancestors 'none'")?
+        .with_header("X-Frame-Options", "DENY")?;
     if let Some(location) = &page.location {
         builder = builder.with_header("Location", location)?;
     }
@@ -170,6 +173,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 email_addr: get("email_addr"),
                 passwd_hash: get("passwd_hash"),
                 user_name: get("user_name"),
+                ..Default::default()
             };
             match create_account(&db, &project.config, &pepper, now(), &random, &account).await {
                 Ok(reply) => xml(reply),
@@ -190,7 +194,17 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 }
             }
         }
-        "/am_set_info.php" => xml(am_set_info()),
+        "/am_set_info.php" => {
+            let q = params(&mut req).await?;
+            let pepper = secret_bytes(&env, SECRET_PASSWD_PEPPER)?;
+            match am_set_info(&db, &project.config, &pepper, &q).await {
+                Ok(reply) => xml(reply),
+                Err(e) => {
+                    console_error!("am_set_info: {e}");
+                    xml(AccountError::DbError.reply())
+                }
+            }
+        }
         "/am_set_host_info.php" => {
             let q = params(&mut req).await?;
             let get = |k: &str| q.get(k).map(String::as_str).unwrap_or_default();
@@ -210,6 +224,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 .and_then(|h| auth_from_cookie(&h));
             let q = params(&mut req).await?;
             let pepper = secret_bytes(&env, SECRET_PASSWD_PEPPER).ok();
+            let random = random_u32;
             let ctx = SiteCtx {
                 db: &db,
                 project: &project,
@@ -217,6 +232,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 post,
                 pepper: pepper.as_deref(),
                 now: now(),
+                random: &random,
             };
             match site_page(&ctx, p, &q).await {
                 Ok(Some(page)) => site_response(page),

@@ -407,6 +407,7 @@ fn lookup_account_replies() {
             email_addr: "ada@example.com",
             passwd_hash: &hash,
             user_name: "Ada",
+            ..Default::default()
         },
     ))
     .unwrap()
@@ -489,6 +490,7 @@ fn create_account_replies() {
                 email_addr: email,
                 passwd_hash: hash,
                 user_name: name,
+                ..Default::default()
             },
         ))
         .unwrap()

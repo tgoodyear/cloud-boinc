@@ -61,8 +61,64 @@ pub fn is_valid_user_name(name: &str) -> bool {
             .any(|c| c.is_control() || c == '<' || c == '>' || c == '&')
 }
 
-fn is_passwd_hash(s: &str) -> bool {
+/// Whether `s` looks like the client's `md5(password + email)`.
+pub(crate) fn is_passwd_hash(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Longest postal code stored.
+const MAX_POSTAL_CODE: usize = 64;
+/// Longest URL stored for an account.
+const MAX_URL: usize = 254;
+
+/// A postal code: short, printable, no markup (`sanitize_tags` upstream
+/// strips tags; here they are refused).
+pub fn is_valid_postal_code(s: &str) -> bool {
+    s.len() <= MAX_POSTAL_CODE
+        && !s
+            .chars()
+            .any(|c| c.is_control() || c == '<' || c == '>' || c == '&')
+}
+
+/// `sanitize_user_url` (`html/inc/user_util.inc`): an optional `http://` or
+/// `https://`, then only letters, digits and `-_./#?&=`. Empty is allowed.
+pub fn is_valid_user_url(url: &str) -> bool {
+    if url.len() > MAX_URL {
+        return false;
+    }
+    let parts: Vec<&str> = url.split("//").collect();
+    let rest = match parts.as_slice() {
+        [only] => *only,
+        [scheme, rest] => {
+            let scheme = scheme.to_ascii_lowercase();
+            if scheme != "http:" && scheme != "https:" {
+                return false;
+            }
+            *rest
+        }
+        _ => return false,
+    };
+    rest.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-_./#?&=".contains(&b))
+}
+
+/// Longest venue name stored, for an account or a computer.
+const MAX_VENUE: usize = 64;
+
+/// A venue name an account manager may set. The site offers only `home`,
+/// `school` and `work` (and none), as upstream's `check_venue`.
+pub fn is_valid_venue(venue: &str) -> bool {
+    venue.len() <= MAX_VENUE
+        && !venue
+            .chars()
+            .any(|c| c.is_control() || c == '<' || c == '>' || c == '&' || c == '"')
+}
+
+/// Why an account may not be made here, if it may not. Shared by
+/// `create_account.php` and the site's sign-up form, as upstream's
+/// `disable_account_creation` applies to both.
+pub fn account_creation_refusal(config: &Config) -> Option<AccountError> {
+    (!config.account_creation).then_some(AccountError::CreationDisabled)
 }
 
 async fn user_by_email(db: &dyn Db, email: &str) -> CoreResult<Option<User>> {
@@ -111,6 +167,9 @@ pub struct NewAccount<'a> {
     /// for an account that can only use its authenticator.
     pub passwd_hash: &'a str,
     pub user_name: &'a str,
+    /// One of [`crate::countries::COUNTRIES`], or empty.
+    pub country: &'a str,
+    pub postal_code: &'a str,
 }
 
 /// Inserts a user. `Ok(Err(..))` is a refusal with the upstream error.
@@ -137,6 +196,12 @@ pub async fn make_user(
     if !is_valid_user_name(&name) {
         return Ok(Err(AccountError::BadUserName));
     }
+    if !crate::countries::is_valid_country(account.country)
+        || !is_valid_postal_code(account.postal_code)
+    {
+        // The site checks both before it gets here; the RPC sends neither.
+        return Err(CoreError::Invalid("bad country or postal code".into()));
+    }
     if let Some(user) = user_by_email(db, &email).await? {
         // Creating an account that exists, with its password, is a lookup.
         if !passwd_hash.is_empty()
@@ -157,7 +222,7 @@ pub async fn make_user(
     let inserted = db
         .run(stmt!(
             "INSERT INTO user (create_time, email_addr, name, authenticator, cross_project_id, \
-             passwd_hash, expavg_time) VALUES (?, ?, ?, ?, ?, ?, ?) \
+             passwd_hash, expavg_time, country, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (email_addr) DO NOTHING RETURNING id",
             now,
             email.as_str(),
@@ -165,7 +230,9 @@ pub async fn make_user(
             authenticator.as_str(),
             cross_project_id.as_str(),
             stored.as_str(),
-            now
+            now,
+            account.country,
+            account.postal_code
         ))
         .await?;
     if inserted.rows.is_empty() {
@@ -183,8 +250,8 @@ pub async fn create_account(
     random: &dyn Fn() -> u32,
     account: &NewAccount<'_>,
 ) -> CoreResult<String> {
-    if !config.account_creation {
-        return Ok(AccountError::CreationDisabled.reply());
+    if let Some(refusal) = account_creation_refusal(config) {
+        return Ok(refusal.reply());
     }
     if account.passwd_hash.is_empty() {
         return Ok(AccountError::BadPasswdHashLength.reply());
@@ -243,14 +310,214 @@ pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
     ))
 }
 
-/// `am_set_info.php`. Upstream switched this RPC off ("This probably
-/// shouldn't exist") and answers every request with this error.
-pub fn am_set_info() -> String {
-    write_error(-1, Some("not supported"))
-}
+/// Largest form body read, for `am_set_info.php`, which can carry both
+/// preference documents (up to [`crate::prefs::MAX_PREFS_BYTES`] each) with
+/// every byte URL-encoded to three, plus the account key, name, URL and the
+/// other fields. A longer body is not from a BOINC client; its fields are
+/// ignored.
+pub const MAX_FORM_BYTES: usize = 2 * 3 * crate::prefs::MAX_PREFS_BYTES + 64 * 1024;
 
-/// Longest venue `am_set_host_info.php` stores.
-const MAX_VENUE: usize = 64;
+/// `am_set_info.php`: an account manager changes an account. Upstream
+/// switched this RPC off ("This probably shouldn't exist") but its
+/// code is still there; this follows that code. Parameters come from the
+/// query or a POST form, as upstream reads either.
+///
+/// Each of `name`, `country`, `postal_code`, `global_prefs`,
+/// `project_prefs`, `url` and `venue` is changed when given and not empty;
+/// `send_email` and `show_hosts` when given and not empty; `email_addr` when
+/// it differs from the current address; `password_hash` (the client's
+/// `md5(password + email)`) when given. Values are checked before anything is
+/// written, and a refused value changes nothing. `teamid` is accepted and
+/// ignored, since there are no teams; the consent fields are ignored, since
+/// there is no consent table. As upstream, a new email address without a new
+/// `password_hash` leaves the stored hash, which was made with the old
+/// address, so the password stops working until it is set again.
+///
+/// Two statements: the account by key, then one `UPDATE` whose `WHERE`
+/// clause refuses an email address another account has. The stored hash
+/// depends on the address, so a write of either (or a request that names the
+/// address) is also conditional on the address and hash read with the
+/// account, and project preferences that inherit the stored
+/// `<project_specific>` block are conditional on `project_prefs` being still
+/// what was read; when the account changed meanwhile, nothing is written
+/// and the reply is `ERR_RETRY`; a refused write costs one more statement, to tell
+/// that from a taken address.
+pub async fn am_set_info(
+    db: &dyn Db,
+    config: &Config,
+    pepper: &[u8],
+    q: &crate::site::Params,
+) -> CoreResult<String> {
+    let get = |k: &str| q.get(k).map(String::as_str).unwrap_or_default();
+    let Some(user) = crate::site::user_by_auth(db, get("account_key").trim()).await? else {
+        return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
+    };
+    let mut update = Stmt::new("");
+    let mut sets: Vec<&str> = Vec::new();
+    let mut set = |col: &'static str, v: cb_db::Value| {
+        sets.push(col);
+        update.params.push(v);
+    };
+
+    let name = get("name");
+    if !name.is_empty() {
+        if !is_valid_user_name(name) {
+            return Ok(write_error(-1, Some("invalid name")));
+        }
+        set("name", name.into());
+    }
+    let country = if config.user_country {
+        get("country")
+    } else {
+        ""
+    };
+    if !crate::countries::is_valid_country(country) {
+        return Ok(write_error(-1, Some("invalid country")));
+    }
+    if !country.is_empty() {
+        set("country", country.into());
+    }
+    let postal_code = get("postal_code");
+    if !postal_code.is_empty() {
+        if !is_valid_postal_code(postal_code) {
+            return Ok(write_error(-1, Some("invalid postal code")));
+        }
+        set("postal_code", postal_code.into());
+    }
+    let global_prefs = get("global_prefs").replace("\r\n", "\n");
+    if !global_prefs.is_empty() {
+        if let Some(why) = crate::prefs::bad_xml(&global_prefs, "global_preferences") {
+            return Ok(write_error(
+                err::ERR_XML_PARSE,
+                Some(&format!("Invalid global preferences: {why}")),
+            ));
+        }
+        if global_prefs.len() > crate::prefs::MAX_PREFS_BYTES {
+            return Ok(write_error(err::ERR_BUFFER_OVERFLOW, None));
+        }
+        set("global_prefs", global_prefs.into());
+    }
+    let mut keeps_stored_prefs = false;
+    let project_prefs = get("project_prefs").replace("\r\n", "\n");
+    if !project_prefs.is_empty() {
+        if let Some(why) = crate::prefs::bad_xml(&project_prefs, "project_preferences") {
+            return Ok(write_error(
+                err::ERR_XML_PARSE,
+                Some(&format!("Invalid project preferences: {why}")),
+            ));
+        }
+        let merged = crate::prefs::keep_project_specific(&project_prefs, &user.project_prefs);
+        // The stored block came from the row read above; a site save of the
+        // application selection or task limit since would be undone.
+        keeps_stored_prefs = merged != project_prefs;
+        let project_prefs = merged;
+        if project_prefs.len() > crate::prefs::MAX_PREFS_BYTES {
+            return Ok(write_error(err::ERR_BUFFER_OVERFLOW, None));
+        }
+        set("project_prefs", project_prefs.into());
+    }
+    let url = if config.user_url { get("url") } else { "" };
+    if !url.is_empty() {
+        if !is_valid_user_url(url) {
+            return Ok(write_error(-1, Some("invalid URL")));
+        }
+        set("url", url.into());
+    }
+    for col in ["send_email", "show_hosts"] {
+        let v = get(col).trim();
+        if !v.is_empty() {
+            set(col, i32::from(v != "0").into());
+        }
+    }
+    let venue = get("venue");
+    if !venue.is_empty() {
+        if !is_valid_venue(venue) {
+            return Ok(write_error(-1, Some("invalid venue")));
+        }
+        set("venue", venue.into());
+    }
+    let email = get("email_addr").trim().to_lowercase();
+    let new_email = !email.is_empty() && email != user.email_addr;
+    if new_email {
+        if !is_valid_email(&email) {
+            return Ok(write_error(
+                AccountError::BadEmailAddr.num(),
+                Some("Invalid email address"),
+            ));
+        }
+        set("email_addr", email.as_str().into());
+        set("email_validated", 0.into());
+    }
+    let password_hash = get("password_hash").trim().to_lowercase();
+    if !password_hash.is_empty() {
+        if !is_passwd_hash(&password_hash) {
+            return Ok(AccountError::BadPasswdHashLength.reply());
+        }
+        set(
+            "passwd_hash",
+            pepper_passwd_hash(pepper, &password_hash).into(),
+        );
+    }
+
+    if !sets.is_empty() {
+        let assignments: Vec<String> = sets.iter().map(|c| format!("{c} = ?")).collect();
+        let target = if new_email {
+            email.as_str()
+        } else {
+            user.email_addr.as_str()
+        };
+        // `password_hash` was made for an address, and the address and the
+        // hash are what this RPC compared with. If a site request changed
+        // either since, the pair written would not match.
+        let credentials = !password_hash.is_empty() || !email.is_empty();
+        let mut guard = String::new();
+        let mut observed: Vec<&str> = Vec::new();
+        if credentials {
+            guard.push_str(" AND email_addr = ? AND passwd_hash = ?");
+            observed.extend([user.email_addr.as_str(), user.passwd_hash.as_str()]);
+        }
+        if keeps_stored_prefs {
+            guard.push_str(" AND project_prefs IS ?");
+            observed.push(user.project_prefs.as_str());
+        }
+        update.sql = format!(
+            "UPDATE user SET {} WHERE id = ?{guard} AND NOT EXISTS \
+             (SELECT 1 FROM user WHERE email_addr = ? AND id != ?) RETURNING id",
+            assignments.join(", ")
+        );
+        update = update.bind(user.id);
+        for v in observed {
+            update = update.bind(v);
+        }
+        update = update.bind(target).bind(user.id);
+        if db.run(update).await?.rows.is_empty() {
+            // Refused: the address is taken, or the account changed since it
+            // was read. Only this path asks which.
+            let taken = db
+                .run(stmt!(
+                    "SELECT count(*) AS n FROM user WHERE email_addr = ? AND id != ?",
+                    target,
+                    user.id
+                ))
+                .await?
+                .scalar_i64()
+                .unwrap_or(0);
+            if taken > 0 {
+                return Ok(write_error(
+                    err::ERR_DB_NOT_UNIQUE,
+                    Some("There's already an account with that email address."),
+                ));
+            }
+            return Ok(write_error(
+                err::ERR_RETRY,
+                Some("The account changed meanwhile; please try again."),
+            ));
+        }
+    }
+    Ok(format!(
+        "{XML_HEADER}<am_set_info_reply>\n    <success/>\n    \n</am_set_info_reply>\n"
+    ))
+}
 
 /// `am_set_host_info.php`: sets the venue of one of the account's
 /// computers. An unknown key and a computer of another account both get
@@ -269,11 +536,7 @@ pub async fn am_set_host_info(
     if !crate::site::plausible_account_key(account_key) || hostid <= 0 {
         return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
     }
-    if venue.len() > MAX_VENUE
-        || venue
-            .chars()
-            .any(|c| c.is_control() || c == '<' || c == '>' || c == '&')
-    {
+    if !is_valid_venue(venue) {
         return Ok(write_error(-1, Some("invalid venue")));
     }
     let updated = db
@@ -460,10 +723,11 @@ pub fn master_page(project: &Project) -> String {
             ));
         }
     }
-    body.push_str(
-        "</table>\n<p><a href=\"home.php\">Your account</a> &middot; \
-         <a href=\"server_status.php\">Server status</a></p>\n",
-    );
+    body.push_str("</table>\n<p><a href=\"home.php\">Your account</a> &middot; ");
+    if account_creation_refusal(c).is_none() {
+        body.push_str("<a href=\"create_account_form.php\">Create an account</a> &middot; ");
+    }
+    body.push_str("<a href=\"server_status.php\">Server status</a></p>\n");
     page(&c.long_name, &head, &body)
 }
 

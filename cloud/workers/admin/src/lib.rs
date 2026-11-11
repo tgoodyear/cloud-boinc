@@ -405,6 +405,7 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
                 email_addr: &u.email_addr,
                 passwd_hash: &u.passwd_hash,
                 user_name: &u.user_name,
+                ..Default::default()
             };
             match make_user(&db, &pepper, now(), &random, &account).await {
                 Ok(Ok(authenticator)) => ok(&json!({ "authenticator": authenticator })),

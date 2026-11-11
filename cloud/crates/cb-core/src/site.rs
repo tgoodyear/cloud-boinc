@@ -22,7 +22,8 @@ use cb_proto::web_rpc::{err, write_error};
 
 use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
-use crate::web::{html_escape, page, show_user_xml, weak_account_key};
+use crate::site_account;
+use crate::web::{account_creation_refusal, html_escape, page, show_user_xml, weak_account_key};
 use crate::CoreResult;
 
 #[derive(serde::Deserialize)]
@@ -79,7 +80,7 @@ const HTML: &str = "text/html; charset=utf-8";
 const XML: &str = "text/xml; charset=utf-8";
 
 impl SitePage {
-    fn html(status: u16, body: String) -> SitePage {
+    pub(crate) fn html(status: u16, body: String) -> SitePage {
         SitePage {
             status,
             content_type: HTML,
@@ -99,7 +100,7 @@ impl SitePage {
         }
     }
 
-    fn redirect(location: String) -> SitePage {
+    pub(crate) fn redirect(location: String) -> SitePage {
         SitePage {
             status: 303,
             content_type: HTML,
@@ -121,10 +122,12 @@ pub struct SiteCtx<'a> {
     /// The password pepper, for logins by email address and password.
     pub pepper: Option<&'a [u8]>,
     pub now: i64,
+    /// Random numbers, for new account keys.
+    pub random: &'a dyn Fn() -> u32,
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 10] = [
+pub const SITE_PATHS: [&str; 22] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -135,6 +138,18 @@ pub const SITE_PATHS: [&str; 10] = [
     "/result.php",
     "/workunit.php",
     "/show_user.php",
+    "/create_account_form.php",
+    "/signup.php",
+    "/create_account_action.php",
+    "/edit_user_info_form.php",
+    "/edit_user_info_action.php",
+    "/edit_passwd_form.php",
+    "/edit_passwd_action.php",
+    "/edit_email_form.php",
+    "/edit_email_action.php",
+    "/prefs.php",
+    "/prefs_edit.php",
+    "/prefs_remove.php",
 ];
 
 /// Answers one of [`SITE_PATHS`]; `None` for any other path.
@@ -142,7 +157,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
     Ok(Some(match path {
         "/login_form.php" => login_form(ctx.project, q),
         "/login_action.php" => login_action(ctx, q).await?,
-        "/logout.php" => logout(ctx.project),
+        "/logout.php" => site_account::logout(ctx, q).await?,
         "/home.php" => home(ctx).await?,
         "/hosts_user.php" => hosts_user(ctx, q).await?,
         "/show_host_detail.php" => show_host_detail(ctx, q).await?,
@@ -150,6 +165,19 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/result.php" => result(ctx, q).await?,
         "/workunit.php" => workunit(ctx, q).await?,
         "/show_user.php" => show_user(ctx, q).await?,
+        "/create_account_form.php" | "/signup.php" => {
+            site_account::create_account_form(ctx.project, q)
+        }
+        "/create_account_action.php" => site_account::create_account_action(ctx, q).await?,
+        "/edit_user_info_form.php" => site_account::edit_user_info_form(ctx).await?,
+        "/edit_user_info_action.php" => site_account::edit_user_info_action(ctx, q).await?,
+        "/edit_passwd_form.php" => site_account::edit_passwd_form(ctx).await?,
+        "/edit_passwd_action.php" => site_account::edit_passwd_action(ctx, q).await?,
+        "/edit_email_form.php" => site_account::edit_email_form(ctx).await?,
+        "/edit_email_action.php" => site_account::edit_email_action(ctx, q).await?,
+        "/prefs.php" => site_account::prefs(ctx, q).await?,
+        "/prefs_edit.php" => site_account::prefs_edit(ctx, q).await?,
+        "/prefs_remove.php" => site_account::prefs_remove(ctx, q).await?,
         _ => return Ok(None),
     }))
 }
@@ -271,8 +299,16 @@ fn size_string(x: f64) -> String {
     }
 }
 
-fn row2(out: &mut String, label: &str, value: &str) {
+pub(crate) fn row2(out: &mut String, label: &str, value: &str) {
     out.push_str(&format!("<tr><th>{label}</th><td>{value}</td></tr>\n"));
+}
+
+/// A row of a form: the caption is the `<label>` of the control with ID `id`
+/// (which `control` must carry), so that the control has a name.
+pub(crate) fn label_row(out: &mut String, id: &str, caption: &str, control: &str) {
+    out.push_str(&format!(
+        "<tr><th scope=\"row\"><label for=\"{id}\">{caption}</label></th><td>{control}</td></tr>\n"
+    ));
 }
 
 fn host_link(hostid: i64) -> String {
@@ -284,7 +320,7 @@ fn host_link(hostid: i64) -> String {
 }
 
 /// A page in the site layout: the given body under a short navigation bar.
-fn layout(project: &Project, title: &str, body: &str) -> String {
+pub(crate) fn layout(project: &Project, title: &str, body: &str) -> String {
     let nav = format!(
         "<p><a href=\"./\">{}</a> &middot; <a href=\"home.php\">Your account</a> &middot; \
          <a href=\"server_status.php\">Server status</a></p>\n<h1>{}</h1>\n",
@@ -294,7 +330,7 @@ fn layout(project: &Project, title: &str, body: &str) -> String {
     page(title, "", &format!("{nav}{body}"))
 }
 
-fn error_page(project: &Project, status: u16, msg: &str) -> SitePage {
+pub(crate) fn error_page(project: &Project, status: u16, msg: &str) -> SitePage {
     SitePage::html(
         status,
         layout(
@@ -309,7 +345,7 @@ fn int_param(q: &Params, name: &str) -> Option<i64> {
     q.get(name).and_then(|v| v.trim().parse().ok())
 }
 
-fn str_param<'a>(q: &'a Params, name: &str) -> &'a str {
+pub(crate) fn str_param<'a>(q: &'a Params, name: &str) -> &'a str {
     q.get(name).map(|s| s.trim()).unwrap_or_default()
 }
 
@@ -381,7 +417,7 @@ pub fn logout_cookie(project: &Project) -> String {
 
 /// `sanitize_local_url`, stricter: a page of this site and its query, or
 /// nothing.
-fn local_url(next: &str) -> Option<&str> {
+pub(crate) fn local_url(next: &str) -> Option<&str> {
     let next = next.trim().trim_matches('/');
     let (page, query) = next.split_once('?').unwrap_or((next, ""));
     let page_ok = page.ends_with(".php")
@@ -407,8 +443,13 @@ pub fn login_form(project: &Project, q: &Params) -> SitePage {
          <p><label><input type=\"checkbox\" name=\"stay_logged_in\" value=\"1\"> Stay logged in</label></p>\n\
          <p><input type=\"submit\" value=\"Log in\"></p>\n</form>\n\
          <p>Your account key is in the file <code>account_*.xml</code> for this project in the \
-         BOINC data directory of a computer attached to your account.</p>\n",
-        html_escape(next)
+         BOINC data directory of a computer attached to your account.</p>\n{}",
+        html_escape(next),
+        if account_creation_refusal(&project.config).is_none() {
+            "<p>No account yet? <a href=\"create_account_form.php\">Create one</a>.</p>\n"
+        } else {
+            ""
+        }
     );
     SitePage::html(200, layout(project, "Log in", &body))
 }
@@ -465,14 +506,7 @@ pub async fn login_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
     Ok(out)
 }
 
-/// `logout.php`: clears the cookie and goes to the master page.
-pub fn logout(project: &Project) -> SitePage {
-    let mut out = SitePage::redirect(project.config.master_url.clone());
-    out.set_cookie = Some(logout_cookie(project));
-    out
-}
-
-fn to_login(project: &Project, next: &str) -> SitePage {
+pub(crate) fn to_login(project: &Project, next: &str) -> SitePage {
     let next: String = next
         .bytes()
         .map(|b| match b {
@@ -488,7 +522,7 @@ fn to_login(project: &Project, next: &str) -> SitePage {
     ))
 }
 
-async fn viewer(ctx: &SiteCtx<'_>) -> CoreResult<Option<User>> {
+pub(crate) async fn viewer(ctx: &SiteCtx<'_>) -> CoreResult<Option<User>> {
     match ctx.auth {
         Some(a) => user_by_auth(ctx.db, a).await,
         None => Ok(None),
@@ -558,8 +592,16 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
         &user_cpid(&user.cross_project_id, &user.email_addr),
     );
     b.push_str(
-        "</table>\n<form method=\"post\" action=\"logout.php\"><p><input type=\"submit\" value=\"Log out\"></p></form>\n",
+        "</table>\n<h2>Settings</h2>\n<ul>\n\
+         <li><a href=\"edit_user_info_form.php\">Account information</a></li>\n\
+         <li><a href=\"edit_email_form.php\">Email address</a></li>\n\
+         <li><a href=\"edit_passwd_form.php\">Password</a></li>\n\
+         <li><a href=\"prefs.php?subset=global\">Computing preferences</a></li>\n\
+         <li><a href=\"prefs.php?subset=project\">Project preferences</a></li>\n</ul>\n\
+         <form method=\"post\" action=\"logout.php\">\n",
     );
+    b.push_str(&site_account::token_fields(&user, ctx.now));
+    b.push_str("<p><input type=\"submit\" value=\"Log out\"></p>\n</form>\n");
     Ok(SitePage::html(200, layout(project, "Your account", &b)))
 }
 
