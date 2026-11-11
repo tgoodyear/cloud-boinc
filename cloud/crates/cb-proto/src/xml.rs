@@ -259,24 +259,22 @@ pub fn xml_escape(input: &str) -> String {
 /// parser: it turns each byte of a multi-byte character into its own
 /// reference, which a standard parser reads as several Latin-1 characters.
 ///
-/// `<` and `&` become entities, `]]>` becomes `]]&gt;`, and tab, newline and
-/// carriage return become `&#N;`, so for ASCII input the output equals
-/// [`xml_escape`]'s. Other control characters and U+FFFE and U+FFFF, which
-/// XML 1.0 forbids, are dropped. Every other character is kept.
+/// `<` and `&` become entities and tab, newline and carriage return become
+/// `&#N;`. Other control characters and U+FFFE and U+FFFF, which XML 1.0
+/// forbids, are dropped. A `>` that would follow `]]` in the output becomes
+/// `&gt;`. Every other character is kept. For ASCII input without dropped
+/// characters the output equals [`xml_escape`]'s.
 pub fn xml_escape_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 16);
-    let mut chars = input.char_indices();
-    while let Some((i, c)) = chars.next() {
+    for c in input.chars() {
         match c {
             '<' => out.push_str("&lt;"),
             '&' => out.push_str("&amp;"),
             '\t' | '\n' | '\r' => out.push_str(&format!("&#{};", c as u32)),
             '\0'..='\x1f' | '\u{fffe}' | '\u{ffff}' => {}
-            ']' if input[i..].starts_with("]]>") => {
-                out.push_str("]]&gt;");
-                chars.next();
-                chars.next();
-            }
+            // Checked against the output, so that a dropped character
+            // between the brackets and the `>` does not leave `]]>`.
+            '>' if out.ends_with("]]") => out.push_str("&gt;"),
             _ => out.push(c),
         }
     }
@@ -1290,6 +1288,9 @@ mod tests {
         assert_eq!(xml_escape_text("a<b>&c"), "a&lt;b>&amp;c");
         assert_eq!(xml_escape_text("x]]>y]z"), "x]]&gt;y]z");
         assert_eq!(xml_escape_text("]]]>\u{e9}"), "]]]&gt;\u{e9}");
+        assert_eq!(xml_escape_text("x]]\u{fffe}>y"), "x]]&gt;y");
+        assert_eq!(xml_escape_text("x]\x01]\x02>y"), "x]]&gt;y");
+        assert_eq!(xml_escape_text("x]]\n>y"), "x]]&#10;>y");
         assert_eq!(
             xml_escape_text("a\tb\nc\rd\x01e\u{fffe}"),
             "a&#9;b&#10;c&#13;de"
