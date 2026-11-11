@@ -9,7 +9,9 @@ use cb_core::web::{
     server_status_page, server_status_xml, NewAccount,
 };
 use cb_proto::web_rpc::AccountError;
-use cb_worker::{db, now, project, random_u32, secret_bytes, text, xml, SECRET_PASSWD_PEPPER};
+use cb_worker::{
+    db, now, project, random_u32, read_body, secret_bytes, text, xml, SECRET_PASSWD_PEPPER,
+};
 use worker::{
     console_error, event, Cache, Context, Env, Headers, Method, Request, Response, Result,
 };
@@ -17,6 +19,7 @@ use worker::{
 /// How long the edge cache keeps the master page and the project config.
 /// Both change only when the settings do.
 const PAGE_CACHE_SECS: u32 = 30;
+const MAX_FORM_BYTES: usize = 16 * 1024;
 
 fn html(body: String) -> Result<Response> {
     Ok(Response::builder()
@@ -52,8 +55,9 @@ async fn params(req: &mut Request) -> Result<HashMap<String, String>> {
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     if req.method() == Method::Post {
-        let body = req.text().await?;
-        if body.len() <= 16 * 1024 {
+        // A longer form is not from a BOINC client; its fields are ignored.
+        if let Some(body) = read_body(req, MAX_FORM_BYTES).await? {
+            let body = String::from_utf8_lossy(&body);
             for (k, v) in worker::Url::parse(&format!("http://x/?{body}"))?.query_pairs() {
                 out.insert(k.into_owned(), v.into_owned());
             }

@@ -2,7 +2,7 @@
 
 use cb_core::scheduler::{handle_request, SchedCtx};
 use cb_proto::sched_reply::write_project_down;
-use cb_worker::{db, enqueue, now, project, random_u32, text, xml};
+use cb_worker::{db, enqueue, now, project, random_u32, read_body, text, xml};
 use worker::{console_error, console_log, event, Context, Env, Method, Request, Response, Result};
 
 /// A scheduler request with a full host description and a few hundred
@@ -23,10 +23,9 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         );
     }
     let started = cb_worker::now_ms();
-    let body = req.bytes().await?;
-    if body.len() > MAX_REQUEST_BYTES {
+    let Some(body) = read_body(&mut req, MAX_REQUEST_BYTES).await? else {
         return down("The request is too large.");
-    }
+    };
     let body = String::from_utf8_lossy(&body);
     let db = db(&env)?;
     let project = match project(&db).await {

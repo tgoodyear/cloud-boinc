@@ -198,7 +198,7 @@ fn a_registered_version_is_sent_to_a_client() {
 
     let platform = NewPlatform {
         name: LINUX.into(),
-        user_friendly_name: "Linux x86-64".into(),
+        user_friendly_name: "Linux x86-64 <glibc & musl>".into(),
         ..Default::default()
     };
     let pid = block_on(put_platform(&w.db, 1, &platform)).unwrap();
@@ -305,6 +305,7 @@ fn a_registered_version_is_sent_to_a_client() {
     let config_xml = project_config(&project);
     assert!(config_xml.contains("<name>Test Project</name>"));
     assert!(config_xml.contains(LINUX));
+    assert!(config_xml.contains("Linux x86-64 &lt;glibc &amp; musl>"));
     let page = master_page(&project);
     assert!(page.contains("<link rel=\"boinc_scheduler\" href=\"https://p.example/sched\">"));
     assert!(page.contains("<scheduler>https://p.example/sched</scheduler>"));

@@ -11,6 +11,7 @@ use cb_core::{CoreError, CoreResult, FileKind, FileStat, Files, Webhook};
 use cb_crypto::account::constant_time_eq;
 use cb_crypto::{PrivateKey, Signer};
 pub use cb_d1::D1Db;
+use futures_util::StreamExt;
 use worker::wasm_bindgen::JsValue;
 use worker::{Bucket, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result};
 
@@ -144,6 +145,29 @@ pub async fn enqueue(env: &Env, ids: &[i64]) {
             worker::console_warn!("queue send failed: {e}");
         }
     }
+}
+
+/// The request body, or `None` when it is longer than `limit`. A declared
+/// length over the limit is refused before anything is read, and a body
+/// without one is dropped as soon as it passes the limit.
+pub async fn read_body(req: &mut Request, limit: usize) -> Result<Option<Vec<u8>>> {
+    let declared = req
+        .headers()
+        .get("Content-Length")?
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return Ok(None);
+    }
+    let mut stream = req.stream()?;
+    let mut out = Vec::with_capacity(declared.unwrap_or(0) as usize);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len() + chunk.len() > limit {
+            return Ok(None);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Some(out))
 }
 
 pub fn xml(body: String) -> Result<Response> {

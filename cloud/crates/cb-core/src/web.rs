@@ -215,9 +215,9 @@ pub fn project_config(project: &Project) -> String {
             continue;
         };
         let entry = ConfigPlatform {
-            name: p.name.clone(),
-            user_friendly_name: p.user_friendly_name.clone(),
-            plan_class: av.plan_class.clone(),
+            name: xml_escape(&p.name),
+            user_friendly_name: xml_escape(&p.user_friendly_name),
+            plan_class: xml_escape(&av.plan_class),
         };
         if !platforms.contains(&entry) {
             platforms.push(entry);
@@ -322,7 +322,7 @@ pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
                 ASSIMILATE_READY
             ),
             stmt!(
-                "SELECT count(*) AS n FROM workunit WHERE transition_time < ?",
+                "SELECT count(*) AS n FROM workunit WHERE transition_time < ? AND transition_time < 2147483647",
                 now
             ),
             Stmt::new("SELECT coalesce(max(id), 0) AS n FROM user"),

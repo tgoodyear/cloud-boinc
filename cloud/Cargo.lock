@@ -274,6 +274,7 @@ dependencies = [
  "cb-crypto",
  "cb-d1",
  "cb-db",
+ "futures-util",
  "getrandom",
  "serde",
  "serde_json",

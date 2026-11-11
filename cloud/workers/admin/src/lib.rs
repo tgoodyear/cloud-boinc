@@ -15,8 +15,8 @@ use cb_core::{CoreError, FileKind};
 use cb_crypto::PublicKey;
 use cb_proto::upload::is_valid_filename;
 use cb_worker::{
-    db, enqueue, forget_project, is_admin, now, object_key, project, random_u32, secret_bytes,
-    signer, text, D1Db, R2Files, BUCKET, SECRET_PASSWD_PEPPER,
+    db, enqueue, forget_project, is_admin, now, object_key, project, random_u32, read_body,
+    secret_bytes, signer, text, D1Db, R2Files, BUCKET, SECRET_PASSWD_PEPPER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,6 +27,8 @@ use worker::{
 const PREFIX: &str = "/admin/v1/";
 /// JSON request bodies; a submission of a few thousand jobs fits.
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+/// One setting; a D1 row holds no more than this.
+const MAX_SETTING_BYTES: usize = 1024 * 1024;
 
 fn json_status<T: Serialize>(status: u16, value: &T) -> Result<Response> {
     Ok(Response::from_json(value)?.with_status(status))
@@ -73,10 +75,9 @@ fn found(changed: bool, what: &str) -> Result<Response> {
 async fn body<T: for<'de> Deserialize<'de>>(
     req: &mut Request,
 ) -> Result<std::result::Result<T, String>> {
-    let bytes = req.bytes().await?;
-    if bytes.len() > MAX_JSON_BYTES {
+    let Some(bytes) = read_body(req, MAX_JSON_BYTES).await? else {
         return Ok(Err("the request body is too large".into()));
-    }
+    };
     Ok(serde_json::from_slice(&bytes).map_err(|e| format!("bad JSON: {e}")))
 }
 
@@ -247,7 +248,12 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
             Err(e) => core_error(e),
         },
         (Method::Put, ["config", name]) => {
-            let value = req.text().await?;
+            let Some(value) = read_body(&mut req, MAX_SETTING_BYTES).await? else {
+                return error(413, "the setting is too large");
+            };
+            let Ok(value) = String::from_utf8(value) else {
+                return error(400, "the setting is not UTF-8 text");
+            };
             match put_setting(&db, name, &value, now()).await {
                 Ok(()) => {
                     forget_project();
