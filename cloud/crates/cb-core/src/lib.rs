@@ -9,6 +9,7 @@ pub mod avg;
 pub mod config;
 pub mod model;
 pub mod pipeline;
+pub mod plan_class;
 pub mod template;
 pub mod work;
 

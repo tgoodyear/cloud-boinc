@@ -10,6 +10,7 @@ async-trait = "0.1"
 cb-crypto = { path = "../cb-crypto" }
 cb-db = { path = "../cb-db" }
 cb-proto = { path = "../cb-proto" }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

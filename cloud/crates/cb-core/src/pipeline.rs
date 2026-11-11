@@ -3,9 +3,11 @@
 //! (`sched/validator.cpp`, `sched/validate_util2.cpp`) and the file deleter.
 //!
 //! A transition reads the workunit and its results, decides in memory, and
-//! writes everything back in one batch. The batch is guarded by
-//! `workunit.rev`: every writer of a workunit or of one of its results
-//! increments it, and a transition whose read is stale writes nothing and
+//! writes everything back in one batch. Every writer of a workunit or of one
+//! of its results increments `workunit.rev`. The batch's first statement
+//! updates the workunit only at the revision that was read and stamps it
+//! with a random commit token; the other statements apply only while that
+//! token is there. A transition whose read is stale writes nothing and
 //! starts over.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -60,8 +62,9 @@ pub struct TransitionReport {
 
 /// How a workunit is named in the guard of a result insert.
 pub(crate) enum WuGuard<'a> {
-    /// An existing workunit at a known revision.
-    Rev { id: i64, rev: i64 },
+    /// An existing workunit whose update, earlier in the same batch, wrote
+    /// this commit token.
+    Token { id: i64, token: i64 },
     /// A workunit inserted earlier in the same batch.
     NewByName(&'a str),
 }
@@ -164,10 +167,10 @@ pub(crate) fn new_result(
 
 pub(crate) fn insert_result_stmt(r: &JobResult, guard: WuGuard) -> Stmt {
     let s = Stmt::new(match guard {
-        WuGuard::Rev { .. } => {
+        WuGuard::Token { .. } => {
             "INSERT INTO result (create_time, workunitid, server_state, outcome, name, xml_doc_in, batch, \
              random, appid, priority, validate_state, file_delete_state, mod_time) \
-             SELECT ?, w.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM workunit w WHERE w.id = ? AND w.rev = ?"
+             SELECT ?, w.id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM workunit w WHERE w.id = ? AND w.commit_token = ?"
         }
         WuGuard::NewByName(_) => {
             "INSERT INTO result (create_time, workunitid, server_state, outcome, name, xml_doc_in, batch, \
@@ -188,7 +191,7 @@ pub(crate) fn insert_result_stmt(r: &JobResult, guard: WuGuard) -> Stmt {
     .bind(r.file_delete_state)
     .bind(r.mod_time);
     match guard {
-        WuGuard::Rev { id, rev } => s.bind(id).bind(rev),
+        WuGuard::Token { id, token } => s.bind(id).bind(token),
         WuGuard::NewByName(name) => s.bind(name),
     }
 }
@@ -968,15 +971,20 @@ struct CreditRow {
     avg_turnaround: f64,
 }
 
-fn guard_sql(wu_id: i64, rev: i64) -> (&'static str, [Value; 2]) {
+fn guard_sql(wu_id: i64, token: i64) -> (&'static str, [Value; 2]) {
     (
-        " AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND rev = ?)",
-        [wu_id.into(), rev.into()],
+        " AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND commit_token = ?)",
+        [wu_id.into(), token.into()],
     )
 }
 
-fn guarded(mut s: Stmt, wu_id: i64, rev: i64) -> Stmt {
-    let (sql, params) = guard_sql(wu_id, rev);
+/// Makes a statement apply only if this batch's workunit update did.
+///
+/// The token, not the new revision, is what the guard tests: a transition
+/// that lost the race would find the revision it expected to write already
+/// there, written by the winner.
+fn guarded(mut s: Stmt, wu_id: i64, token: i64) -> Stmt {
+    let (sql, params) = guard_sql(wu_id, token);
     s.sql.push_str(sql);
     for p in params {
         s = s.bind(p);
@@ -990,7 +998,7 @@ fn guarded(mut s: Stmt, wu_id: i64, rev: i64) -> Stmt {
 /// written as computed from the values read here; two transitions crediting
 /// one host at the same instant can lose one sample of an average, never
 /// credit.
-async fn host_statements(st: &State, ctx: &Ctx<'_>, new_rev: i64) -> CoreResult<Vec<Stmt>> {
+async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Vec<Stmt>> {
     if st.events.is_empty() {
         return Ok(Vec::new());
     }
@@ -1185,7 +1193,7 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, new_rev: i64) -> CoreResult<
                 *id
             ),
             wu_id,
-            new_rev,
+            token,
         ));
     }
     for (id, credit) in &user_credit {
@@ -1199,7 +1207,7 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, new_rev: i64) -> CoreResult<
                 *id
             ),
             wu_id,
-            new_rev,
+            token,
         ));
     }
     for ((host_id, gavid), h) in &havs {
@@ -1230,7 +1238,7 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, new_rev: i64) -> CoreResult<
         for p in max_jobs.params.into_iter().chain(consecutive.params) {
             s = s.bind(p);
         }
-        out.push(guarded(s.bind(*host_id).bind(*gavid), wu_id, new_rev));
+        out.push(guarded(s.bind(*host_id).bind(*gavid), wu_id, token));
     }
     Ok(out)
 }
@@ -1337,12 +1345,14 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
                 .await?;
         }
 
-        let new_rev = orig_rev + 1;
+        // Never zero, the value of a workunit no transition has written.
+        let token = ((i64::from((ctx.random)()) << 31) | i64::from((ctx.random)() & 0x7fff_ffff)) | 1;
         let wu = &st.wu;
         let mut batch = vec![stmt!(
             "UPDATE workunit SET need_validate = ?, canonical_resultid = ?, canonical_credit = ?, \
              transition_time = ?, error_mask = ?, file_delete_state = ?, assimilate_state = ?, \
-             target_nresults = ?, app_version_id = ?, mod_time = ?, rev = rev + 1 WHERE id = ? AND rev = ?",
+             target_nresults = ?, app_version_id = ?, mod_time = ?, rev = rev + 1, commit_token = ? \
+             WHERE id = ? AND rev = ?",
             wu.need_validate,
             wu.canonical_resultid,
             wu.canonical_credit,
@@ -1353,6 +1363,7 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
             wu.target_nresults,
             wu.app_version_id,
             ctx.now,
+            token,
             wu.id,
             orig_rev
         )];
@@ -1360,10 +1371,7 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
             match &res.orig {
                 None => batch.push(insert_result_stmt(
                     &res.row,
-                    WuGuard::Rev {
-                        id: wu.id,
-                        rev: new_rev,
-                    },
+                    WuGuard::Token { id: wu.id, token },
                 )),
                 Some(orig) if result_changed(orig, &res.row) => batch.push(guarded(
                     stmt!(
@@ -1378,12 +1386,12 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
                         res.row.id
                     ),
                     wu.id,
-                    new_rev,
+                    token,
                 )),
                 Some(_) => {}
             }
         }
-        batch.extend(host_statements(&st, ctx, new_rev).await?);
+        batch.extend(host_statements(&st, ctx, token).await?);
         if !st.delete_downloads.is_empty() {
             let mut s = Stmt::new(format!(
                 "DELETE FROM job_file WHERE name IN ({})",
@@ -1392,7 +1400,7 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
             for n in &st.delete_downloads {
                 s = s.bind(n.as_str());
             }
-            batch.push(guarded(s, wu.id, new_rev));
+            batch.push(guarded(s, wu.id, token));
         }
 
         let written = ctx.db.batch(batch).await?;

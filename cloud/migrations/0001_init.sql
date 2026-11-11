@@ -190,7 +190,10 @@ CREATE TABLE workunit (
     n_sent INTEGER NOT NULL DEFAULT 0,
     -- cloud-boinc: bumped by every transition; guards against two transitions
     -- of one workunit writing over each other
-    rev INTEGER NOT NULL DEFAULT 0
+    rev INTEGER NOT NULL DEFAULT 0,
+    -- cloud-boinc: random value written by a transition's workunit update; the
+    -- other statements of its batch apply only while it is still there
+    commit_token INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX wu_name ON workunit (name);
 -- Workunits with nothing pending are parked at INT_MAX, as the transitioner does.
