@@ -595,7 +595,9 @@ fn login_sets_a_cookie_and_logout_clears_it() {
     assert_eq!((weak.status, n), (403, 0));
     assert!(weak.set_cookie.is_none());
 
-    let out = w.get("/logout.php", Some(&ada.auth), &[]);
+    // The account page's "Log out" form carries the token.
+    let home = w.get("/home.php", Some(&ada.auth), &[]);
+    let (out, _) = w.submit(&home, "/logout.php", Some(&ada.auth), &[]);
     assert_eq!(out.status, 303);
     assert_eq!(out.location.as_deref(), Some("https://p.example/"));
     assert!(out.set_cookie.unwrap().starts_with("auth=; Path=/;"));
@@ -607,6 +609,57 @@ fn login_sets_a_cookie_and_logout_clears_it() {
     );
     assert!(form.body.contains("value=\"home.php\""));
     assert!(!form.body.contains("<script>"));
+}
+
+#[test]
+fn logout_needs_a_post_a_login_and_the_form_token() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    let home = w.get("/home.php", Some(&ada.auth), &[]);
+    assert!(home
+        .body
+        .contains("<form method=\"post\" action=\"logout.php\">"));
+    assert!(home.body.contains("name=\"ttok\""));
+    let token = hidden_fields(&home.body);
+    let pairs: Vec<(&str, &str)> = token
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    // A GET, even with a valid token in the query, does not log out.
+    let by_get = w.get("/logout.php", Some(&ada.auth), &pairs);
+    assert_eq!(by_get.status, 403);
+    assert!(by_get.set_cookie.is_none());
+    assert!(by_get.body.contains("Link has timed out"));
+
+    // A POST without a token, or with another account's token, does not.
+    let bare = w.post("/logout.php", Some(&ada.auth), &[]);
+    assert_eq!(bare.status, 403);
+    assert!(bare.set_cookie.is_none());
+    let bobs_home = w.get("/home.php", Some(&bob.auth), &[]);
+    let (foreign, _) = w.submit(&bobs_home, "/logout.php", Some(&ada.auth), &[]);
+    assert_eq!(foreign.status, 403);
+    assert!(foreign.set_cookie.is_none());
+
+    // A POST with no login has nothing to log out of, and sets no cookie.
+    let anon = w.post("/logout.php", None, &pairs);
+    assert_eq!(anon.status, 303);
+    assert_eq!(anon.location.as_deref(), Some("https://p.example/"));
+    assert!(anon.set_cookie.is_none());
+    let unknown = w.post(
+        "/logout.php",
+        Some("0123456789abcdef0123456789abcdef"),
+        &pairs,
+    );
+    assert_eq!(unknown.status, 303);
+    assert!(unknown.set_cookie.is_none());
+
+    // A POST with the cookie and a valid token clears the cookie.
+    let ok = w.post("/logout.php", Some(&ada.auth), &pairs);
+    assert_eq!(ok.status, 303);
+    assert_eq!(ok.location.as_deref(), Some("https://p.example/"));
+    assert!(ok.set_cookie.unwrap().starts_with("auth=; Path=/;"));
 }
 
 #[test]

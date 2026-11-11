@@ -18,8 +18,8 @@ use crate::model::User;
 use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
 use crate::site::{
-    error_page, layout, local_url, login_cookie, row2, str_param, to_login, viewer, Params,
-    SiteCtx, SitePage,
+    error_page, layout, local_url, login_cookie, logout_cookie, row2, str_param, to_login, viewer,
+    Params, SiteCtx, SitePage,
 };
 use crate::web::{
     account_creation_refusal, html_escape, is_valid_email, is_valid_postal_code,
@@ -38,7 +38,7 @@ pub const FORM_TOKEN_SECS: i64 = 86400;
 const TIMED_OUT: &str = "Link has timed out. Please go back, reload the page, and try again.";
 
 /// The hidden fields that tie a form to the logged-in account.
-fn token_fields(user: &User, now: i64) -> String {
+pub(crate) fn token_fields(user: &User, now: i64) -> String {
     format!(
         "<input type=\"hidden\" name=\"tnow\" value=\"{now}\">\n\
          <input type=\"hidden\" name=\"ttok\" value=\"{}\">\n",
@@ -120,6 +120,27 @@ fn passwd_input(name: &str, label: &str, autocomplete: &str) -> String {
     format!(
         "<p><label>{label}<br><input type=\"password\" name=\"{name}\" autocomplete=\"{autocomplete}\"></label></p>\n"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Log out.
+
+/// `logout.php`: clears the cookie and goes to the master page. As upstream
+/// it needs a logged-in account and the form token (`check_tokens`), and
+/// takes a POST only, so a link or an image on another site cannot log a
+/// browser out. With no login there is nothing to clear; a missing, old or
+/// foreign token, or a GET, is refused as the other actions refuse it.
+pub async fn logout(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
+    let project = ctx.project;
+    let Some(user) = viewer(ctx).await? else {
+        return Ok(SitePage::redirect(project.config.master_url.clone()));
+    };
+    if !token_ok(ctx, &user, q) {
+        return Ok(error_page(project, 403, TIMED_OUT));
+    }
+    let mut out = SitePage::redirect(project.config.master_url.clone());
+    out.set_cookie = Some(logout_cookie(project));
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

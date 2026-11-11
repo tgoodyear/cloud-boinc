@@ -650,7 +650,7 @@ The site pages are in `cloud/crates/cb-core/src/site.rs`, reached through `site_
 the account and preference pages listed below. Logging in, with the account key or with email address and password, sets the `auth` cookie
 to the account key as upstream does, with `HttpOnly`, `Secure` and `SameSite=Lax`. It lasts a
 year when "stay logged in" is ticked, and for the browser session otherwise. A password is
-taken from a POST only. Private fields follow upstream: the account page, the IP address,
+taken from a POST only. Logging out is a POST with the form token, as described under the account pages below. Private fields follow upstream: the account page, the IP address,
 domain name, disk and activity fractions of a computer, and an account's task list are shown
 to the account holder only. Another account's computers are listed only when it has
 `show_hosts` set, and then without names. A computer's task list, a task (with its stderr) and
@@ -709,8 +709,12 @@ Every page that changes an account takes a POST only, and every one used while l
 a form token as well: the form page puts `tnow` and `ttok = HMAC-SHA-256(account key, "form " +
 tnow)` (`form_token` in `cloud/crates/cb-crypto/src/account.rs`) in hidden fields, and the action
 accepts the token for a day (`FORM_TOKEN_SECS`), as upstream's `form_tokens` and `check_tokens`
-do with an MD5. The `SameSite=Lax` cookie already keeps other sites' POSTs from carrying the
-login. Sign-up has no token, as upstream. Each page runs at most two round trips: the account by
+do with an MD5. `logout.php` (`logout` in `cloud/crates/cb-core/src/site_account.rs`) is one of
+them: as upstream's `logout.php` checks tokens, it clears the cookie only for a POST from a
+logged-in account with a valid token, so the "Log out" form on `home.php` carries the token
+fields and a plain link or a GET does nothing but answer 403. With no login it redirects to the
+master URL without setting a cookie. The `SameSite=Lax` cookie already keeps other sites' POSTs
+from carrying the login. Sign-up has no token, as upstream. Each page runs at most two round trips: the account by
 cookie, then one write (the email change sends its write as a batch of two statements).
 
 Every site page is sent with `Content-Security-Policy: frame-ancestors 'none'` and

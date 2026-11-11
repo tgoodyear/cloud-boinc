@@ -157,7 +157,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
     Ok(Some(match path {
         "/login_form.php" => login_form(ctx.project, q),
         "/login_action.php" => login_action(ctx, q).await?,
-        "/logout.php" => logout(ctx.project),
+        "/logout.php" => site_account::logout(ctx, q).await?,
         "/home.php" => home(ctx).await?,
         "/hosts_user.php" => hosts_user(ctx, q).await?,
         "/show_host_detail.php" => show_host_detail(ctx, q).await?,
@@ -498,13 +498,6 @@ pub async fn login_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
     Ok(out)
 }
 
-/// `logout.php`: clears the cookie and goes to the master page.
-pub fn logout(project: &Project) -> SitePage {
-    let mut out = SitePage::redirect(project.config.master_url.clone());
-    out.set_cookie = Some(logout_cookie(project));
-    out
-}
-
 pub(crate) fn to_login(project: &Project, next: &str) -> SitePage {
     let next: String = next
         .bytes()
@@ -597,8 +590,10 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
          <li><a href=\"edit_passwd_form.php\">Password</a></li>\n\
          <li><a href=\"prefs.php?subset=global\">Computing preferences</a></li>\n\
          <li><a href=\"prefs.php?subset=project\">Project preferences</a></li>\n</ul>\n\
-         <form method=\"post\" action=\"logout.php\"><p><input type=\"submit\" value=\"Log out\"></p></form>\n",
+         <form method=\"post\" action=\"logout.php\">\n",
     );
+    b.push_str(&site_account::token_fields(&user, ctx.now));
+    b.push_str("<p><input type=\"submit\" value=\"Log out\"></p>\n</form>\n");
     Ok(SitePage::html(200, layout(project, "Your account", &b)))
 }
 
