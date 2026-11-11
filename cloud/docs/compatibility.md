@@ -112,6 +112,16 @@ Kinds are `scheduler_reply`, `upload_reply`, `master`, `project_config`, `lookup
 signature checks, and `--prior-reply FILE` to give the client the earlier replies a reply refers
 to. Paths may be relative to the directory the oracle is started in.
 
+The replies of the web RPCs pass between the client core and the GUI RPC client over socket pairs,
+with a writer and a reader on separate threads, so a reply larger than a socket buffer cannot
+block them. `--socket-buffer BYTES` shrinks the buffers to make even a short reply need that; the
+test `project_config_larger_than_a_socket_buffer` uses it. A reply is also limited by the client
+core itself: it builds the `get_project_config_poll` answer with a single 100000 byte buffer
+(`MFILE::vprintf` in `lib/mfile.cpp`), so a project configuration larger than that does not reach
+the GUI client at all, and the test stays under it. Each program ends itself with a message after
+60 seconds (`CB_PARSER_ORACLE_TIMEOUT_SECS` changes this), and the Rust tests stop an oracle that
+has not finished after 120 seconds.
+
 ## What it does not cover
 
 - One client version. The oracle is the client in this tree (see `version.h`). Older clients

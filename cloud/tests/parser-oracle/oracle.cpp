@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -30,6 +31,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "io_util.h"
 #include "cpp.h"
 #include "config.h"
 
@@ -120,6 +122,7 @@ struct Options {
     string kind, file, master_url = "https://oracle.example/";
     vector<string> platforms, gpus, md5s, priors;
     string code_sign_key_file;
+    int socket_buffer = 0;
 };
 
 static void usage() {
@@ -128,6 +131,7 @@ static void usage() {
         "project_config|lookup_account|create_account --file PATH\n"
         "  [--master-url URL] [--platform NAME]... [--gpu TYPE]...\n"
         "  [--code-sign-key FILE] [--file-md5 NAME=HEX]... [--prior-reply FILE]...\n"
+        "  [--socket-buffer BYTES]\n"
     );
     exit(2);
 }
@@ -148,6 +152,7 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--file-md5") o.md5s.push_back(next());
         else if (a == "--prior-reply") o.priors.push_back(next());
         else if (a == "--code-sign-key") o.code_sign_key_file = next();
+        else if (a == "--socket-buffer") o.socket_buffer = atoi(next().c_str());
         else usage();
     }
     if (o.kind.empty() || o.file.empty()) usage();
@@ -755,6 +760,7 @@ static int do_web_rpc(const Options& o, const string& reply_path) {
         perror("socketpair");
         return 2;
     }
+    set_socket_buffers(sv, o.socket_buffer);
     GUI_RPC_CONN* grc = new GUI_RPC_CONN(sv[0]);
     grc->is_local = true;
     // What the *_OP::handle_reply of client/acct_setup.cpp does when the
@@ -766,22 +772,30 @@ static int do_web_rpc(const Options& o, const string& reply_path) {
     }
     string request = "<boinc_gui_rpc_request>\n" + req +
         "</boinc_gui_rpc_request>\n\003";
-    if (write(sv[1], request.data(), request.size()) < 0) return 2;
-    grc->handle_rpc();
+    if (!write_fully(sv[1], request.data(), request.size())) return 2;
 
+    // handle_rpc() sends the whole reply with a blocking send(), which
+    // waits for a reader once the socket buffer is full. Read on another
+    // thread so that it does not wait for this one.
     string reply;
-    char buf[4096];
-    for (;;) {
-        ssize_t n = read(sv[1], buf, sizeof(buf));
-        if (n <= 0) break;
-        reply.append(buf, n);
-        if (reply.find('\003') != string::npos) break;
+    bool read_ok = false;
+    std::thread reader([&]() {
+        read_ok = read_message(sv[1], reply);
+        // A reader that gave up must not leave the sender blocked.
+        if (!read_ok) shutdown(sv[1], SHUT_RDWR);
+    });
+    grc->handle_rpc();
+    reader.join();
+    if (!read_ok) {
+        fprintf(stderr, "oracle: no complete reply from the client core\n");
+        return 2;
     }
     write_all("gui_reply.bin", reply);
     emit("core.reply_bytes", (int)reply.size());
     fflush(out);
 
     pid_t pid = fork();
+    watchdog_child = pid;
     if (pid == 0) {
         // oracle-gui sits next to this binary.
         char self[4096];
@@ -793,8 +807,10 @@ static int do_web_rpc(const Options& o, const string& reply_path) {
         dup2(fileno(out), 1);
         char path[4096];
         string gui_reply = string(getcwd(path, sizeof(path))) + "/gui_reply.bin";
+        string buffer = std::to_string(o.socket_buffer);
         execl(gui.c_str(), gui.c_str(), "--kind", o.kind.c_str(),
-            "--file", gui_reply.c_str(), (char*)NULL
+            "--file", gui_reply.c_str(), "--socket-buffer", buffer.c_str(),
+            (char*)NULL
         );
         perror("exec oracle-gui");
         _exit(2);
@@ -805,6 +821,7 @@ static int do_web_rpc(const Options& o, const string& reply_path) {
 }
 
 int main(int argc, char** argv) {
+    watchdog_start();
     Options o = parse_args(argc, argv);
 
     // The client prints its messages to stdout; the dump goes elsewhere.
@@ -830,6 +847,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     string tmpdir = tmpl;
+    snprintf(watchdog_dir, sizeof(watchdog_dir), "%s", tmpl);
     if (chdir(tmpdir.c_str())) {
         perror("chdir");
         return 2;

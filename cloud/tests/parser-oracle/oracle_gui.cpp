@@ -15,11 +15,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "io_util.h"
 #include "config.h"
 #include "error_numbers.h"
 #include "gui_rpc_client.h"
@@ -57,21 +59,30 @@ static void emit_rc(const string& key, int rc) {
 }
 
 int main(int argc, char** argv) {
+    watchdog_start();
     string kind, file;
+    int socket_buffer = 0;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a == "--kind" && i + 1 < argc) kind = argv[++i];
         else if (a == "--file" && i + 1 < argc) file = argv[++i];
+        else if (a == "--socket-buffer" && i + 1 < argc) socket_buffer = atoi(argv[++i]);
         else {
             fprintf(stderr,
                 "usage: oracle-gui --kind project_config|lookup_account|"
-                "create_account --file PATH\n"
+                "create_account --file PATH [--socket-buffer BYTES]\n"
             );
             return 2;
         }
     }
     if (kind.empty() || file.empty()) {
         fprintf(stderr, "oracle-gui: --kind and --file are required\n");
+        return 2;
+    }
+    if (kind != "project_config" && kind != "lookup_account" &&
+        kind != "create_account"
+    ) {
+        fprintf(stderr, "oracle-gui: unknown kind %s\n", kind.c_str());
         return 2;
     }
     FILE* f = fopen(file.c_str(), "rb");
@@ -90,10 +101,16 @@ int main(int argc, char** argv) {
         perror("socketpair");
         return 2;
     }
-    if (write(sv[1], reply.data(), reply.size()) != (ssize_t)reply.size()) {
-        perror("write");
-        return 2;
-    }
+    set_socket_buffers(sv, socket_buffer);
+    // The reply may be larger than the socket buffer, and RPC_CLIENT reads
+    // only once it is called, so a thread feeds the reply meanwhile. When it
+    // has written everything it half-closes, so that a reply without its
+    // ETX ends the read instead of waiting for more.
+    bool write_ok = false;
+    std::thread writer([&]() {
+        write_ok = write_fully(sv[1], reply.data(), reply.size());
+        shutdown(sv[1], SHUT_WR);
+    });
     RPC_CLIENT rpc;
     rpc.sock = sv[0];
 
@@ -133,8 +150,15 @@ int main(int argc, char** argv) {
         emit("account.error_num", ao.error_num);
         emit("account.error_msg", ao.error_msg);
         emit("account.authenticator", ao.authenticator);
-    } else {
-        fprintf(stderr, "oracle-gui: unknown kind %s\n", kind.c_str());
+    }
+
+    // The reader is done. Closing its end ends a writer that still has
+    // bytes the RPC did not need.
+    close(sv[0]);
+    writer.join();
+    close(sv[1]);
+    if (!write_ok && reply.find('\003') == string::npos) {
+        fprintf(stderr, "oracle-gui: could not feed the reply to the RPC client\n");
         return 2;
     }
     return 0;

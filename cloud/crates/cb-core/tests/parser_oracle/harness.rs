@@ -1,9 +1,19 @@
 //! Running the oracle and comparing its dump with what the server meant.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// What a finished oracle run left.
+struct Output {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
 
 /// A built oracle.
 pub struct Oracle {
@@ -96,14 +106,67 @@ fn locate() -> Option<Oracle> {
     None
 }
 
+/// Reads a pipe to its end on another thread.
+fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// What `drain` read, once the oracle has exited. A pipe that stays open
+/// means something the oracle started is still running.
+fn finished(rx: &mpsc::Receiver<Vec<u8>>, kind: &str) -> Vec<u8> {
+    rx.recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("oracle {kind} exited but left a process holding its output"))
+}
+
+/// How long one oracle run may take before the test fails. The oracle's own
+/// watchdog (60 seconds unless `CB_PARSER_ORACLE_TIMEOUT_SECS` says
+/// otherwise) fires first, with its own message; this one covers an oracle
+/// that cannot even do that.
+const RUN_LIMIT: Duration = Duration::from_secs(120);
+
 impl Oracle {
     fn run(&self, kind: &str, file: &Path, args: &[&str]) -> Dump {
-        let out = Command::new(&self.bin)
+        let mut child = Command::new(&self.bin)
             .args(["--kind", kind, "--file"])
             .arg(file)
             .args(args)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap_or_else(|e| panic!("cannot run {:?}: {e}", self.bin));
+        // Both pipes are read while the oracle runs, so that output larger
+        // than a pipe buffer cannot stop it.
+        let stdout = drain(child.stdout.take().unwrap());
+        let stderr = drain(child.stderr.take().unwrap());
+        let deadline = Instant::now() + RUN_LIMIT;
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break status,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // The readers are left alone: a grandchild may still
+                    // hold the pipes, and it ends on its own watchdog.
+                    panic!(
+                        "oracle {kind} on {file:?} did not finish within {RUN_LIMIT:?}; \
+                         killed it"
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let out = Output {
+            status,
+            stdout: finished(&stdout, kind),
+            stderr: finished(&stderr, kind),
+        };
         assert!(
             out.status.success(),
             "oracle {kind} on {file:?} failed: {:?}\n{}",

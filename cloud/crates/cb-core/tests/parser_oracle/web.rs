@@ -65,11 +65,23 @@ fn check_config(
     want: &ProjectConfig,
     unescaped_name: &str,
 ) {
+    check_config_with(h, case, file, text, want, unescaped_name, &[]);
+}
+
+fn check_config_with(
+    h: &Harness,
+    case: &str,
+    file: &str,
+    text: &str,
+    want: &ProjectConfig,
+    unescaped_name: &str,
+    args: &[&str],
+) {
     let path = h.save(file, text);
     if !h.ready() {
         return;
     }
-    let d = h.run("project_config", &path, &[]);
+    let d = h.run("project_config", &path, args);
     let mut e = Expect::new(case, &d);
     e.rc("parse.rc", 0);
     e.s("config.name", unescaped_name);
@@ -155,6 +167,56 @@ fn project_config_of_the_server() {
         &want,
         &unescape_name(&want.name),
     );
+}
+
+/// A long reply crosses two exchanges over a socket pair: the client core
+/// sends it, and the GUI RPC client reads it. Each side blocks while the
+/// socket buffer is full, so each needs a peer that is already reading.
+/// With the oracle's `--socket-buffer` set to 4 KiB, this reply is many
+/// times the buffer. Without it the reply is smaller than the default
+/// buffer on Linux, which the first run covers.
+///
+/// The reply cannot be much larger than this: the client core builds the
+/// `get_project_config_poll` reply with one `printf` into a 100000 byte
+/// buffer (`MFILE::vprintf` in `lib/mfile.cpp`) and drops a longer config.
+/// The test keeps the reply between 64 KiB, above the client's fixed buffer
+/// for `terms_of_use`, and 99000 bytes.
+#[test]
+fn project_config_larger_than_a_socket_buffer() {
+    let h = Harness::new("web");
+    let mut want = ProjectConfig {
+        name: "Oracle Project &amp; Friends".into(),
+        master_url: MASTER.into(),
+        web_rpc_url_base: MASTER.into(),
+        ..Default::default()
+    };
+    want.platforms = (0..500)
+        .map(|i| ConfigPlatform {
+            name: format!("platform-{i:04}"),
+            user_friendly_name: format!("Platform number {i}"),
+            plan_class: String::new(),
+        })
+        .collect();
+    let text = want.write();
+    assert!(
+        (65_536..99_000).contains(&text.len()),
+        "the reply is {} bytes",
+        text.len()
+    );
+    for (case, args) in [
+        ("default buffers", vec![]),
+        ("4 KiB socket buffers", vec!["--socket-buffer", "4096"]),
+    ] {
+        check_config_with(
+            &h,
+            &format!("large project config, {case}"),
+            "project_config_large.xml",
+            &text,
+            &want,
+            &unescape_name(&want.name),
+            &args,
+        );
+    }
 }
 
 #[test]
