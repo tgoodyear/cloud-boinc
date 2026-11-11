@@ -8,13 +8,16 @@
 pub mod admin;
 pub mod avg;
 pub mod config;
+pub mod countries;
 pub mod model;
 pub mod pipeline;
 pub mod plan_class;
+pub mod prefs;
 pub mod project;
 pub mod purge;
 pub mod scheduler;
 pub mod site;
+pub mod site_account;
 pub mod template;
 pub mod web;
 pub mod work;

@@ -8,9 +8,7 @@ use cb_core::project::{put_setting, Project, SETTING_CONFIG};
 use cb_core::site::{
     site_page, Params, SiteCtx, SitePage, RESULTS_FILTER_WINDOW, RESULTS_PER_PAGE,
 };
-use cb_core::web::{
-    am_get_info, am_set_host_info, am_set_info, make_user, weak_account_key, NewAccount,
-};
+use cb_core::web::{am_get_info, am_set_host_info, make_user, weak_account_key, NewAccount};
 use cb_crypto::account::passwd_hash;
 use cb_db::{stmt, Db};
 use cb_sqlite::SqliteDb;
@@ -33,8 +31,12 @@ struct Account {
 
 impl World {
     fn new() -> World {
+        World::with_config(CONFIG)
+    }
+
+    fn with_config(config: &str) -> World {
         let db = SqliteDb::with_schema().unwrap();
-        block_on(put_setting(&db, SETTING_CONFIG, CONFIG, 10)).unwrap();
+        block_on(put_setting(&db, SETTING_CONFIG, config, 10)).unwrap();
         block_on(db.run(stmt!(
             "INSERT INTO platform (id, create_time, name, user_friendly_name) \
              VALUES (1, 1, 'x86_64-pc-linux-gnu', 'Linux')"
@@ -79,6 +81,7 @@ impl World {
                 email_addr: email,
                 passwd_hash: &hash,
                 user_name: "someone",
+                ..Default::default()
             },
         ))
         .unwrap()
@@ -175,6 +178,7 @@ impl World {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        let random = || self.rand();
         let ctx = SiteCtx {
             db: &self.db,
             project: &self.project,
@@ -182,6 +186,7 @@ impl World {
             post,
             pepper: Some(PEPPER),
             now: NOW,
+            random: &random,
         };
         let before = self.db.statements();
         let page = block_on(site_page(&ctx, path, &q)).unwrap().unwrap();
@@ -191,6 +196,52 @@ impl World {
     fn get(&self, path: &str, auth: Option<&str>, params: &[(&str, &str)]) -> SitePage {
         self.page(path, auth, false, params).0
     }
+
+    fn post(&self, path: &str, auth: Option<&str>, params: &[(&str, &str)]) -> SitePage {
+        self.page(path, auth, true, params).0
+    }
+
+    /// The form fields of a page, as a browser would send them back, with
+    /// `changes` applied.
+    fn submit(
+        &self,
+        form_page: &SitePage,
+        action: &str,
+        auth: Option<&str>,
+        changes: &[(&str, &str)],
+    ) -> (SitePage, u64) {
+        let mut q = hidden_fields(&form_page.body);
+        for (k, v) in changes {
+            q.push((k.to_string(), v.to_string()));
+        }
+        let pairs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        self.page(action, auth, true, &pairs)
+    }
+
+    fn user(&self, id: i64) -> cb_core::model::User {
+        block_on(cb_db::query_one(
+            &self.db,
+            stmt!("SELECT * FROM user WHERE id = ?", id),
+        ))
+        .unwrap()
+        .unwrap()
+    }
+}
+
+/// The hidden inputs of a form.
+fn hidden_fields(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for part in html.split("<input type=\"hidden\" ").skip(1) {
+        let attr = |name: &str| {
+            let key = format!("{name}=\"");
+            let at = part.find(&key)? + key.len();
+            Some(part[at..at + part[at..].find('"')?].to_string())
+        };
+        if let (Some(k), Some(v)) = (attr("name"), attr("value")) {
+            out.push((k, v));
+        }
+    }
+    out
 }
 
 fn error_num(xml: &str) -> Option<i32> {
@@ -240,11 +291,124 @@ fn am_get_info_takes_the_account_key_only() {
     );
 }
 
+fn am_set_info(w: &World, params: &[(&str, &str)]) -> (String, u64) {
+    let q: Params = params
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let before = w.db.statements();
+    let reply = block_on(cb_core::web::am_set_info(
+        &w.db,
+        &w.project.config,
+        PEPPER,
+        &q,
+    ))
+    .unwrap();
+    (reply, w.db.statements() - before)
+}
+
 #[test]
-fn am_set_info_is_switched_off_as_upstream() {
-    let reply = am_set_info();
-    assert_eq!(error_num(&reply), Some(-1));
-    assert!(reply.contains("<error_msg>not supported</error_msg>"));
+fn am_set_info_changes_the_account() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    w.sql(
+        "UPDATE user SET project_prefs = '<project_preferences>\n<project_specific>\n<x>1</x>\n</project_specific>\n</project_preferences>\n'",
+    );
+    let global = "<global_preferences>\n<mod_time>1900000000</mod_time>\n<max_ncpus_pct>50</max_ncpus_pct>\n</global_preferences>\n";
+    let project =
+        "<project_preferences>\n<resource_share>7</resource_share>\n</project_preferences>\n";
+    let new_hash = passwd_hash("newer", "ada@new.example");
+    let (reply, n) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            ("name", "Ada L"),
+            ("country", "United Kingdom"),
+            ("postal_code", "N1 9GU"),
+            ("global_prefs", global),
+            ("project_prefs", project),
+            ("url", "https://ada.example/"),
+            ("send_email", "1"),
+            ("show_hosts", "1"),
+            ("teamid", "5"),
+            ("venue", "work"),
+            ("email_addr", "Ada@New.example"),
+            ("password_hash", &new_hash),
+        ],
+    );
+    assert_eq!(n, 2);
+    assert!(
+        reply.contains("<am_set_info_reply>\n    <success/>"),
+        "{reply}"
+    );
+    let u = w.user(ada.id);
+    assert_eq!(
+        (u.name.as_str(), u.country.as_str(), u.postal_code.as_str()),
+        ("Ada L", "United Kingdom", "N1 9GU")
+    );
+    assert_eq!(u.global_prefs, global);
+    // The stored project-specific part is kept.
+    assert!(u
+        .project_prefs
+        .contains("<project_specific>\n<x>1</x>\n</project_specific>"));
+    assert!(u
+        .project_prefs
+        .contains("<resource_share>7</resource_share>"));
+    assert_eq!((u.send_email, u.show_hosts, u.teamid), (1, 1, 0));
+    assert_eq!(
+        (u.url.as_str(), u.venue.as_str()),
+        ("https://ada.example/", "work")
+    );
+    assert_eq!(u.email_addr, "ada@new.example");
+    let found = block_on(cb_core::web::lookup_account(
+        &w.db,
+        PEPPER,
+        "ada@new.example",
+        &new_hash,
+    ))
+    .unwrap();
+    assert!(found.contains(&ada.auth));
+
+    // Empty fields change nothing; refused values change nothing either.
+    let (reply, _) = am_set_info(&w, &[("account_key", &ada.auth), ("name", "")]);
+    assert!(reply.contains("<success/>"));
+    assert_eq!(w.user(ada.id).name, "Ada L");
+    for (field, value, num) in [
+        ("country", "Atlantis", -1),
+        ("name", "<b>", -1),
+        ("url", "javascript:alert(1)", -1),
+        ("venue", "a<b", -1),
+        (
+            "global_prefs",
+            "<global_preferences></global_preferences>",
+            -112,
+        ),
+        ("project_prefs", "<x>\n</x>", -112),
+        ("email_addr", "not an address", -205),
+        ("password_hash", "short", -1),
+        ("email_addr", "bob@example.com", -137),
+    ] {
+        let (reply, _) = am_set_info(
+            &w,
+            &[
+                ("account_key", &ada.auth),
+                ("show_hosts", "0"),
+                (field, value),
+            ],
+        );
+        assert_eq!(error_num(&reply), Some(num), "{field}: {reply}");
+        assert_eq!(w.user(ada.id).show_hosts, 1, "{field}");
+    }
+    assert_eq!(w.user(bob.id).email_addr, "bob@example.com");
+
+    // Only the account key itself is accepted.
+    let weak = weak_account_key(&w.user(bob.id));
+    for key in [weak.as_str(), "0123456789abcdef0123456789abcdef", ""] {
+        let (reply, _) = am_set_info(&w, &[("account_key", key), ("name", "x")]);
+        assert_eq!(error_num(&reply), Some(-136));
+    }
+    assert_eq!(w.user(bob.id).name, "Bob");
 }
 
 #[test]
@@ -884,4 +1048,503 @@ fn task_lists_read_their_indexes() {
         vec![5.into(), 0.into(), 100.into()],
     );
     assert!(hosts.contains("INDEX host_user"), "{hosts}");
+}
+
+const OPEN_CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<user_country>1</user_country>\n<account_creation>1</account_creation>\n</config>\n";
+
+#[test]
+fn accounts_are_created_on_the_site_only_when_creation_is_open() {
+    let closed = World::new();
+    assert_eq!(
+        closed.get("/create_account_form.php", None, &[]).status,
+        403
+    );
+    let refused = closed.post(
+        "/create_account_action.php",
+        None,
+        &[
+            ("new_name", "Ada"),
+            ("new_email_addr", "ada@example.com"),
+            ("passwd", "secret1"),
+            ("passwd2", "secret1"),
+        ],
+    );
+    assert_eq!(refused.status, 403);
+    assert!(!closed
+        .get("/login_form.php", None, &[])
+        .body
+        .contains("create_account_form.php"));
+
+    let w = World::with_config(OPEN_CONFIG);
+    let form = w.get(
+        "/signup.php",
+        None,
+        &[("next_url", "prefs.php?subset=global")],
+    );
+    assert_eq!(form.status, 200);
+    assert!(form.body.contains("action=\"create_account_action.php\""));
+    assert!(form.body.contains("<option value=\"United Kingdom\">"));
+    assert!(w
+        .get("/login_form.php", None, &[])
+        .body
+        .contains("create_account_form.php"));
+
+    let good = [
+        ("new_name", "Ada"),
+        ("new_email_addr", "Ada@Example.com"),
+        ("passwd", "secret1"),
+        ("passwd2", "secret1"),
+        ("country", "United Kingdom"),
+        ("postal_code", "N1"),
+        ("next_url", "prefs.php?subset=global"),
+    ];
+    let with = |k: &str, v: &'static str| -> Vec<(&str, &str)> {
+        good.iter()
+            .map(|&(a, b)| if a == k { (a, v) } else { (a, b) })
+            .collect()
+    };
+    for (k, v, status) in [
+        ("passwd", "short", 400),
+        ("passwd2", "secret2", 400),
+        ("new_name", "12345", 400),
+        ("new_name", "<b>Ada</b>", 400),
+        ("new_email_addr", "ada", 400),
+        ("country", "Atlantis", 400),
+    ] {
+        let page = w.post("/create_account_action.php", None, &with(k, v));
+        assert_eq!(page.status, status, "{k}={v}");
+        assert!(page.set_cookie.is_none());
+    }
+    // A GET does not make an account.
+    assert_eq!(w.get("/create_account_action.php", None, &good).status, 405);
+
+    let (made, n) = w.page("/create_account_action.php", None, true, &good);
+    assert_eq!(n, 2, "lookup by email, then the insert");
+    assert_eq!(made.status, 303);
+    assert_eq!(
+        made.location.as_deref(),
+        Some("https://p.example/prefs.php?subset=global")
+    );
+    let cookie = made.set_cookie.unwrap();
+    assert!(cookie.ends_with("; Max-Age=31536000"));
+    let auth = cookie
+        .trim_start_matches("auth=")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let home = w.get("/home.php", Some(&auth), &[]);
+    assert!(home.body.contains("ada@example.com"));
+    let id = block_on(w.db.run(stmt!(
+        "SELECT id FROM user WHERE authenticator = ?",
+        auth.as_str()
+    )))
+    .unwrap()
+    .scalar_i64()
+    .unwrap();
+    let u = w.user(id);
+    assert_eq!(
+        (u.name.as_str(), u.country.as_str(), u.postal_code.as_str()),
+        ("Ada", "United Kingdom", "N1")
+    );
+    // The password works for the client's lookup.
+    let found = block_on(cb_core::web::lookup_account(
+        &w.db,
+        PEPPER,
+        "ada@example.com",
+        &passwd_hash("secret1", "ada@example.com"),
+    ))
+    .unwrap();
+    assert!(found.contains(&auth));
+
+    let again = w.post(
+        "/create_account_action.php",
+        None,
+        &with("passwd", "another1")
+            .iter()
+            .map(|&(a, b)| {
+                if a == "passwd2" {
+                    (a, "another1")
+                } else {
+                    (a, b)
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(again.status, 409);
+}
+
+#[test]
+fn account_changes_need_the_form_token() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada \"<x>\"");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    assert_eq!(w.get("/edit_user_info_form.php", None, &[]).status, 303);
+
+    let form = w.get("/edit_user_info_form.php", Some(&ada.auth), &[]);
+    assert!(form.body.contains("value=\"Ada &quot;&lt;x&gt;&quot;\""));
+    let change = [
+        ("user_name", "Ada L"),
+        ("country", "France"),
+        ("url", "ada.example/x"),
+        ("postal_code", "75001"),
+    ];
+
+    // No token, a token for another account, an old token, or a GET: refused.
+    assert_eq!(
+        w.post("/edit_user_info_action.php", Some(&ada.auth), &change)
+            .status,
+        403
+    );
+    let bobs = w.get("/edit_user_info_form.php", Some(&bob.auth), &[]);
+    assert_eq!(
+        w.submit(
+            &bobs,
+            "/edit_user_info_action.php",
+            Some(&ada.auth),
+            &change
+        )
+        .0
+        .status,
+        403
+    );
+    let mut old = hidden_fields(&form.body);
+    let tnow = (NOW - 86_401).to_string();
+    let ttok = cb_crypto::account::form_token(&ada.auth, NOW - 86_401);
+    old.retain(|(k, _)| k != "tnow" && k != "ttok");
+    let mut q: Vec<(&str, &str)> = change.to_vec();
+    q.push(("tnow", &tnow));
+    q.push(("ttok", &ttok));
+    assert_eq!(
+        w.post("/edit_user_info_action.php", Some(&ada.auth), &q)
+            .status,
+        403
+    );
+    let mut get_q: Vec<(String, String)> = hidden_fields(&form.body);
+    get_q.extend(change.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let get_pairs: Vec<(&str, &str)> = get_q
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        w.get("/edit_user_info_action.php", Some(&ada.auth), &get_pairs)
+            .status,
+        403
+    );
+    assert_eq!(w.user(ada.id).name, "Ada \"<x>\"");
+
+    let (ok, n) = w.submit(
+        &form,
+        "/edit_user_info_action.php",
+        Some(&ada.auth),
+        &change,
+    );
+    assert_eq!((ok.status, n), (303, 2));
+    let u = w.user(ada.id);
+    assert_eq!(
+        (
+            u.name.as_str(),
+            u.country.as_str(),
+            u.url.as_str(),
+            u.postal_code.as_str()
+        ),
+        ("Ada L", "France", "ada.example/x", "75001")
+    );
+    for (k, v) in [
+        ("user_name", ""),
+        ("url", "ftp://x"),
+        ("country", "Narnia"),
+        ("postal_code", "<b>"),
+    ] {
+        let page = w
+            .submit(
+                &form,
+                "/edit_user_info_action.php",
+                Some(&ada.auth),
+                &[("user_name", "Ada"), (k, v)],
+            )
+            .0;
+        assert_eq!(page.status, 400, "{k}");
+    }
+    assert_eq!(w.user(ada.id).name, "Ada L");
+}
+
+#[test]
+fn password_and_email_changes_need_the_password() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.account("bob@example.com", "secret", "Bob");
+    let weak_before = weak_account_key(&w.user(ada.id));
+
+    let form = w.get("/edit_passwd_form.php", Some(&ada.auth), &[]);
+    let wrong = w
+        .submit(
+            &form,
+            "/edit_passwd_action.php",
+            Some(&ada.auth),
+            &[
+                ("old_passwd", "nope"),
+                ("passwd", "better1"),
+                ("passwd2", "better1"),
+            ],
+        )
+        .0;
+    assert_eq!(wrong.status, 403);
+    let short = w
+        .submit(
+            &form,
+            "/edit_passwd_action.php",
+            Some(&ada.auth),
+            &[("old_passwd", "secret"), ("passwd", "x"), ("passwd2", "x")],
+        )
+        .0;
+    assert_eq!(short.status, 400);
+    let (ok, n) = w.submit(
+        &form,
+        "/edit_passwd_action.php",
+        Some(&ada.auth),
+        &[
+            ("old_passwd", "secret"),
+            ("passwd", "better1"),
+            ("passwd2", "better1"),
+        ],
+    );
+    assert_eq!((ok.status, n), (200, 2));
+    assert_ne!(weak_account_key(&w.user(ada.id)), weak_before);
+    let login = |email: &str, pw: &str| {
+        w.post(
+            "/login_action.php",
+            None,
+            &[("email_addr", email), ("passwd", pw)],
+        )
+        .status
+    };
+    assert_eq!(login("ada@example.com", "secret"), 403);
+    assert_eq!(login("ada@example.com", "better1"), 303);
+    // The account key does instead of the current password.
+    let by_key = w
+        .submit(
+            &form,
+            "/edit_passwd_action.php",
+            Some(&ada.auth),
+            &[
+                ("old_passwd", &ada.auth),
+                ("passwd", "best12"),
+                ("passwd2", "best12"),
+            ],
+        )
+        .0;
+    assert_eq!(by_key.status, 200);
+
+    let form = w.get("/edit_email_form.php", Some(&ada.auth), &[]);
+    assert!(form.body.contains("ada@example.com"));
+    let wrong = w
+        .submit(
+            &form,
+            "/edit_email_action.php",
+            Some(&ada.auth),
+            &[("email_addr", "ada@new.example"), ("passwd", "better1")],
+        )
+        .0;
+    assert_eq!(wrong.status, 403);
+    let taken = w
+        .submit(
+            &form,
+            "/edit_email_action.php",
+            Some(&ada.auth),
+            &[("email_addr", "Bob@example.com"), ("passwd", "best12")],
+        )
+        .0;
+    assert_eq!(taken.status, 409);
+    let (ok, n) = w.submit(
+        &form,
+        "/edit_email_action.php",
+        Some(&ada.auth),
+        &[("email_addr", "Ada@New.example"), ("passwd", "best12")],
+    );
+    assert_eq!(
+        (ok.status, n),
+        (200, 3),
+        "the account, then one batch of two"
+    );
+    assert!(ok.body.contains("ada@new.example"));
+    // The same password works with the new address, for the site and the client.
+    assert_eq!(login("ada@new.example", "best12"), 303);
+    assert_eq!(login("ada@example.com", "best12"), 403);
+    let found = block_on(cb_core::web::lookup_account(
+        &w.db,
+        PEPPER,
+        "ada@new.example",
+        &passwd_hash("best12", "ada@new.example"),
+    ))
+    .unwrap();
+    assert!(found.contains(&ada.auth));
+}
+
+#[test]
+fn preferences_are_edited_per_venue_and_reach_clients() {
+    use cb_core::prefs::{PrefsForm, Subset};
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    assert_eq!(
+        w.get("/prefs.php", Some(&ada.auth), &[("subset", "other")])
+            .status,
+        400
+    );
+    let shown = w.get("/prefs.php", Some(&ada.auth), &[("subset", "global")]);
+    assert_eq!(shown.status, 200);
+    assert!(shown.body.contains("Store at least"));
+    assert!(shown
+        .body
+        .contains("prefs_edit.php?subset=global&amp;venue=work"));
+
+    let global = PrefsForm::new(Subset::Global, &w.project);
+    let mut fields: Vec<(String, String)> =
+        global.form_values(&global.defaults()).into_iter().collect();
+    let set = |fields: &mut Vec<(String, String)>, k: &str, v: &str| {
+        fields.retain(|(a, _)| a != k);
+        fields.push((k.into(), v.into()));
+    };
+    set(&mut fields, "max_ncpus_pct", "60");
+    let form = w.get("/prefs_edit.php", Some(&ada.auth), &[("subset", "global")]);
+    assert_eq!(form.status, 200);
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (saved, n) = w.submit(&form, "/prefs_edit.php", Some(&ada.auth), &pairs);
+    assert_eq!((saved.status, n), (303, 2));
+    assert_eq!(
+        saved.location.as_deref(),
+        Some("https://p.example/prefs.php?subset=global&updated=1")
+    );
+    let stored = w.user(ada.id).global_prefs;
+    assert!(stored.starts_with(&format!(
+        "<global_preferences>\n<mod_time>{NOW}</mod_time>\n"
+    )));
+    assert!(stored.contains("<max_ncpus_pct>60</max_ncpus_pct>"));
+    let p = cb_proto::sched_request::GlobalPrefs::parse(&stored, "");
+    assert_eq!((p.mod_time, p.max_ncpus_pct), (NOW as f64, 60.0));
+
+    // A separate set for work starts from the main one.
+    let form = w.get(
+        "/prefs_edit.php",
+        Some(&ada.auth),
+        &[("subset", "global"), ("venue", "work")],
+    );
+    assert!(form.body.contains("name=\"max_ncpus_pct\" value=\"60\""));
+    set(&mut fields, "max_ncpus_pct", "20");
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        w.submit(&form, "/prefs_edit.php", Some(&ada.auth), &pairs)
+            .0
+            .status,
+        303
+    );
+    let stored = w.user(ada.id).global_prefs;
+    assert_eq!(
+        cb_proto::sched_request::GlobalPrefs::parse(&stored, "work").max_ncpus_pct,
+        20.0
+    );
+    assert_eq!(
+        cb_proto::sched_request::GlobalPrefs::parse(&stored, "home").max_ncpus_pct,
+        60.0
+    );
+
+    // Out-of-range values show the form again and store nothing.
+    set(&mut fields, "max_ncpus_pct", "500");
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let refused = w
+        .submit(&form, "/prefs_edit.php", Some(&ada.auth), &pairs)
+        .0;
+    assert_eq!(refused.status, 400);
+    assert!(refused.body.contains("value=\"500\""));
+    assert_eq!(w.user(ada.id).global_prefs, stored);
+    // A GET with the fields, tokens included, changes nothing either.
+    let mut get_q: Vec<(String, String)> = hidden_fields(&form.body);
+    get_q.extend(fields.iter().cloned());
+    set(&mut get_q, "max_ncpus_pct", "30");
+    let pairs: Vec<(&str, &str)> = get_q
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let page = w.get("/prefs_edit.php", Some(&ada.auth), &pairs);
+    assert_eq!(page.status, 200);
+    assert_eq!(w.user(ada.id).global_prefs, stored);
+
+    // Removing the work set: confirm by GET, remove by POST.
+    let confirm = w.get(
+        "/prefs_remove.php",
+        Some(&ada.auth),
+        &[("subset", "global"), ("venue", "work")],
+    );
+    assert!(confirm.body.contains("Are you sure"));
+    assert!(w
+        .user(ada.id)
+        .global_prefs
+        .contains("<venue name=\"work\">"));
+    assert_eq!(
+        w.submit(&confirm, "/prefs_remove.php", Some(&ada.auth), &[])
+            .0
+            .status,
+        303
+    );
+    assert!(!w.user(ada.id).global_prefs.contains("<venue"));
+
+    // Project preferences, with the account's settings beside them.
+    let project = PrefsForm::new(Subset::Project, &w.project);
+    let mut fields: Vec<(String, String)> = project
+        .form_values(&project.defaults())
+        .into_iter()
+        .collect();
+    set(&mut fields, "resource_share", "250");
+    fields.retain(|(k, _)| k != "app_id_2");
+    set(&mut fields, "show_hosts", "1");
+    set(&mut fields, "default_venue", "school");
+    let form = w.get("/prefs_edit.php", Some(&ada.auth), &[("subset", "project")]);
+    assert!(form.body.contains("Worker &lt;one&gt;"));
+    assert!(form.body.contains("name=\"default_venue\""));
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        w.submit(&form, "/prefs_edit.php", Some(&ada.auth), &pairs)
+            .0
+            .status,
+        303
+    );
+    let u = w.user(ada.id);
+    assert_eq!(
+        (u.show_hosts, u.send_email, u.venue.as_str()),
+        (1, 0, "school")
+    );
+    assert!(u
+        .project_prefs
+        .starts_with("<project_preferences>\n<resource_share>250</resource_share>\n"));
+    assert!(u
+        .project_prefs
+        .contains("<apps_selected>\n<app_id>1</app_id>\n</apps_selected>"));
+    let shown = w.get("/prefs.php", Some(&ada.auth), &[("subset", "project")]);
+    assert!(shown.body.contains("Worker &lt;one&gt;"));
+    assert!(shown.body.contains("school"));
+
+    // A bad default venue is refused.
+    set(&mut fields, "default_venue", "moon");
+    let pairs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        w.submit(&form, "/prefs_edit.php", Some(&ada.auth), &pairs)
+            .0
+            .status,
+        400
+    );
 }

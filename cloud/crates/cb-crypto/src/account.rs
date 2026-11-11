@@ -150,6 +150,18 @@ pub fn verify_peppered_passwd_hash(pepper: &[u8], passwd_hash: &str, stored: &st
         .is_ok()
 }
 
+/// The token a site form carries so that only a page the account holder
+/// loaded can submit it (`form_tokens` in upstream `html/inc/util.inc`,
+/// which uses `md5(time . authenticator)`): `HMAC-SHA-256(authenticator,
+/// "form " + tnow)` as 64 lowercase hex characters. `tnow` is the time the
+/// form was made, sent beside the token.
+pub fn form_token(authenticator: &str, tnow: i64) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(authenticator.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(format!("form {tnow}").as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 fn pepper_mac(pepper: &[u8], passwd_hash: &str) -> Hmac<Sha256> {
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(pepper).expect("HMAC accepts keys of any length");
@@ -230,5 +242,19 @@ mod tests {
             "hash",
             &stored[..62]
         ));
+    }
+
+    #[test]
+    fn form_tokens_depend_on_key_and_time() {
+        let t = form_token("abc", 1000);
+        assert_eq!(t.len(), 64);
+        assert_eq!(t, form_token("abc", 1000));
+        assert_ne!(t, form_token("abc", 1001));
+        assert_ne!(t, form_token("abd", 1000));
+        assert_eq!(
+            t,
+            pepper_passwd_hash(b"abc", "form 1000"),
+            "the same HMAC as the pepper, keyed by the account key"
+        );
     }
 }

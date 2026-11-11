@@ -74,6 +74,7 @@ impl World {
                 email_addr: email,
                 passwd_hash: &hash,
                 user_name: name,
+                ..Default::default()
             },
         ))
         .unwrap()
