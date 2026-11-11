@@ -404,3 +404,102 @@ fn status_counts_come_from_a_snapshot_until_it_expires() {
     // The snapshot row does not disturb project settings.
     block_on(Project::load(&db)).unwrap();
 }
+
+#[test]
+fn assigned_jobs_are_submitted_with_their_assignment() {
+    let w = World::new();
+    block_on(w.db.run(stmt!(
+        "INSERT INTO app (create_time, name, user_friendly_name) VALUES (0, 'worker', 'Worker')"
+    )))
+    .unwrap();
+    let signer = Signer::new(&keys().0).unwrap();
+    // As the admin API receives it.
+    let sub: Submission = serde_json::from_value(serde_json::json!({
+        "app": "worker",
+        "input_template": INPUT_TEMPLATE,
+        "result_template": RESULT_TEMPLATE,
+        "jobs": [
+            {"name": "t1", "min_quorum": 1, "target_nresults": 1,
+             "assign": {"target": "host", "id": 5}},
+            {"name": "t2", "min_quorum": 2, "target_nresults": 2,
+             "assign": {"target": "user", "id": 3}},
+            {"name": "t3", "assign": {"target": "user", "id": 0}},
+            {"name": "t4", "min_quorum": 2, "target_nresults": 2,
+             "assign": {"target": "host", "id": 5}},
+        ],
+    }))
+    .unwrap();
+    let submit = |config: &cb_core::Config| {
+        let random = || w.rand();
+        block_on(create_work(
+            &w.db,
+            config,
+            Some(&signer),
+            300,
+            &random,
+            &sub,
+        ))
+        .unwrap()
+    };
+    let count = |sql: &str| {
+        block_on(w.db.run(cb_db::Stmt::new(sql))).unwrap().rows[0]["n"]
+            .as_i64()
+            .unwrap()
+    };
+
+    // Refused while the project does not enable assignment.
+    let jobs = submit(&w.project().config);
+    for j in &jobs {
+        assert_eq!(j.workunit_id, 0);
+        assert!(j.error.as_deref().unwrap().contains("enable_assignment"));
+    }
+    assert_eq!(count("SELECT count(*) AS n FROM workunit"), 0);
+
+    let config = CONFIG.replace(
+        "</config>",
+        "<enable_assignment>1</enable_assignment>\n</config>",
+    );
+    block_on(put_setting(&w.db, SETTING_CONFIG, &config, 11)).unwrap();
+    let jobs = submit(&w.project().config);
+    assert_eq!(jobs[0].error, None);
+    assert_eq!(jobs[1].error, None);
+    assert!(jobs[2].error.as_deref().unwrap().contains("nonzero"));
+    assert!(jobs[3]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("target_nresults 1"));
+
+    let rows = block_on(w.db.run(stmt!(
+        "SELECT target_type, target_id, multi, workunitid FROM assignment ORDER BY id"
+    )))
+    .unwrap()
+    .rows;
+    let got: Vec<(i64, i64, i64, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["target_type"].as_i64().unwrap(),
+                r["target_id"].as_i64().unwrap(),
+                r["multi"].as_i64().unwrap(),
+                r["workunitid"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, 5, 0, jobs[0].workunit_id),
+            (2, 3, 0, jobs[1].workunit_id)
+        ]
+    );
+    assert_eq!(
+        count("SELECT count(*) AS n FROM workunit WHERE transitioner_flags = 2"),
+        2
+    );
+    assert_eq!(
+        count("SELECT count(*) AS n FROM result WHERE server_state = 1"),
+        3
+    );
+    assert_eq!(count("SELECT count(*) AS n FROM result"), 3);
+}

@@ -7,9 +7,16 @@
 //! read from the index on unsent results and claimed with a conditional
 //! UPDATE, so two requests cannot be sent the same result.
 //!
-//! Not done here: anonymous platform, assigned jobs, homogeneous redundancy
-//! and homogeneous app version, locality scheduling, and the client workload
-//! simulation behind upstream's deadline check.
+//! Assigned (targeted) jobs, with `enable_assignment`, are sent first, as
+//! `send_targeted_jobs` in `sched/sched_assign.cpp` does. Their results are
+//! created ahead of time in the reserved state (`RESULT_SERVER_STATE_INACTIVE`)
+//! by work submission and the pipeline, and a request claims one for its host
+//! as it claims an unsent result; see `crates/cb-core/src/pipeline.rs`.
+//!
+//! Not done here: anonymous platform, assigned jobs for teams and broadcast
+//! (`multi`) assignments, homogeneous redundancy and homogeneous app version,
+//! locality scheduling, and the client workload simulation behind upstream's
+//! deadline check.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,6 +44,8 @@ const MAX_IN_LIST: usize = 90;
 const MAX_SEND: usize = 100;
 /// Most lost results looked at in one request.
 const MAX_LOST: usize = 50;
+/// Most assigned jobs looked at, and so sent, in one request.
+const MAX_ASSIGNED: usize = 20;
 /// Most reported results handled in one request when the project sets no
 /// `max_results_accepted`. The client reports the rest next time.
 const MAX_REPORTED: usize = 500;
@@ -265,6 +274,101 @@ struct Outgoing {
     deadline: i64,
     /// Index of the claim statement in the write batch; `None` for a resend.
     claim: Option<usize>,
+    /// An assigned job.
+    assigned: bool,
+}
+
+/// Limits a claim repeats against the database, so that two requests from
+/// one host at once cannot both pass them.
+struct ClaimLimits<'a> {
+    /// The in-progress limit of the version's resource; 0 for none.
+    resource: i64,
+    gpu: bool,
+    /// The GPU app version IDs, as an SQL list.
+    gpu_ids: &'a str,
+    /// The volunteer's limit on jobs in progress; 0 for none.
+    total: i64,
+    /// The host's daily limit for the version.
+    quota: i32,
+}
+
+/// The conditional UPDATE that sends a result to a host.
+struct Claim<'a> {
+    result_id: i64,
+    wu_id: i64,
+    host_id: i64,
+    user_id: i64,
+    team_id: i64,
+    now: i64,
+    deadline: i64,
+    av: &'a AppVersion,
+    peak_flops: f64,
+    /// The state the result must still be in: unsent, or reserved for an
+    /// assignment.
+    from_state: i32,
+    limits: Option<ClaimLimits<'a>>,
+    /// No result of the workunit may already have this `(column, value)`:
+    /// the replica rule, or one instance per host of an assigned job.
+    one_per: Option<(&'static str, i64)>,
+}
+
+impl Claim<'_> {
+    fn stmt(&self) -> Stmt {
+        let mut sql = String::from(
+            "UPDATE result SET server_state = 4, hostid = ?, userid = ?, teamid = ?, \
+             sent_time = ?, report_deadline = ?, app_version_id = ?, app_version_num = ?, \
+             flops_estimate = ?, mod_time = ? WHERE id = ? AND server_state = ?",
+        );
+        let mut params: Vec<cb_db::Value> = vec![
+            self.host_id.into(),
+            self.user_id.into(),
+            self.team_id.into(),
+            self.now.into(),
+            self.deadline.into(),
+            self.av.id.into(),
+            self.av.version_num.into(),
+            self.peak_flops.into(),
+            self.now.into(),
+            self.result_id.into(),
+            self.from_state.into(),
+        ];
+        if let Some(l) = &self.limits {
+            if l.resource > 0 {
+                sql.push_str(&format!(
+                    " AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4 \
+                     AND app_version_id {} ({})) < ?",
+                    if l.gpu { "IN" } else { "NOT IN" },
+                    l.gpu_ids
+                ));
+                params.push(self.host_id.into());
+                params.push(l.resource.into());
+            }
+            if l.total > 0 {
+                sql.push_str(
+                    " AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4) < ?",
+                );
+                params.push(self.host_id.into());
+                params.push(l.total.into());
+            }
+            sql.push_str(
+                " AND coalesce((SELECT n_jobs_today FROM host_app_version \
+                 WHERE host_id = ? AND app_version_id = ?), 0) < ?",
+            );
+            params.push(self.host_id.into());
+            params.push(self.av.id.into());
+            params.push(l.quota.into());
+        }
+        if let Some((column, who)) = self.one_per {
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = ? \
+                 AND r2.{column} = ?)"
+            ));
+            params.push(self.wu_id.into());
+            params.push(who.into());
+        }
+        sql.push_str(" RETURNING id");
+        Stmt { sql, params }
+    }
 }
 
 fn unit(random: &dyn Fn() -> u32) -> f64 {
@@ -1186,6 +1290,41 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
         reads.push(s.bind(host.id));
     }
+    // Assigned jobs for this host or user, one reserved result each, that
+    // the host holds no result of (`need_targeted_instance`). Only jobs of
+    // an app, and a pinned version, this host has a usable version of: the
+    // limit counts jobs that can be sent, so ones the host cannot run do
+    // not hold back later ones. The IDs are integers of the catalog.
+    let want_assigned = send && config.enable_assignment && !app_ids.is_empty();
+    let id_list = |ids: &mut dyn Iterator<Item = i64>| {
+        ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+    };
+    let assigned_apps = id_list(&mut app_ids.iter().copied());
+    let assigned_versions = id_list(&mut versions.iter().map(|v| v.av.id));
+    if want_assigned {
+        reads.push(stmt!(
+            format!(
+                "SELECT {CANDIDATE_COLS} FROM assignment a \
+                 JOIN workunit w ON w.id = a.workunitid \
+                 JOIN result r ON r.id = (SELECT min(r3.id) FROM result r3 \
+                 WHERE r3.workunitid = a.workunitid AND r3.server_state = 1) \
+                 WHERE a.multi = 0 AND ((a.target_type = ? AND a.target_id = ?) \
+                 OR (a.target_type = ? AND a.target_id = ?)) \
+                 AND w.error_mask = 0 AND w.canonical_resultid = 0 \
+                 AND w.appid IN ({assigned_apps}) \
+                 AND w.app_version_id IN (0,{assigned_versions}) \
+                 AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = a.workunitid \
+                 AND r2.hostid = ?) \
+                 ORDER BY a.id LIMIT ?"
+            ),
+            ASSIGN_HOST,
+            host.id,
+            ASSIGN_USER,
+            user.id,
+            host.id,
+            MAX_ASSIGNED as i64
+        ));
+    }
     let fetch = (3 * max_send + 20).min(100);
     for id in &app_ids {
         reads.push(stmt!(
@@ -1198,11 +1337,15 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         ));
     }
     let mut lost_rows: Vec<Candidate> = Vec::new();
+    let mut assigned_rows: Vec<Candidate> = Vec::new();
     let mut queues: Vec<(i64, std::collections::VecDeque<Candidate>)> = Vec::new();
     if !reads.is_empty() {
         let mut rows = ctx.db.batch(reads).await?.into_iter();
         if !lost.is_empty() {
             lost_rows = rows.next().unwrap_or_default().decode()?;
+        }
+        if want_assigned {
+            assigned_rows = rows.next().unwrap_or_default().decode()?;
         }
         for id in &app_ids {
             let mut c: Vec<Candidate> = rows.next().unwrap_or_default().decode()?;
@@ -1286,6 +1429,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             hu,
             deadline,
             claim: None,
+            assigned: false,
         });
     }
 
@@ -1316,37 +1460,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
     }
 
-    // Batch 4: workunits this user or host already has a result of.
-    let mut excluded: HashSet<i64> = HashSet::new();
-    let replica_rule = config.one_result_per_user_per_wu || config.one_result_per_host_per_wu;
-    if replica_rule && !merged.is_empty() {
-        let (column, who) = if config.one_result_per_user_per_wu {
-            ("userid", user.id)
-        } else {
-            ("hostid", host.id)
-        };
-        let mut ids: Vec<i64> = merged.iter().map(|c| c.wu.id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let mut reads = Vec::new();
-        for chunk in ids.chunks(MAX_IN_LIST) {
-            let mut s = Stmt::new(format!(
-                "SELECT DISTINCT workunitid FROM result WHERE workunitid IN ({}) AND {column} = ?",
-                in_list(chunk.len())
-            ));
-            for id in chunk {
-                s = s.bind(*id);
-            }
-            reads.push(s.bind(who));
-        }
-        for rows in ctx.db.batch(reads).await? {
-            for r in rows.decode::<WuIdRow>()? {
-                excluded.insert(r.workunitid);
-            }
-        }
-    }
-
     // Choose (`send_work`, `wu_is_infeasible_fast`).
+    let replica_rule = config.one_result_per_user_per_wu || config.one_result_per_host_per_wu;
+    let replica_who = if config.one_result_per_user_per_wu {
+        ("userid", user.id)
+    } else {
+        ("hostid", host.id)
+    };
     let gpu_ids = if gpu_version_ids.is_empty() {
         "0".to_string()
     } else {
@@ -1366,234 +1486,266 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let total_limit = i64::from(prefs.max_jobs_in_progress);
     let mut disk = disk_available(&req, config);
     let ram = usable_ram(&req);
+    let est_secs = |wu: &Workunit, hu: &HostUsage, pt: usize| {
+        let mut avail = unit_frac(req.time_stats.on_frac) * unit_frac(req.time_stats.active_frac);
+        if pt != 0 {
+            avail *= unit_frac(req.time_stats.gpu_active_frac);
+        }
+        wu.rsc_fpops_est / hu.projected_flops / avail.max(0.1)
+    };
     let mut skipped = Skipped::default();
     let mut sent_wus: HashSet<i64> = outgoing.iter().map(|o| o.wu.id).collect();
-    let n_candidates = merged.len();
+    let n_candidates = merged.len() + assigned_rows.len();
     let mut n_new = 0;
-    for c in merged {
-        if n_new >= max_send {
-            break;
-        }
-        if (0..NPROC).all(|pt| need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0) {
-            break;
-        }
-        if sent_wus.contains(&c.wu.id) || excluded.contains(&c.wu.id) {
-            continue;
-        }
-        let Some(app) = catalog.app(c.wu.appid) else {
-            continue;
-        };
-        let mut chosen: Option<(usize, usize, f64)> = None;
-        for (i, v) in versions.iter().enumerate() {
-            if v.av.appid != c.wu.appid {
-                continue;
-            }
-            if c.wu.app_version_id != 0 && c.wu.app_version_id != v.av.id {
-                continue;
-            }
-            if !ctx
-                .plan_classes
-                .admits_workunit(&v.av.plan_class, c.wu.id, c.wu.batch)
-            {
-                continue;
-            }
-            let pt = proc_index(v.hu.proc_type);
-            if need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0 {
-                continue;
-            }
-            if v.n_today >= v.quota {
-                skipped.quota = true;
-                continue;
-            }
-            let (count, limit) = if v.gpu {
-                (n_gpu, gpu_limit)
-            } else {
-                (n_cpu, cpu_limit)
-            };
-            if (limit > 0 && count >= limit) || (total_limit > 0 && n_cpu + n_gpu >= total_limit) {
-                skipped.in_progress_limit = true;
-                continue;
-            }
-            let mem = if v.hu.mem_usage > 0.0 {
-                v.hu.mem_usage
-            } else {
-                c.wu.rsc_memory_bound
-            };
-            if ram > 0.0 && mem > ram {
-                skipped.memory = true;
-                continue;
-            }
-            if c.wu.rsc_disk_bound > disk {
-                skipped.disk = true;
-                continue;
-            }
-            let mut avail =
-                unit_frac(req.time_stats.on_frac) * unit_frac(req.time_stats.active_frac);
-            if pt != 0 {
-                avail *= unit_frac(req.time_stats.gpu_active_frac);
-            }
-            let est = c.wu.rsc_fpops_est / v.hu.projected_flops / avail.max(0.1);
-            if !config.ignore_delay_bound && est_delay[pt] + est > c.wu.delay_bound as f64 {
-                skipped.speed = true;
-                continue;
-            }
-            chosen = Some((i, pt, est));
-            break;
-        }
-        let Some((i, pt, est)) = chosen else {
-            continue;
-        };
-        let v = &mut versions[i];
-        let usage = if pt == 0 {
-            v.hu.avg_ncpus
+    let mut n_assigned = 0;
+    let mut excluded: HashSet<i64> = HashSet::new();
+    // Assigned jobs first. Like upstream, they skip the feasibility checks
+    // and limits but need a usable app version and a request for work; when
+    // any is sent, the reply carries no other new work.
+    for assigned in [true, false] {
+        let list = if assigned {
+            std::mem::take(&mut assigned_rows)
         } else {
-            v.hu.gpu_usage
-        }
-        .max(0.01);
-        need_secs[pt] -= est * usage;
-        need_inst[pt] -= usage;
-        est_delay[pt] += est * usage / ninstances[pt].max(1.0);
-        disk -= c.wu.rsc_disk_bound;
-        v.n_today += 1;
-        if v.gpu {
-            n_gpu += 1;
-        } else {
-            n_cpu += 1;
-        }
-        n_new += 1;
-        sent_wus.insert(c.wu.id);
+            if n_assigned > 0 {
+                break;
+            }
+            // Batch 4: workunits this user or host already has a result of.
+            if replica_rule && !merged.is_empty() {
+                let (column, who) = replica_who;
+                let mut ids: Vec<i64> = merged.iter().map(|c| c.wu.id).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let mut reads = Vec::new();
+                for chunk in ids.chunks(MAX_IN_LIST) {
+                    let mut s = Stmt::new(format!(
+                        "SELECT DISTINCT workunitid FROM result WHERE workunitid IN ({}) AND {column} = ?",
+                        in_list(chunk.len())
+                    ));
+                    for id in chunk {
+                        s = s.bind(*id);
+                    }
+                    reads.push(s.bind(who));
+                }
+                for rows in ctx.db.batch(reads).await? {
+                    for r in rows.decode::<WuIdRow>()? {
+                        excluded.insert(r.workunitid);
+                    }
+                }
+            }
+            std::mem::take(&mut merged)
+        };
+        for c in list {
+            if n_new >= max_send {
+                break;
+            }
+            if (0..NPROC).all(|pt| need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0) {
+                break;
+            }
+            if sent_wus.contains(&c.wu.id) || excluded.contains(&c.wu.id) {
+                continue;
+            }
+            let Some(app) = catalog.app(c.wu.appid) else {
+                continue;
+            };
+            let admitted = |v: &Version<'_>| {
+                v.av.appid == c.wu.appid
+                    && (c.wu.app_version_id == 0 || c.wu.app_version_id == v.av.id)
+                    && ctx
+                        .plan_classes
+                        .admits_workunit(&v.av.plan_class, c.wu.id, c.wu.batch)
+            };
+            let mut chosen: Option<(usize, usize, f64)> = None;
+            if assigned {
+                // The fastest version, preferring one for a resource the
+                // client asks for (upstream's `get_app_version` does not
+                // look at the request for an assigned job).
+                let wanted = |v: &Version<'_>| {
+                    let pt = proc_index(v.hu.proc_type);
+                    need_secs[pt] > 0.0 || need_inst[pt] > 0.0
+                };
+                chosen = versions
+                    .iter()
+                    .position(|v| admitted(v) && wanted(v))
+                    .or_else(|| versions.iter().position(admitted))
+                    .map(|i| {
+                        let pt = proc_index(versions[i].hu.proc_type);
+                        (i, pt, est_secs(&c.wu, &versions[i].hu, pt))
+                    });
+            } else {
+                for (i, v) in versions.iter().enumerate() {
+                    if !admitted(v) {
+                        continue;
+                    }
+                    let pt = proc_index(v.hu.proc_type);
+                    if need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0 {
+                        continue;
+                    }
+                    if v.n_today >= v.quota {
+                        skipped.quota = true;
+                        continue;
+                    }
+                    let (count, limit) = if v.gpu {
+                        (n_gpu, gpu_limit)
+                    } else {
+                        (n_cpu, cpu_limit)
+                    };
+                    if (limit > 0 && count >= limit)
+                        || (total_limit > 0 && n_cpu + n_gpu >= total_limit)
+                    {
+                        skipped.in_progress_limit = true;
+                        continue;
+                    }
+                    let mem = if v.hu.mem_usage > 0.0 {
+                        v.hu.mem_usage
+                    } else {
+                        c.wu.rsc_memory_bound
+                    };
+                    if ram > 0.0 && mem > ram {
+                        skipped.memory = true;
+                        continue;
+                    }
+                    if c.wu.rsc_disk_bound > disk {
+                        skipped.disk = true;
+                        continue;
+                    }
+                    let est = est_secs(&c.wu, &v.hu, pt);
+                    if !config.ignore_delay_bound && est_delay[pt] + est > c.wu.delay_bound as f64 {
+                        skipped.speed = true;
+                        continue;
+                    }
+                    chosen = Some((i, pt, est));
+                    break;
+                }
+            }
+            let Some((i, pt, est)) = chosen else {
+                continue;
+            };
+            let v = &mut versions[i];
+            let usage = if pt == 0 {
+                v.hu.avg_ncpus
+            } else {
+                v.hu.gpu_usage
+            }
+            .max(0.01);
+            need_secs[pt] -= est * usage;
+            need_inst[pt] -= usage;
+            est_delay[pt] += est * usage / ninstances[pt].max(1.0);
+            disk -= c.wu.rsc_disk_bound;
+            v.n_today += 1;
+            if v.gpu {
+                n_gpu += 1;
+            } else {
+                n_cpu += 1;
+            }
+            n_new += 1;
+            if assigned {
+                n_assigned += 1;
+            }
+            sent_wus.insert(c.wu.id);
 
-        if !v.has_row {
-            v.has_row = true;
+            if !v.has_row {
+                v.has_row = true;
+                writes.push(stmt!(
+                    "INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day, \
+                     n_jobs_today) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
+                    host.id,
+                    v.av.id,
+                    daily_quota
+                ));
+            }
+
+            let deadline = now + c.wu.delay_bound;
+            let claim = Claim {
+                result_id: c.result_id,
+                wu_id: c.wu.id,
+                host_id: host.id,
+                user_id: user.id,
+                team_id: user.teamid,
+                now,
+                deadline,
+                av: v.av,
+                peak_flops: v.hu.peak_flops,
+                from_state: if assigned {
+                    RESULT_SERVER_STATE_INACTIVE
+                } else {
+                    RESULT_SERVER_STATE_UNSENT
+                },
+                limits: (!assigned).then(|| ClaimLimits {
+                    resource: if v.gpu { gpu_limit } else { cpu_limit },
+                    gpu: v.gpu,
+                    gpu_ids: &gpu_ids,
+                    total: total_limit,
+                    quota: v.quota,
+                }),
+                // Upstream sends at most one instance of an assigned job to
+                // a host, whatever the replica rule says.
+                one_per: if assigned {
+                    Some(("hostid", host.id))
+                } else {
+                    replica_rule.then_some(replica_who)
+                },
+            };
+            let claim_at = writes.len();
+            writes.push(claim.stmt());
+
+            // What follows the claim happens only if the claim did.
+            const CLAIMED: &str = "EXISTS (SELECT 1 FROM result WHERE id = ? AND hostid = ? \
+                 AND server_state = 4 AND sent_time = ?)";
             writes.push(stmt!(
-                "INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day, \
-                 n_jobs_today) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
+                format!(
+                    "UPDATE host_app_version SET n_jobs_today = n_jobs_today + 1 \
+                     WHERE host_id = ? AND app_version_id = ? AND {CLAIMED}"
+                ),
                 host.id,
                 v.av.id,
-                daily_quota
+                c.result_id,
+                host.id,
+                now
             ));
-        }
-
-        // The claim. Its guards repeat the limits against the database, so
-        // two requests from one host at once cannot both pass them.
-        let deadline = now + c.wu.delay_bound;
-        let mut sql = String::from(
-            "UPDATE result SET server_state = 4, hostid = ?, userid = ?, teamid = ?, \
-             sent_time = ?, report_deadline = ?, app_version_id = ?, app_version_num = ?, \
-             flops_estimate = ?, mod_time = ? WHERE id = ? AND server_state = 2",
-        );
-        let mut params: Vec<cb_db::Value> = vec![
-            host.id.into(),
-            user.id.into(),
-            user.teamid.into(),
-            now.into(),
-            deadline.into(),
-            v.av.id.into(),
-            v.av.version_num.into(),
-            v.hu.peak_flops.into(),
-            now.into(),
-            c.result_id.into(),
-        ];
-        let limit = if v.gpu { gpu_limit } else { cpu_limit };
-        if limit > 0 {
-            sql.push_str(&format!(
-                " AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4 \
-                 AND app_version_id {} ({gpu_ids})) < ?",
-                if v.gpu { "IN" } else { "NOT IN" }
-            ));
-            params.push(host.id.into());
-            params.push(limit.into());
-        }
-        if total_limit > 0 {
-            sql.push_str(
-                " AND (SELECT count(*) FROM result WHERE hostid = ? AND server_state = 4) < ?",
-            );
-            params.push(host.id.into());
-            params.push(total_limit.into());
-        }
-        sql.push_str(
-            " AND coalesce((SELECT n_jobs_today FROM host_app_version \
-             WHERE host_id = ? AND app_version_id = ?), 0) < ?",
-        );
-        params.push(host.id.into());
-        params.push(v.av.id.into());
-        params.push(v.quota.into());
-        if replica_rule {
-            let column = if config.one_result_per_user_per_wu {
-                "userid"
+            // A job sent unreplicated to a host that has not earned it gets
+            // the app's replication after all. Not an assigned job: its
+            // extra results could go nowhere but its own host or user.
+            let trusted = v.consecutive_valid >= CONS_VALID_UNREPLICATED
+                && unit(ctx.random) > 1.0 / f64::from(v.consecutive_valid);
+            if !assigned && app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
+                writes.push(stmt!(
+                    format!(
+                        "UPDATE workunit SET target_nresults = ?, min_quorum = ?, \
+                         transition_time = ?, rev = rev + 1 WHERE id = ? AND {CLAIMED}"
+                    ),
+                    app.target_nresults,
+                    app.target_nresults,
+                    now,
+                    c.wu.id,
+                    c.result_id,
+                    host.id,
+                    now
+                ));
             } else {
-                "hostid"
-            };
-            sql.push_str(&format!(
-                " AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = ? \
-                 AND r2.{column} = ?)"
-            ));
-            params.push(c.wu.id.into());
-            params.push(if config.one_result_per_user_per_wu {
-                user.id.into()
-            } else {
-                host.id.into()
+                writes.push(stmt!(
+                    format!(
+                        "UPDATE workunit SET transition_time = min(transition_time, ?), \
+                         rev = rev + 1 WHERE id = ? AND {CLAIMED}"
+                    ),
+                    deadline + i64::from(config.report_grace_period),
+                    c.wu.id,
+                    c.result_id,
+                    host.id,
+                    now
+                ));
+            }
+            outgoing.push(Outgoing {
+                result_name: c.result_name,
+                xml_doc_in: c.xml_doc_in,
+                wu: c.wu,
+                av_id: v.av.id,
+                platform: v.platform.to_string(),
+                hu: v.hu.clone(),
+                deadline,
+                claim: Some(claim_at),
+                assigned,
             });
         }
-        sql.push_str(" RETURNING id");
-        let claim = writes.len();
-        writes.push(Stmt { sql, params });
-
-        // What follows the claim happens only if the claim did.
-        const CLAIMED: &str = "EXISTS (SELECT 1 FROM result WHERE id = ? AND hostid = ? \
-             AND server_state = 4 AND sent_time = ?)";
-        writes.push(stmt!(
-            format!(
-                "UPDATE host_app_version SET n_jobs_today = n_jobs_today + 1 \
-                 WHERE host_id = ? AND app_version_id = ? AND {CLAIMED}"
-            ),
-            host.id,
-            v.av.id,
-            c.result_id,
-            host.id,
-            now
-        ));
-        // A job sent unreplicated to a host that has not earned it gets
-        // the app's replication after all.
-        let trusted = v.consecutive_valid >= CONS_VALID_UNREPLICATED
-            && unit(ctx.random) > 1.0 / f64::from(v.consecutive_valid);
-        if app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
-            writes.push(stmt!(
-                format!(
-                    "UPDATE workunit SET target_nresults = ?, min_quorum = ?, \
-                     transition_time = ?, rev = rev + 1 WHERE id = ? AND {CLAIMED}"
-                ),
-                app.target_nresults,
-                app.target_nresults,
-                now,
-                c.wu.id,
-                c.result_id,
-                host.id,
-                now
-            ));
-        } else {
-            writes.push(stmt!(
-                format!(
-                    "UPDATE workunit SET transition_time = min(transition_time, ?), \
-                     rev = rev + 1 WHERE id = ? AND {CLAIMED}"
-                ),
-                deadline + i64::from(config.report_grace_period),
-                c.wu.id,
-                c.result_id,
-                host.id,
-                now
-            ));
-        }
-        outgoing.push(Outgoing {
-            result_name: c.result_name,
-            xml_doc_in: c.xml_doc_in,
-            wu: c.wu,
-            av_id: v.av.id,
-            platform: v.platform.to_string(),
-            hu: v.hu.clone(),
-            deadline,
-            claim: Some(claim),
-        });
     }
 
     // Batch 5: everything this request changes.
@@ -1659,7 +1811,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             version_num: av.version_num,
             plan_class: av.plan_class.clone(),
         });
-        if o.claim.is_some() && app.target_nresults > 1 && o.wu.target_nresults == 1 {
+        if o.claim.is_some() && !o.assigned && app.target_nresults > 1 && o.wu.target_nresults == 1
+        {
             bumped.push(o.wu.id);
         }
     }

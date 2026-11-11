@@ -8,8 +8,8 @@ use cb_core::model::{JobResult, Workunit};
 use cb_core::pipeline::{due_workunits, transition, Ctx};
 use cb_core::purge::{commit_purge, plan_purge, purge_pass};
 use cb_core::work::{
-    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, CancelTarget,
-    JobSpec, Submission,
+    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, Assign,
+    AssignTarget, CancelTarget, JobSpec, Submission,
 };
 use cb_core::{Config, CoreError, CoreResult, FileKind, FileStat, Files, Webhook, NEVER};
 use cb_crypto::Signer;
@@ -105,16 +105,40 @@ impl World {
     }
 
     fn submit(&self, name: &str, now: i64, quorum: i32, target: i32) -> i64 {
-        let sub = Submission {
-            app: "a".into(),
-            input_template: INPUT_TEMPLATE.into(),
-            result_template: RESULT_TEMPLATE.into(),
-            jobs: vec![JobSpec {
+        self.submit_job(
+            JobSpec {
                 name: name.into(),
                 min_quorum: Some(quorum),
                 target_nresults: Some(target),
                 ..Default::default()
-            }],
+            },
+            now,
+        )
+    }
+
+    /// A job for user 1's hosts; the config must enable assignment.
+    fn submit_assigned(&self, name: &str, now: i64, quorum: i32, target: i32) -> i64 {
+        self.submit_job(
+            JobSpec {
+                name: name.into(),
+                min_quorum: Some(quorum),
+                target_nresults: Some(target),
+                assign: Some(Assign {
+                    target: AssignTarget::User,
+                    id: 1,
+                }),
+                ..Default::default()
+            },
+            now,
+        )
+    }
+
+    fn submit_job(&self, job: JobSpec, now: i64) -> i64 {
+        let sub = Submission {
+            app: "a".into(),
+            input_template: INPUT_TEMPLATE.into(),
+            result_template: RESULT_TEMPLATE.into(),
+            jobs: vec![job],
         };
         let random = || self.rand();
         let out = block_on(create_work(
@@ -161,11 +185,11 @@ impl World {
         .unwrap()
     }
 
-    /// What the scheduler does when it sends a result.
+    /// What the scheduler does when it sends a result, unsent or reserved.
     fn dispatch(&self, r: &JobResult, host: i64, now: i64) {
         block_on(self.db.batch(vec![
             stmt!(
-                "UPDATE result SET server_state = 4, hostid = ?, userid = 1, sent_time = ?, report_deadline = ?, app_version_id = 7, flops_estimate = 2e9 WHERE id = ? AND server_state = 2",
+                "UPDATE result SET server_state = 4, hostid = ?, userid = 1, sent_time = ?, report_deadline = ?, app_version_id = 7, flops_estimate = 2e9 WHERE id = ? AND server_state IN (1, 2)",
                 host,
                 now,
                 now + 3600,
@@ -649,4 +673,119 @@ fn purge_leaves_changed_pending_and_highest_workunits() {
     .unwrap();
     let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
     assert_eq!((rep.workunits, rep.results), (1, 1));
+}
+
+#[test]
+fn an_errored_assigned_result_gets_a_reserved_replacement() {
+    let mut w = World::new("trivial");
+    w.config.enable_assignment = true;
+    let wu = w.submit_assigned("t1", 1000, 1, 1);
+    assert_eq!(w.wu(wu).transitioner_flags, TRANSITION_NO_NEW_RESULTS);
+    let rs = w.results(wu);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0].server_state, RESULT_SERVER_STATE_INACTIVE);
+
+    w.dispatch(&rs[0], 1, 1500);
+    w.report(&w.results(wu)[0], 2000, None, 1);
+    let rep = w.transition(wu, 2000);
+    assert_eq!(rep.results_created, 1);
+    assert_eq!(rep.error_mask, 0);
+    let rs = w.results(wu);
+    assert_eq!(rs.len(), 2);
+    assert_eq!(rs[1].name, "t1_1");
+    assert_eq!(rs[1].server_state, RESULT_SERVER_STATE_INACTIVE);
+
+    // Nothing changes until the replacement is claimed.
+    let rep = w.transition(wu, 2100);
+    assert_eq!(rep.results_created, 0);
+    assert_eq!(w.results(wu).len(), 2);
+}
+
+#[test]
+fn a_canonical_result_retires_reserved_results() {
+    let mut w = World::new("trivial");
+    w.config.enable_assignment = true;
+    // Quorum 1, two instances: the first success is enough.
+    let wu = w.submit_assigned("t1", 1000, 1, 2);
+    let rs = w.results(wu);
+    assert_eq!(rs.len(), 2);
+    assert!(rs
+        .iter()
+        .all(|r| r.server_state == RESULT_SERVER_STATE_INACTIVE));
+    w.dispatch(&rs[0], 1, 1500);
+    w.report(&w.results(wu)[0], 2000, Some("out"), 0);
+    let rep = w.transition(wu, 2000);
+    assert_eq!(rep.canonical_resultid, rs[0].id);
+    let rs = w.results(wu);
+    assert_eq!(rs[1].server_state, RESULT_SERVER_STATE_OVER);
+    assert_eq!(rs[1].outcome, RESULT_OUTCOME_DIDNT_NEED);
+}
+
+#[test]
+fn cancel_retires_reserved_results() {
+    let mut w = World::new("trivial");
+    w.config.enable_assignment = true;
+    let wu = w.submit_assigned("t1", 1000, 1, 2);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1500);
+    let ids = block_on(cancel_workunits(&w.db, &CancelTarget::Ids(vec![wu]), 2000)).unwrap();
+    assert_eq!(ids, vec![wu]);
+    let rs = w.results(wu);
+    assert_eq!(rs[0].server_state, RESULT_SERVER_STATE_IN_PROGRESS);
+    assert_eq!(rs[1].server_state, RESULT_SERVER_STATE_OVER);
+    assert_eq!(rs[1].outcome, RESULT_OUTCOME_DIDNT_NEED);
+    let rep = w.transition(wu, 2000);
+    assert_eq!(rep.error_mask, WU_ERROR_CANCELLED);
+    assert!(rep.assimilate_ready);
+    assert_eq!(rep.results_created, 0);
+}
+
+#[test]
+fn reserved_results_time_out_and_fail_as_upstream() {
+    let mut w = World::new("trivial");
+    w.config.enable_assignment = true;
+    let wu = w.submit_job(
+        JobSpec {
+            name: "t1".into(),
+            min_quorum: Some(1),
+            target_nresults: Some(1),
+            max_total_results: Some(2),
+            max_error_results: Some(2),
+            max_success_results: Some(1),
+            assign: Some(Assign {
+                target: AssignTarget::User,
+                id: 1,
+            }),
+            ..Default::default()
+        },
+        1000,
+    );
+
+    // A workunit holding only a reserved result waits, with the safety-net
+    // transition time, and is not failed; upstream's would hold no result.
+    let rep = w.transition(wu, 1000);
+    assert_eq!(rep.error_mask, 0);
+    assert_eq!(rep.results_created, 0);
+    assert!(rep.transition_time >= 1000 + 10 * 86400);
+    assert_eq!(w.results(wu)[0].server_state, RESULT_SERVER_STATE_INACTIVE);
+
+    // Sent and failed: a reserved replacement, the second and last result.
+    w.dispatch(&w.results(wu)[0], 1, 1500);
+    w.report(&w.results(wu)[0], 2000, None, 1);
+    assert_eq!(w.transition(wu, 2000).results_created, 1);
+
+    // The replacement is sent to another host of the user and times out:
+    // one more is needed and none is allowed.
+    w.dispatch(&w.results(wu)[1], 2, 3000);
+    assert_eq!(w.wu(wu).transition_time, 3000 + 3600);
+    let due = block_on(due_workunits(&w.db, 3000 + 3600, 10)).unwrap();
+    assert_eq!(due, vec![wu]);
+    let rep = w.transition(wu, 3000 + 3600 + 1);
+    assert_eq!(rep.results_timed_out, 1);
+    assert_eq!(rep.error_mask, WU_ERROR_TOO_MANY_TOTAL_RESULTS);
+    assert!(rep.assimilate_ready);
+    assert!(w
+        .results(wu)
+        .iter()
+        .all(|r| r.server_state == RESULT_SERVER_STATE_OVER));
 }

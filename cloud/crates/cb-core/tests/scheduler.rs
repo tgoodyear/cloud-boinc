@@ -1,15 +1,18 @@
 //! The scheduler RPC against SQLite.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
 
+use async_trait::async_trait;
 use cb_core::model::{Host, HostAppVersion, JobResult, Workunit};
 use cb_core::plan_class::PlanClassSpecs;
 use cb_core::scheduler::{handle_request, Catalog, SchedCtx, SchedOutcome};
-use cb_core::work::{create_work, JobSpec, Submission};
+use cb_core::work::{create_work, Assign, AssignTarget, JobSpec, Submission};
 use cb_core::Config;
 use cb_crypto::Signer;
-use cb_db::{query, query_one, stmt, Db};
+use cb_db::{query, query_one, stmt, Db, DbResult, Rows, Stmt};
 use cb_proto::consts::*;
 use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
@@ -130,6 +133,17 @@ impl World {
     }
 
     fn submit(&self, name: &str, now: i64, quorum: i32, target: i32) -> i64 {
+        self.submit_assigned(name, now, quorum, target, None)
+    }
+
+    fn submit_assigned(
+        &self,
+        name: &str,
+        now: i64,
+        quorum: i32,
+        target: i32,
+        assign: Option<Assign>,
+    ) -> i64 {
         let sub = Submission {
             app: "a".into(),
             input_template: INPUT_TEMPLATE.into(),
@@ -138,6 +152,7 @@ impl World {
                 name: name.into(),
                 min_quorum: Some(quorum),
                 target_nresults: Some(target),
+                assign,
                 ..Default::default()
             }],
         };
@@ -585,4 +600,226 @@ fn memory_and_deadline_are_checked() {
     let out = w.rpc(&req, 2100);
     assert_eq!(out.n_sent, 0);
     assert!(has_message(&out, "won't finish in time"));
+}
+
+fn to_host(id: i64) -> Option<Assign> {
+    Some(Assign {
+        target: AssignTarget::Host,
+        id,
+    })
+}
+
+fn to_user(id: i64) -> Option<Assign> {
+    Some(Assign {
+        target: AssignTarget::User,
+        id,
+    })
+}
+
+/// A request from a computer of `auth`'s user that asks for no work, so
+/// that the host exists before jobs are assigned to it.
+fn computer(w: &World, auth: &str, cpid: &str, now: i64) -> Req {
+    let mut req = Req::new(0);
+    req.auth = auth.into();
+    req.cpid = cpid.into();
+    req.domain = cpid.into();
+    req.work_secs = 0.0;
+    let out = w.rpc(&req, now);
+    assert_eq!(out.n_sent, 0);
+    req.hostid = out.host_id;
+    req.seqno = 2;
+    req.work_secs = 1e6;
+    req
+}
+
+#[test]
+fn a_host_assigned_job_goes_only_to_its_host() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let mut mine = computer(&w, "auth1", "aa", 1000);
+    let mut other = computer(&w, "auth2", "bb", 1000);
+    let wu = w.submit_assigned("t1", 1100, 1, 1, to_host(mine.hostid));
+    assert_eq!(w.results(wu)[0].server_state, RESULT_SERVER_STATE_INACTIVE);
+
+    let out = w.rpc(&other, 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(has_message(&out, "No tasks sent"));
+    other.seqno += 1;
+
+    let out = w.rpc(&mine, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert!(out.transition.is_empty());
+    let r = &w.results(wu)[0];
+    assert_eq!(r.server_state, RESULT_SERVER_STATE_IN_PROGRESS);
+    assert_eq!(r.hostid, mine.hostid);
+    assert_eq!(r.report_deadline, 2000 + 3600);
+    assert_eq!(w.wu(wu).transition_time, 2000 + 3600);
+    assert_eq!(w.hav(mine.hostid).n_jobs_today, 1);
+    assert!(out.reply.write().unwrap().contains("<name>t1_0</name>"));
+
+    mine.seqno += 1;
+    assert_eq!(w.rpc(&mine, 2100).n_sent, 0);
+    assert_eq!(w.rpc(&other, 2100).n_sent, 0);
+}
+
+#[test]
+fn a_user_assigned_job_goes_to_each_of_the_users_hosts_once() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let mut first = computer(&w, "auth1", "aa", 1000);
+    let second = computer(&w, "auth1", "cc", 1000);
+    let stranger = computer(&w, "auth2", "bb", 1000);
+    let wu = w.submit_assigned("t1", 1100, 2, 2, to_user(1));
+    assert_eq!(w.results(wu).len(), 2);
+
+    // Two instances wanted, one per host however much is asked for.
+    let out = w.rpc(&first, 2000);
+    assert_eq!(out.n_sent, 1);
+    first.seqno += 1;
+    assert_eq!(w.rpc(&first, 2100).n_sent, 0);
+    assert_eq!(w.rpc(&stranger, 2100).n_sent, 0);
+    assert_eq!(w.rpc(&second, 2200).n_sent, 1);
+
+    let rs = w.results(wu);
+    assert!(rs
+        .iter()
+        .all(|r| r.server_state == RESULT_SERVER_STATE_IN_PROGRESS));
+    let mut hosts: Vec<i64> = rs.iter().map(|r| r.hostid).collect();
+    hosts.sort_unstable();
+    assert_eq!(hosts, vec![first.hostid, second.hostid]);
+}
+
+#[test]
+fn assigned_work_is_sent_alone() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let mut req = computer(&w, "auth1", "aa", 1000);
+    let open = w.submit("j1", 1100, 1, 1);
+    let targeted = w.submit_assigned("t1", 1100, 1, 1, to_user(1));
+
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(
+        w.results(targeted)[0].server_state,
+        RESULT_SERVER_STATE_IN_PROGRESS
+    );
+    assert_eq!(w.results(open)[0].server_state, RESULT_SERVER_STATE_UNSENT);
+
+    // With nothing assigned left, regular work flows again.
+    req.seqno += 1;
+    let out = w.rpc(&req, 2100);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(
+        w.results(open)[0].server_state,
+        RESULT_SERVER_STATE_IN_PROGRESS
+    );
+}
+
+#[test]
+fn assignment_disabled_sends_no_assigned_jobs() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let req = computer(&w, "auth1", "aa", 1000);
+    let wu = w.submit_assigned("t1", 1100, 1, 1, to_host(req.hostid));
+    w.config.enable_assignment = false;
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 0);
+    assert_eq!(w.results(wu)[0].server_state, RESULT_SERVER_STATE_INACTIVE);
+}
+
+#[test]
+fn assigned_jobs_the_host_cannot_run_do_not_hold_back_later_ones() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let req = computer(&w, "auth1", "aa", 1000);
+    // More jobs than one request looks at, pinned to a version the host
+    // has no use of, ahead of one it can run.
+    for i in 0..25 {
+        let wu = w.submit_assigned(&format!("p{i}"), 1100, 1, 1, to_host(req.hostid));
+        block_on(w.db.run(stmt!(
+            "UPDATE workunit SET app_version_id = 999999 WHERE id = ?",
+            wu
+        )))
+        .unwrap();
+    }
+    let wu = w.submit_assigned("t1", 1100, 1, 1, to_host(req.hostid));
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(w.results(wu)[0].hostid, req.hostid);
+}
+
+/// A database that, before the first write batch of a request, runs another
+/// request to completion: two requests planned from the same reads.
+struct Interleave<'a> {
+    inner: &'a SqliteDb,
+    before_write: RefCell<Option<Pin<Box<dyn Future<Output = SchedOutcome> + 'a>>>>,
+    other: RefCell<Option<SchedOutcome>>,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for Interleave<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if stmts
+            .iter()
+            .any(|s| s.sql.starts_with("UPDATE host SET rpc_seqno"))
+        {
+            let next = self.before_write.borrow_mut().take();
+            if let Some(f) = next {
+                let out = f.await;
+                *self.other.borrow_mut() = Some(out);
+            }
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn an_assigned_claim_race_has_one_winner() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let a = computer(&w, "auth1", "aa", 1000);
+    let b = computer(&w, "auth1", "cc", 1000);
+    let wu = w.submit_assigned("t1", 1100, 1, 1, to_user(1));
+
+    let catalog = block_on(Catalog::load(&w.db)).unwrap();
+    let random = || w.rand();
+    let ctx_b = SchedCtx {
+        db: &w.db,
+        config: &w.config,
+        plan_classes: &w.plan_classes,
+        catalog: &catalog,
+        code_sign_key: "",
+        now: 2000,
+        random: &random,
+        client_ip: "198.51.100.9",
+    };
+    let xml_b = b.xml();
+    let db = Interleave {
+        inner: &w.db,
+        before_write: RefCell::new(Some(Box::pin(async {
+            handle_request(&ctx_b, &xml_b).await.unwrap()
+        }))),
+        other: RefCell::new(None),
+    };
+    let ctx_a = SchedCtx {
+        db: &db,
+        config: &w.config,
+        plan_classes: &w.plan_classes,
+        catalog: &catalog,
+        code_sign_key: "",
+        now: 2000,
+        random: &random,
+        client_ip: "198.51.100.9",
+    };
+    let out_a = block_on(handle_request(&ctx_a, &a.xml())).unwrap();
+    let out_b = db.other.borrow_mut().take().unwrap();
+
+    // Both chose the reserved result; the request that wrote first has it.
+    assert_eq!(out_b.n_sent, 1);
+    assert_eq!(out_a.n_sent, 0);
+    assert!(out_a.reply.results.is_empty());
+    let rs = w.results(wu);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs[0].hostid, b.hostid);
+    assert_eq!(w.hav(b.hostid).n_jobs_today, 1);
 }

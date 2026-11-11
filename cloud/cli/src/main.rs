@@ -182,6 +182,14 @@ enum Command {
         quorum: Option<i32>,
         #[arg(long)]
         delay_bound: Option<i64>,
+        /// Send the jobs only to this host (needs `enable_assignment` and
+        /// --quorum 1). For jobs made with --count; a --jobs file sets
+        /// "assign" per job.
+        #[arg(long, conflicts_with = "target_user")]
+        target_host: Option<i64>,
+        /// Send the jobs only to this user's hosts, as --target-host.
+        #[arg(long)]
+        target_user: Option<i64>,
     },
     /// The state of a job and its results.
     Job {
@@ -531,7 +539,14 @@ fn run(cli: Cli) -> Res<()> {
             batch,
             quorum,
             delay_bound,
+            target_host,
+            target_user,
         } => {
+            let assign = match (target_host, target_user) {
+                (Some(id), _) => json!({ "target": "host", "id": id }),
+                (None, Some(id)) => json!({ "target": "user", "id": id }),
+                (None, None) => Value::Null,
+            };
             let jobs = match jobs {
                 Some(p) => serde_json::from_str::<Value>(&read(&p)?)
                     .map_err(|e| format!("{}: {e}", p.display()))?,
@@ -549,6 +564,7 @@ fn run(cli: Cli) -> Res<()> {
                                     "min_quorum": quorum,
                                     "target_nresults": quorum,
                                     "delay_bound": delay_bound,
+                                    "assign": assign,
                                 })
                             })
                             .collect(),
