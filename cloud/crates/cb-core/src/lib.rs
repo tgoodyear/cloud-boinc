@@ -19,6 +19,7 @@ pub mod scheduler;
 pub mod site;
 pub mod site_account;
 pub mod template;
+pub mod upload;
 pub mod web;
 pub mod work;
 
@@ -64,6 +65,8 @@ pub enum FileKind {
     Upload,
     /// Purged workunit and result rows. Nothing serves these.
     Archive,
+    /// Pieces of unfinished uploads, `<name>/<start>` (see [`upload`]).
+    Partial,
 }
 
 impl FileKind {
@@ -72,6 +75,7 @@ impl FileKind {
             FileKind::Download => "download/",
             FileKind::Upload => "upload/",
             FileKind::Archive => "archive/",
+            FileKind::Partial => "partial/",
         }
     }
 }

@@ -31,7 +31,7 @@ In scope, because the reference deployment uses it:
 | --- | --- |
 | Scheduler | account keys and weak keys, host records, result reporting, work requests for CPU and GPU, plan classes (container, NVIDIA, AMD, Intel, Apple GPU, multi-thread), client-version floors, batch and workunit-ID gates, per-app weights, assigned (targeted) jobs, `one_result_per_host_per_wu`, in-progress and daily limits, lost-result resend, request back-off |
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
-| Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits and checksums |
+| Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits, checksums and resume |
 | Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
 | Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
@@ -179,6 +179,7 @@ One bucket per project.
 | --- | --- | --- | --- |
 | `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
+| `partial/<name>/<start>` | pieces of unfinished uploads over 8 MiB (see "Upload") | files Worker | until the file is finished, else by bucket lifecycle rule |
 | `archive/<date>/` | purged workunit and result rows, as JSON lines, one object per purge pass | pipeline cron | by bucket lifecycle rule |
 
 Names are flat. The stock fan-out directories exist to keep directory sizes down on a POSIX
@@ -586,13 +587,93 @@ R2 with the client's MD5 as an integrity check. A stored output is never replace
 is conditional on the object not existing, so a second upload of the same name cannot change a
 file a result was validated against.
 
-Two differences from the stock handler:
+An upload cut off part-way resumes as it does with the stock handler. A client asks
+`<get_file_size>` before sending a file of 8 KB or more, and again after a failed attempt that
+sent any bytes, then sends the rest of the file with `<offset>` set to the answer
+(`FILE_XFER::init_upload` in `client/file_xfer.cpp`). The stock handler appends to the file on
+disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receive`,
+`file_size`) keeps the bytes in pieces:
 
-- No partial-file resume. An interrupted upload starts again from zero (`get_file_size`
-  answers 0 until the object is complete). The stock handler appends to a file at an offset,
-  which an object store cannot do.
-- One upload request is limited by the zone plan's request body limit (100 MB on Free and Pro).
-  Larger outputs need the client's `gzip_when_done` or a higher plan.
+- The file is divided on a fixed grid of 8 MiB (`PIECE_BYTES`). Each grid piece that ends
+  before the last byte of the file is stored as its own object, `partial/<name>/<start>`, as
+  soon as its bytes have arrived. A put is atomic, so a piece exists only if all its bytes do.
+- The last stretch of the file, 1 byte to 8 MiB long, is never a piece. The request that
+  carries it writes the finished object with one conditional put whose body is the stored
+  pieces read back in order followed by that tail from the request. R2 therefore holds the
+  MD5 of the whole object, checks it against the client's `<md5_cksum>`, and bitwise
+  validation keeps reading MD5s from metadata. The pieces are deleted afterwards.
+- `<get_file_size>` answers the size of the finished object, or else the pieces present
+  without a gap from offset 0. The tail is never a piece, so that number is always below the
+  file size: the client counts an upload as done when the server reports at least its size
+  (`FILE_XFER_SET::poll`), and it never hears that for a file that is not stored. A cut
+  request keeps the pieces it finished; the bytes of the piece in flight are lost and sent
+  again.
+- A file of 8 MiB or less has no pieces: its upload is one head and one put, as before.
+
+Offsets follow `copy_socket_to_file` in `sched/file_upload_handler.cpp`. An offset beyond the
+bytes held is a transient error ("length of file ... < offset ..."), after which the client
+asks for the size again. An offset below them is accepted, and the bytes already held are read
+and dropped where upstream writes them again in place. One difference: upstream answers
+success to an offset at or past the end of the file without reading anything; here that is
+the same transient error, because this handler never reports success for a file it does not
+hold.
+
+Every request passes the same checks before any byte is stored, whatever its offset
+(`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
+the name. The finished object is exactly `<nbytes>` long, so pieces left by an earlier attempt
+cannot make it longer. A stored file is never replaced or appended to: a request for a name
+that is stored gets success if the size matches and a permanent error if not, and writes
+nothing.
+
+Failure cases:
+
+- The finished object's put is refused with the body and pieces intact (most likely the MD5
+  does not match, for example pieces of other contents under the same name): the pieces are
+  deleted and the client is told to start again, so a retry cannot fail the same way forever.
+- A piece cannot be read back (it expired, or a request that finished the file deleted it):
+  transient error, pieces kept; the next size query reports what is left.
+- Two requests for the same file: pieces sit on a fixed grid, so they write the same keys with
+  the same bytes, and the conditional put lets only one finished object exist. The loser is
+  answered as a retry of a stored file. Pieces written after another request finished the file
+  are never read again.
+- Stale pieces, from uploads that are never finished or from a lost race, are removed by a
+  bucket lifecycle rule on `partial/` (see `docs/deploy.md`). The rule removes the oldest piece
+  first, and that ends what is held at its start, so a client whose pieces expired starts
+  again from 0.
+
+R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
+(`one_shot_upload_costs_a_head_and_a_put`, `large_upload_writes_pieces_then_one_object`):
+
+| Request | Operations |
+| --- | --- |
+| Upload of a file of 8 MiB or less from offset 0 | 1 head, 1 put (unchanged) |
+| Upload of a larger file from offset 0, with n pieces | 1 head, n + 1 puts, n gets, 1 delete |
+| Resumed upload | as above, plus 1 list; pieces already held are not written again |
+| `<get_file_size>`, file stored or never seen | 2 heads, run together (was 1) |
+| `<get_file_size>`, pieces held | 2 heads, 1 list |
+
+No database query is added. The settings read on the upload path is unchanged.
+
+Alternatives not taken:
+
+- R2 multipart upload with a part per request. Parts other than the last must be at least
+  5 MiB and the same size, which a cut at any byte does not give, and a multipart object has
+  no MD5 for bitwise validation to read.
+- A row per upload in D1 recording the bytes held. A listing of `partial/<name>/` is strongly
+  consistent and holds the same facts, and a row would add a query to every upload, including
+  the common small ones.
+- Buffering the body in the Worker and writing on a cut. A Worker stops when the client
+  disconnects, so nothing written after the cut can be relied on, and memory is limited to
+  128 MB.
+
+Limits:
+
+- One upload request is limited by the zone plan's request body limit (100 MB on Free and
+  Pro), and a client always sends from its offset to the end, so files above that limit still
+  need the client's `gzip_when_done` or a higher plan.
+- File data passes through the Worker's WebAssembly, and a file over 8 MiB is read back once
+  more when it is finished, which costs CPU time. Large outputs may need the Workers Paid
+  plan's CPU limit.
 
 ## Keys and secrets
 
@@ -933,7 +1014,6 @@ Not implemented yet:
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
-- Upload resume, as described under Upload.
 - On the site: password reset and email login links, email address verification and change
   notices, invitation codes, consent records, merging and deleting computers, per-app details of
   a computer, cross-project statistics links and certificates, and anything that sends email.
@@ -953,5 +1033,4 @@ server.
 
 - Whether the queue is worth keeping once the sweep interval and scheduler-triggered
   transitions are measured.
-- Upload resume for large outputs (R2 multipart keyed by upload offset).
 - Importing an existing project's MySQL database, and cutting a live master URL over.

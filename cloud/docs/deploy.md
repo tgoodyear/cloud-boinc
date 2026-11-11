@@ -56,6 +56,17 @@ the schema:
 cd workers/scheduler && npx wrangler d1 migrations apply cloud-boinc-dev --remote
 ```
 
+Unfinished uploads over 8 MiB leave pieces under `partial/` (see "Upload" in
+[architecture.md](architecture.md)). A finished upload deletes its own; give the bucket a
+lifecycle rule for the ones that are never finished:
+
+```
+npx wrangler r2 bucket lifecycle add cloud-boinc-dev --name partial --prefix partial/ --expire-days 14
+```
+
+A client whose pieces expired is told it holds fewer bytes and sends the file again from the
+start.
+
 The hostname needs a proxied DNS record in the zone. An `AAAA` record pointing at `100::` is
 enough, since the routes answer every path.
 
@@ -116,6 +127,21 @@ cboinc load --authenticator <key> --hosts 4 --rounds 3
 
 `cboinc load` runs simulated hosts against jobs already submitted. It reports made-up
 results for those jobs, so use a deployment that holds test jobs and nothing else.
+
+To check upload resume, submit test jobs whose result template allows outputs above one
+piece (`<max_nbytes>` of at least `--output-bytes`), then cut every upload part-way:
+
+```
+cboinc submit --app <test app> --input-template <file> --result-template <file with max_nbytes 30000000> --count 4
+cboinc load --authenticator <key> --hosts 2 --rounds 2 --output-bytes 20000000 --cut-at 12000000 --cut-mode abort
+```
+
+Each upload is first sent with the connection dropped after 12,000,000 bytes of file data
+(`--cut-mode short` sends a complete request whose data stops there instead), then the host
+asks `<get_file_size>` and sends the rest from the offset it hears, as a client does. The run
+fails if the server reports more bytes than were sent or refuses the resumed upload; the final
+put checks the MD5 of the whole file, so a success means the stored file is byte-identical.
+`resumed_from_bytes` in the output shows the offsets the server gave (multiples of 8 MiB).
 
 ## Plan limits
 
