@@ -168,6 +168,19 @@ static string read_all(const string& path) {
     return s;
 }
 
+// Replaces an input path by its absolute form; the oracle changes into a
+// temporary directory before it reads anything.
+static bool resolve_path(string& path) {
+    char* real = realpath(path.c_str(), NULL);
+    if (!real) {
+        fprintf(stderr, "cannot open %s: %s\n", path.c_str(), strerror(errno));
+        return false;
+    }
+    path = real;
+    free(real);
+    return true;
+}
+
 static void write_all(const string& path, const string& data) {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) {
@@ -799,13 +812,15 @@ int main(int argc, char** argv) {
     dup2(2, 1);
     out = fdopen(fd, "w");
 
-    char* real = realpath(o.file.c_str(), NULL);
-    if (!real) {
-        fprintf(stderr, "cannot open %s: %s\n", o.file.c_str(), strerror(errno));
+    // Every input path is made absolute here, before the chdir below.
+    string path = o.file;
+    if (!resolve_path(path)) return 2;
+    if (!o.code_sign_key_file.empty() && !resolve_path(o.code_sign_key_file)) {
         return 2;
     }
-    string path = real;
-    free(real);
+    for (size_t i = 0; i < o.priors.size(); i++) {
+        if (!resolve_path(o.priors[i])) return 2;
+    }
 
     // The client writes files (statistics, preferences, master and reply
     // copies) into its working directory.

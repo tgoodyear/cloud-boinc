@@ -97,8 +97,10 @@ cd cloud && cargo test -p cb-core --test parser_oracle
 The build took about 25 seconds on four cores, and the tests run in about three seconds. Without the built oracle the tests write the replies
 and skip, with a message. `CB_PARSER_ORACLE_REQUIRED=1` turns a missing oracle into a failure, as
 the `parser-oracle` job in `.github/workflows/cloud-ci.yml` does. `CB_PARSER_ORACLE` names another
-`oracle` binary and `CB_PARSER_ORACLE_REPLIES` names the directory the replies go to (by default
-`target/tmp/parser-oracle-replies` under `cloud/`). To look at one reply by hand:
+`oracle` binary. Each test writes its replies into a directory of its own, so tests running in
+parallel do not overwrite each other. The directories are removed when a test passes. Set
+`CB_PARSER_ORACLE_REPLIES` to a directory (absolute or relative) to keep them there, under
+`<group>/<process id>-<number>`. To look at one reply by hand:
 
 ```
 cloud/tests/parser-oracle/build/oracle --kind scheduler_reply --file reply.xml \
@@ -108,7 +110,7 @@ cloud/tests/parser-oracle/build/oracle --kind scheduler_reply --file reply.xml \
 Kinds are `scheduler_reply`, `upload_reply`, `master`, `project_config`, `lookup_account` and
 `create_account`. Further flags: `--gpu`, `--file-md5 NAME=HEX` and `--code-sign-key FILE` for
 signature checks, and `--prior-reply FILE` to give the client the earlier replies a reply refers
-to.
+to. Paths may be relative to the directory the oracle is started in.
 
 ## What it does not cover
 

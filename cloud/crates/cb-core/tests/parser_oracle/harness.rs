@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A built oracle.
 pub struct Oracle {
@@ -11,21 +12,35 @@ pub struct Oracle {
 
 /// Where the replies of a test are written, and the oracle to run on them,
 /// if it is built.
+///
+/// Every `Harness` has a directory of its own, so tests running in parallel
+/// never overwrite each other's replies, whatever the file names.
 pub struct Harness {
     dir: PathBuf,
+    keep: bool,
     pub oracle: Option<Oracle>,
 }
 
+/// Distinguishes the `Harness` instances of one test process.
+static INSTANCES: AtomicUsize = AtomicUsize::new(0);
+
 impl Harness {
+    /// `group` names the kind of reply; it only labels the directory.
     pub fn new(group: &str) -> Harness {
-        let dir = match std::env::var_os("CB_PARSER_ORACLE_REPLIES") {
+        // With CB_PARSER_ORACLE_REPLIES set the replies stay for inspection;
+        // otherwise they are removed once the test passes.
+        let named = std::env::var_os("CB_PARSER_ORACLE_REPLIES");
+        let base = match &named {
             Some(d) => PathBuf::from(d),
             None => Path::new(env!("CARGO_TARGET_TMPDIR")).join("parser-oracle-replies"),
-        }
-        .join(group);
+        };
+        let base = std::path::absolute(base).unwrap();
+        let n = INSTANCES.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(group).join(format!("{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Harness {
             dir,
+            keep: named.is_some(),
             oracle: locate(),
         }
     }
@@ -51,6 +66,16 @@ impl Harness {
     /// Runs the oracle on a saved reply.
     pub fn run(&self, kind: &str, file: &Path, args: &[&str]) -> Dump {
         self.oracle.as_ref().unwrap().run(kind, file, args)
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // A failed test keeps its replies.
+        if self.keep || std::thread::panicking() {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
