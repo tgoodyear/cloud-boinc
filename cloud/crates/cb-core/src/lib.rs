@@ -5,13 +5,16 @@
 //! HTTP. The Workers supply D1, R2 and `fetch`; the tests supply SQLite and
 //! in-memory fakes.
 
+pub mod admin;
 pub mod avg;
 pub mod config;
 pub mod model;
 pub mod pipeline;
 pub mod plan_class;
+pub mod project;
 pub mod scheduler;
 pub mod template;
+pub mod web;
 pub mod work;
 
 use async_trait::async_trait;
