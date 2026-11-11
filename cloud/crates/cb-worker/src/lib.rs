@@ -28,8 +28,9 @@ pub const SECRET_PASSWD_PEPPER: &str = "PASSWD_PEPPER";
 /// webhooks.
 pub const SECRET_WEBHOOK_TOKEN: &str = "WEBHOOK_TOKEN";
 
-/// How long an isolate keeps the project settings.
-const PROJECT_TTL_MS: u64 = 5_000;
+/// How long an isolate keeps the project settings. A changed setting
+/// reaches every isolate within this time.
+const PROJECT_TTL_MS: u64 = 30_000;
 
 pub fn now() -> i64 {
     (Date::now().as_millis() / 1000) as i64
@@ -60,7 +61,7 @@ thread_local! {
     static SIGNER: RefCell<Option<Rc<Signer>>> = const { RefCell::new(None) };
 }
 
-/// The project settings and catalog, at most a few seconds old.
+/// The project settings and catalog, at most `PROJECT_TTL_MS` old.
 pub async fn project(db: &D1Db) -> CoreResult<Rc<Project>> {
     let now = now_ms();
     let cached = PROJECT.with(|c| {

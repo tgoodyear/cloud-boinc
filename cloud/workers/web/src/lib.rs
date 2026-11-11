@@ -10,13 +10,39 @@ use cb_core::web::{
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{db, now, project, random_u32, secret_bytes, text, xml, SECRET_PASSWD_PEPPER};
-use worker::{console_error, event, Context, Env, Method, Request, Response, Result};
+use worker::{
+    console_error, event, Cache, Context, Env, Headers, Method, Request, Response, Result,
+};
+
+/// How long the edge cache keeps the master page and the project config.
+/// Both change only when the settings do.
+const PAGE_CACHE_SECS: u32 = 30;
 
 fn html(body: String) -> Result<Response> {
     Ok(Response::builder()
         .with_header("Content-Type", "text/html; charset=utf-8")?
-        .with_header("Cache-Control", "public, max-age=30")?
+        .with_header(
+            "Cache-Control",
+            &format!("public, max-age={PAGE_CACHE_SECS}"),
+        )?
         .fixed(body.into_bytes()))
+}
+
+fn cacheable_xml(body: String) -> Result<Response> {
+    Ok(Response::builder()
+        .with_header("Content-Type", "text/xml")?
+        .with_header(
+            "Cache-Control",
+            &format!("public, max-age={PAGE_CACHE_SECS}"),
+        )?
+        .fixed(body.into_bytes()))
+}
+
+/// Pages that are the same for every client and need no database read when
+/// the edge cache has them.
+fn is_static_page(req: &Request, path: &str) -> bool {
+    req.method() == Method::Get
+        && matches!(path, "/" | "/index.php" | "/get_project_config.php")
 }
 
 /// Query parameters, then form fields for a POST.
@@ -38,11 +64,28 @@ async fn params(req: &mut Request) -> Result<HashMap<String, String>> {
 }
 
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     if !matches!(req.method(), Method::Get | Method::Head | Method::Post) {
         return text(405, "method not allowed\n");
     }
     let path = req.path();
+    let cache_key = is_static_page(&req, &path).then(|| req.url().map(|u| u.to_string()));
+    let cache_key = cache_key.transpose()?;
+    if let Some(key) = &cache_key {
+        if let Some(hit) = Cache::default().get(key.as_str(), false).await? {
+            // The zone's browser cache setting rewrites Cache-Control on a
+            // stored response; clients get the lifetime the page was built with.
+            let headers = Headers::new();
+            if let Some(kind) = hit.headers().get("Content-Type")? {
+                headers.set("Content-Type", &kind)?;
+            }
+            headers.set(
+                "Cache-Control",
+                &format!("public, max-age={PAGE_CACHE_SECS}"),
+            )?;
+            return Ok(Response::from_body(hit.body().clone())?.with_headers(headers));
+        }
+    }
     let db = db(&env)?;
     let project = match project(&db).await {
         Ok(p) => p,
@@ -52,8 +95,22 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     };
     match path.as_str() {
-        "/" | "/index.php" => html(master_page(&project)),
-        "/get_project_config.php" => xml(project_config(&project)),
+        "/" | "/index.php" | "/get_project_config.php" => {
+            let mut response = if path == "/get_project_config.php" {
+                cacheable_xml(project_config(&project))?
+            } else {
+                html(master_page(&project))?
+            };
+            if let Some(key) = cache_key {
+                let copy = response.cloned()?;
+                ctx.wait_until(async move {
+                    if let Err(e) = Cache::default().put(key.as_str(), copy).await {
+                        console_error!("cache: {e}");
+                    }
+                });
+            }
+            Ok(response)
+        }
         "/server_status.php" => {
             let q = params(&mut req).await?;
             let now = now();

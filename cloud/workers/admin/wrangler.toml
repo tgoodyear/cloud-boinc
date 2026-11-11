@@ -20,7 +20,7 @@ zone_name = "usnewsmap.com"
 [[d1_databases]]
 binding = "DB"
 database_name = "cloud-boinc-dev"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "3ae057c8-0c75-418c-b975-b2a91b60ac33"
 migrations_dir = "../../migrations"
 
 [[r2_buckets]]

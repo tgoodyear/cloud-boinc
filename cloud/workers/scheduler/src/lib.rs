@@ -62,10 +62,11 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             return down("The project is temporarily unavailable.");
         }
     };
+    let elapsed = cb_worker::now_ms().saturating_sub(started);
     console_log!(
         "{} ms={} stmts={} trips={} read={} written={}",
         out.log,
-        cb_worker::now_ms().saturating_sub(started),
+        elapsed,
         db.statements(),
         db.round_trips(),
         db.rows_read(),
@@ -75,5 +76,12 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         let ids = out.transition;
         ctx.wait_until(async move { enqueue(&env, &ids).await });
     }
-    xml(reply)
+    let mut response = xml(reply)?;
+    // Time spent in this Worker and its database round trips, for measuring
+    // from outside.
+    response.headers_mut().set(
+        "Server-Timing",
+        &format!("app;dur={elapsed}, db;desc=\"{} trips\"", db.round_trips()),
+    )?;
+    Ok(response)
 }

@@ -89,7 +89,7 @@ flowchart LR
 | Apache download directory | `files` Worker reading from R2 |
 | PHP web RPCs and site | `web` Worker |
 | `create_work`, `update_versions`, `xadd`, ops pages | `admin` Worker and the `cboinc` CLI |
-| `config.xml`, `plan_class_spec.xml`, `project.xml` | rows in D1, edited through the admin API, cached in each Worker for a few seconds |
+| `config.xml`, `plan_class_spec.xml`, `project.xml` | rows in D1, edited through the admin API, cached in each Worker for up to 30 seconds |
 
 The split follows the stock daemons' boundaries where they have different load shapes and
 different secrets: the scheduler is the hot request path; file transfer is byte-heavy and holds
