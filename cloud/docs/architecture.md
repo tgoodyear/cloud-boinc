@@ -222,11 +222,16 @@ deadline, so neither sends a message.
    any state. A host that returned, failed or timed out on a replica must not get another
    one (`sched/sched_check.cpp`, `slow_check`), so the in-progress list from batch 2 is not
    enough.
-8. Filter candidates in memory. For each candidate, apply the batch and workunit-ID gates to
-   the kept versions and take the fastest version that remains; drop the candidate if none
-   does. Then feasibility (memory, disk, deadline against the host's estimated speed and
-   availability), the replica rule from batch 4 and within this reply, per-host and per-app
-   in-progress limits, daily quota, requested seconds and instances per resource.
+8. Filter candidates in memory. For each candidate, narrow the kept versions to the ones
+   that can still be sent: the batch and workunit-ID gates admit the job, the client still
+   wants work for the version's resource (seconds or idle instances not yet filled by this
+   reply, as `need_this_resource` in `sched/sched_version.cpp`), and the version's daily
+   quota and in-progress limits are not used up. Take the fastest version that remains; drop
+   the candidate if none does. A CPU-only request therefore gets the CPU version of an app
+   that also has a faster GPU version, and so does a request whose GPU share is already
+   filled. Then check feasibility with that version (memory, disk, deadline against the
+   host's estimated speed and availability) and the replica rule from batch 4 and within
+   this reply.
 9. Batch 5 (write, one transaction): update the host; apply result reports; claim each chosen
    result; lower `transition_time` on the workunits of claimed results and set it to now on
    the workunits of reported ones. The claim statements enforce the limits again (see
@@ -299,10 +304,18 @@ What changes is that one handler does the work of three daemons.
    too late, as upstream does, and gets no credit.
 5. If more results are needed (`target_nresults`, or a quorum not yet reached), create them,
    signing each output file's upload certificate with the upload key.
-6. If a canonical result exists or the workunit has failed, mark it ready to assimilate.
+6. If a canonical result exists or the workunit has failed, and assimilation has not started
+   (`ASSIMILATE_INIT`), mark it ready to assimilate. A workunit that is already ready or
+   acknowledged (`ASSIMILATE_DONE`) keeps its state, so the transition that follows an
+   acknowledgement does not put it back in the result feed.
 7. When everything is reported and assimilated and `delete_delay_hours` has passed, delete
    the output objects, and the input objects not marked `no_delete`, and record that.
-8. Set the next `transition_time` to the earliest outstanding deadline.
+8. Set the next `transition_time` to the earliest of: the deadlines of results in progress,
+   the time deferred deletion falls due (the most recently returned result plus
+   `delete_delay_hours`, as `deferred_file_delete_time` in `sched/transitioner.cpp`), and
+   the next validation retry when a webhook or storage read failed. With none of these
+   outstanding, `transition_time` is set to 2147483647, which keeps the workunit out of the
+   deadline sweep.
 9. Commit (one write batch).
 
 Steps 2 to 8 run in memory on the rows read in step 1. Validation may read object metadata
@@ -316,12 +329,17 @@ writer of a workunit or of one of its results (scheduler, admin API, transition)
 it in the same batch as its change.
 
 The commit batch of a transition starts with
-`UPDATE workunit SET ..., rev = rev + 1 WHERE id = ? AND rev = <the revision read>`. Every
+`UPDATE workunit SET ..., rev = rev + 1, commit_token = <token> WHERE id = ? AND rev = <the
+revision read>`, where the token is a random 62-bit number drawn for this attempt. Every
 other statement in the batch (result updates and inserts, credit, host statistics) carries
-`AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND rev = <the new revision>)`. If anything
-changed since the read, the first statement matches no row, so none of the others do either;
-the transition reads again and retries, a bounded number of times, and after that leaves the
-workunit to the sweep.
+`AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND commit_token = <token>)`. If anything
+changed since the read, the first statement matches no row, the token is not written, and
+none of the other statements apply; the transition reads again and retries, a bounded number
+of times, and after that leaves the workunit to the sweep.
+
+The guard tests the token and not the new revision, because two transitions that read the
+same revision expect to write the same next one: the loser would find it in place, written
+by the winner, and its result updates and credit would go through.
 
 Objects are deleted before the commit that records the deletion. A transition that loses the
 race after deleting repeats the deletion, which is harmless; the reverse order could record a
@@ -347,8 +365,10 @@ The stock assimilator is project code that runs next to the database. Here the p
 `GET /admin/v1/assimilate?app=<name>&limit=<n>` returns ready workunits with their canonical
 result, output file names and sizes; output bodies are fetched from `/admin/v1/files/upload/`;
 `POST /admin/v1/assimilate/ack` marks them done. An optional webhook announces new work so the
-project does not have to poll. Outputs are deleted `delete_delay_hours` after the acknowledgement (upstream counts from the
-most recently returned result).
+project does not have to poll. Outputs are deleted once the workunit is acknowledged and
+`delete_delay_hours` have passed since its most recently returned result, the rule upstream
+uses. The project fetches outputs before it acknowledges, so an acknowledgement that comes
+after the delay can delete them at once.
 
 ### Credit
 
