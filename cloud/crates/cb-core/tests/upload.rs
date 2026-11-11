@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use cb_core::upload::{
-    check_header, file_size, receive, CompleteWrite, PieceWrite, UploadStore, PIECE_BYTES,
+    check_header, file_size, md5_to_hex, parse_piece_name, receive, CompleteWrite, PieceWrite,
+    StoredPiece, UploadStore, PIECE_BYTES,
 };
 use cb_core::{CoreResult, FileKind};
 use cb_crypto::md5_hex;
@@ -56,8 +57,22 @@ fn upload_key(name: &str) -> String {
     format!("{}{name}", FileKind::Upload.prefix())
 }
 
-fn piece_key(name: &str, start: u64) -> String {
-    format!("{}{name}/{start}", FileKind::Partial.prefix())
+/// The key of the piece at `start` of the file `data`, as its client
+/// describes it with `md5_cksum`.
+fn piece_key(name: &str, data: &[u8], start: u64) -> String {
+    format!(
+        "{}{name}/{}/{start}",
+        FileKind::Partial.prefix(),
+        md5_hex(data)
+    )
+}
+
+fn piece_key_md5(name: &str, md5: &[u8; 16], start: u64) -> String {
+    format!(
+        "{}{name}/{}/{start}",
+        FileKind::Partial.prefix(),
+        md5_to_hex(md5)
+    )
 }
 
 impl MemStore {
@@ -87,10 +102,10 @@ impl MemStore {
             .collect()
     }
 
-    /// Bytes from 0 that stored pieces really hold.
-    fn stored_from_zero(&self, name: &str) -> u64 {
+    /// Bytes from 0 that stored pieces of the file `data` really hold.
+    fn stored_from_zero(&self, name: &str, data: &[u8]) -> u64 {
         let mut at = 0;
-        while let Some(p) = self.objects.borrow().get(&piece_key(name, at)) {
+        while let Some(p) = self.objects.borrow().get(&piece_key(name, data, at)) {
             at += p.len() as u64;
         }
         at
@@ -110,12 +125,7 @@ impl UploadStore for MemStore {
         Ok(self.complete(name).map(|d| d.len() as u64))
     }
 
-    async fn has_piece(&self, name: &str, start: u64) -> CoreResult<bool> {
-        self.op("head");
-        Ok(self.objects.borrow().contains_key(&piece_key(name, start)))
-    }
-
-    async fn list_pieces(&self, name: &str) -> CoreResult<Vec<(u64, u64)>> {
+    async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>> {
         self.op("list");
         let prefix = format!("{}{name}/", FileKind::Partial.prefix());
         Ok(self
@@ -123,8 +133,12 @@ impl UploadStore for MemStore {
             .borrow()
             .iter()
             .filter_map(|(k, v)| {
-                let start = k.strip_prefix(&prefix)?.parse().ok()?;
-                Some((start, v.len() as u64))
+                let (md5, start) = parse_piece_name(k.strip_prefix(&prefix)?)?;
+                Some(StoredPiece {
+                    md5,
+                    start,
+                    size: v.len() as u64,
+                })
             })
             .collect())
     }
@@ -136,6 +150,7 @@ impl UploadStore for MemStore {
     async fn put_piece(
         &self,
         name: &str,
+        md5: &[u8; 16],
         start: u64,
         body: &MemBody,
         len: u64,
@@ -146,7 +161,7 @@ impl UploadStore for MemStore {
         };
         self.objects
             .borrow_mut()
-            .insert(piece_key(name, start), bytes);
+            .insert(piece_key_md5(name, md5, start), bytes);
         Ok(PieceWrite::Stored)
     }
 
@@ -169,7 +184,8 @@ impl UploadStore for MemStore {
         let mut data = Vec::new();
         for s in starts {
             self.op("get");
-            match self.objects.borrow().get(&piece_key(name, *s)) {
+            let key = piece_key_md5(name, &md5.expect("pieces are composed with an MD5"), *s);
+            match self.objects.borrow().get(&key) {
                 Some(p) if p.len() as u64 == piece => data.extend_from_slice(p),
                 _ => return Ok(CompleteWrite::PieceMissing),
             }
@@ -188,10 +204,10 @@ impl UploadStore for MemStore {
         Ok(CompleteWrite::Stored)
     }
 
-    async fn delete_pieces(&self, name: &str, starts: &[u64]) -> CoreResult<()> {
+    async fn delete_pieces(&self, name: &str, pieces: &[StoredPiece]) -> CoreResult<()> {
         self.op("delete");
-        for s in starts {
-            self.remove(&piece_key(name, *s));
+        for p in pieces {
+            self.remove(&piece_key_md5(name, &p.md5, p.start));
         }
         Ok(())
     }
@@ -261,10 +277,10 @@ fn one_shot_upload_costs_a_head_and_a_put() {
     assert_eq!(store.take_ops(), ["head", "put"]);
     assert_eq!(store.complete(NAME), Some(data));
 
-    // A size query for a file never seen: two heads.
+    // A size query for a file never seen: a head and a listing.
     let store = MemStore::default();
     assert_eq!(size(&store), 0);
-    assert_eq!(store.take_ops(), ["head", "head"]);
+    assert_eq!(store.take_ops(), ["head", "list"]);
 }
 
 #[test]
@@ -273,13 +289,13 @@ fn large_upload_writes_pieces_then_one_object() {
     let data = file(100, 3);
     assert_eq!(send(&store, &data, 0, None), Ok(()));
     let ops = store.take_ops();
-    // Head, six pieces, the finished file (reading the six back), one
-    // delete of the pieces.
+    // Head, a listing (for pieces of other files), six pieces, the finished
+    // file (reading the six back), one delete of the pieces.
     assert_eq!(MemStore::count(&ops, "head"), 1);
     assert_eq!(MemStore::count(&ops, "put"), 7);
     assert_eq!(MemStore::count(&ops, "get"), 6);
     assert_eq!(MemStore::count(&ops, "delete"), 1);
-    assert_eq!(MemStore::count(&ops, "list"), 0);
+    assert_eq!(MemStore::count(&ops, "list"), 1);
     assert_eq!(store.complete(NAME), Some(data));
     assert!(store.pieces().is_empty());
     assert_eq!(size(&store), 100);
@@ -296,7 +312,7 @@ fn resume_after_a_cut_gives_identical_bytes() {
         // Whole pieces before the cut are held; the tail never is.
         let held = size(&store);
         assert_eq!(held, (cut as u64 / P * P).min(96), "cut at {cut}");
-        assert!(held <= store.stored_from_zero(NAME));
+        assert!(held <= store.stored_from_zero(NAME, &data));
         assert!(held < data.len() as u64);
 
         store.take_ops();
@@ -458,12 +474,14 @@ fn size_limits_hold_for_resumed_requests() {
     );
 
     // The finished file is exactly as long as the request says, whatever
-    // pieces an earlier, longer attempt left.
+    // pieces an earlier, longer attempt left: they are not reused, so
+    // the request that has the whole short file sends it from the start.
     let store = MemStore::default();
     assert!(send(&store, &data, 0, Some(99)).is_err());
     assert_eq!(size(&store), 96);
     let short = data[..40].to_vec();
-    assert_eq!(send(&store, &short, 32, None), Ok(()));
+    assert!(send(&store, &short, 32, None).is_err());
+    assert_eq!(send(&store, &short, 0, None), Ok(()));
     assert_eq!(store.complete(NAME), Some(short));
 }
 
@@ -474,8 +492,9 @@ fn contents_that_do_not_match_start_over() {
     let store = MemStore::default();
     assert!(send(&store, &a, 0, Some(50)).is_err());
     assert_eq!(size(&store), 48);
-    // The tail and MD5 of another file: the store refuses the result, and
-    // the pieces go so that the next attempt does not fail the same way.
+    // Another file under the same name, resumed at the offset the size
+    // query gave: the pieces are not b's, so they go and the client starts
+    // again from 0.
     let e = send(&store, &b, 48, None).unwrap_err();
     assert!(e.transient);
     assert!(e.message.contains("from the start"), "{e}");
@@ -492,7 +511,7 @@ fn stale_pieces() {
     // The lifecycle rule removes the oldest piece first.
     let store = MemStore::default();
     assert!(send(&store, &data, 0, Some(70)).is_err());
-    store.remove(&piece_key(NAME, 0));
+    store.remove(&piece_key(NAME, &data, 0));
     assert_eq!(size(&store), 0);
     assert!(send(&store, &data, 64, None).unwrap_err().transient);
     assert_eq!(send(&store, &data, 0, None), Ok(()));
@@ -502,7 +521,7 @@ fn stale_pieces() {
     // A gap ends what is held.
     let store = MemStore::default();
     assert!(send(&store, &data, 0, Some(70)).is_err());
-    store.remove(&piece_key(NAME, 32));
+    store.remove(&piece_key(NAME, &data, 32));
     assert_eq!(size(&store), 32);
     assert_eq!(send(&store, &data, 32, None), Ok(()));
     assert_eq!(store.complete(NAME), Some(data));
@@ -513,8 +532,9 @@ fn a_piece_lost_before_the_file_is_written() {
     let data = file(100, 15);
     let store = MemStore::default();
     assert!(send(&store, &data, 0, Some(70)).is_err());
-    *store.before_complete.borrow_mut() = Some(Box::new(|s: &MemStore| {
-        s.remove(&piece_key(NAME, 16));
+    let d = data.clone();
+    *store.before_complete.borrow_mut() = Some(Box::new(move |s: &MemStore| {
+        s.remove(&piece_key(NAME, &d, 16));
     }));
     let e = send(&store, &data, 64, None).unwrap_err();
     assert!(e.transient);
@@ -572,8 +592,200 @@ fn a_size_query_never_reports_a_finished_file_that_is_not_stored() {
         assert!(send(&store, &data, 0, Some(len - 1)).is_err());
         let held = size(&store);
         assert!(held < len as u64, "{len}");
-        assert_eq!(held, store.stored_from_zero(NAME));
+        assert_eq!(held, store.stored_from_zero(NAME, &data));
         assert_eq!(send(&store, &data, held, None), Ok(()));
         assert_eq!(store.complete(NAME), Some(data));
     }
+}
+
+/// Copies every stored piece of `from` to the keys of the file `to`, as if
+/// a request for `to` had written them.
+fn copy_pieces(store: &MemStore, from: &[u8], to: &[u8]) {
+    let (a, b) = (md5_hex(from), md5_hex(to));
+    let copies: Vec<(String, Vec<u8>)> = store
+        .objects
+        .borrow()
+        .iter()
+        .filter(|(k, _)| k.starts_with(FileKind::Partial.prefix()) && k.contains(&a))
+        .map(|(k, v)| (k.replace(&a, &b), v.clone()))
+        .collect();
+    store.objects.borrow_mut().extend(copies);
+}
+
+#[test]
+fn pieces_that_fail_the_check_are_dropped() {
+    // Pieces stored under b's MD5 whose bytes are not b's: the store
+    // refuses the finished file, and the pieces go so that the next attempt
+    // does not fail the same way.
+    let a = file(100, 18);
+    let b = file(100, 19);
+    let store = MemStore::default();
+    assert!(send(&store, &a, 0, Some(50)).is_err());
+    copy_pieces(&store, &a, &b);
+    let keys: Vec<String> = store.pieces();
+    for k in keys.iter().filter(|k| k.contains(&md5_hex(&a))) {
+        store.remove(k);
+    }
+    assert_eq!(size(&store), 48);
+    let e = send(&store, &b, 48, None).unwrap_err();
+    assert!(e.transient);
+    assert!(e.message.contains("from the start"), "{e}");
+    assert!(store.complete(NAME).is_none());
+    assert!(store.pieces().is_empty());
+    assert_eq!(send(&store, &b, 0, None), Ok(()));
+    assert_eq!(store.complete(NAME), Some(b));
+}
+
+/// What a stock client does with one file (`FILE_XFER::init_upload` and
+/// `FILE_XFER_SET::poll`): ask for the size, count the upload as done when
+/// the answer is at least the file's size, else send from that offset, and
+/// ask again after an error.
+#[derive(Debug, PartialEq, Eq)]
+enum Client {
+    /// The size answer was at least the file's size: no data was sent.
+    DoneWithoutSending,
+    Sent,
+    GaveUp,
+}
+
+fn stock_client(store: &MemStore, data: &[u8]) -> Client {
+    for _ in 0..3 {
+        let held = size(store);
+        if held >= data.len() as u64 {
+            return Client::DoneWithoutSending;
+        }
+        if send(store, data, held, None).is_ok() {
+            return Client::Sent;
+        }
+    }
+    Client::GaveUp
+}
+
+#[test]
+fn a_recomputed_file_never_mixes_with_an_earlier_attempt() {
+    // An earlier attempt at 100 bytes was cut at 70 and left 64 bytes in
+    // pieces. A lost task is sent again and writes another file under the
+    // same name, of any length.
+    let a = file(100, 20);
+    for len in 17usize..=200 {
+        let b = file(len, 21);
+        let store = MemStore::default();
+        assert!(send(&store, &a, 0, Some(70)).is_err());
+        assert_eq!(size(&store), 64);
+
+        let client = stock_client(&store, &b);
+        if len > 64 {
+            // The size query reports the old pieces, the request that
+            // follows finds they are not this file's and drops them, and
+            // the client's next query and request send the file whole. The
+            // finished object is exactly the new file.
+            assert_eq!(client, Client::Sent, "{len} bytes");
+            assert_eq!(store.complete(NAME), Some(b), "{len} bytes");
+            assert!(store.pieces().is_empty(), "{len} bytes");
+        } else {
+            // The size query cannot know the new file is shorter than the
+            // bytes held, and the stock client then declares the upload
+            // done without a request, as it does against the stock handler.
+            // Nothing is stored under the finished name, so the result
+            // fails validation instead of being taken for the old file.
+            assert_eq!(client, Client::DoneWithoutSending, "{len} bytes");
+            assert!(store.complete(NAME).is_none(), "{len} bytes");
+        }
+    }
+}
+
+#[test]
+fn a_recomputed_file_of_the_same_size_does_not_take_the_old_prefix() {
+    // The reviewer's case: same name, same length, other contents.
+    let a = file(100, 22);
+    let b = file(100, 23);
+    let store = MemStore::default();
+    assert!(send(&store, &a, 0, Some(90)).is_err());
+    assert_eq!(size(&store), 80);
+    assert_eq!(stock_client(&store, &b), Client::Sent);
+    assert_eq!(store.complete(NAME), Some(b));
+    assert!(store.pieces().is_empty());
+}
+
+#[test]
+fn pieces_of_two_files_are_not_reported() {
+    let a = file(100, 24);
+    let b = file(100, 25);
+    let store = MemStore::default();
+    assert!(send(&store, &a, 0, Some(70)).is_err());
+    copy_pieces(&store, &a, &b);
+    // Which file the client has is unknown.
+    assert_eq!(size(&store), 0);
+    // A request from the start drops the other file's pieces too.
+    assert_eq!(send(&store, &b, 0, None), Ok(()));
+    assert_eq!(store.complete(NAME), Some(b));
+    assert!(store.pieces().is_empty());
+}
+
+#[test]
+fn a_missing_or_malformed_checksum_reuses_nothing() {
+    let bad = [
+        "",
+        "not-an-md5",
+        "d41d8cd98f00b204e9800998ecf8427",
+        "g41d8cd98f00b204e9800998ecf8427e",
+        "d41d8cd98f00b204e9800998ecf8427e00",
+    ];
+    let a = file(100, 26);
+    let b = file(100, 27);
+    for md5 in bad {
+        let with = |data: &[u8], offset: f64| {
+            let mut h = header(NAME, data, offset);
+            h.md5_cksum = md5.to_string();
+            h
+        };
+        // From the start the file is stored whole, in one put, with no
+        // piece: there is nothing for another request to pick up.
+        let store = MemStore::default();
+        assert_eq!(send_with(&store, &with(&a, 0.0), &a, None, P), Ok(()));
+        let ops = store.take_ops();
+        assert_eq!(MemStore::count(&ops, "put"), 1, "{md5:?}");
+        assert_eq!(MemStore::count(&ops, "get"), 0, "{md5:?}");
+        assert_eq!(store.complete(NAME), Some(a.clone()));
+        assert!(store.pieces().is_empty());
+
+        // A cut keeps nothing, so the client is told 0.
+        let store = MemStore::default();
+        assert!(send_with(&store, &with(&a, 0.0), &a, Some(70), P).is_err());
+        assert!(store.pieces().is_empty());
+        assert_eq!(size(&store), 0);
+
+        // Pieces another request left are not combined with this file's
+        // tail, whether the file is the same or another: the request is
+        // refused, the pieces go, and the next size query says 0.
+        for data in [&a, &b] {
+            let store = MemStore::default();
+            assert!(send(&store, &a, 0, Some(70)).is_err());
+            assert_eq!(size(&store), 64);
+            let e = send_with(&store, &with(data, 64.0), data, None, P).unwrap_err();
+            assert!(e.transient, "{e}");
+            assert!(store.complete(NAME).is_none(), "{md5:?}");
+            assert!(store.pieces().is_empty(), "{md5:?}");
+            assert_eq!(size(&store), 0);
+            assert_eq!(
+                send_with(&store, &with(data, 0.0), data, None, P),
+                Ok(()),
+                "{md5:?}"
+            );
+            assert_eq!(store.complete(NAME), Some(data.clone()));
+        }
+    }
+}
+
+#[test]
+fn a_valid_checksum_in_capitals_resumes() {
+    let data = file(100, 28);
+    let store = MemStore::default();
+    let mut h = header(NAME, &data, 0.0);
+    h.md5_cksum = h.md5_cksum.to_uppercase();
+    assert!(send_with(&store, &h, &data, Some(70), P).is_err());
+    assert_eq!(size(&store), 64);
+    h.offset = 64.0;
+    assert_eq!(send_with(&store, &h, &data, None, P), Ok(()));
+    assert_eq!(store.complete(NAME), Some(data));
 }

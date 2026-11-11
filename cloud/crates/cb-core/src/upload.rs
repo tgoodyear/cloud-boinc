@@ -8,22 +8,35 @@
 //!
 //! - The file is divided on a fixed grid of `piece` bytes. Every grid piece
 //!   that ends before the last byte of the file is written as its own
-//!   object, `partial/<name>/<start>`, as soon as its bytes have arrived.
-//!   A put of a piece is atomic, so a piece exists only when all its bytes
-//!   do.
+//!   object, `partial/<name>/<md5>/<start>`, as soon as its bytes have
+//!   arrived. A put of a piece is atomic, so a piece exists only when all
+//!   its bytes do. `<md5>` is the client's whole-file `<md5_cksum>`: pieces
+//!   of two files that share a name (a task recomputed after it was lost
+//!   can write another file under the name its first attempt used) never
+//!   share a key, and a request reuses only the pieces under its own MD5.
+//!   A request whose `<md5_cksum>` is missing or not an MD5 writes no
+//!   pieces: its file goes into one put, and no earlier piece is reused.
 //! - The last stretch of the file, between 1 and `piece` bytes and called
 //!   the tail here, is never written as a piece. It goes straight into the
 //!   finished object: one conditional put of `upload/<name>` whose body is
 //!   the stored pieces read back in order, followed by the tail from the
 //!   request. That put is the only write of the finished object, so R2
 //!   computes its MD5 (bitwise validation reads it) and checks it against
-//!   the client's `<md5_cksum>`. The pieces are deleted afterwards.
+//!   the client's `<md5_cksum>`; pieces are only ever composed with that
+//!   check on. The pieces are deleted afterwards.
 //! - The bytes held for an unfinished file are the grid pieces present
 //!   without a gap from offset 0. Because the tail is never a piece, that
-//!   number is always less than the file size, so `<get_file_size>` never
-//!   tells a client its file is complete when it is not; a client that
+//!   number is always less than the size of the file that wrote the pieces.
+//!   A `<get_file_size>` request carries only the name, so it cannot be
+//!   checked against the file the client is about to send: a client that
 //!   hears a size at least as large as its file counts the upload as done
-//!   (`FILE_XFER_SET::poll` in `client/file_xfer.cpp`).
+//!   (`FILE_XFER_SET::poll` in `client/file_xfer.cpp`), and a name whose
+//!   pieces came from a longer file of an earlier attempt can make that
+//!   happen for a shorter recomputed file. The stock handler has the same
+//!   property with the bytes on disk. Nothing is then stored under the
+//!   finished name, so the result fails validation and is retried; no
+//!   wrong file is ever served as the output. A request that does arrive
+//!   removes the pieces of any other file under its name.
 //!
 //! A file no larger than one piece has no pieces: its upload is one head
 //! and one put, as before resume existed.
@@ -56,10 +69,28 @@ pub fn is_flat_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && is_valid_filename(name) && !name.contains('/')
 }
 
-/// The name under the `partial/` prefix of the piece of `name` that starts
-/// at byte `start`.
-pub fn piece_name(name: &str, start: u64) -> String {
-    format!("{name}/{start}")
+/// The 32 lowercase hex digits of an MD5, as used in piece names.
+pub fn md5_to_hex(md5: &[u8; 16]) -> String {
+    md5.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The name under the `partial/` prefix of the piece of `name`, for the file
+/// with this MD5, that starts at byte `start`.
+pub fn piece_name(name: &str, md5: &[u8; 16], start: u64) -> String {
+    format!("{name}/{}/{start}", md5_to_hex(md5))
+}
+
+/// Splits what follows `<name>/` in a piece's name into its MD5 and start;
+/// `None` for a name that is not a piece's.
+pub fn parse_piece_name(rest: &str) -> Option<([u8; 16], u64)> {
+    let (md5, start) = rest.split_once('/')?;
+    if md5.len() != 32 || !md5.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    if start.is_empty() || !start.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((parse_md5(md5)?, start.parse().ok()?))
 }
 
 /// Where the tail of a file of `nbytes` bytes starts: the last grid
@@ -163,34 +194,42 @@ pub enum CompleteWrite {
     Rejected,
 }
 
+/// A stored piece: the file's MD5 as its client sent it, where the piece
+/// starts, and its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPiece {
+    pub md5: [u8; 16],
+    pub start: u64,
+    pub size: u64,
+}
+
 /// The object store as the upload path needs it: `upload/<name>` for
-/// finished files and `partial/<name>/<start>` for pieces. `Body` is the
-/// unread rest of the request body.
+/// finished files and `partial/<name>/<md5>/<start>` for pieces. `Body` is
+/// the unread rest of the request body.
 #[async_trait(?Send)]
 pub trait UploadStore {
     type Body;
 
     /// Size of the finished file, if it is stored.
     async fn complete_size(&self, name: &str) -> CoreResult<Option<u64>>;
-    /// Whether the piece starting at `start` is stored.
-    async fn has_piece(&self, name: &str, start: u64) -> CoreResult<bool>;
-    /// Every stored piece of `name`, as (start, size), in any order.
-    async fn list_pieces(&self, name: &str) -> CoreResult<Vec<(u64, u64)>>;
+    /// Every stored piece of `name`, whatever file wrote it, in any order.
+    async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>>;
     /// Reads and drops `n` bytes of the body. False if it ended first.
     async fn skip(&self, body: &Self::Body, n: u64) -> CoreResult<bool>;
-    /// Stores the next `len` bytes of the body as the piece at `start`,
-    /// replacing a piece of the same name.
+    /// Stores the next `len` bytes of the body as the piece at `start` of
+    /// the file with this `md5`, replacing a piece of the same name.
     async fn put_piece(
         &self,
         name: &str,
+        md5: &[u8; 16],
         start: u64,
         body: &Self::Body,
         len: u64,
     ) -> CoreResult<PieceWrite>;
-    /// Stores the finished file, unless it exists: the pieces at `starts`,
-    /// in that order, each `piece` bytes long, then the next `tail` bytes
-    /// of the body. With `md5`, the store refuses contents with another
-    /// MD5.
+    /// Stores the finished file, unless it exists: the pieces at `starts`
+    /// (of the file with this `md5`, which is then present), in that order,
+    /// each `piece` bytes long, then the next `tail` bytes of the body.
+    /// With `md5`, the store refuses contents with another MD5.
     async fn put_complete(
         &self,
         name: &str,
@@ -201,22 +240,35 @@ pub trait UploadStore {
         md5: Option<[u8; 16]>,
     ) -> CoreResult<CompleteWrite>;
     /// Deletes pieces; a missing piece is not an error.
-    async fn delete_pieces(&self, name: &str, starts: &[u64]) -> CoreResult<()>;
+    async fn delete_pieces(&self, name: &str, pieces: &[StoredPiece]) -> CoreResult<()>;
 }
 
 /// The answer to `<get_file_size>` (`handle_get_file_size`): the size of the
-/// finished file, or else the bytes held, 0 for a file never seen. The two
-/// heads run together; a listing follows only when a first piece exists.
+/// finished file, or else the bytes held, 0 for a file never seen. The head
+/// and the listing run together.
+///
+/// The request names the file and nothing else, so the answer cannot depend
+/// on the file the client will send. When pieces of more than one file are
+/// present, which one the client has is unknown and the answer is 0.
 pub async fn file_size<S: UploadStore>(store: &S, name: &str, piece: u64) -> CoreResult<u64> {
-    let (complete, first) =
-        futures_util::future::join(store.complete_size(name), store.has_piece(name, 0)).await;
+    let (complete, listed) =
+        futures_util::future::join(store.complete_size(name), store.list_pieces(name)).await;
     if let Some(size) = complete? {
         return Ok(size);
     }
-    if !first? {
+    let listed = listed?;
+    let Some(first) = listed.first() else {
+        return Ok(0);
+    };
+    if listed.iter().any(|p| p.md5 != first.md5) {
         return Ok(0);
     }
-    Ok(held_bytes(&store.list_pieces(name).await?, piece, u64::MAX))
+    Ok(held_of(&listed, piece, u64::MAX))
+}
+
+fn held_of(pieces: &[StoredPiece], piece: u64, limit: u64) -> u64 {
+    let v: Vec<(u64, u64)> = pieces.iter().map(|p| (p.start, p.size)).collect();
+    held_bytes(&v, piece, limit)
 }
 
 fn exists_with_another_size(name: &str) -> UploadError {
@@ -258,39 +310,83 @@ pub async fn receive<S: UploadStore>(
         });
     }
     let last = tail_start(nbytes, piece);
-    // An upload from the start writes every piece, so it needs no listing.
+    // Pieces are kept, and reused, only under a whole-file MD5 that the
+    // finished object can be checked against.
+    let md5 = parse_md5(&header.md5_cksum);
+    let mut held = 0;
+    let mut dropped_others = false;
+    if last > 0 || offset > 0 {
+        let (mine, others): (Vec<StoredPiece>, Vec<StoredPiece>) = store
+            .list_pieces(name)
+            .await?
+            .into_iter()
+            .partition(|p| Some(p.md5) == md5);
+        // Pieces of another file under this name are never composed into
+        // this one. Dropping them also keeps a later size query from
+        // reporting bytes this client does not have.
+        if !others.is_empty() {
+            store.delete_pieces(name, &others).await?;
+            dropped_others = true;
+        }
+        held = held_of(&mine, piece, last);
+    }
+    // An upload from the start writes every piece.
     let start = if offset == 0 {
         0
     } else {
-        let held = held_bytes(&store.list_pieces(name).await?, piece, last);
         if offset > held {
-            return Ok(Err(UploadError::transient(format!(
-                "length of file {name} {held} bytes < offset {offset} bytes"
-            ))));
+            return Ok(Err(if dropped_others {
+                UploadError::transient(format!(
+                    "pieces of file {name} came from other contents and were dropped; \
+                     send it again from the start"
+                ))
+            } else {
+                UploadError::transient(format!(
+                    "length of file {name} {held} bytes < offset {offset} bytes"
+                ))
+            }));
         }
         held
     };
     if start > offset && !store.skip(body, start - offset).await? {
         return Ok(Err(cut_off(name, start)));
     }
+    // With no MD5 the whole file is the tail: one put, no pieces.
+    let (last, tail) = match md5 {
+        Some(_) => (last, nbytes - last),
+        None => (0, nbytes),
+    };
     let mut at = start;
-    while at < last {
-        match store.put_piece(name, at, body, piece).await? {
-            PieceWrite::Stored => at += piece,
-            PieceWrite::BodyEnded => return Ok(Err(cut_off(name, at))),
+    if let Some(m) = &md5 {
+        while at < last {
+            match store.put_piece(name, m, at, body, piece).await? {
+                PieceWrite::Stored => at += piece,
+                PieceWrite::BodyEnded => return Ok(Err(cut_off(name, at))),
+            }
         }
     }
     let starts: Vec<u64> = (0..last / piece).map(|k| k * piece).collect();
-    let md5 = parse_md5(&header.md5_cksum);
+    let mine = |starts: &[u64]| -> Vec<StoredPiece> {
+        starts
+            .iter()
+            .filter_map(|&start| {
+                md5.map(|md5| StoredPiece {
+                    md5,
+                    start,
+                    size: piece,
+                })
+            })
+            .collect()
+    };
     match store
-        .put_complete(name, &starts, piece, body, nbytes - last, md5)
+        .put_complete(name, &starts, piece, body, tail, md5)
         .await?
     {
         CompleteWrite::Stored => {
             if !starts.is_empty() {
                 // Pieces left by a failed delete expire under the lifecycle
                 // rule; the upload itself succeeded.
-                let _ = store.delete_pieces(name, &starts).await;
+                let _ = store.delete_pieces(name, &mine(&starts)).await;
             }
             Ok(Ok(()))
         }
@@ -316,7 +412,7 @@ pub async fn receive<S: UploadStore>(
             // The pieces do not make the file the client describes (most
             // likely its MD5 differs). Keeping them would fail the same way
             // on every retry, so the next attempt starts from 0.
-            store.delete_pieces(name, &starts).await?;
+            store.delete_pieces(name, &mine(&starts)).await?;
             Ok(Err(UploadError::transient(format!(
                 "file {name} could not be stored; send it again from the start"
             ))))
@@ -384,6 +480,27 @@ mod tests {
         assert!(!is_flat_name("a/b"));
         assert!(!is_flat_name("../a"));
         assert!(!is_flat_name(&"x".repeat(256)));
-        assert_eq!(piece_name("f", 8388608), "f/8388608");
+        let m = parse_md5("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        assert_eq!(
+            piece_name("f", &m, 8388608),
+            "f/d41d8cd98f00b204e9800998ecf8427e/8388608"
+        );
+        assert_eq!(
+            parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/8388608"),
+            Some((m, 8388608))
+        );
+        // Not pieces: the old layout, a stray object, upper case, a bad
+        // start.
+        assert_eq!(parse_piece_name("8388608"), None);
+        assert_eq!(parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/"), None);
+        assert_eq!(parse_piece_name("D41D8CD98F00B204E9800998ECF8427E/1"), None);
+        assert_eq!(
+            parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/1/2"),
+            None
+        );
+        assert_eq!(
+            parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/-1"),
+            None
+        );
     }
 }

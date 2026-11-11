@@ -179,7 +179,7 @@ One bucket per project.
 | --- | --- | --- | --- |
 | `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
-| `partial/<name>/<start>` | pieces of unfinished uploads over 8 MiB (see "Upload") | files Worker | until the file is finished, else by bucket lifecycle rule |
+| `partial/<name>/<md5>/<start>` | pieces of unfinished uploads over 8 MiB (see "Upload") | files Worker | until the file is finished, else by bucket lifecycle rule |
 | `archive/<date>/` | purged workunit and result rows, as JSON lines, one object per purge pass | pipeline cron | by bucket lifecycle rule |
 
 Names are flat. The stock fan-out directories exist to keep directory sizes down on a POSIX
@@ -595,19 +595,26 @@ disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receiv
 `file_size`) keeps the bytes in pieces:
 
 - The file is divided on a fixed grid of 8 MiB (`PIECE_BYTES`). Each grid piece that ends
-  before the last byte of the file is stored as its own object, `partial/<name>/<start>`, as
-  soon as its bytes have arrived. A put is atomic, so a piece exists only if all its bytes do.
+  before the last byte of the file is stored as its own object, `partial/<name>/<md5>/<start>`,
+  as soon as its bytes have arrived. A put is atomic, so a piece exists only if all its bytes
+  do. `<md5>` is the whole-file `<md5_cksum>` the client sent, so pieces of two different files
+  that share a name never share a key, and a request reuses only the pieces under its own MD5.
+  A request whose `<md5_cksum>` is missing or not an MD5 writes no pieces: its file goes into
+  one put and no earlier piece is reused (stock clients always send the checksum: they compute
+  it when the task ends, `md5_file` in `client/cs_apps.cpp`, and put it in every upload
+  request, `FILE_XFER::init_upload`).
 - The last stretch of the file, 1 byte to 8 MiB long, is never a piece. The request that
   carries it writes the finished object with one conditional put whose body is the stored
   pieces read back in order followed by that tail from the request. R2 therefore holds the
   MD5 of the whole object, checks it against the client's `<md5_cksum>`, and bitwise
-  validation keeps reading MD5s from metadata. The pieces are deleted afterwards.
+  validation keeps reading MD5s from metadata. Pieces are only composed with that check on.
+  The pieces are deleted afterwards.
 - `<get_file_size>` answers the size of the finished object, or else the pieces present
-  without a gap from offset 0. The tail is never a piece, so that number is always below the
-  file size: the client counts an upload as done when the server reports at least its size
-  (`FILE_XFER_SET::poll`), and it never hears that for a file that is not stored. A request
-  whose data stops early keeps the pieces it finished; the bytes of the piece in flight are
-  lost and sent again. A dropped connection keeps pieces only with a zone rule; see below.
+  without a gap from offset 0, or 0 when pieces of more than one file are present. The tail
+  is never a piece, so that number is always below the size of the file that wrote the pieces.
+  A request whose data stops early keeps the pieces it finished; the bytes of the piece in
+  flight are lost and sent again. A dropped connection keeps pieces only with a zone rule; see
+  below.
 - A file of 8 MiB or less has no pieces: its upload is one head and one put, as before.
 
 Offsets follow `copy_socket_to_file` in `sched/file_upload_handler.cpp`. An offset beyond the
@@ -663,6 +670,32 @@ exceeding the CPU limit.
 A complete request whose data stops early (a client that hit its own error) keeps its finished
 pieces with or without the rule.
 
+A recomputed file under an old name. A task the server sends again after the client lost it
+(`resend_lost_work` in `sched/sched_resend.cpp`; the scheduler Worker's lost-result resend)
+runs again and uploads under the same names, because the names and their signed certificates
+are made when the result is created and the scheduler Worker holds no upload key. If the
+first attempt left pieces and the new output differs, three cases follow:
+
+- The new upload request has other contents (another MD5): the old pieces are not reused. The
+  request drops them and, if its offset was the one the size query gave, is answered with a
+  transient error; the client asks again, hears 0 and sends the file from the start. The
+  finished object is exactly the new file. Nothing from the old attempt can end up in it.
+- The new request has no valid MD5: the same, and the file is sent whole in one put.
+- The size query comes first and reports the old pieces, and the new file is no longer than
+  they are. The query carries only the name, so the server cannot know this, and the stock
+  client counts the upload as done without sending a request (`FILE_XFER_SET::poll`: a
+  reported size at least the file's size). This is the stock handler's behaviour too, with
+  the old bytes on disk as the answer, and there the stale file stays as the output. Here
+  nothing is stored under the finished name, so validation of the result fails
+  (`output_stats` in `crates/cb-core/src/pipeline.rs`) and the work is issued again; a wrong
+  file is never served. Closing this fully needs the attempt to be known when the size query
+  arrives. A result's upload names cannot change per attempt (they are signed), and the
+  scheduler Worker has no bucket binding to clear the pieces when it resends a result. One way
+  is for the resend to set `sent_time` as the stock scheduler does and for the size query to
+  ignore pieces older than it; that is not built. The regression tests
+  (`a_recomputed_file_never_mixes_with_an_earlier_attempt` in `crates/cb-core/tests/upload.rs`)
+  pin both outcomes.
+
 Every request passes the same checks before any byte is stored, whatever its offset
 (`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
 the name. The finished object is exactly `<nbytes>` long, so pieces left by an earlier attempt
@@ -672,9 +705,9 @@ nothing.
 
 Failure cases:
 
-- The finished object's put is refused with the body and pieces intact (most likely the MD5
-  does not match, for example pieces of other contents under the same name): the pieces are
-  deleted and the client is told to start again, so a retry cannot fail the same way forever.
+- The finished object's put is refused with the body and pieces intact (the MD5 does not
+  match: pieces stored under this MD5 hold other bytes): the pieces are deleted and the client
+  is told to start again, so a retry cannot fail the same way forever.
 - A piece cannot be read back (it expired, or a request that finished the file deleted it):
   transient error, pieces kept; the next size query reports what is left.
 - Two requests for the same file: pieces sit on a fixed grid, so they write the same keys with
@@ -692,10 +725,9 @@ R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
 | Request | Operations |
 | --- | --- |
 | Upload of a file of 8 MiB or less from offset 0 | 1 head, 1 put (unchanged) |
-| Upload of a larger file from offset 0, with n pieces | 1 head, n + 1 puts, n gets, 1 delete |
-| Resumed upload | as above, plus 1 list; pieces already held are not written again |
-| `<get_file_size>`, file stored or never seen | 2 heads, run together (was 1) |
-| `<get_file_size>`, pieces held | 2 heads, 1 list |
+| Upload of a larger file from offset 0, with n pieces | 1 head, 1 list, n + 1 puts, n gets, 1 delete |
+| Resumed upload | the same; pieces already held are not written again |
+| `<get_file_size>` | 1 head and 1 list, run together |
 
 No database query is added. The settings read on the upload path is unchanged.
 

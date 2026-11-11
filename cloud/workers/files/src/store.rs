@@ -7,7 +7,9 @@
 //! parsed.
 
 use async_trait::async_trait;
-use cb_core::upload::{piece_name, CompleteWrite, PieceWrite, UploadStore};
+use cb_core::upload::{
+    parse_piece_name, piece_name, CompleteWrite, PieceWrite, StoredPiece, UploadStore,
+};
 use cb_core::{CoreError, CoreResult, FileKind};
 use cb_worker::object_key;
 use js_sys::{Array, Promise, Uint8Array};
@@ -86,8 +88,8 @@ fn files_err(e: Error) -> CoreError {
     CoreError::Files(e.to_string())
 }
 
-fn partial_key(name: &str, start: u64) -> String {
-    object_key(FileKind::Partial, &piece_name(name, start))
+fn partial_key(name: &str, md5: &[u8; 16], start: u64) -> String {
+    object_key(FileKind::Partial, &piece_name(name, md5, start))
 }
 
 pub struct R2Uploads(pub Bucket);
@@ -105,16 +107,7 @@ impl UploadStore for R2Uploads {
         Ok(head.map(|o| o.size()))
     }
 
-    async fn has_piece(&self, name: &str, start: u64) -> CoreResult<bool> {
-        let head = self
-            .0
-            .head(partial_key(name, start))
-            .await
-            .map_err(files_err)?;
-        Ok(head.is_some())
-    }
-
-    async fn list_pieces(&self, name: &str) -> CoreResult<Vec<(u64, u64)>> {
+    async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>> {
         let prefix = object_key(FileKind::Partial, &format!("{name}/"));
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
@@ -125,8 +118,13 @@ impl UploadStore for R2Uploads {
             }
             let page = list.execute().await.map_err(files_err)?;
             for o in page.objects() {
-                if let Some(Ok(start)) = o.key().strip_prefix(&prefix).map(str::parse::<u64>) {
-                    out.push((start, o.size()));
+                if let Some((md5, start)) = o.key().strip_prefix(&prefix).and_then(parse_piece_name)
+                {
+                    out.push(StoredPiece {
+                        md5,
+                        start,
+                        size: o.size(),
+                    });
                 }
             }
             match page.cursor() {
@@ -146,12 +144,18 @@ impl UploadStore for R2Uploads {
     async fn put_piece(
         &self,
         name: &str,
+        md5: &[u8; 16],
         start: u64,
         body: &Body,
         len: u64,
     ) -> CoreResult<PieceWrite> {
         let data = body.0.take(len as f64);
-        match self.0.put(partial_key(name, start), data).execute().await {
+        match self
+            .0
+            .put(partial_key(name, md5, start), data)
+            .execute()
+            .await
+        {
             Ok(_) => Ok(PieceWrite::Stored),
             Err(_) if body.failed() => Ok(PieceWrite::BodyEnded),
             Err(e) => Err(files_err(e)),
@@ -167,10 +171,15 @@ impl UploadStore for R2Uploads {
         tail: u64,
         md5: Option<[u8; 16]>,
     ) -> CoreResult<CompleteWrite> {
-        let keys: Array = starts
-            .iter()
-            .map(|s| JsValue::from(partial_key(name, *s)))
-            .collect();
+        // Pieces are only composed under the MD5 they were stored for, and
+        // `receive` passes starts only with one.
+        let keys: Array = match md5 {
+            Some(m) => starts
+                .iter()
+                .map(|s| JsValue::from(partial_key(name, &m, *s)))
+                .collect(),
+            None => Array::new(),
+        };
         let composed = body
             .0
             .compose(self.0.as_ref(), keys, piece as f64, tail as f64);
@@ -196,9 +205,12 @@ impl UploadStore for R2Uploads {
         })
     }
 
-    async fn delete_pieces(&self, name: &str, starts: &[u64]) -> CoreResult<()> {
-        for chunk in starts.chunks(1000) {
-            let keys: Vec<String> = chunk.iter().map(|s| partial_key(name, *s)).collect();
+    async fn delete_pieces(&self, name: &str, pieces: &[StoredPiece]) -> CoreResult<()> {
+        for chunk in pieces.chunks(1000) {
+            let keys: Vec<String> = chunk
+                .iter()
+                .map(|p| partial_key(name, &p.md5, p.start))
+                .collect();
             self.0.delete_multiple(keys).await.map_err(files_err)?;
         }
         Ok(())
