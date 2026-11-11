@@ -266,10 +266,7 @@ impl Host {
             // The request fails on the client side; what matters is what the
             // server kept.
             CutMode::Abort => {
-                let _ = self
-                    .agent
-                    .post(url)
-                    .send(CutBody { data: body, pos: 0 });
+                let _ = self.agent.post(url).send(CutBody { data: body, pos: 0 });
             }
         }
         let name = element(info, "name").ok_or("upload: the file has no name")?;

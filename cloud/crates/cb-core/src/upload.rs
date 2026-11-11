@@ -127,12 +127,7 @@ pub fn check_header(
         let Some(key) = key else {
             return Err(UploadError::transient("the project has no upload key"));
         };
-        if !verify_upload_certificate(
-            &header.name,
-            header.max_nbytes,
-            &header.xml_signature,
-            key,
-        ) {
+        if !verify_upload_certificate(&header.name, header.max_nbytes, &header.xml_signature, key) {
             return Err(UploadHeader::invalid_signature());
         }
     }

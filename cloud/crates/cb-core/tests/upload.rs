@@ -366,7 +366,9 @@ fn offset_beyond_what_is_held_is_a_transient_error() {
             pos: Cell::new(0),
             end: 0,
         };
-        let e = block_on(receive(&store, &h, &body, P)).unwrap().unwrap_err();
+        let e = block_on(receive(&store, &h, &body, P))
+            .unwrap()
+            .unwrap_err();
         assert!(e.transient, "{e}");
     }
     assert_eq!(*store.objects.borrow(), before);
@@ -541,7 +543,9 @@ fn concurrent_uploads_of_one_file() {
     let store = MemStore::default();
     assert!(send(&store, &data, 0, Some(70)).is_err());
     *store.before_complete.borrow_mut() = Some(Box::new(|s: &MemStore| {
-        s.objects.borrow_mut().insert(upload_key(NAME), vec![1, 2, 3]);
+        s.objects
+            .borrow_mut()
+            .insert(upload_key(NAME), vec![1, 2, 3]);
     }));
     let e = send(&store, &data, 64, None).unwrap_err();
     assert!(!e.transient);

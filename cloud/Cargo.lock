@@ -195,7 +195,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cb-core",
- "cb-crypto",
  "cb-db",
  "cb-proto",
  "cb-worker",
