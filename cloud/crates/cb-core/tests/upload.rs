@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use cb_core::upload::{
     check_header, file_size, md5_to_hex, parse_piece_name, receive, CompleteWrite, PieceWrite,
-    StoredPiece, UploadStore, PIECE_BYTES,
+    StoredFile, StoredPiece, UploadStore, PIECE_BYTES,
 };
 use cb_core::{CoreResult, FileKind};
 use cb_crypto::md5_hex;
@@ -120,9 +120,12 @@ impl MemStore {
 impl UploadStore for MemStore {
     type Body = MemBody;
 
-    async fn complete_size(&self, name: &str) -> CoreResult<Option<u64>> {
+    async fn complete(&self, name: &str) -> CoreResult<Option<StoredFile>> {
         self.op("head");
-        Ok(self.complete(name).map(|d| d.len() as u64))
+        Ok(MemStore::complete(self, name).map(|d| StoredFile {
+            size: d.len() as u64,
+            md5: cb_core::upload::parse_md5(&md5_hex(&d)),
+        }))
     }
 
     async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>> {
@@ -417,9 +420,20 @@ fn a_finished_file_is_never_appended_to() {
         assert_eq!(send(&store, &data, offset, None), Ok(()));
         assert_eq!(store.take_ops(), ["head"]);
     }
-    // Other contents of the same size do not replace it.
+    // Other contents of the same size do not replace it, and are not told
+    // they were stored: the file the client has is not the one held.
     let other = file(100, 10);
-    assert_eq!(send(&store, &other, 0, None), Ok(()));
+    assert_eq!(
+        send(&store, &other, 0, None),
+        Err(UploadError::permanent(format!(
+            "file {NAME} exists with other contents"
+        )))
+    );
+    assert_eq!(store.complete(NAME), Some(data.clone()));
+    // A request that gives no MD5 is judged by size alone.
+    let mut h = header(NAME, &other, 0.0);
+    h.md5_cksum = String::new();
+    assert_eq!(send_with(&store, &h, &other, None, P), Ok(()));
     assert_eq!(store.complete(NAME), Some(data.clone()));
 
     // A longer file under the same name, resumed past the old end.
@@ -427,7 +441,7 @@ fn a_finished_file_is_never_appended_to() {
     let e = send(&store, &longer, 100, None).unwrap_err();
     assert_eq!(
         e,
-        UploadError::permanent(format!("file {NAME} exists with another size"))
+        UploadError::permanent(format!("file {NAME} exists with other contents"))
     );
     assert_eq!(store.complete(NAME), Some(data));
     assert!(store.pieces().is_empty());

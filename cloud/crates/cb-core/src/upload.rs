@@ -194,6 +194,24 @@ pub enum CompleteWrite {
     Rejected,
 }
 
+/// A finished file as the store holds it: its size and, when the store
+/// has it, its MD5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredFile {
+    pub size: u64,
+    pub md5: Option<[u8; 16]>,
+}
+
+impl StoredFile {
+    /// Whether this is the file a request describes: its size, and its MD5
+    /// when both sides have one. A retry of the same upload matches; a
+    /// request for another file under the name does not, so it is never
+    /// answered with success for data the store does not hold.
+    pub fn is(&self, nbytes: u64, md5: Option<[u8; 16]>) -> bool {
+        self.size == nbytes && !matches!((self.md5, md5), (Some(a), Some(b)) if a != b)
+    }
+}
+
 /// A stored piece: the file's MD5 as its client sent it, where the piece
 /// starts, and its size.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,8 +228,8 @@ pub struct StoredPiece {
 pub trait UploadStore {
     type Body;
 
-    /// Size of the finished file, if it is stored.
-    async fn complete_size(&self, name: &str) -> CoreResult<Option<u64>>;
+    /// The finished file, if it is stored.
+    async fn complete(&self, name: &str) -> CoreResult<Option<StoredFile>>;
     /// Every stored piece of `name`, whatever file wrote it, in any order.
     async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>>;
     /// Reads and drops `n` bytes of the body. False if it ended first.
@@ -252,9 +270,9 @@ pub trait UploadStore {
 /// present, which one the client has is unknown and the answer is 0.
 pub async fn file_size<S: UploadStore>(store: &S, name: &str, piece: u64) -> CoreResult<u64> {
     let (complete, listed) =
-        futures_util::future::join(store.complete_size(name), store.list_pieces(name)).await;
-    if let Some(size) = complete? {
-        return Ok(size);
+        futures_util::future::join(store.complete(name), store.list_pieces(name)).await;
+    if let Some(file) = complete? {
+        return Ok(file.size);
     }
     let listed = listed?;
     let Some(first) = listed.first() else {
@@ -271,8 +289,8 @@ fn held_of(pieces: &[StoredPiece], piece: u64, limit: u64) -> u64 {
     held_bytes(&v, piece, limit)
 }
 
-fn exists_with_another_size(name: &str) -> UploadError {
-    UploadError::permanent(format!("file {name} exists with another size"))
+fn exists_with_other_contents(name: &str) -> UploadError {
+    UploadError::permanent(format!("file {name} exists with other contents"))
 }
 
 fn cut_off(name: &str, kept: u64) -> UploadError {
@@ -300,19 +318,20 @@ pub async fn receive<S: UploadStore>(
             "can't resume partial file {name}: bad offset"
         ))));
     };
+    let md5 = parse_md5(&header.md5_cksum);
     // A stored file is never replaced or appended to: the upload was
     // complete, and the result may have been validated against it since.
-    if let Some(size) = store.complete_size(name).await? {
-        return Ok(if size == nbytes {
+    // Success only for the same file (size and MD5), as a retry sends it.
+    if let Some(file) = store.complete(name).await? {
+        return Ok(if file.is(nbytes, md5) {
             Ok(())
         } else {
-            Err(exists_with_another_size(name))
+            Err(exists_with_other_contents(name))
         });
     }
     let last = tail_start(nbytes, piece);
     // Pieces are kept, and reused, only under a whole-file MD5 that the
     // finished object can be checked against.
-    let md5 = parse_md5(&header.md5_cksum);
     let mut held = 0;
     let mut dropped_others = false;
     if last > 0 || offset > 0 {
@@ -392,9 +411,9 @@ pub async fn receive<S: UploadStore>(
         }
         // Another request stored the file first. A retry of the same
         // upload is answered as the check above answers it.
-        CompleteWrite::Exists => Ok(match store.complete_size(name).await? {
-            Some(size) if size == nbytes => Ok(()),
-            _ => Err(exists_with_another_size(name)),
+        CompleteWrite::Exists => Ok(match store.complete(name).await? {
+            Some(file) if file.is(nbytes, md5) => Ok(()),
+            _ => Err(exists_with_other_contents(name)),
         }),
         CompleteWrite::BodyEnded => Ok(Err(cut_off(name, last))),
         // Expired or deleted by a request that finished the file. The next
@@ -403,7 +422,11 @@ pub async fn receive<S: UploadStore>(
             "part of file {name} is no longer held; ask for its size again"
         )))),
         CompleteWrite::Rejected => {
-            if store.complete_size(name).await? == Some(nbytes) {
+            if store
+                .complete(name)
+                .await?
+                .is_some_and(|f| f.is(nbytes, md5))
+            {
                 return Ok(Ok(()));
             }
             if starts.is_empty() {

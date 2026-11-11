@@ -884,20 +884,26 @@ struct OutputStat {
     nbytes: u64,
 }
 
-/// Looks up the stored output files of a result. `Err(Fp)` when the result
-/// cannot be fingerprinted.
+/// Looks up the stored output files of a result. `Err(Fp::Invalid)` when a
+/// required output (one not marked `<optional/>`) is not stored, whatever
+/// the validator: a client that counts an upload as done without sending it
+/// (a size query that answered at least its file's size) reports a result
+/// with no finished object, and no result is accepted without its data.
+/// `Err(Fp::Transient)` when the store cannot be read. Files marked
+/// `<no_validate/>` are looked up but left out of the list.
 async fn output_stats(r: &JobResult, files: &dyn Files) -> Result<Vec<OutputStat>, Fp> {
     let mut v = Vec::new();
     for f in output_files(&r.xml_doc_in) {
-        if f.no_validate {
-            continue;
-        }
         match files.stat(FileKind::Upload, &f.name).await {
-            Ok(Some(s)) => v.push(OutputStat {
-                name: f.name,
-                md5: s.md5,
-                nbytes: s.nbytes,
-            }),
+            Ok(Some(s)) => {
+                if !f.no_validate {
+                    v.push(OutputStat {
+                        name: f.name,
+                        md5: s.md5,
+                        nbytes: s.nbytes,
+                    });
+                }
+            }
             Ok(None) if f.optional => {}
             Ok(None) => return Err(Fp::Invalid),
             Err(_) => return Err(Fp::Transient),
@@ -980,10 +986,24 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp
                 }
             }
         }
-        // "trivial": every result that came back is right.
+        // "trivial": every result that came back with its outputs is right.
+        // A result already checked (the canonical one, looked at again
+        // beside a late result) is not looked up again.
         _ => {
             for i in wanted {
-                fps.insert(i, Fp::Ok(String::new()));
+                let row = &st.results[i].row;
+                let fp = if matches!(
+                    row.validate_state,
+                    VALIDATE_STATE_INIT | VALIDATE_STATE_INCONCLUSIVE
+                ) {
+                    match output_stats(row, ctx.files).await {
+                        Ok(_) => Fp::Ok(String::new()),
+                        Err(fp) => fp,
+                    }
+                } else {
+                    Fp::Ok(String::new())
+                };
+                fps.insert(i, fp);
             }
         }
     }

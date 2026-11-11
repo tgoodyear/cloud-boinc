@@ -134,10 +134,14 @@ impl World {
     }
 
     fn submit_job(&self, job: JobSpec, now: i64) -> i64 {
+        self.submit_job_with(job, RESULT_TEMPLATE, now)
+    }
+
+    fn submit_job_with(&self, job: JobSpec, result_template: &str, now: i64) -> i64 {
         let sub = Submission {
             app: "a".into(),
             input_template: INPUT_TEMPLATE.into(),
-            result_template: RESULT_TEMPLATE.into(),
+            result_template: result_template.into(),
             jobs: vec![job],
         };
         let random = || self.rand();
@@ -477,6 +481,150 @@ fn missing_output_is_a_validate_error() {
     let rs = w.results(wu);
     assert_eq!(rs[0].outcome, RESULT_OUTCOME_VALIDATE_ERROR);
     assert_eq!(rs[0].validate_state, VALIDATE_STATE_INVALID);
+}
+
+/// What the pipeline must not do: accept a result whose finished output is
+/// not stored, whatever the validator. The sequence is the one an
+/// interrupted upload and a recomputation make: pieces of a longer earlier
+/// attempt are held under the output's name, the recomputed file is
+/// shorter, the size query answers at least its size, the client sends no
+/// data and reports success (`upload_when_present` outputs are counted
+/// done), and no object exists under `upload/` (see the upload tests).
+#[test]
+fn a_result_without_its_finished_output_is_not_accepted_by_any_validator() {
+    for validator in ["trivial", "bitwise"] {
+        let w = World::new(validator);
+        let wu = w.submit("j8", 1000, 1, 1);
+        let rs = w.results(wu);
+        w.dispatch(&rs[0], 1, 1100);
+        w.report(&rs[0], 1200, Some("x"), 0);
+        let name = cb_core::template::output_files(&rs[0].xml_doc_in)[0]
+            .name
+            .clone();
+        // The stale pieces stay; the finished object was never written.
+        w.files.objects.borrow_mut().clear();
+        w.files.objects.borrow_mut().insert(
+            (FileKind::Partial, format!("{name}/{}/0", "0".repeat(32))),
+            FileStat {
+                nbytes: 8,
+                md5: String::new(),
+            },
+        );
+        let rep = w.transition(wu, 1200);
+        assert_eq!(rep.canonical_resultid, 0, "{validator}");
+        assert_eq!(rep.results_valid, 0, "{validator}");
+        assert_eq!(rep.results_invalid, 1, "{validator}");
+        assert_eq!(rep.results_created, 1, "{validator}: work is issued again");
+        let wurow = w.wu(wu);
+        assert_eq!(wurow.canonical_resultid, 0);
+        assert_ne!(wurow.assimilate_state, ASSIMILATE_READY);
+        let rs = w.results(wu);
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].outcome, RESULT_OUTCOME_VALIDATE_ERROR);
+        assert_eq!(rs[0].validate_state, VALIDATE_STATE_INVALID);
+        assert_eq!(rs[0].granted_credit, 0.0);
+        assert_eq!(w.scalar("SELECT total_credit FROM host WHERE id = 1"), 0.0);
+        assert_eq!(rs[1].server_state, RESULT_SERVER_STATE_UNSENT);
+
+        // The reissued result, uploaded this time, is accepted.
+        w.dispatch(&rs[1], 2, 1300);
+        w.report(&rs[1], 1400, Some("x"), 0);
+        let rep = w.transition(wu, 1400);
+        assert_eq!(rep.canonical_resultid, rs[1].id, "{validator}");
+        assert_eq!(rep.results_valid, 1, "{validator}");
+    }
+}
+
+#[test]
+fn trivial_validator_accepts_results_whose_outputs_are_stored() {
+    let w = World::new("trivial");
+    let wu = w.submit("j9", 1000, 1, 1);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    let rep = w.transition(wu, 1200);
+    assert_eq!(rep.canonical_resultid, rs[0].id);
+    assert_eq!((rep.results_valid, rep.results_invalid), (1, 0));
+    assert!(w.results(wu)[0].granted_credit > 0.0);
+
+    // A late result is checked against the canonical one without looking
+    // the canonical result's files up again; it is accepted when its own
+    // output is stored.
+    let w = World::new("trivial");
+    let wu = w.submit("j10", 1000, 1, 2);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.dispatch(&rs[1], 2, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    w.transition(wu, 1200);
+    assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+    w.report(&rs[1], 1300, Some("y"), 0);
+    let rep = w.transition(wu, 1300);
+    assert_eq!((rep.results_valid, rep.results_invalid), (1, 0));
+    assert_eq!(w.results(wu)[1].validate_state, VALIDATE_STATE_VALID);
+}
+
+#[test]
+fn only_required_outputs_must_be_stored() {
+    // out0 is required, out1 and out2 are optional; out2 is also not
+    // validated, out3 is required and not validated.
+    const TEMPLATE: &str = "<output_template>\n\
+<file_info><name><OUTFILE_0/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_1/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_2/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_3/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<result>\n\
+<file_ref><file_name><OUTFILE_0/></file_name><open_name>a</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_1/></file_name><open_name>b</open_name><optional/></file_ref>\n\
+<file_ref><file_name><OUTFILE_2/></file_name><open_name>c</open_name><optional/><no_validate/></file_ref>\n\
+<file_ref><file_name><OUTFILE_3/></file_name><open_name>d</open_name><no_validate/></file_ref>\n\
+</result>\n</output_template>\n";
+    let put = |w: &World, name: &str| {
+        w.files.objects.borrow_mut().insert(
+            (FileKind::Upload, name.to_string()),
+            FileStat {
+                nbytes: 1,
+                md5: "m".into(),
+            },
+        );
+    };
+    for validator in ["trivial", "bitwise"] {
+        // (stored outputs, accepted)
+        for (stored, accepted) in [
+            (vec![0usize, 3], true),
+            (vec![0, 1, 2, 3], true),
+            (vec![0], false),
+            (vec![3], false),
+            (vec![1, 2], false),
+        ] {
+            let w = World::new(validator);
+            let wu = w.submit_job_with(
+                JobSpec {
+                    name: "j11".into(),
+                    min_quorum: Some(1),
+                    target_nresults: Some(1),
+                    ..Default::default()
+                },
+                TEMPLATE,
+                1000,
+            );
+            let rs = w.results(wu);
+            w.dispatch(&rs[0], 1, 1100);
+            w.report(&rs[0], 1200, Some("x"), 0);
+            w.files.objects.borrow_mut().clear();
+            let outs = cb_core::template::output_files(&rs[0].xml_doc_in);
+            assert_eq!(outs.len(), 4);
+            for i in &stored {
+                put(&w, &outs[*i].name);
+            }
+            let rep = w.transition(wu, 1200);
+            assert_eq!(
+                rep.canonical_resultid != 0,
+                accepted,
+                "{validator} with outputs {stored:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -533,9 +533,18 @@ repeats the deletes, which is harmless because an R2 delete of a missing object 
 
 ### Validation
 
+Whatever the validator, a result is accepted only if every required output file (a `<file_ref>`
+not marked `<optional/>`, whether or not it is `<no_validate/>`) is stored under `upload/`
+(`output_stats` in `crates/cb-core/src/pipeline.rs`, called from `fingerprints`). A result with
+a required output missing is a validate error and the work is issued again; an output marked
+optional may be absent. This matters because a client counts an upload as done when the
+server's size answer is at least its file's size (see "Upload"), so a result can arrive whose
+output was never stored. The check is one head per required output of each result not yet
+validated; the canonical result is not looked up again beside a late result.
+
 Per app, one of:
 
-- `trivial`: any successful result is valid (quorum 1 apps).
+- `trivial`: any successful result with its outputs stored is valid (quorum 1 apps).
 - `bitwise`: results agree when every output file has the same MD5. Upload stores each
   object's MD5, so comparison reads metadata, not file bodies.
 - `webhook`: the pipeline posts the workunit, the candidate results and short-lived signed
@@ -686,21 +695,23 @@ first attempt left pieces and the new output differs, three cases follow:
   client counts the upload as done without sending a request (`FILE_XFER_SET::poll`: a
   reported size at least the file's size). This is the stock handler's behaviour too, with
   the old bytes on disk as the answer, and there the stale file stays as the output. Here
-  nothing is stored under the finished name, so validation of the result fails
-  (`output_stats` in `crates/cb-core/src/pipeline.rs`) and the work is issued again; a wrong
-  file is never served. Closing this fully needs the attempt to be known when the size query
+  nothing is stored under the finished name, so the pipeline rejects the result for its
+  missing output, whatever the validator (see "Validation"), and the work is issued again; a
+  wrong file is never served. Closing this fully needs the attempt to be known when the size query
   arrives. A result's upload names cannot change per attempt (they are signed), and the
   scheduler Worker has no bucket binding to clear the pieces when it resends a result. One way
   is for the resend to set `sent_time` as the stock scheduler does and for the size query to
   ignore pieces older than it; that is not built. The regression tests
   (`a_recomputed_file_never_mixes_with_an_earlier_attempt` in `crates/cb-core/tests/upload.rs`)
-  pin both outcomes.
+  pin both outcomes, and `a_result_without_its_finished_output_is_not_accepted_by_any_validator`
+  in `crates/cb-core/tests/pipeline.rs` drives the result through validation.
 
 Every request passes the same checks before any byte is stored, whatever its offset
 (`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
 the name. The finished object is exactly `<nbytes>` long, so pieces left by an earlier attempt
 cannot make it longer. A stored file is never replaced or appended to: a request for a name
-that is stored gets success if the size matches and a permanent error if not, and writes
+that is stored gets success if the size and the MD5 match (the size alone when the request
+has no valid MD5) and a permanent error if not, and writes
 nothing.
 
 Failure cases:
@@ -729,7 +740,14 @@ R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
 | Resumed upload | the same; pieces already held are not written again |
 | `<get_file_size>` | 1 head and 1 list, run together |
 
-No database query is added. The settings read on the upload path is unchanged.
+No database query is added. The settings read on the upload path is unchanged. A retry of an
+upload for a stored file is one head, which now also reads the stored MD5.
+
+Validation adds R2 heads in the pipeline Worker: one per required output of each result that
+is validated, for the `trivial` validator too (`bitwise` and `webhook` already looked up every
+validated output). A transition does these one after another within one invocation, and a
+queue batch holds up to 25 workunits, so a batch with one result and one output per workunit
+is 25 heads.
 
 Alternatives not taken:
 

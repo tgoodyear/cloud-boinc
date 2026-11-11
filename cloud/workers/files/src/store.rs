@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use cb_core::upload::{
-    parse_piece_name, piece_name, CompleteWrite, PieceWrite, StoredPiece, UploadStore,
+    parse_piece_name, piece_name, CompleteWrite, PieceWrite, StoredFile, StoredPiece, UploadStore,
 };
 use cb_core::{CoreError, CoreResult, FileKind};
 use cb_worker::object_key;
@@ -98,13 +98,16 @@ pub struct R2Uploads(pub Bucket);
 impl UploadStore for R2Uploads {
     type Body = Body;
 
-    async fn complete_size(&self, name: &str) -> CoreResult<Option<u64>> {
+    async fn complete(&self, name: &str) -> CoreResult<Option<StoredFile>> {
         let head = self
             .0
             .head(object_key(FileKind::Upload, name))
             .await
             .map_err(files_err)?;
-        Ok(head.map(|o| o.size()))
+        Ok(head.map(|o| StoredFile {
+            size: o.size(),
+            md5: o.checksum().md5.and_then(|m| m.try_into().ok()),
+        }))
     }
 
     async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>> {
