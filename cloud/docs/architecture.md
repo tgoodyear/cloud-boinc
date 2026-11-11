@@ -713,6 +713,10 @@ do with an MD5. The `SameSite=Lax` cookie already keeps other sites' POSTs from 
 login. Sign-up has no token, as upstream. Each page runs at most two round trips: the account by
 cookie, then one write (the email change sends its write as a batch of two statements).
 
+Every site page is sent with `Content-Security-Policy: frame-ancestors 'none'` and
+`X-Frame-Options: DENY` (`site_response` in `cloud/workers/web/src/lib.rs`), so another site
+cannot show a form inside a frame.
+
 The preference documents are read and written by `cloud/crates/cb-core/src/prefs.rs` in
 upstream's formats (`html/inc/prefs.inc`, `prefs_project.inc`), and they are what the scheduler
 already sends: a save of computing preferences sets `<mod_time>` to the current time, so the
