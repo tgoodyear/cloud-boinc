@@ -425,7 +425,7 @@ Differences from upstream:
   used, with the bounds above; upstream does not bound the client's CPU or GPU counts either. The
   client's stated `flops` is not used for credit upstream or here.
 - A zero or missing benchmark and no stated speed give 1e9 FLOPS for the client's estimate;
-  upstream divides by zero.
+  upstream is left with a speed of zero.
 - Beta apps (`app.beta`) go to a user who allows beta work, as for the project's own versions.
   Upstream does that for jobs in `quick_check` of `sched/sched_array.cpp`, for every platform; what
   the anonymous path lacks upstream is the per-version `beta` flag, which a client's own version
