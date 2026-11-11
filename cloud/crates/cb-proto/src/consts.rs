@@ -112,6 +112,25 @@ pub const PROC_TYPE_INTEL_GPU: i32 = 3;
 /// Apple GPU.
 pub const PROC_TYPE_APPLE_GPU: i32 = 4;
 
+/// `result.app_version_id` of a result sent to the anonymous platform whose
+/// resource type is unknown (`ANON_PLATFORM_UNKNOWN` in
+/// `db/boinc_db_types.h`; a relic of the old scheduler, never written now).
+pub const ANON_PLATFORM_UNKNOWN: i64 = -1;
+/// `result.app_version_id` of an anonymous-platform result that used CPUs.
+pub const ANON_PLATFORM_CPU: i64 = -2;
+/// `result.app_version_id` of an anonymous-platform result that used an
+/// NVIDIA GPU.
+pub const ANON_PLATFORM_NVIDIA: i64 = -3;
+/// `result.app_version_id` of an anonymous-platform result that used an AMD
+/// GPU.
+pub const ANON_PLATFORM_ATI: i64 = -4;
+/// `result.app_version_id` of an anonymous-platform result that used an
+/// Intel GPU.
+pub const ANON_PLATFORM_INTEL_GPU: i64 = -5;
+/// `result.app_version_id` of an anonymous-platform result that used an
+/// Apple GPU.
+pub const ANON_PLATFORM_APPLE_GPU: i64 = -6;
+
 /// `DOCKER_TYPE` in `lib/common_defs.h`: no container runtime.
 pub const DOCKER_TYPE_NONE: i32 = 0;
 /// Docker.

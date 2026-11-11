@@ -805,6 +805,31 @@ fn a_task_and_its_workunit() {
 }
 
 #[test]
+fn a_task_of_the_anonymous_platform_names_its_resource() {
+    // `anon_platform_string` in `html/inc/result.inc`, for the negative
+    // `result.app_version_id` the scheduler stores.
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let host = w.host(ada.id, "ada-desk", NOW);
+    let wu = w.workunit("wu_anon", 1);
+    for (id, shown) in [
+        (-2, "Worker &lt;one&gt;<br>Anonymous platform (CPU)"),
+        (-3, "Worker &lt;one&gt;<br>Anonymous platform (NVIDIA GPU)"),
+        (-4, "Worker &lt;one&gt;<br>Anonymous platform (AMD GPU)"),
+        (-5, "Worker &lt;one&gt;<br>Anonymous platform (Intel GPU)"),
+        (-6, "Worker &lt;one&gt;<br>Anonymous platform (Apple GPU)"),
+        (-1, "Worker &lt;one&gt;<br>Anonymous platform<"),
+    ] {
+        let rid = w.result(wu, &format!("anon_{}", -id), host, ada.id, 5, "");
+        w.sql(&format!(
+            "UPDATE result SET app_version_id = {id} WHERE id = {rid}"
+        ));
+        let page = w.get("/result.php", None, &[("resultid", &rid.to_string())]);
+        assert!(page.body.contains(shown), "{id}: {}", page.body);
+    }
+}
+
+#[test]
 fn task_lists_read_their_indexes() {
     let w = World::new();
     let plan = |sql: &str, params: Vec<cb_db::Value>| {

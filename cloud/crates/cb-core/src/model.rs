@@ -138,8 +138,8 @@ pub struct Host {
 #[serde(default)]
 pub struct HostAppVersion {
     pub host_id: i64,
-    /// An app version ID. For anonymous platform upstream uses the
-    /// generalized ID `-(appid * 1000000 + resource type)` instead.
+    /// An app version ID. For anonymous platform it is the generalized ID
+    /// `appid * 1000000 - resource type` instead (`anon_gavid`).
     pub app_version_id: i64,
     pub pfc_n: f64,
     pub pfc_avg: f64,
@@ -278,13 +278,102 @@ pub const RESULT_COLS_LIGHT: &str = "id, create_time, workunitid, server_state, 
      appid, exit_status, teamid, priority, mod_time, elapsed_time, flops_estimate, app_version_id, \
      runtime_outlier, peak_working_set_size, peak_swap_size, peak_disk_usage";
 
-/// `generalized_app_version_id` in `sched/sched_types.h`: the key of
+/// `generalized_app_version_id` in `sched/sched_util.h`: the key of
 /// `host_app_version` for a result. Anonymous-platform results carry a
-/// negative `app_version_id` naming the resource type.
+/// negative `app_version_id` naming the resource type, and share one
+/// `host_app_version` row per app and resource type:
+/// `appid * 1000000 - app_version_id`, so `appid * 1000000 + 2` for CPU.
 pub fn generalized_app_version_id(app_version_id: i64, appid: i64) -> i64 {
     if app_version_id < 0 {
         appid * 1_000_000 - app_version_id
     } else {
         app_version_id
+    }
+}
+
+/// `HOST_USAGE::resource_type` in `sched/sched_types.h`: the
+/// `result.app_version_id` of a result an anonymous-platform client runs on
+/// this kind of processor.
+pub fn anon_platform_id(proc_type: i32) -> i64 {
+    use cb_proto::consts::*;
+    match proc_type {
+        PROC_TYPE_NVIDIA_GPU => ANON_PLATFORM_NVIDIA,
+        PROC_TYPE_AMD_GPU => ANON_PLATFORM_ATI,
+        PROC_TYPE_INTEL_GPU => ANON_PLATFORM_INTEL_GPU,
+        PROC_TYPE_APPLE_GPU => ANON_PLATFORM_APPLE_GPU,
+        _ => ANON_PLATFORM_CPU,
+    }
+}
+
+/// The processor type an anonymous-platform result's `app_version_id` names;
+/// `None` for anything else (a real version, or the unknown type).
+pub fn anon_proc_type(app_version_id: i64) -> Option<i32> {
+    use cb_proto::consts::*;
+    match app_version_id {
+        ANON_PLATFORM_CPU => Some(PROC_TYPE_CPU),
+        ANON_PLATFORM_NVIDIA => Some(PROC_TYPE_NVIDIA_GPU),
+        ANON_PLATFORM_ATI => Some(PROC_TYPE_AMD_GPU),
+        ANON_PLATFORM_INTEL_GPU => Some(PROC_TYPE_INTEL_GPU),
+        ANON_PLATFORM_APPLE_GPU => Some(PROC_TYPE_APPLE_GPU),
+        _ => None,
+    }
+}
+
+/// `host_usage_to_gavid` in `sched/sched_version.cpp`: the
+/// `host_app_version.app_version_id` of an app for anonymous-platform
+/// clients, by the processor type their version uses.
+pub fn anon_gavid(appid: i64, proc_type: i32) -> i64 {
+    generalized_app_version_id(anon_platform_id(proc_type), appid)
+}
+
+/// Whether a result's `app_version_id` means it runs on a GPU: an
+/// anonymous-platform GPU resource type.
+pub fn anon_uses_gpu(app_version_id: i64) -> bool {
+    app_version_id <= cb_proto::consts::ANON_PLATFORM_NVIDIA
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cb_proto::consts::*;
+
+    #[test]
+    fn anonymous_platform_ids_follow_upstream() {
+        // `ANON_PLATFORM_*` in `db/boinc_db_types.h`
+        assert_eq!(anon_platform_id(PROC_TYPE_CPU), -2);
+        assert_eq!(anon_platform_id(PROC_TYPE_NVIDIA_GPU), -3);
+        assert_eq!(anon_platform_id(PROC_TYPE_AMD_GPU), -4);
+        assert_eq!(anon_platform_id(PROC_TYPE_INTEL_GPU), -5);
+        assert_eq!(anon_platform_id(PROC_TYPE_APPLE_GPU), -6);
+        for pt in [
+            PROC_TYPE_CPU,
+            PROC_TYPE_NVIDIA_GPU,
+            PROC_TYPE_AMD_GPU,
+            PROC_TYPE_INTEL_GPU,
+            PROC_TYPE_APPLE_GPU,
+        ] {
+            assert_eq!(anon_proc_type(anon_platform_id(pt)), Some(pt));
+        }
+        assert_eq!(anon_proc_type(ANON_PLATFORM_UNKNOWN), None);
+        assert_eq!(anon_proc_type(7), None);
+        // `appid * 1000000 - app_version_id`; what `av_desc` in
+        // `html/user/host_app_versions.php` takes apart again.
+        assert_eq!(anon_gavid(3, PROC_TYPE_CPU), 3_000_002);
+        assert_eq!(anon_gavid(3, PROC_TYPE_NVIDIA_GPU), 3_000_003);
+        assert_eq!(generalized_app_version_id(-2, 12), 12_000_002);
+        // A real version keeps its own ID, and so does "unknown".
+        assert_eq!(generalized_app_version_id(7, 12), 7);
+        assert_eq!(generalized_app_version_id(0, 12), 0);
+        assert_eq!(generalized_app_version_id(-1, 12), 12_000_001);
+    }
+
+    #[test]
+    fn gpu_results_are_told_apart_by_their_id() {
+        assert!(!anon_uses_gpu(7));
+        assert!(!anon_uses_gpu(0));
+        assert!(!anon_uses_gpu(ANON_PLATFORM_UNKNOWN));
+        assert!(!anon_uses_gpu(ANON_PLATFORM_CPU));
+        assert!(anon_uses_gpu(ANON_PLATFORM_NVIDIA));
+        assert!(anon_uses_gpu(ANON_PLATFORM_APPLE_GPU));
     }
 }

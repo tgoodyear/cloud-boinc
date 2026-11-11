@@ -1303,7 +1303,18 @@ fn app_version_string(project: &Project, r: &JobResult) -> String {
         return "---".into();
     }
     if r.app_version_id < 0 {
-        return format!("{}<br>Anonymous platform", app_name(r.appid));
+        // `anon_platform_string` in `html/inc/result.inc`: the resource type
+        // is shown for the types the scheduler writes, and not for the
+        // unknown one.
+        let resource = match r.app_version_id {
+            ANON_PLATFORM_CPU => " (CPU)",
+            ANON_PLATFORM_NVIDIA => " (NVIDIA GPU)",
+            ANON_PLATFORM_ATI => " (AMD GPU)",
+            ANON_PLATFORM_INTEL_GPU => " (Intel GPU)",
+            ANON_PLATFORM_APPLE_GPU => " (Apple GPU)",
+            _ => "",
+        };
+        return format!("{}<br>Anonymous platform{resource}", app_name(r.appid));
     }
     let Some(av) = catalog
         .app_versions

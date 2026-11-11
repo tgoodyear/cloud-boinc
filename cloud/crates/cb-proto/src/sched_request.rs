@@ -28,6 +28,23 @@ use crate::ProtoError;
 /// (`MAX_OPENCL_CPU_PLATFORMS` in `lib/opencl_boinc.h`).
 pub const MAX_OPENCL_CPU_PLATFORMS: usize = 4;
 
+/// Longest app name, platform and plan class kept from an entry of
+/// `<app_versions>`: the 256-byte buffers `CLIENT_APP_VERSION::parse` reads
+/// them into upstream.
+pub const MAX_CLIENT_STRING: usize = 256;
+
+/// The text cut to [`MAX_CLIENT_STRING`] bytes, at a character boundary.
+fn bounded(mut s: String) -> String {
+    if s.len() > MAX_CLIENT_STRING {
+        let mut end = MAX_CLIENT_STRING;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 /// An entry of `<app_versions>` (`CLIENT_APP_VERSION`): an app version the
 /// client has. With the anonymous platform these are the versions the
 /// scheduler may send work for.
@@ -74,9 +91,18 @@ impl ClientAppVersion {
                 v.parsed = true;
                 return v;
             }
-            take!(xp.parse_str("app_name") => v.app_name);
-            take!(xp.parse_str("platform") => v.platform);
-            take!(xp.parse_str("plan_class") => v.plan_class);
+            if let Some(x) = xp.parse_str("app_name") {
+                v.app_name = bounded(x);
+                continue;
+            }
+            if let Some(x) = xp.parse_str("platform") {
+                v.platform = bounded(x);
+                continue;
+            }
+            if let Some(x) = xp.parse_str("plan_class") {
+                v.plan_class = bounded(x);
+                continue;
+            }
             take!(xp.parse_int("version_num") => v.version_num);
             if let Some(x) = xp.parse_double("avg_ncpus") {
                 if x > 0.0 {
@@ -1951,6 +1977,33 @@ SIGSEGV: segmentation violation
         assert_eq!(r.other_results.len(), 1);
         assert_eq!(r.other_results[0].name, "x_1");
         assert_eq!(r.other_results[0].app_version, -1);
+    }
+
+    #[test]
+    fn client_strings_are_cut_to_256_bytes_on_a_character_boundary() {
+        // 3-byte characters: 256 is not a multiple of 3, so the cut falls
+        // inside one and backs up to the boundary before it.
+        let long = "\u{20ac}".repeat(300);
+        let r = parse(&wrap(&format!(
+            "<app_versions><app_version><app_name>{long}</app_name>\
+             <platform>{}</platform><plan_class>{long}</plan_class>\
+             <version_num>5</version_num></app_version></app_versions>",
+            "p".repeat(1000)
+        )))
+        .unwrap();
+        let v = &r.client_app_versions[0];
+        assert_eq!(v.app_name.len(), 255);
+        assert!(v.app_name.chars().all(|c| c == '\u{20ac}'));
+        assert_eq!(v.plan_class.len(), 255);
+        assert_eq!(v.platform, "p".repeat(256));
+        assert_eq!(v.version_num, 5);
+        // Entities are undone before the cut, so the kept text is at most
+        // 256 bytes of what the client meant.
+        let r = parse(&wrap(
+            "<app_versions><app_version><app_name>a&lt;b&amp;c</app_name></app_version></app_versions>",
+        ))
+        .unwrap();
+        assert_eq!(r.client_app_versions[0].app_name, "a<b&c");
     }
 
     #[test]
