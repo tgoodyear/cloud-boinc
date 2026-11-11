@@ -14,6 +14,7 @@ pub mod plan_class;
 pub mod project;
 pub mod purge;
 pub mod scheduler;
+pub mod site;
 pub mod template;
 pub mod web;
 pub mod work;

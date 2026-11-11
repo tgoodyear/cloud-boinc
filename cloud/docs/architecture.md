@@ -32,11 +32,11 @@ In scope, because the reference deployment uses it:
 | Scheduler | account keys and weak keys, host records, result reporting, work requests for CPU and GPU, plan classes (container, NVIDIA, AMD, Intel, Apple GPU, multi-thread), client-version floors, batch and workunit-ID gates, per-app weights, assigned (targeted) jobs, `one_result_per_host_per_wu`, in-progress and daily limits, lost-result resend, request back-off |
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
 | Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits and checksums |
-| Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1` |
+| Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
 | Site | project home (master URL), apps, server status, account, hosts and tasks pages |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
 
-Out of scope for now: forums, teams, profiles, account managers, locality scheduling,
+Out of scope for now: forums, teams, profiles, preference editing, locality scheduling,
 homogeneous redundancy, adaptive replication, trickle messages, BUDA, the XML stats export,
 and the full PFC credit model (see "Credit").
 
@@ -103,7 +103,7 @@ cloud/
     cb-proto/    BOINC XML tokenizer, scheduler request and reply, upload protocol
     cb-crypto/   BOINC key file format, RSA signatures, MD5
     cb-db/       the Db trait
-    cb-core/     scheduling, plan classes, state machine, validators, credit, web RPCs, admin operations
+    cb-core/     scheduling, plan classes, state machine, validators, credit, web RPCs, site pages, admin operations
     cb-sqlite/   Db trait on rusqlite, for native tests and tools
     cb-d1/       Db trait on D1
     cb-worker/   what the five Workers share: bindings, the settings cache, replies
@@ -162,6 +162,8 @@ Indexes on the two large tables:
 | `result(workunitid)` | transitions | all |
 | `result(appid, priority desc, id)` where `server_state = 2` | dispatch | unsent |
 | `result(hostid)` where `server_state = 4` | lost-result resend, per-host limits | in progress |
+| `result(hostid, id)` where `hostid > 0` | a computer's task list | sent |
+| `result(userid, id)` where `userid > 0` | an account's task list | sent |
 
 Large XML (`xml_doc`, `xml_doc_in`, `stderr_out`) is stored in the row; D1 allows 2 MB per row
 and BOINC documents are a few KB. `stderr_out` is truncated to 64 KB as upstream does.
@@ -496,11 +498,44 @@ A deployment generates its own keys. A dev deployment never holds another projec
 The `web` Worker serves the master URL page, which carries the scheduler URL in the
 `<link rel="boinc_scheduler">` form the client looks for, `get_project_config.php`,
 `lookup_account.php` and `create_account.php` with the stock XML shapes and error numbers, and
-`server_status.php` in HTML and XML. The account manager RPCs answer with the stock "not
-implemented" error. The account and computer counts on the status page (`server_status` in
-`cloud/crates/cb-core/src/web.rs`) are a snapshot stored in the `config` table under
-`status_counts` and refreshed after `STATUS_COUNTS_TTL` (10 minutes), so a poll does not scan the
-`user` and `host` tables. PHP file names are kept in the URLs because clients have them built in.
+`server_status.php` in HTML and XML. The account and computer counts on the status page
+(`server_status` in `cloud/crates/cb-core/src/web.rs`) are a snapshot stored in the `config`
+table under `status_counts` and refreshed after `STATUS_COUNTS_TTL` (10 minutes), so a poll does
+not scan the `user` and `host` tables. PHP file names are kept in the URLs because clients have
+them built in.
+
+The account manager RPCs are in `cloud/crates/cb-core/src/web.rs`. `am_get_info` returns the
+account a key belongs to, in the upstream reply shape. `am_set_host_info` sets a computer's venue;
+one `UPDATE` whose `WHERE` clause checks both the key and that the computer belongs to it.
+`am_set_info` answers "not supported" with error -1, as upstream has done since it switched
+that RPC off. These RPCs, `show_user.php?format=xml&auth=` and the site login accept the account
+key only: a weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream's
+`BoincUser::lookup_auth` does. A blocked account is treated as unknown.
+
+The site pages are in `cloud/crates/cb-core/src/site.rs`, reached through `site_page`:
+`login_form.php`, `login_action.php`, `logout.php`, `home.php`, `hosts_user.php`,
+`show_host_detail.php`, `results.php`, `result.php`, `workunit.php` and `show_user.php`.
+Logging in, with the account key or with email address and password, sets the `auth` cookie
+to the account key as upstream does, with `HttpOnly`, `Secure` and `SameSite=Lax`. It lasts a
+year when "stay logged in" is ticked, and for the browser session otherwise. A password is
+taken from a POST only. Private fields follow upstream: the account page, the IP address,
+domain name, disk and activity fractions of a computer, and an account's task list are shown
+to the account holder only. Another account's computers are listed only when it has
+`show_hosts` set, and then without names. A computer's task list, a task (with its stderr) and
+a workunit are public, as upstream. Every value from a client or a user is HTML-escaped. The
+pages are served with `Cache-Control: private, no-store`.
+
+Each page makes at most two round trips and three statements, and every list has a `LIMIT`:
+20 tasks per page, 100 computers, 100 tasks of a workunit. `results.php` pages by task ID
+(`before=` and `after=`) instead of upstream's `offset`, so a deep page reads as few index
+entries as the first one. Its indexes (`res_host`, `res_user`) hold no state or application, so
+a filtered page reads at most 500 tasks (`RESULTS_FILTER_WINDOW`) and filters those; when they
+hold fewer than a page of matches, the page links on from the last task read, and can be
+empty while older tasks still match. `hosts_user.php` leaves out computers that have been out
+of contact for 30 days in the query, before the limit, and counts them separately. `results.php`
+does not show upstream's per-state counts, which would count every
+task of the computer or account. A computer page links to its tasks without counting them for
+the same reason.
 
 ## Admin API and CLI
 
@@ -642,7 +677,9 @@ Not implemented yet:
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
 - Upload resume, as described under Upload.
-- The account manager RPCs and the site pages for account, hosts and tasks.
+- On the site: account creation, password reset and email login links, editing account
+  details and preferences, merging and deleting computers, per-app details of a computer,
+  cross-project statistics links and certificates, and anything that sends email.
 
 ## Isolation from other deployments
 

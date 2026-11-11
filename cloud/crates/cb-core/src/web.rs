@@ -2,18 +2,18 @@
 //! status. Replies have the shapes of upstream `html/user/*.php`.
 
 use cb_crypto::account::{
-    pepper_passwd_hash, random_hex_string, verify_peppered_passwd_hash, weak_auth,
+    pepper_passwd_hash, random_hex_string, user_cpid, verify_peppered_passwd_hash, weak_auth,
 };
 use cb_db::{query_one, stmt, Db, Stmt};
 use cb_proto::consts::*;
 use cb_proto::web_rpc::{
-    write_create_account, write_error, write_lookup_account, write_lookup_account_exists,
+    err, write_create_account, write_error, write_lookup_account, write_lookup_account_exists,
     AccountError, ConfigPlatform, ProjectConfig, XML_HEADER,
 };
 use cb_proto::xml::xml_escape;
 use serde::Serialize;
 
-use crate::model::User;
+use crate::model::{Host, User};
 use crate::project::{scheduler_url, Project};
 use crate::{Config, CoreError, CoreResult};
 
@@ -195,10 +195,172 @@ pub async fn create_account(
     })
 }
 
-/// `am_get_info.php` is not offered; clients that ask get the stock
-/// "not implemented" error.
-pub fn not_implemented() -> String {
-    write_error(cb_proto::web_rpc::err::ERR_NOT_IMPLEMENTED, None)
+/// PHP `urlencode`: letters, digits and `-_.` kept, space as `+`, every
+/// other byte as `%XX`.
+pub fn php_urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// `am_get_info.php`: an account manager reads the account a key belongs
+/// to. Only the account key itself is accepted, not the weak key, as
+/// upstream (`BoincUser::lookup_auth`). One statement.
+///
+/// Profiles and teams are not offered, so `has_profile` and `teamid` are 0
+/// and there is no `<teamfounder/>`; `postal_code` is left out as upstream
+/// does by default.
+pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
+    let Some(user) = crate::site::user_by_auth(db, account_key.trim()).await? else {
+        return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
+    };
+    Ok(format!(
+        "{XML_HEADER}<am_get_info_reply>\n    <success/>\n    <id>{}</id>\n<name>{}</name>\n\
+         <country>{}</country>\n<weak_auth>{}</weak_auth>\n<cpid>{}</cpid>\n\
+         <has_profile>0</has_profile>\n<create_time>{}</create_time>\n\
+         <global_prefs>\n{}\n</global_prefs>\n<project_prefs>\n{}\n</project_prefs>\n\
+         <url>{}</url>\n<send_email>{}</send_email>\n<show_hosts>{}</show_hosts>\n\
+         <teamid>{}</teamid>\n<venue>{}</venue>\n</am_get_info_reply>\n",
+        user.id,
+        php_urlencode(&user.name),
+        php_urlencode(&user.country),
+        weak_account_key(&user),
+        user_cpid(&user.cross_project_id, &user.email_addr),
+        user.create_time,
+        user.global_prefs,
+        user.project_prefs,
+        php_urlencode(&user.url),
+        user.send_email,
+        user.show_hosts,
+        user.teamid,
+        xml_escape(&user.venue),
+    ))
+}
+
+/// `am_set_info.php`. Upstream switched this RPC off ("This probably
+/// shouldn't exist") and answers every request with this error.
+pub fn am_set_info() -> String {
+    write_error(-1, Some("not supported"))
+}
+
+/// Longest venue `am_set_host_info.php` stores.
+const MAX_VENUE: usize = 64;
+
+/// `am_set_host_info.php`: sets the venue of one of the account's
+/// computers. An unknown key and a computer of another account both get
+/// `ERR_DB_NOT_FOUND`, as upstream. One statement: the update matches only
+/// when the key and the computer agree.
+pub async fn am_set_host_info(
+    db: &dyn Db,
+    account_key: &str,
+    hostid: &str,
+    venue: &str,
+) -> CoreResult<String> {
+    let account_key = account_key.trim();
+    let Ok(hostid) = hostid.trim().parse::<i64>() else {
+        return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
+    };
+    if !crate::site::plausible_account_key(account_key) || hostid <= 0 {
+        return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
+    }
+    if venue.len() > MAX_VENUE
+        || venue
+            .chars()
+            .any(|c| c.is_control() || c == '<' || c == '>' || c == '&')
+    {
+        return Ok(write_error(-1, Some("invalid venue")));
+    }
+    let updated = db
+        .run(stmt!(
+            "UPDATE host SET venue = ? WHERE id = ? AND userid = \
+             (SELECT id FROM user WHERE authenticator = ? AND blocked = 0) RETURNING id",
+            venue,
+            hostid,
+            account_key
+        ))
+        .await?;
+    if updated.rows.is_empty() {
+        return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
+    }
+    Ok(format!(
+        "{XML_HEADER}<am_set_host_info_reply>\n    <success/>\n</am_set_host_info_reply>\n"
+    ))
+}
+
+/// `show_host_xml` in `html/inc/xml.inc`. Strings are escaped.
+fn host_xml(out: &mut String, h: &Host) {
+    out.push_str(&format!(
+        "    <host>\n        <id>{}</id>\n        <create_time>{}</create_time>\n        \
+         <rpc_seqno>{}</rpc_seqno>\n        <rpc_time>{}</rpc_time>\n        \
+         <host_cpid>{}</host_cpid>\n        <total_credit>{}</total_credit>\n        \
+         <expavg_credit>{}</expavg_credit>\n        <expavg_time>{}</expavg_time>\n        \
+         <domain_name>{}</domain_name>\n        <p_ncpus>{}</p_ncpus>\n        \
+         <p_vendor>{}</p_vendor>\n        <p_model>{}</p_model>\n        <p_fpops>{}</p_fpops>\n        \
+         <p_iops>{}</p_iops>\n        <os_name>{}</os_name>\n        <os_version>{}</os_version>\n        \
+         <m_nbytes>{}</m_nbytes>\n        <d_free>{}</d_free>\n        <d_total>{}</d_total>\n        \
+         <venue>{}</venue>\n    </host>\n",
+        h.id,
+        h.create_time,
+        h.rpc_seqno,
+        h.rpc_time,
+        xml_escape(&h.host_cpid),
+        h.total_credit,
+        h.expavg_credit,
+        h.expavg_time,
+        xml_escape(&h.domain_name),
+        h.p_ncpus,
+        xml_escape(&h.p_vendor),
+        xml_escape(&h.p_model),
+        h.p_fpops,
+        h.p_iops,
+        xml_escape(&h.os_name),
+        xml_escape(&h.os_version),
+        h.m_nbytes,
+        h.d_free,
+        h.d_total,
+        xml_escape(&h.venue),
+    ));
+}
+
+/// `show_user.php?format=xml` (`show_user_xml` in `html/inc/xml.inc`).
+/// `hosts` is given when the request carried the account key.
+pub fn show_user_xml(config: &Config, user: &User, hosts: Option<&[Host]>) -> String {
+    let mut out = format!(
+        "{XML_HEADER}<user>\n    <id>{}</id>\n    <cpid>{}</cpid>\n    <create_time>{}</create_time>\n    \
+         <name>{}</name>\n    <total_credit>{}</total_credit>\n    <expavg_credit>{}</expavg_credit>\n    \
+         <expavg_time>{}</expavg_time>\n    <teamid>{}</teamid>\n    <has_profile>0</has_profile>\n",
+        user.id,
+        user_cpid(&user.cross_project_id, &user.email_addr),
+        user.create_time,
+        xml_escape(&user.name),
+        user.total_credit,
+        user.expavg_credit,
+        user.expavg_time,
+        user.teamid,
+    );
+    if let Some(hosts) = hosts {
+        out.push_str(&format!("   <venue>{}</venue>\n", xml_escape(&user.venue)));
+        for h in hosts {
+            host_xml(&mut out, h);
+        }
+    }
+    if config.user_country {
+        out.push_str(&format!(
+            "     <country>{}</country>\n",
+            xml_escape(&user.country)
+        ));
+    }
+    if config.user_url && !user.url.is_empty() {
+        out.push_str(&format!("    <url>{}</url>\n", xml_escape(&user.url)));
+    }
+    out.push_str("</user>\n");
+    out
 }
 
 /// `get_project_config.php`.
@@ -236,14 +398,16 @@ pub fn project_config(project: &Project) -> String {
     .write()
 }
 
-fn html_escape(s: &str) -> String {
+/// Escapes text for an HTML element or a double- or single-quoted attribute.
+pub fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
-fn page(title: &str, head: &str, body: &str) -> String {
+pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -291,7 +455,10 @@ pub fn master_page(project: &Project) -> String {
             ));
         }
     }
-    body.push_str("</table>\n<p><a href=\"server_status.php\">Server status</a></p>\n");
+    body.push_str(
+        "</table>\n<p><a href=\"home.php\">Your account</a> &middot; \
+         <a href=\"server_status.php\">Server status</a></p>\n",
+    );
     page(&c.long_name, &head, &body)
 }
 

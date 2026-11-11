@@ -103,6 +103,9 @@ npx wrangler r2 bucket lifecycle add cloud-boinc-dev --name archive --prefix arc
 A database created before `migrations/0002_purge.sql` existed needs
 `wrangler d1 migrations apply` again before the purge is switched on.
 
+Likewise, `migrations/0003_user_tasks.sql` adds the index behind an account's task list
+(`results.php?userid=`); apply it before the web Worker that serves that page is deployed.
+
 ## Checks
 
 ```
