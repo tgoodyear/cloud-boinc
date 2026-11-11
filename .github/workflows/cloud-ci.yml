@@ -1,0 +1,53 @@
+name: cloud-ci
+
+on:
+  pull_request:
+    paths:
+      - 'cloud/**'
+      - '.github/workflows/cloud-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'cloud/**'
+      - '.github/workflows/cloud-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: cloud
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cloud
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy, Workers
+        run: >
+          cargo clippy --target wasm32-unknown-unknown
+          -p cb-scheduler-worker -p cb-files-worker -p cb-pipeline-worker
+          -p cb-web-worker -p cb-admin-worker -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Build Workers
+        run: |
+          cargo install worker-build --version 0.8.7 --locked
+          dev/build.sh

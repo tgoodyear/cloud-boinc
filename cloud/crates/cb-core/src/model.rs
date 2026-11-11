@@ -138,8 +138,8 @@ pub struct Host {
 #[serde(default)]
 pub struct HostAppVersion {
     pub host_id: i64,
-    /// An app version ID, or for anonymous platform the generalized ID
-    /// `-(appid * 1000000 + resource type)` variant upstream uses.
+    /// An app version ID. For anonymous platform upstream uses the
+    /// generalized ID `-(appid * 1000000 + resource type)` instead.
     pub app_version_id: i64,
     pub pfc_n: f64,
     pub pfc_avg: f64,

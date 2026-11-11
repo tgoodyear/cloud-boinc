@@ -1,7 +1,6 @@
 # Architecture
 
-Status: draft, written before implementation. Table columns marked "measured" are filled in as
-the implementation lands.
+Status: implemented in part; see "Implementation status".
 
 ## Goal
 
@@ -103,14 +102,17 @@ cloud/
   crates/
     cb-proto/    BOINC XML tokenizer, scheduler request and reply, upload protocol
     cb-crypto/   BOINC key file format, RSA signatures, MD5
-    cb-core/     scheduling, plan classes, state machine, validators, credit; SQL behind a Db trait
+    cb-db/       the Db trait
+    cb-core/     scheduling, plan classes, state machine, validators, credit, web RPCs, admin operations
     cb-sqlite/   Db trait on rusqlite, for native tests and tools
     cb-d1/       Db trait on D1
+    cb-worker/   what the five Workers share: bindings, the settings cache, replies
   workers/
     scheduler/  files/  pipeline/  web/  admin/
   cli/           cboinc: admin client, key tools, app signing, load generator
   migrations/    D1 schema
-  tests/         end-to-end tests that drive a real BOINC client
+  dev/           build, local stack and seeding scripts
+  tests/app/     a small BOINC app for end-to-end tests
   docs/
 ```
 
@@ -283,7 +285,7 @@ Plan classes are stored as the stock `plan_class_spec.xml` document in the `conf
 parsed into the same structure upstream uses. The reference deployment opens and closes
 admission by editing workunit-ID and batch bounds on live plan classes; here that is an admin
 API call that bumps the config version, and every isolate picks it up within its cache
-lifetime (5 seconds).
+lifetime (30 seconds).
 
 ## Job pipeline
 
@@ -375,7 +377,7 @@ Per app, one of:
 
 The stock assimilator is project code that runs next to the database. Here the project pulls:
 `GET /admin/v1/assimilate?app=<name>&limit=<n>` returns ready workunits with their canonical
-result, output file names and sizes; output bodies are fetched from `/admin/v1/files/upload/`;
+result, output file names and sizes; output bodies are fetched from `/admin/v1/outputs/<name>`;
 `POST /admin/v1/assimilate/ack` marks them done. An optional webhook announces new work so the
 project does not have to poll. Outputs are deleted once the workunit is acknowledged and
 `delete_delay_hours` have passed since its most recently returned result, the rule upstream
@@ -396,8 +398,8 @@ webhook can override the granted credit.
 ### Download
 
 `GET /download/<name>` streams the R2 object with `Content-Length`, `ETag`, `Accept-Ranges`
-and range support (the client resumes interrupted downloads with `Range`). Small immutable
-objects are cached at the edge by name. The client verifies app files against the code-signing
+and range support (the client resumes interrupted downloads with `Range`). Responses carry a
+five-minute `Cache-Control`. The client verifies app files against the code-signing
 public key and input files against the MD5 in the workunit, so the download path needs no
 authentication and holds no secret.
 
@@ -440,10 +442,10 @@ A deployment generates its own keys. A dev deployment never holds another projec
 ## Web RPCs and site
 
 The `web` Worker serves the master URL page, which carries the scheduler URL in the
-`<link rel="boinc_scheduler">` form the client looks for, the three account RPCs with the
-stock XML shapes and error numbers, `server_status.php` in HTML and XML, and server-rendered
-pages for apps, account, hosts and tasks. PHP file names are kept in the URLs because clients
-have them built in.
+`<link rel="boinc_scheduler">` form the client looks for, `get_project_config.php`,
+`lookup_account.php` and `create_account.php` with the stock XML shapes and error numbers, and
+`server_status.php` in HTML and XML. The account manager RPCs answer with the stock "not
+implemented" error. PHP file names are kept in the URLs because clients have them built in.
 
 ## Admin API and CLI
 
@@ -451,13 +453,14 @@ have them built in.
 
 | Resource | Operations |
 | --- | --- |
-| `platforms`, `apps` | create, update, deprecate |
-| `app-versions` | upload signed files, register, deprecate, hold |
-| `config` | project settings, plan classes, admission gates |
+| `status`, `catalog` | project counts; platforms, apps and app versions |
+| `platforms`, `apps` | create, update |
+| `app-versions` | upload signed files and register, deprecate, restore |
+| `config` | project settings, plan classes, public keys |
 | `files` | stage inputs (upload, or register an object already in the bucket) |
-| `jobs` | submit a batch of workunits in one call, query, cancel, target to a host |
-| `assimilate` | pull and acknowledge finished work |
-| `hosts`, `users` | look up, block, set limits |
+| `jobs` | submit a batch of workunits in one call, query, cancel |
+| `assimilate`, `outputs` | list finished work, fetch output files, acknowledge |
+| `users`, `hosts` | create an account, block a user, set a host's daily result limit |
 
 Job submission takes many workunits per request and writes them in batched statements, since
 the reference pipeline submits in chunks of hundreds.
@@ -495,36 +498,72 @@ realistic production choice. Input storage is the largest line:
 1 TB in R2 is about $15 a month, so a project that keeps every input should keep cold inputs
 elsewhere and stage only the working set.
 
-## Performance targets
+## Performance
 
-Targets are set against the reference deployment, measured from the same client machines.
+The target is to be no slower than the reference deployment, a stock BOINC server behind a
+Cloudflare Tunnel, measured from the same client machine. The figures below are from the dev
+deployment on the Workers Free plan, 11 November 2026. The first table gives time to first byte
+over 12 requests each, as minimum / median / maximum in milliseconds.
 
-| Measure | Reference (measured) | Target |
+| Request | Reference | cloud-boinc |
 | --- | --- | --- |
-| Web RPC time to first byte (`get_project_config.php`) | 73 to 98 ms | no slower |
-| Scheduler RPC wall time, no work sent | to be measured from client logs | no slower at p50 and p95 |
-| Scheduler RPC wall time, work sent | to be measured | no slower at p50 and p95 |
-| Sustained request rate | ~0.1 requests/s observed | 10 requests/s for 10 minutes with no errors |
-| Large file download | to be measured | no slower |
-| Upload of a 2 MB output | to be measured | no slower |
+| `get_project_config.php` | 92 / 110 / 288 | 62 / 87 / 159 |
+| Master page | 105 / 138 / 186 | 49 / 71 / 165 |
+| Scheduler RPC, rejected account key | 151 / 206 / 352 | 75 / 141 / 297 |
 
-A load generator in the CLI replays recorded scheduler requests from simulated hosts so the
-rate targets can be tested without real compute.
+An earlier run with a 5-second settings cache and no edge cache had cloud-boinc ahead on the
+minimum and about 20 ms behind on the median. The settings are now cached in each Worker for
+30 seconds, and the master page and project config are kept in the edge cache for the same
+time.
+
+Load test with `cboinc load`: 8 simulated hosts, 400 jobs, each host asking for work, uploading
+a 1 KB output per result and reporting.
+
+| Measure | Result |
+| --- | --- |
+| Requests | 464 in 23 s, 20 requests/s, no errors |
+| Scheduler RPC, up to 8 jobs sent and reported per request | p50 157 ms, p90 472 ms, p99 623 ms |
+| Upload | p50 310 ms, p90 410 ms, p99 508 ms |
+
+The scheduler Worker reports its own time and database round trips in a `Server-Timing`
+header. A request that sends no work takes one to four round trips of about 20 ms each.
+
+Not compared with the reference: scheduler requests that send work, uploads and large
+downloads, because measuring them there would put test load on a production project. The
+reference deployment's observed rate is about 0.1 requests a second.
 
 ## Testing
 
-1. Unit tests for the tokenizer, request and reply round trips, key format and signatures
-   (checked against signatures produced by the upstream `crypt_prog`), plan class evaluation
-   and each state transition.
+1. Unit tests for the tokenizer, request and reply round trips, key format and signatures,
+   plan class evaluation and each state transition.
 2. Native integration tests: scheduler and pipeline logic end to end on SQLite, including
-   quorum, deadline, error-limit and resend cases, and the row-write budget.
-3. Local end-to-end: `wrangler dev` with local D1, R2 and queue, and a real BOINC client in a
-   container that attaches, downloads an app, runs a job and reports it.
-4. Deployed end-to-end on the dev hostname with real clients on several machines and
-   platforms, CPU and GPU.
-5. Load test against the dev deployment.
+   quorum, deadline, error-limit and resend cases.
+3. Local end-to-end: `dev/local.sh` runs the five Workers under `wrangler dev` with a local
+   database, bucket and queue; `dev/seed.sh` sets up a test project; a stock BOINC client
+   attaches, downloads the signed test app, runs jobs, uploads and reports.
+4. Deployed end-to-end on the dev hostname with a stock client. Clients on several machines
+   and platforms, CPU and GPU, are still to do.
+5. Load test against the dev deployment with `cboinc load`.
 
-CI runs formatting, Clippy, native tests and the WebAssembly builds.
+The `cloud-ci` workflow runs formatting, Clippy, the native tests and the WebAssembly builds.
+
+## Implementation status
+
+Working end to end with a stock 8.0.4 client: attach, signature-checked download, compute,
+upload, report, validation, assimilation and file deletion.
+
+Not implemented yet:
+
+- Purging old workunits and results. `purge_days` is read from the config and nothing acts
+  on it, so the database grows until rows are removed by hand.
+- In the scheduler: anonymous platform, assigned jobs, homogeneous redundancy and homogeneous
+  app version, locality scheduling, size classes, and the client workload simulation behind
+  upstream's deadline check.
+- Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
+  file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
+  `crates/cb-core/src/plan_class.rs`.
+- Upload resume, as described under Upload.
+- The account manager RPCs and the site pages for account, hosts and tasks.
 
 ## Isolation from other deployments
 
