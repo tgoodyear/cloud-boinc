@@ -55,6 +55,8 @@ jobs:
           -p cb-web-worker -p cb-admin-worker -- -D warnings
       - name: Tests
         run: cargo test
+      - name: Local router
+        run: node --test dev/router/routes.test.mjs
       - name: Build Workers
         run: |
           cargo install worker-build --version 0.8.7 --locked

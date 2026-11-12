@@ -433,12 +433,12 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
     let mut delete_reserved = false;
     if wu.file_delete_state == FILE_DELETE_READY {
         wu.file_delete_state = FILE_DELETE_DONE;
-        let own = format!("{}/", config.download_url);
         for fi in file_infos(&wu.xml_doc) {
-            // Only files this project serves, and not shared ones.
+            // Only files this project serves, and not shared ones. Work
+            // imported from a stock server names the stock download URL.
             let ours =
                 cb_proto::xml::line::parse_str(&file_info_body(&wu.xml_doc, &fi.name), "<url>")
-                    .is_some_and(|u| u.starts_with(&own));
+                    .is_some_and(|u| config.is_own_download_url(&u));
             if ours && !fi.no_delete {
                 st.delete_downloads.push(fi.name);
             }

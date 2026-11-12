@@ -59,14 +59,14 @@ impl Project {
         Ok(p)
     }
 
-    /// Where clients send scheduler requests.
+    /// Where the master page tells clients to send scheduler requests.
     pub fn scheduler_url(&self) -> String {
         scheduler_url(&self.config)
     }
 }
 
 pub fn scheduler_url(config: &Config) -> String {
-    format!("{}sched", config.master_url)
+    config.scheduler_url()
 }
 
 /// Stores a setting after checking that it parses, so that a bad document

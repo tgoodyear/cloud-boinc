@@ -98,6 +98,73 @@ The configs declare the routes, the queue consumer and the pipeline's two cron t
 sweep every minute, the purge every five) for `wrangler deploy` to create. The dev deployment's resources and Workers were created through
 the Cloudflare API, so the `wrangler` commands on this page have not been run as written.
 
+## Stock layout routes
+
+A project taking over a stock server's master URL turns on the stock URL layout (see "Stock URL
+layout" in [architecture.md](architecture.md)) with tags in the `config` setting, for a project
+made with `make_project` under the short name `example`:
+
+```
+<stock_short_name>example</stock_short_name>
+<uldl_dir_fanout>1024</uldl_dir_fanout>
+```
+
+`uldl_dir_fanout` is the value of the stock server's `config.xml`. Other paths are set with
+`stock_cgi_prefix`, `stock_upload_prefix`, `stock_download_prefix` and `stock_page_prefix`, each
+a path such as `/example_cgi`. The setting only decides what the Workers answer; the routes decide
+what reaches them, so each Worker needs the routes for its stock paths, in addition to the native
+ones. For the default layout:
+
+| Worker | Route pattern |
+| --- | --- |
+| `scheduler` | `<host>/example_cgi/cgi*` |
+| `files` | `<host>/example_cgi/file_upload_handler*` |
+| `files` | `<host>/example/download/*` |
+| `web` | `<host>/example*` and `<host>/example/*`; needed when the short name begins with `sched` or `upload`, and harmless otherwise |
+
+Cloudflare picks the most specific matching pattern for a request, and a longer literal part is
+more specific (an exact pattern beats a wildcard one of the same length). That matters in three
+places.
+The scheduler and the upload handler share the `example_cgi/` directory but are different
+Workers, so each pattern names its script and ends in `*` (so a request with a query string
+matches); a pattern for `example_cgi/*` would send both to one Worker. And the download
+directory of the default layout is under the pages' path, so `example/download/*` has to be a
+route of its own, or the web Worker's `/*` takes it and answers 404. The pattern with the
+longer literal part, `example/download/*`, wins over `/*`. The third: a short name that begins
+with `sched` or `upload`, such as `scheduler` or `uploadtest`, has its pages under a path that
+the native `/sched*` or `/upload*` route also matches, and that route would send the master
+page and every page to the scheduler or files Worker. The web routes `<host>/scheduler*` (the
+prefix without its slash, which redirects to it; the wildcard also covers a query string, which
+Cloudflare matches as part of the URL) and `<host>/scheduler/*` are more specific and
+win; they are listed for every short name and are only required for these. Short names that
+only resemble the native `/download/` and `/admin/` routes (`downloads`, `admin2`) do not
+overlap them, since those patterns end in a slash. If the stock project set its own
+download or upload directory, the patterns follow the prefixes in the setting. The pieces in
+`wrangler.toml` are commented out in each Worker's file for a deployment to uncomment and
+adapt.
+
+If the Configuration Rule for upload buffering (above) is used, give it the stock handler's path
+as well:
+
+```
+expression: (http.host eq "<hostname>" and (starts_with(http.request.uri.path, "/upload/") or starts_with(http.request.uri.path, "/example_cgi/file_upload_handler")))
+```
+
+The `*` in a route pattern matches any characters, so `example_cgi/cgi*` also reaches the
+scheduler Worker for `example_cgi/cgi-bin/...`, and `/sched*` reaches it for `/scheduler/...`;
+the Worker answers 404 for any path that is not exactly `/sched` or the stock scheduler path.
+
+The setting refuses layouts that would need two routes with one pattern, or in which a page
+route would answer an endpoint: the page, cgi, upload and download prefixes and the two endpoint
+paths (`<cgi>/cgi` and `<upload>/file_upload_handler`) may not be equal to each other (the cgi and
+upload prefixes are one by default), the page prefix may not be, or lie under, an endpoint path,
+a page, cgi or upload prefix may not start with `/admin`, `/download`, `/sched` or
+`/upload` as a whole segment, and the download prefix may not start with `/admin`. Prefixes
+nested inside one another are accepted, because the longer route wins. `StockLayout::routes` in
+`cloud/crates/cb-core/src/stock.rs` produces the stock routes, and its test and
+`cloud/dev/router/routes.test.mjs` check, for a table of short names, that every stock and native
+URL reaches the Worker meant for it.
+
 ## Secrets
 
 | Secret | Workers | Value |

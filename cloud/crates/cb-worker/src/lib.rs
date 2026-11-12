@@ -8,8 +8,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use async_trait::async_trait;
-use cb_core::project::Project;
-use cb_core::{CoreError, CoreResult, FileKind, FileStat, Files, Webhook};
+use cb_core::project::{get_setting, Project, SETTING_CONFIG};
+use cb_core::{Config, CoreError, CoreResult, FileKind, FileStat, Files, Webhook};
 use cb_crypto::account::constant_time_eq;
 use cb_crypto::{PrivateKey, Signer};
 pub use cb_d1::D1Db;
@@ -64,6 +64,7 @@ pub fn core_err(e: CoreError) -> worker::Error {
 
 thread_local! {
     static PROJECT: RefCell<Option<(u64, Rc<Project>)>> = const { RefCell::new(None) };
+    static CONFIG: RefCell<Option<(u64, Rc<Config>)>> = const { RefCell::new(None) };
     static SIGNER: RefCell<Option<Rc<Signer>>> = const { RefCell::new(None) };
 }
 
@@ -84,9 +85,34 @@ pub async fn project(db: &D1Db) -> CoreResult<Rc<Project>> {
     Ok(p)
 }
 
+/// The `<config>` setting alone, at most `PROJECT_TTL_MS` old: one small
+/// statement instead of the settings and the catalog. For a Worker that needs
+/// the options and nothing else, such as the files Worker deciding whether a
+/// path is one of the stock layout's. No stored config reads as the defaults.
+pub async fn config(db: &D1Db) -> CoreResult<Rc<Config>> {
+    let now = now_ms();
+    let cached = CONFIG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(at, _)| now.saturating_sub(*at) < PROJECT_TTL_MS)
+            .map(|(_, c)| c.clone())
+    });
+    if let Some(c) = cached {
+        return Ok(c);
+    }
+    let config = match get_setting(db, SETTING_CONFIG).await? {
+        Some(xml) => Config::parse(&xml)?,
+        None => Config::default(),
+    };
+    let config = Rc::new(config);
+    CONFIG.with(|c| *c.borrow_mut() = Some((now, config.clone())));
+    Ok(config)
+}
+
 /// Drops the cached settings, after this isolate changed them.
 pub fn forget_project() {
     PROJECT.with(|c| *c.borrow_mut() = None);
+    CONFIG.with(|c| *c.borrow_mut() = None);
 }
 
 /// The upload signer, when this Worker holds the private key.

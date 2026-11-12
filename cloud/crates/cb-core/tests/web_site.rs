@@ -48,6 +48,8 @@ struct World {
     /// Whether pages get the transport.
     use_mail: Cell<bool>,
     now: Cell<i64>,
+    /// The directory URL pages are served from; the master URL when unset.
+    base: RefCell<Option<String>>,
 }
 
 struct Account {
@@ -90,6 +92,7 @@ impl World {
             mail: Capture::default(),
             use_mail: Cell::new(false),
             now: Cell::new(NOW),
+            base: RefCell::new(None),
         }
     }
 
@@ -237,9 +240,15 @@ impl World {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let random = || self.rand();
+        let base = self
+            .base
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.project.config.master_url.clone());
         let ctx = SiteCtx {
             db,
             project: &self.project,
+            base: &base,
             auth,
             post,
             pepper: Some(PEPPER),
@@ -674,6 +683,7 @@ fn login_sets_a_cookie_and_logout_clears_it() {
     assert_eq!(out.status, 303);
     assert_eq!(out.location.as_deref(), Some("https://p.example/"));
     assert!(out.set_cookie.unwrap().starts_with("auth=; Path=/;"));
+    assert!(out.more_cookies.is_empty());
 
     let form = w.get(
         "/login_form.php",
@@ -682,6 +692,82 @@ fn login_sets_a_cookie_and_logout_clears_it() {
     );
     assert!(form.body.contains("value=\"home.php\""));
     assert!(!form.body.contains("<script>"));
+}
+
+/// Pages served under a stock page prefix keep the visitor there: redirects
+/// go to the prefix, the cookie applies to it, and the links in the pages are
+/// relative, so they resolve under it.
+#[test]
+fn pages_under_a_stock_prefix_stay_under_it() {
+    let config = CONFIG.replace(
+        "<user_country>",
+        "<stock_short_name>testproj</stock_short_name>\n<user_country>",
+    );
+    let w = World::with_config(&config);
+    let stock = w.project.config.stock.clone().unwrap();
+    // The master URL is the host root; the page base of a prefixed request
+    // is the stock prefix on the same host.
+    assert_eq!(
+        stock.page_base("https://p.example"),
+        "https://p.example/testproj/"
+    );
+    *w.base.borrow_mut() = Some(stock.page_base("https://p.example"));
+    let ada = w.account("ada@example.com", "secret", "Ada");
+
+    let login = w.post(
+        "/login_action.php",
+        None,
+        &[("authenticator", &ada.auth), ("next_url", "home.php")],
+    );
+    assert_eq!(
+        login.location.as_deref(),
+        Some("https://p.example/testproj/home.php")
+    );
+    assert_eq!(
+        login.set_cookie.as_deref(),
+        Some(
+            format!(
+                "auth={}; Path=/testproj/; HttpOnly; Secure; SameSite=Lax",
+                ada.auth
+            )
+            .as_str()
+        )
+    );
+
+    // Pages that need a login send the visitor to the login form under the
+    // prefix, and the logout returns to the prefix and clears that cookie.
+    let anonymous = w.get("/home.php", None, &[]);
+    assert_eq!(
+        anonymous.location.as_deref(),
+        Some("https://p.example/testproj/login_form.php?next_url=home.php")
+    );
+    let home = w.get("/home.php", Some(&ada.auth), &[]);
+    assert!(home.body.contains("href=\"edit_email_form.php\""));
+    assert!(!home.body.contains("href=\"/"));
+    // The weak-key instructions name the master URL clients attach to.
+    assert!(home
+        .body
+        .contains("&lt;master_url&gt;https://p.example/&lt;/master_url&gt;"));
+    let (out, _) = w.submit(&home, "/logout.php", Some(&ada.auth), &[]);
+    assert_eq!(out.location.as_deref(), Some("https://p.example/testproj/"));
+    assert!(out
+        .set_cookie
+        .unwrap()
+        .starts_with("auth=; Path=/testproj/;"));
+    // A login made at the root has Path=/, which pages under the prefix also
+    // receive, so the logout clears that path too.
+    assert_eq!(
+        out.more_cookies,
+        ["auth=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"]
+    );
+
+    // A request at the root keeps the master URL.
+    *w.base.borrow_mut() = None;
+    let at_root = w.get("/home.php", None, &[]);
+    assert_eq!(
+        at_root.location.as_deref(),
+        Some("https://p.example/login_form.php?next_url=home.php")
+    );
 }
 
 #[test]
