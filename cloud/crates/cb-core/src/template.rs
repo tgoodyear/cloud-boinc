@@ -533,6 +533,13 @@ pub fn file_infos(xml: &str) -> Vec<FileInfo> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputFile {
     pub name: String,
+    /// The `<open_name>` of the `<file_ref>`: the file's logical name, as
+    /// the application knows it. Empty when the template gives none.
+    pub open_name: String,
+    /// Position of the `<file_ref>` among the result's file references, from
+    /// 0, in document order. It counts every reference, so it does not
+    /// depend on which files were uploaded.
+    pub index: usize,
     pub optional: bool,
     pub no_validate: bool,
     /// The client is told to upload it: its `<file_info>` has an upload
@@ -594,6 +601,8 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
         }
         let mut f = OutputFile {
             name: String::new(),
+            open_name: String::new(),
+            index: 0,
             optional: false,
             no_validate: false,
             uploadable: false,
@@ -609,6 +618,10 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
                 f.name = n;
                 continue;
             }
+            if let Some(n) = xp.parse_str("open_name") {
+                f.open_name = n;
+                continue;
+            }
             if let Some(b) = xp.parse_bool("optional") {
                 f.optional = b;
                 continue;
@@ -621,6 +634,7 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
         }
         if !f.name.is_empty() {
             f.uploadable = uploadable.contains(&f.name);
+            f.index = v.len();
             v.push(f);
         }
     }
@@ -658,6 +672,8 @@ mod tests {
             outs,
             vec![OutputFile {
                 name: "wu1_0_r123_0".into(),
+                open_name: "out".into(),
+                index: 0,
                 optional: true,
                 no_validate: false,
                 uploadable: true
@@ -666,6 +682,28 @@ mod tests {
         let fis = file_infos(&doc);
         assert_eq!(fis.len(), 1);
         assert_eq!(fis[0].max_nbytes, 5000000.0);
+    }
+
+    #[test]
+    fn output_files_carry_open_name_and_position() {
+        let doc = "<result>\
+<file_ref><file_name>a</file_name><open_name>first</open_name></file_ref>\
+<file_ref><file_name>b</file_name><optional/></file_ref>\
+<file_ref><open_name>nameless</open_name></file_ref>\
+<file_ref><open_name>c</open_name><file_name>c</file_name></file_ref>\
+</result>";
+        let got: Vec<(String, String, usize)> = output_files(doc)
+            .into_iter()
+            .map(|f| (f.name, f.open_name, f.index))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a".to_string(), "first".to_string(), 0),
+                ("b".to_string(), String::new(), 1),
+                ("c".to_string(), "c".to_string(), 2),
+            ]
+        );
     }
 
     #[test]

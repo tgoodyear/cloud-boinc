@@ -11,7 +11,7 @@ use cb_core::status::{operator_summary, STATUS_COUNTS_TTL};
 use cb_core::web::{make_user, server_status, NewAccount};
 use cb_core::work::{
     acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate,
-    register_job_file, CancelTarget, Submission,
+    register_job_file, reopen_assimilation, AssimilateList, CancelTarget, Submission,
 };
 use cb_core::{CoreError, FileKind};
 use cb_crypto::PublicKey;
@@ -454,12 +454,23 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(100)
                 .clamp(1, 500);
+            let list = match query(&req, "state")?.as_deref() {
+                None | Some("ready") => AssimilateList::Ready,
+                Some("done") => AssimilateList::Done,
+                Some(_) => return error(400, "state is ready or done"),
+            };
+            let since = query(&req, "since")?
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
             let files = R2Files(env.bucket(BUCKET)?);
-            reply(
-                ready_to_assimilate(&db, &files, &app, after, limit)
-                    .await
-                    .map(|w| json!({ "workunits": w })),
-            )
+            reply(ready_to_assimilate(&db, &files, &app, list, after, since, limit).await)
+        }
+        (Method::Post, ["assimilate", "reopen"]) => {
+            let a: Ack = parse!(req);
+            match reopen_assimilation(&db, &a.workunit_ids, now()).await {
+                Ok(ids) => ok(&json!({ "reopened": ids })),
+                Err(e) => core_error(e),
+            }
         }
         (Method::Post, ["assimilate", "ack"]) => {
             let a: Ack = parse!(req);

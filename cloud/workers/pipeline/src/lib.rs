@@ -37,7 +37,7 @@ impl Runner {
         let project = project(&db).await.map_err(cb_worker::core_err)?;
         Ok(Runner {
             files: R2Files(env.bucket(BUCKET)?),
-            webhook: FetchWebhook::from_env(env),
+            webhook: FetchWebhook::from_env(env, project.config.webhook_timeout_secs),
             signer: signer(env)?,
             project,
             db,

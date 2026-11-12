@@ -877,12 +877,113 @@ Per app, one of:
 - `trivial`: any successful result with its outputs stored is valid (quorum 1 apps).
 - `bitwise`: results agree when every output file has the same MD5. Upload stores each
   object's MD5, so comparison reads metadata, not file bodies.
-- `webhook`: the pipeline posts the workunit, the candidate results and short-lived signed
-  download URLs for their outputs to a project endpoint, which answers with a verdict per
-  result, the canonical result and optionally credit. This is where project-specific compare
-  code runs (the stock `script_validator` case). It can be an external HTTPS endpoint or
-  another Worker through a service binding. The call is retried with back-off; the workunit
-  stays in "needs validation" until it answers.
+- `webhook`: the pipeline posts the workunit and the candidate results to a project endpoint
+  (`fingerprints` in `crates/cb-core/src/pipeline.rs`), which answers with a verdict per result,
+  and optionally a credit. This is where project-specific compare code runs (the stock
+  `script_validator` case). The endpoint is the app's `validator_url`, which must be an `https`
+  URL. Each call carries the bearer token
+  `WEBHOOK_TOKEN` when that secret is set. The workunit stays in "needs validation" until a call
+  succeeds; see "Webhook call" below for the request, the reply, the timeout and the retry.
+
+#### Webhook call
+
+The call is a `POST` of JSON. Which results it names depends on where the workunit is:
+`check_set` (no canonical result yet: every successful result that passed the storage check, once
+there are `min_quorum` of them) or `check_pair` (a canonical result exists and a late result is
+compared with it: the late results still unvalidated, and the canonical one). These are the two
+entry points of upstream's validator framework (`check_set` and `check_pair` in
+`sched/validate_util.cpp`). Request:
+
+```json
+{
+  "call_id": "wu1234-rev17-check_set",
+  "mode": "check_set",
+  "workunit": {"id": 1234, "name": "job_1234", "app": "myapp", "batch": 5, "min_quorum": 2},
+  "canonical_result_id": null,
+  "results": [
+    {
+      "id": 9001,
+      "name": "job_1234_0",
+      "host_id": 42,
+      "canonical": false,
+      "files": [
+        {"name": "job_1234_0_0", "open_name": "out", "index": 0, "md5": "0cc175b9c0f1b6a831c399e269772661", "nbytes": 3},
+        {"name": "job_1234_0_2", "open_name": null, "index": 2, "md5": "92eb5ffee6ae2fec3ad71c777531578f", "nbytes": 1}
+      ]
+    }
+  ]
+}
+```
+
+- `call_id` is `wu<workunit id>-rev<revision>-<mode>`. The revision is the workunit's
+  `rev` as the transition read it. A transition that did not commit (it lost the revision race, or
+  the Worker was stopped) and runs again sees the same revision and sends the same `call_id`. A
+  call that is repeated after a failure is not a repeat in this sense: the failed transition wrote
+  the workunit (it set the retry time), so the revision, and the ID, are new. A validator that
+  keeps records can use the ID to ignore a duplicate delivery of one transition, not to match a
+  retry with the call that failed.
+- `mode` is `check_set` or `check_pair`. `canonical_result_id` is null in `check_set`, and the
+  canonical result's ID in `check_pair`, where the result with that ID also has
+  `"canonical": true`. Its fingerprint, with the others, is what the pass compares.
+- `workunit` has `app` (the application's name), `batch` (0 when the job has none) and
+  `min_quorum`.
+- `files` lists the result's output files that were stored, in the order of the result template.
+  `open_name` is the template's `<open_name>` (null when it has none), `index` is the position of
+  the `<file_ref>` in the template, counting from 0. A file left out (an optional file that was
+  not uploaded, a file with `<no_validate/>`, a file with no upload URL) does not shift the
+  others: the `index` values of the files that are listed are the template positions, so a gap
+  shows a file that is not there.
+- The request does not carry download URLs. See "Output access" below.
+
+Reply (every field but `results[].id` is optional; unknown fields are ignored, and so are the
+new request fields by a validator written against the old request):
+
+```json
+{
+  "results": [
+    {"id": 9001, "fingerprint": "ab12", "credit": 12.5},
+    {"id": 9002, "invalid": true},
+    {"id": 9003, "retry": true}
+  ]
+}
+```
+
+- `fingerprint`: results with equal fingerprints agree. The comparison is equality, so it is
+  transitive: a project that matches by similarity clusters the results itself and returns the
+  same fingerprint for one cluster. In `check_pair` the late result is valid when its fingerprint
+  equals the canonical result's.
+- `invalid: true`: the output is unusable (the result gets the validate-error outcome and is
+  marked invalid). `retry: true`: no verdict yet; the whole workunit is looked at again later. A
+  result with no entry, or a reply that is not valid JSON or has a non-success status, counts as
+  `retry` for every result of the call.
+- `credit`: credit to grant for this result instead of the computed credit. It must be a finite
+  number that is not negative; a larger value than `max_granted_credit` is cut to it (as the
+  computed credit is), and anything else is ignored. Without it the credit is computed as before
+  (see "Credit"). The workunit's `canonical_credit` is the granted credit of the canonical result.
+  In `check_pair` the late result's own `credit` is used, and if it has none it gets the
+  canonical result's credit.
+
+Timeout and retry. `<webhook_timeout_secs>` in the config (default 20, from 1 to 120; a value
+outside that range is cut to it) bounds the whole call, answer body included. A call that takes
+longer is cut off and counts as a failed call. A failed call is retried after a fixed 600 seconds
+(`VALIDATE_RETRY_DELAY` in `crates/cb-core/src/pipeline.rs`), every time, until it succeeds: there
+is no back-off. Upstream waits six hours for an operator after a validator failure; a webhook or
+storage failure here is usually brief, so the delay is short, and the retries are cheap (one
+transition, no results are changed). The delay is the same for every workunit of an app, so an
+endpoint that is down receives one call per workunit every ten minutes.
+
+Output access. The request carries each file's name, MD5 and size, not a way to read the file.
+A validator that needs the bytes reads them from `GET /admin/v1/outputs/<name>` with an admin
+token. Signed, short-lived download URLs are not built: the files Worker serves `download/` with
+no authentication and has no read route for `upload/`, and a signed read route needs a signing
+secret the project does not have yet (the upload key signs certificates the client sends back,
+and nothing checks a signature on a read). Adding it is a design of its own (a new secret
+binding on the files Worker, an expiry and a route that serves only output objects), tracked in
+issue 39.
+
+Statements. The new fields add no D1 statements to a transition: the logical names and
+positions come from the result's stored XML, which the pass already reads, and the head request
+per file is the one that was already made.
 
 ### Assimilation
 
@@ -894,6 +995,79 @@ project does not have to poll. Outputs are deleted once the workunit is acknowle
 `delete_delay_hours` have passed since its most recently returned result, the rule upstream
 uses. The project fetches outputs before it acknowledges, so an acknowledgement that comes
 after the delay can delete them at once.
+
+The list (`ready_to_assimilate` in `crates/cb-core/src/work.rs`) takes these query parameters:
+`app` (required), `state` (`ready`, the default, or `done`), `after` (a workunit ID; the list is
+in ID order and returns IDs greater than it), `limit` (1 to 500, default 100) and, with
+`state=done`, `since` (a Unix time; keep only workunits whose row changed at or after it). The
+reply:
+
+```json
+{
+  "workunits": [
+    {
+      "id": 1234,
+      "name": "job_1234",
+      "batch": 5,
+      "error_mask": 0,
+      "canonical_result": {
+        "id": 9001,
+        "name": "job_1234_0",
+        "host_id": 42,
+        "user_id": 7,
+        "elapsed_time": 100.0,
+        "granted_credit": 0.46,
+        "files": [
+          {"name": "job_1234_0_0", "open_name": "out", "index": 0, "nbytes": 3, "md5": "0cc175b9c0f1b6a831c399e269772661"},
+          {"name": "job_1234_0_2", "open_name": null, "index": 2, "nbytes": 1, "md5": "92eb5ffee6ae2fec3ad71c777531578f"}
+        ]
+      }
+    }
+  ],
+  "has_more": true,
+  "next_after": 1234
+}
+```
+
+- `open_name` is the `<open_name>` of the result template's `<file_ref>` for the file (null when
+  the template has none), and `index` its position in the template from 0, so a puller can write
+  the names the stock assimilator writes (`<workunit name>__file_<open_name>`). `files` is in
+  template order.
+- A file that is not in storage (an optional output that was not uploaded, or a file with no
+  upload URL, which stays on the client) is left out of `files`, and the others keep their
+  positions: the list shows a gap in `index`, it does not renumber. It is not listed with a flag
+  because a puller has nothing to read for it, and the gap is enough to see that it is missing.
+- `has_more` is true when another workunit follows this page, and `next_after` is the ID to pass
+  as `after` for the next page (null when the page is empty). A page that ends exactly at the
+  last workunit has `has_more` false.
+- A failed workunit (`error_mask` not 0) has no `canonical_result`.
+- `canonical_result.files` is read from storage, one head request per file, as before.
+
+Re-opening. `state=done` lists workunits that were acknowledged and whose files are still kept:
+`assimilate_state` is done and neither the workunit's nor its canonical result's
+`file_delete_state` has left its initial value, which the pipeline changes in the pass that
+marks files for deletion (see "Job pipeline"). `POST /admin/v1/assimilate/reopen` with
+`{"workunit_ids": [...]}` puts such workunits back in the ready list and answers
+`{"reopened": [ids]}`, the IDs that changed:
+
+- One conditional `UPDATE` makes the change, with the same test as the done list, so a workunit
+  whose deletion has been scheduled or done is not changed and is not in the reply, and a repeat
+  finds nothing to change (the workunit is ready again by then). An unknown ID, or one that is
+  not acknowledged, is ignored in the same way.
+- The update raises the workunit's `rev`, so a transition that read the workunit before and is
+  about to schedule its deletion loses the revision race and runs again against the new row.
+- It sets `transition_time` to never, which drops the pending deferred deletion. The next
+  acknowledgement sets it back and enqueues a transition, and the delay is counted from the most
+  recently returned result as always, so a re-opened workunit is deleted on its original
+  schedule, or at once if that time has passed, and re-opening gains no extra time.
+- Purge (`plan_purge` in `crates/cb-core/src/purge.rs`) takes only workunits whose
+  `file_delete_state` is done, which a re-openable workunit never has, so the two cannot meet.
+- The list with `state=done` reads workunits by ID within the app with no index of its own (the
+  ready list uses the `wu_assim` index). `since` bounds what is returned, not what is read, so
+  a pull of a large project's whole history is a scan; keep `limit` small and page with `after`.
+
+`cboinc assimilate` takes `--state` and `--since`, and `cboinc assimilate-reopen --workunit-id N`
+(repeatable) calls the re-open route.
 
 ### Credit
 
@@ -2492,7 +2666,7 @@ is not running (a sweep older than five minutes; none recorded counts as running
 | `config` | project settings, plan classes, public keys; one tag of the config at a time |
 | `files` | stage inputs (upload, or register an object already in the bucket); a stored name keeps its contents unless the caller asks to replace them |
 | `jobs` | submit a batch of workunits in one call, query, cancel, release from an HR class or app version |
-| `assimilate`, `outputs` | list finished work, fetch output files, acknowledge |
+| `assimilate`, `outputs` | list finished work (ready, or acknowledged with files kept), fetch output files, acknowledge, re-open |
 | `users`, `hosts` | create an account, block a user, set a host's daily result limit |
 
 `platforms` and `apps` do what upstream's `tools/xadd` does for the `<platform>` and `<app>`

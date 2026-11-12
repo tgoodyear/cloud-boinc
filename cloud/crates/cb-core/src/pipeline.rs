@@ -645,7 +645,8 @@ fn results_to_fingerprint(st: &State) -> Vec<usize> {
 
 /// `handle_wu` of the validator with `check_set` and `check_pair`, on the
 /// in-memory state. Returns true when the transitioner pass must run again.
-fn validator_pass(st: &mut State, app: &App, fps: &HashMap<usize, Fp>, ctx: &Ctx) -> bool {
+fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bool {
+    let fps = &checked.fps;
     let now = ctx.now;
     let max_granted_credit = ctx.config.max_granted_credit;
     let mut transition_time = TransitionTime::NoChange;
@@ -693,9 +694,10 @@ fn validator_pass(st: &mut State, app: &App, fps: &HashMap<usize, Fp>, ctx: &Ctx
                 let r = &mut st.results[i].row;
                 match valid {
                     Some(true) => {
+                        let credit = checked.credits.get(&i).copied().unwrap_or(canonical_credit);
                         r.validate_state = VALIDATE_STATE_VALID;
-                        r.granted_credit = canonical_credit;
-                        st.events.push(valid_event(r, wu, app, canonical_credit));
+                        r.granted_credit = credit;
+                        st.events.push(valid_event(r, wu, app, credit));
                         st.report.results_valid += 1;
                     }
                     Some(false) => {
@@ -806,6 +808,7 @@ fn validator_pass(st: &mut State, app: &App, fps: &HashMap<usize, Fp>, ctx: &Ctx
                 }
                 match r.validate_state {
                     VALIDATE_STATE_VALID => {
+                        let credit = checked.credits.get(&i).copied().unwrap_or(credit);
                         r.granted_credit = credit;
                         st.events.push(valid_event(r, wu, app, credit));
                         st.report.results_valid += 1;
@@ -824,7 +827,7 @@ fn validator_pass(st: &mut State, app: &App, fps: &HashMap<usize, Fp>, ctx: &Ctx
                 // file deletion when assimilation is acknowledged.
                 transition_time = TransitionTime::Never;
                 st.wu.canonical_resultid = st.results[ci].row.id;
-                st.wu.canonical_credit = credit;
+                st.wu.canonical_credit = st.results[ci].row.granted_credit;
                 st.wu.assimilate_state = ASSIMILATE_READY;
                 for res in st.results.iter_mut() {
                     if matches!(
@@ -882,10 +885,41 @@ struct WebhookResult {
     invalid: bool,
     #[serde(default)]
     retry: bool,
+    /// Credit to grant for this result instead of the computed one.
+    #[serde(default)]
+    credit: Option<f64>,
+}
+
+/// The credit a validator asked for, if it is usable: a finite number that is
+/// not negative, cut to `max_granted_credit` as the computed credit is.
+/// Anything else is ignored and the computed credit stands.
+fn webhook_credit(v: Option<f64>, max_granted_credit: f64) -> Option<f64> {
+    let c = v.filter(|c| c.is_finite() && *c >= 0.0)?;
+    Some(if max_granted_credit > 0.0 {
+        c.min(max_granted_credit)
+    } else {
+        c
+    })
+}
+
+/// Credit the validator asked for, by result index.
+type CreditOverrides = HashMap<usize, f64>;
+
+/// The fingerprints of the results a validator pass looks at, and credit a
+/// webhook asked for.
+#[derive(Default)]
+struct Checked {
+    fps: HashMap<usize, Fp>,
+    credits: CreditOverrides,
 }
 
 struct OutputStat {
     name: String,
+    /// The template's `<open_name>`; empty when it gives none.
+    open_name: String,
+    /// Position of the file in the result template, counting files that are
+    /// not looked up, absent or left out of the request.
+    index: usize,
     md5: String,
     nbytes: u64,
 }
@@ -910,6 +944,8 @@ async fn output_stats(r: &JobResult, files: &dyn Files) -> Result<Vec<OutputStat
                 if !f.no_validate {
                     v.push(OutputStat {
                         name: f.name,
+                        open_name: f.open_name,
+                        index: f.index,
                         md5: s.md5,
                         nbytes: s.nbytes,
                     });
@@ -923,11 +959,36 @@ async fn output_stats(r: &JobResult, files: &dyn Files) -> Result<Vec<OutputStat
     Ok(v)
 }
 
-async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp> {
+/// The body of a validator call. `mode` is `check_set` while the workunit has
+/// no canonical result and `check_pair` once it has one and a late result is
+/// compared with it (the validator's `check_set` and `check_pair`). `call_id`
+/// follows the workunit's revision as the transition read it, so a call
+/// repeated by a transition that did not commit has the same ID.
+fn webhook_request(st: &State, app: &App, results: &[serde_json::Value]) -> serde_json::Value {
+    let wu = &st.wu;
+    let pair = wu.canonical_resultid != 0;
+    let mode = if pair { "check_pair" } else { "check_set" };
+    json!({
+        "call_id": format!("wu{}-rev{}-{}", wu.id, wu.rev, mode),
+        "mode": mode,
+        "workunit": {
+            "id": wu.id,
+            "name": wu.name,
+            "app": app.name,
+            "batch": wu.batch,
+            "min_quorum": wu.min_quorum,
+        },
+        "canonical_result_id": if pair { serde_json::Value::from(wu.canonical_resultid) } else { serde_json::Value::Null },
+        "results": results,
+    })
+}
+
+async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> Checked {
     let wanted = results_to_fingerprint(st);
     let mut fps = HashMap::new();
+    let mut credits = CreditOverrides::new();
     if wanted.is_empty() {
-        return fps;
+        return Checked::default();
     }
     match app.validator.as_str() {
         "bitwise" => {
@@ -946,6 +1007,7 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp
             }
         }
         "webhook" => {
+            let canonical_id = st.wu.canonical_resultid;
             let mut body_results = Vec::new();
             for &i in &wanted {
                 let r = &st.results[i].row;
@@ -954,9 +1016,20 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp
                         "id": r.id,
                         "name": r.name,
                         "host_id": r.hostid,
+                        "canonical": canonical_id != 0 && r.id == canonical_id,
                         "files": stats
                             .iter()
-                            .map(|s| json!({"name": s.name, "md5": s.md5, "nbytes": s.nbytes}))
+                            .map(|s| json!({
+                                "name": s.name,
+                                "open_name": if s.open_name.is_empty() {
+                                    serde_json::Value::Null
+                                } else {
+                                    serde_json::Value::from(s.open_name.clone())
+                                },
+                                "index": s.index,
+                                "md5": s.md5,
+                                "nbytes": s.nbytes,
+                            }))
                             .collect::<Vec<_>>(),
                     })),
                     Err(fp) => {
@@ -965,10 +1038,7 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp
                 }
             }
             if !body_results.is_empty() {
-                let body = json!({
-                    "workunit": {"id": st.wu.id, "name": st.wu.name},
-                    "results": body_results,
-                });
+                let body = webhook_request(st, app, &body_results);
                 let reply = ctx
                     .webhook
                     .post_json(&app.validator_url, &body)
@@ -980,10 +1050,15 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp
                         continue;
                     }
                     let id = st.results[i].row.id;
-                    let fp = match reply
+                    let answer = reply
                         .as_ref()
-                        .and_then(|rep| rep.results.iter().find(|x| x.id == id))
+                        .and_then(|rep| rep.results.iter().find(|x| x.id == id));
+                    if let Some(c) = answer
+                        .and_then(|x| webhook_credit(x.credit, ctx.config.max_granted_credit))
                     {
+                        credits.insert(i, c);
+                    }
+                    let fp = match answer {
                         Some(x) if x.retry => Fp::Transient,
                         Some(x) if x.invalid => Fp::Invalid,
                         Some(WebhookResult {
@@ -1018,7 +1093,7 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> HashMap<usize, Fp
             }
         }
     }
-    fps
+    Checked { fps, credits }
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -1442,8 +1517,8 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
             if st.wu.need_validate == 0 {
                 break;
             }
-            let fps = fingerprints(&st, &app, ctx).await;
-            if !validator_pass(&mut st, &app, &fps, ctx) {
+            let checked = fingerprints(&st, &app, ctx).await;
+            if !validator_pass(&mut st, &app, &checked, ctx) {
                 break;
             }
         }

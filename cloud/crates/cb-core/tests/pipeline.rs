@@ -8,8 +8,8 @@ use cb_core::model::{JobResult, Workunit};
 use cb_core::pipeline::{due_workunits, transition, Ctx};
 use cb_core::purge::{commit_purge, plan_purge, purge_pass};
 use cb_core::work::{
-    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, Assign,
-    AssignTarget, CancelTarget, JobSpec, Submission,
+    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, reopen_assimilation, Assign,
+    AssignTarget, AssimilateList, CancelTarget, JobSpec, Submission,
 };
 use cb_core::{Config, CoreError, CoreResult, FileKind, FileStat, Files, Webhook, NEVER};
 use cb_crypto::Signer;
@@ -69,7 +69,31 @@ impl Webhook for NoWebhook {
     }
 }
 
+/// A validator endpoint that records its calls and answers with `reply`,
+/// or fails when there is none.
+#[derive(Default)]
+struct Hook {
+    calls: RefCell<Vec<serde_json::Value>>,
+    reply: RefCell<Option<serde_json::Value>>,
+}
+
+#[async_trait(?Send)]
+impl Webhook for Hook {
+    async fn post_json(
+        &self,
+        _url: &str,
+        body: &serde_json::Value,
+    ) -> CoreResult<serde_json::Value> {
+        self.calls.borrow_mut().push(body.clone());
+        self.reply
+            .borrow()
+            .clone()
+            .ok_or_else(|| CoreError::Invalid("no webhook".into()))
+    }
+}
+
 struct World {
+    hook: Hook,
     db: SqliteDb,
     files: MemFiles,
     config: Config,
@@ -91,6 +115,7 @@ impl World {
         ]))
         .unwrap();
         World {
+            hook: Hook::default(),
             db,
             files: MemFiles::default(),
             config,
@@ -167,7 +192,7 @@ impl World {
         let ctx = Ctx {
             db,
             files: &self.files,
-            webhook: &NoWebhook,
+            webhook: &self.hook,
             config: &self.config,
             signer: Some(&self.signer),
             now,
@@ -305,11 +330,13 @@ fn quorum_one_job_runs_to_deletion() {
         0.0
     );
 
-    let ready = block_on(ready_to_assimilate(&w.db, &w.files, "a", 0, 10)).unwrap();
+    let ready = ready(&w, AssimilateList::Ready, 0, 0, 10).workunits;
     assert_eq!(ready.len(), 1);
     let canonical = ready[0].canonical_result.as_ref().unwrap();
     assert_eq!(canonical.files.len(), 1);
     assert_eq!(canonical.files[0].nbytes, 3);
+    assert_eq!(canonical.files[0].open_name.as_deref(), Some("out"));
+    assert_eq!(canonical.files[0].index, 0);
     assert_eq!(
         block_on(acknowledge_assimilation(&w.db, &[wu], 1300)).unwrap(),
         vec![wu]
@@ -543,7 +570,7 @@ fn too_many_errors_fail_the_workunit() {
     assert_eq!(wurow.error_mask, WU_ERROR_TOO_MANY_ERROR_RESULTS);
     assert_eq!(wurow.assimilate_state, ASSIMILATE_READY);
     assert_eq!(w.results(wu).len(), 4);
-    let ready = block_on(ready_to_assimilate(&w.db, &w.files, "a", 0, 10)).unwrap();
+    let ready = ready(&w, AssimilateList::Ready, 0, 0, 10).workunits;
     assert_eq!(ready[0].error_mask, WU_ERROR_TOO_MANY_ERROR_RESULTS);
     assert!(ready[0].canonical_result.is_none());
 }
@@ -852,6 +879,52 @@ fn duplicate_and_invalid_jobs_are_reported_per_job() {
     assert!(out[0].error.is_some() && out[1].error.is_some() && out[2].error.is_some());
     assert!(out[3].error.is_none() && out[3].workunit_id > 0);
     assert_eq!(w.results(out[3].workunit_id).len(), 2);
+}
+
+fn ready(
+    w: &World,
+    list: AssimilateList,
+    after: i64,
+    since: i64,
+    limit: i64,
+) -> cb_core::work::ReadyPage {
+    block_on(ready_to_assimilate(
+        &w.db, &w.files, "a", list, after, since, limit,
+    ))
+    .unwrap()
+}
+
+/// Runs a quorum-1 job until it is ready to assimilate.
+fn ready_job(w: &World, name: &str) -> i64 {
+    let wu = w.submit(name, 1000, 1, 1);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("out"), 0);
+    w.transition(wu, 1200);
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_READY);
+    wu
+}
+
+const FOUR_FILES: &str = "<output_template>\n\
+<file_info><name><OUTFILE_0/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_1/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_2/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_3/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<result>\n\
+<file_ref><file_name><OUTFILE_0/></file_name><open_name>a</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_1/></file_name><open_name>b</open_name><optional/></file_ref>\n\
+<file_ref><file_name><OUTFILE_2/></file_name><open_name>c</open_name><optional/></file_ref>\n\
+<file_ref><file_name><OUTFILE_3/></file_name></file_ref>\n\
+</result>\n</output_template>\n";
+
+fn put_output(w: &World, name: &str) {
+    w.files.objects.borrow_mut().insert(
+        (FileKind::Upload, name.to_string()),
+        FileStat {
+            nbytes: 1,
+            md5: "m".into(),
+        },
+    );
 }
 
 /// Runs a quorum-1 job to `FILE_DELETE_DONE`; its last change is at 4800.
@@ -1415,4 +1488,353 @@ fn concurrent_transitions_for_one_team_lose_no_average_sample() {
         w.scalar("SELECT expavg_time FROM team WHERE id = 7"),
         1200.0
     );
+}
+
+#[test]
+fn assimilation_files_carry_their_template_position() {
+    // Of the four files only a and the unnamed fourth are stored: the
+    // others keep their positions, so 0 and 3 come back, not 0 and 1.
+    let w = World::new("trivial");
+    let wu = w.submit_job_with(
+        JobSpec {
+            name: "j20".into(),
+            min_quorum: Some(1),
+            target_nresults: Some(1),
+            ..Default::default()
+        },
+        FOUR_FILES,
+        1000,
+    );
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    w.files.objects.borrow_mut().clear();
+    let outs = cb_core::template::output_files(&rs[0].xml_doc_in);
+    put_output(&w, &outs[0].name);
+    put_output(&w, &outs[3].name);
+    w.transition(wu, 1200);
+    let page = ready(&w, AssimilateList::Ready, 0, 0, 10);
+    let files = &page.workunits[0].canonical_result.as_ref().unwrap().files;
+    let got: Vec<(Option<&str>, usize)> = files
+        .iter()
+        .map(|f| (f.open_name.as_deref(), f.index))
+        .collect();
+    assert_eq!(got, [(Some("a"), 0), (None, 3)]);
+    assert_eq!(files[0].name, outs[0].name);
+    let json = serde_json::to_value(&page).unwrap();
+    assert!(json["workunits"][0]["canonical_result"]["files"][1]["open_name"].is_null());
+}
+
+#[test]
+fn assimilation_list_pages_with_has_more() {
+    let w = World::new("trivial");
+    let ids: Vec<i64> = (0..3).map(|i| ready_job(&w, &format!("p{i}"))).collect();
+    let p1 = ready(&w, AssimilateList::Ready, 0, 0, 2);
+    assert_eq!(p1.workunits.len(), 2);
+    assert!(p1.has_more);
+    assert_eq!(p1.next_after, Some(ids[1]));
+    let p2 = ready(&w, AssimilateList::Ready, p1.next_after.unwrap(), 0, 2);
+    assert_eq!(p2.workunits.len(), 1);
+    assert!(!p2.has_more);
+    assert_eq!(p2.next_after, Some(ids[2]));
+    // Exactly a page: nothing follows.
+    let all = ready(&w, AssimilateList::Ready, 0, 0, 3);
+    assert!(!all.has_more);
+    let none = ready(&w, AssimilateList::Ready, ids[2], 0, 3);
+    assert!(none.workunits.is_empty() && !none.has_more && none.next_after.is_none());
+}
+
+#[test]
+fn an_acknowledged_workunit_can_be_listed_and_reopened_until_deletion_starts() {
+    let w = World::new("trivial");
+    let wu = ready_job(&w, "r1");
+    let other = ready_job(&w, "r2");
+    // Not acknowledged yet: not in the done list, and nothing to re-open.
+    assert!(ready(&w, AssimilateList::Done, 0, 0, 10)
+        .workunits
+        .is_empty());
+    assert!(block_on(reopen_assimilation(&w.db, &[wu], 1350))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        block_on(acknowledge_assimilation(&w.db, &[wu], 1300)).unwrap(),
+        vec![wu]
+    );
+    w.transition(wu, 1300);
+
+    let done = ready(&w, AssimilateList::Done, 0, 0, 10);
+    assert_eq!(done.workunits.len(), 1);
+    assert_eq!(done.workunits[0].id, wu);
+    assert_eq!(
+        done.workunits[0].canonical_result.as_ref().unwrap().files.len(),
+        1
+    );
+    // `since` filters on the last change; the ready list does not take it.
+    assert_eq!(ready(&w, AssimilateList::Done, 0, 1300, 10).workunits.len(), 1);
+    assert!(ready(&w, AssimilateList::Done, 0, 1301, 10)
+        .workunits
+        .is_empty());
+    assert_eq!(ready(&w, AssimilateList::Ready, 0, 99999, 10).workunits[0].id, other);
+
+    let rev = w.wu(wu).rev;
+    assert_eq!(
+        block_on(reopen_assimilation(&w.db, &[wu, other, 9999], 1400)).unwrap(),
+        vec![wu]
+    );
+    let row = w.wu(wu);
+    assert_eq!(row.assimilate_state, ASSIMILATE_READY);
+    assert_eq!(row.transition_time, NEVER);
+    assert_eq!(row.rev, rev + 1);
+    // A repeat changes nothing.
+    assert!(block_on(reopen_assimilation(&w.db, &[wu], 1401))
+        .unwrap()
+        .is_empty());
+    assert_eq!(w.wu(wu).rev, rev + 1);
+    let ids: Vec<i64> = ready(&w, AssimilateList::Ready, 0, 0, 10)
+        .workunits
+        .iter()
+        .map(|x| x.id)
+        .collect();
+    assert_eq!(ids, [wu, other]);
+
+    // The acknowledgement that follows puts the delete schedule back: the
+    // delay counts from the last returned result, not from the re-opening.
+    block_on(acknowledge_assimilation(&w.db, &[wu], 1500)).unwrap();
+    let rep = w.transition(wu, 1500);
+    assert_eq!(rep.files_deleted, 0);
+    assert_eq!(rep.transition_time, 1200 + 3600);
+    assert_eq!(w.files.objects.borrow().len(), 2);
+    // Once the deletion is scheduled the files are as good as gone: the
+    // workunit leaves the done list and cannot be re-opened.
+    w.transition(wu, 4800);
+    assert_eq!(w.wu(wu).file_delete_state, FILE_DELETE_READY);
+    assert!(ready(&w, AssimilateList::Done, 0, 0, 10)
+        .workunits
+        .is_empty());
+    assert!(block_on(reopen_assimilation(&w.db, &[wu], 4801))
+        .unwrap()
+        .is_empty());
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_DONE);
+    // And after the files are deleted.
+    w.transition(wu, 4800);
+    assert_eq!(w.wu(wu).file_delete_state, FILE_DELETE_DONE);
+    assert!(block_on(reopen_assimilation(&w.db, &[wu], 4900))
+        .unwrap()
+        .is_empty());
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_DONE);
+}
+
+#[test]
+fn a_reopened_workunit_is_not_taken_by_the_purge() {
+    let w = World::new("trivial");
+    let wu = ready_job(&w, "r3");
+    // A later workunit, so that this one is not the highest.
+    let _later = ready_job(&w, "r4");
+    block_on(acknowledge_assimilation(&w.db, &[wu], 1300)).unwrap();
+    w.transition(wu, 1300);
+    assert_eq!(
+        block_on(reopen_assimilation(&w.db, &[wu], 1400)).unwrap(),
+        vec![wu]
+    );
+    let mut config = w.config.clone();
+    config.purge_days = 1.0;
+    let plan = block_on(plan_purge(&w.db, &config, 1400 + 10 * 86400, 10)).unwrap();
+    assert!(plan.is_none(), "a workunit whose files are kept is not purged");
+}
+
+fn webhook_world() -> World {
+    let w = World::new("webhook");
+    block_on(
+        w.db.run(stmt!(
+            "UPDATE app SET validator_url = 'https://v.example/check' WHERE id = 1"
+        )),
+    )
+    .unwrap();
+    w
+}
+
+fn put_all_outputs(w: &World, r: &JobResult) {
+    for f in cb_core::template::output_files(&r.xml_doc_in) {
+        put_output(w, &f.name);
+    }
+}
+
+#[test]
+fn webhook_check_set_request_and_credit_override() {
+    let w = webhook_world();
+    let wu = w.submit_job_with(
+        JobSpec {
+            name: "w1".into(),
+            min_quorum: Some(2),
+            target_nresults: Some(2),
+            batch: Some(5),
+            ..Default::default()
+        },
+        FOUR_FILES,
+        1000,
+    );
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.dispatch(&rs[1], 2, 1100);
+    for r in &rs {
+        w.report(r, 1200, Some("x"), 0);
+        put_all_outputs(&w, r);
+    }
+    // The optional b is stored by neither result, so the positions have a gap.
+    for r in &rs {
+        let outs = cb_core::template::output_files(&r.xml_doc_in);
+        w.files
+            .objects
+            .borrow_mut()
+            .remove(&(FileKind::Upload, outs[1].name.clone()));
+    }
+    *w.hook.reply.borrow_mut() = Some(serde_json::json!({
+        "results": [
+            {"id": rs[0].id, "fingerprint": "f", "credit": 7.5},
+            {"id": rs[1].id, "fingerprint": "f"},
+        ]
+    }));
+    let rev = w.wu(wu).rev;
+    w.transition(wu, 1300);
+    let calls = w.hook.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    let c = &calls[0];
+    assert_eq!(c["mode"], "check_set");
+    assert_eq!(c["call_id"], format!("wu{wu}-rev{rev}-check_set"));
+    assert!(c["canonical_result_id"].is_null());
+    assert_eq!(c["workunit"]["id"], wu);
+    assert_eq!(c["workunit"]["name"], "w1");
+    assert_eq!(c["workunit"]["app"], "a");
+    assert_eq!(c["workunit"]["batch"], 5);
+    assert_eq!(c["workunit"]["min_quorum"], 2);
+    assert_eq!(c["results"].as_array().unwrap().len(), 2);
+    assert_eq!(c["results"][0]["id"], rs[0].id);
+    assert_eq!(c["results"][0]["canonical"], false);
+    let files = c["results"][0]["files"].as_array().unwrap();
+    let shape: Vec<(String, i64)> = files
+        .iter()
+        .map(|f| {
+            (
+                f["open_name"].as_str().unwrap_or("-").to_string(),
+                f["index"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [("a".to_string(), 0), ("c".to_string(), 2), ("-".to_string(), 3)]
+    );
+    assert_eq!(files[0]["md5"], "m");
+    assert_eq!(files[0]["nbytes"], 1);
+    drop(calls);
+
+    let after = w.results(wu);
+    assert_eq!(after[0].validate_state, VALIDATE_STATE_VALID);
+    assert_eq!(after[0].granted_credit, 7.5);
+    // The one that gave no credit gets the computed credit.
+    let computed = 2e9 * 100.0 * 200.0 / 86400e9;
+    assert!((after[1].granted_credit - computed).abs() < 1e-9);
+    // The first result is the canonical one, so its credit is the workunit's.
+    assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+    assert_eq!(w.wu(wu).canonical_credit, 7.5);
+    assert!((w.scalar("SELECT total_credit FROM host WHERE id = 1") - 7.5).abs() < 1e-9);
+}
+
+#[test]
+fn webhook_check_pair_names_the_canonical_result() {
+    let w = webhook_world();
+    let wu = w.submit("w2", 1000, 1, 2);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.dispatch(&rs[1], 2, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    *w.hook.reply.borrow_mut() = Some(serde_json::json!({
+        "results": [{"id": rs[0].id, "fingerprint": "f"}]
+    }));
+    w.transition(wu, 1200);
+    assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+    {
+        let calls = w.hook.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["mode"], "check_set");
+        assert!(calls[0]["canonical_result_id"].is_null());
+    }
+
+    w.report(&rs[1], 1300, Some("x"), 0);
+    *w.hook.reply.borrow_mut() = Some(serde_json::json!({
+        "results": [
+            {"id": rs[1].id, "fingerprint": "f", "credit": 3.0},
+            {"id": rs[0].id, "fingerprint": "f"},
+        ]
+    }));
+    let rev = w.wu(wu).rev;
+    w.transition(wu, 1300);
+    let calls = w.hook.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    let c = &calls[1];
+    assert_eq!(c["mode"], "check_pair");
+    assert_eq!(c["call_id"], format!("wu{wu}-rev{rev}-check_pair"));
+    assert_eq!(c["canonical_result_id"], rs[0].id);
+    let flags: Vec<(i64, bool)> = c["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["id"].as_i64().unwrap(), r["canonical"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(flags, [(rs[1].id, false), (rs[0].id, true)]);
+    drop(calls);
+    let after = w.results(wu);
+    assert_eq!(after[1].validate_state, VALIDATE_STATE_VALID);
+    assert_eq!(after[1].granted_credit, 3.0);
+    // The canonical result keeps what it was granted.
+    assert_eq!(after[0].granted_credit, w.wu(wu).canonical_credit);
+}
+
+#[test]
+fn webhook_credit_override_is_validated_and_the_old_reply_still_works() {
+    let computed = 2e9 * 100.0 * 200.0 / 86400e9;
+    // (reply credit, credit granted)
+    for (asked, granted) in [
+        (None, computed),
+        (Some(-1.0), computed),
+        (Some(0.0), 0.0),
+        (Some(1e30), 50.0),
+        (Some(12.0), 12.0),
+    ] {
+        let mut w = webhook_world();
+        w.config.max_granted_credit = 50.0;
+        let wu = w.submit("w3", 1000, 1, 1);
+        let rs = w.results(wu);
+        w.dispatch(&rs[0], 1, 1100);
+        w.report(&rs[0], 1200, Some("x"), 0);
+        let mut answer = serde_json::json!({"id": rs[0].id, "fingerprint": "f"});
+        if let Some(c) = asked {
+            answer["credit"] = c.into();
+        }
+        *w.hook.reply.borrow_mut() = Some(serde_json::json!({ "results": [answer] }));
+        w.transition(wu, 1200);
+        let got = w.results(wu)[0].granted_credit;
+        assert!((got - granted).abs() < 1e-9, "asked {asked:?}: {got}");
+        assert_eq!(w.wu(wu).canonical_credit, got);
+    }
+}
+
+#[test]
+fn a_failed_webhook_call_waits_the_fixed_retry_delay() {
+    let w = webhook_world();
+    let wu = w.submit("w4", 1000, 1, 1);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    // No reply: the call fails. The workunit stays unvalidated and comes back
+    // after 600 seconds, and again after 600 more, with no back-off.
+    let rep = w.transition(wu, 1200);
+    assert_eq!(rep.canonical_resultid, 0);
+    assert_eq!(rep.transition_time, 1200 + 600);
+    let rep = w.transition(wu, 1800);
+    assert_eq!(rep.transition_time, 1800 + 600);
+    let calls = w.hook.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    // The workunit was written between the calls, so the IDs differ.
+    assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
 }

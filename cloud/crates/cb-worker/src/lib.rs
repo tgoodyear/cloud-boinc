@@ -284,22 +284,23 @@ impl Files for R2Files {
 /// `fetch` behind the core's [`Webhook`] trait.
 pub struct FetchWebhook {
     pub token: Option<String>,
+    /// How long one call may take, answer included.
+    pub timeout: std::time::Duration,
 }
 
 impl FetchWebhook {
-    pub fn from_env(env: &Env) -> Self {
+    pub fn from_env(env: &Env, timeout_secs: i32) -> Self {
         FetchWebhook {
             token: env.secret(SECRET_WEBHOOK_TOKEN).ok().map(|s| s.to_string()),
+            timeout: std::time::Duration::from_secs(timeout_secs.max(1) as u64),
         }
     }
-}
 
-#[async_trait(?Send)]
-impl Webhook for FetchWebhook {
-    async fn post_json(
+    async fn send(
         &self,
         url: &str,
         body: &serde_json::Value,
+        signal: &worker::AbortSignal,
     ) -> CoreResult<serde_json::Value> {
         let fail = |e: worker::Error| CoreError::Invalid(format!("webhook {url}: {e}"));
         let headers = Headers::new();
@@ -316,7 +317,10 @@ impl Webhook for FetchWebhook {
             .with_headers(headers)
             .with_body(Some(JsValue::from_str(&body.to_string())));
         let request = Request::new_with_init(url, &init).map_err(fail)?;
-        let mut response = Fetch::Request(request).send().await.map_err(fail)?;
+        let mut response = Fetch::Request(request)
+            .send_with_signal(signal)
+            .await
+            .map_err(fail)?;
         let status = response.status_code();
         if !(200..300).contains(&status) {
             return Err(CoreError::Invalid(format!(
@@ -324,5 +328,28 @@ impl Webhook for FetchWebhook {
             )));
         }
         response.json().await.map_err(fail)
+    }
+}
+
+#[async_trait(?Send)]
+impl Webhook for FetchWebhook {
+    async fn post_json(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> CoreResult<serde_json::Value> {
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let call = self.send(url, body, &signal);
+        let timeout = worker::Delay::from(self.timeout);
+        futures_util::pin_mut!(call);
+        futures_util::pin_mut!(timeout);
+        match futures_util::future::select(call, timeout).await {
+            futures_util::future::Either::Left((result, _)) => result,
+            futures_util::future::Either::Right(_) => {
+                controller.abort();
+                Err(CoreError::Invalid(format!("webhook {url}: timed out")))
+            }
+        }
     }
 }

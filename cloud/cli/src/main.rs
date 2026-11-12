@@ -315,16 +315,30 @@ enum Command {
         #[arg(long = "workunit-id")]
         workunit_ids: Vec<i64>,
     },
-    /// Workunits ready to assimilate.
+    /// Workunits ready to assimilate, or with `--state done` those already
+    /// acknowledged whose files are still kept.
     Assimilate {
         #[command(flatten)]
         server: Server,
         #[arg(long)]
         app: String,
+        /// `ready` (the default) or `done`.
+        #[arg(long, default_value = "ready")]
+        state: String,
+        /// With `--state done`: only workunits changed at or after this Unix time.
+        #[arg(long, default_value_t = 0)]
+        since: i64,
         #[arg(long, default_value_t = 0)]
         after: i64,
         #[arg(long, default_value_t = 100)]
         limit: i64,
+    },
+    /// Put acknowledged workunits back in the ready list while their files are kept.
+    AssimilateReopen {
+        #[command(flatten)]
+        server: Server,
+        #[arg(long = "workunit-id", required = true)]
+        workunit_ids: Vec<i64>,
     },
     /// Mark workunits assimilated, which lets their files be deleted.
     Ack {
@@ -807,12 +821,21 @@ fn run(cli: Cli) -> Res<()> {
         Command::Assimilate {
             server,
             app,
+            state,
+            since,
             after,
             limit,
-        } => show(
-            &Client::new(&server)?
-                .get(&format!("assimilate?app={app}&after={after}&limit={limit}"))?,
-        ),
+        } => show(&Client::new(&server)?.get(&format!(
+            "assimilate?app={app}&state={state}&since={since}&after={after}&limit={limit}"
+        ))?),
+        Command::AssimilateReopen {
+            server,
+            workunit_ids,
+        } => show(&Client::new(&server)?.send(
+            "POST",
+            "assimilate/reopen",
+            &json!({ "workunit_ids": workunit_ids }),
+        )?),
         Command::Ack {
             server,
             workunit_ids,
