@@ -537,6 +537,14 @@ mod tests {
                 "ancient updated",
             ),
             (
+                r#"{"schema":1,"sections":[{"title":"T","series":[{"title":"S","start":9223372036854775807,"interval_secs":86400,"values":[1,2]}]}]}"#,
+                "start near i64::MAX",
+            ),
+            (
+                r#"{"schema":1,"sections":[{"title":"T","series":[{"title":"S","start":1700000000,"interval_secs":86400,"values":[-5,5]}]}]}"#,
+                "negative series value",
+            ),
+            (
                 r#"{"schema":1,"sections":[{"title":"T","series":[{"title":"S","start":1700000000,"interval_secs":5,"values":[1]}]}]}"#,
                 "interval too short",
             ),
