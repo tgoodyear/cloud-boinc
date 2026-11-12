@@ -1263,8 +1263,8 @@ weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream
 
 The site pages are in `cloud/crates/cb-core/src/site.rs`, reached through `site_page`:
 `login_form.php`, `login_action.php`, `logout.php`, `home.php`, `hosts_user.php`,
-`show_host_detail.php`, `results.php`, `result.php`, `workunit.php` and `show_user.php`, and
-the account and preference pages listed below, and the pages that send email (see Email below). Logging in, with the account key or with email address and password, sets the `auth` cookie
+`show_host_detail.php`, `results.php`, `result.php`, `workunit.php`, `show_user.php` and
+`apps.php`, and the account and preference pages listed below, and the pages that send email (see Email below). Logging in, with the account key or with email address and password, sets the `auth` cookie
 to the account key as upstream does, with `HttpOnly`, `Secure` and `SameSite=Lax`. It lasts a
 year when "stay logged in" is ticked, and for the browser session otherwise. A password is
 taken from a POST only. Logging out is a POST with the form token, as described under the account pages below. Private fields follow upstream: the account page, the IP address,
@@ -1325,6 +1325,44 @@ lifetime for clients that ask for that path.
 Plain elements need no class: headings, paragraphs, lists, `code`, `pre`, `details`, and forms
 with labels above the fields. A submit button is the primary button; add `class="secondary"` or
 `class="danger"` for the others. New pages use the CSS variables and no inline `style` attributes.
+
+### Applications page and unknown paths
+
+`apps.php` is in `cloud/crates/cb-core/src/site_apps.rs`, reached through `site_page`. It lists each
+application that is not deprecated with its current versions, one table per application: platform,
+version number (`1.02` for 102, as `sprintf("%0.2f", $av->version_num/100)` in `html/user/apps.php`),
+plan class, and creation date, and the application's own creation date under its heading. A beta
+application or version is marked "(beta test)", as upstream does. The current versions are those
+of `latest_avs_app_platform` in `html/inc/boinc_db.inc`: not deprecated, on a platform that is not
+deprecated, and not replaced by a version of the same application, platform, plan class and beta
+flag with a higher number. The page runs no statement. The web Worker has the catalog (platforms,
+applications and versions that are not deprecated) from the settings load that every request
+makes and keeps for 30 seconds in each isolate, so a change to a version shows within that time and
+the cost does not depend on the number of applications. The current versions of every application
+and platform come from one index built in two linear passes over the versions (the highest number of
+each application, platform, plan class and beta flag, then the versions that have it), so the work
+grows with the versions and not with the applications times the platforms; versions that tie for the
+highest number are all listed, as upstream lists them. A test counts the statements with 60
+applications and finds none. `apps.php?xml=1` is the XML list of `show_apps_xml` with the same
+elements and indentation. Upstream's `app_id` and `avid` pages (one application's versions with
+their average GFLOPS, one version's credit statistics) and the "Recent average GFLOPS" column are
+not built. The home page's Applications card links to the page. The page is served with
+`Cache-Control: private, no-store` like the other site pages, and the differences from upstream
+are D16 in [compatibility.md](compatibility.md).
+
+A `GET` for a path the web Worker does not serve answers 404. A request that accepts `text/html` (a
+browser) gets a page in the site shell, with the header and a link to the
+home page (`not_found_page` in `cloud/crates/cb-core/src/site.rs`); it is sent through
+`site_response`, so it carries the site's security headers and `Cache-Control: private, no-store,
+no-transform`. The page does not name the path that was asked for, and it runs no statement. The header's
+links are relative, so the page sets `<base href>` to the directory pages are served from (the root,
+or the stock page prefix); otherwise a missing page in a subdirectory would send "Jobs" to a page
+below it. Every other request keeps the plain `not found` text: any method but `GET`, a `GET` that
+does not accept `text/html` (`curl`, a BOINC client and most tools send `*/*` or no `Accept`), and
+the RPC paths whatever the `Accept` header says (`is_rpc_path`: `*_account.php`, `am_*.php`,
+`get_project_config.php`, `server_status.php`, and the scheduler, upload and download paths). The
+choice is made by path and method and the `Accept` header, not by `User-Agent`. Only an explicit `text/html` entry counts (`text/*` and `*/*` do not); the media type and the `q` name are compared without regard to case, white space around `;` and `=` is ignored, and an entry with a weight of 0 or a malformed weight is refused (`accepts_html` in `site.rs`). `is_rpc_path` compares in lower case and without trailing slashes. Both forms of the 404 carry `Vary: Accept`, and the plain-text one `Cache-Control: no-store`, so a cache cannot hand one form to a request that wants the other (`not_found_headers`). Unknown paths of
+the files and scheduler Workers keep their own plain replies.
 
 ### Dashboards
 

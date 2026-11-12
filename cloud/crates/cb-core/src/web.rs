@@ -1036,6 +1036,7 @@ pub fn master_page_with(
             &apps,
         )
     };
+    let table = format!("{table}<p><a href=\"apps.php\">Details of the current versions</a></p>\n");
     body.push_str(&site_ui::card("Applications", &table));
     page(&c.long_name, &head, &body)
 }
