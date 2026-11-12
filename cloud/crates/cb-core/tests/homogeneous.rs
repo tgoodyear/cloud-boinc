@@ -712,6 +712,39 @@ fn hosts_of_different_classes_cannot_both_commit_an_uncommitted_workunit() {
 }
 
 #[test]
+fn a_losing_claim_of_the_same_host_does_not_overwrite_the_winners_class() {
+    // Two requests of one host in the same second choose the same result
+    // with different classes (the host reported another OS in the second).
+    // The loser's claim fails, and its workunit update must not pass for the
+    // winner's claim and overwrite the class.
+    let w = World::new();
+    let wu = w.submit("r", "j1", 1000, 1);
+    let a = w.linux_intel("a");
+    let mut windows = a.clone();
+    windows.os = WINDOWS_OS.into();
+    let (out_a, out_windows) = w.race(&a, &windows, 2000);
+    assert_eq!(out_windows.n_sent, 1);
+    assert_eq!(out_a.n_sent, 0);
+    assert_eq!(w.wu(wu).hr_class, WINDOWS_INTEL_COARSE);
+}
+
+#[test]
+fn a_losing_claim_of_the_same_host_does_not_overwrite_the_winners_version() {
+    let w = World::new();
+    let wu = w.submit("h", "j1", 1000, 1);
+    let x = w.linux_intel("x");
+    // The host reports one CPU in the second request, so that it picks the
+    // plain version.
+    let mut one_cpu = x.clone();
+    one_cpu.ncpus = 1;
+    let (out_x, out_one) = w.race(&x, &one_cpu, 2000);
+    assert_eq!(out_one.n_sent, 1);
+    assert_eq!(out_x.n_sent, 0);
+    assert_eq!(w.wu(wu).app_version_id, V_PLAIN);
+    assert_eq!(w.versions_of(wu), vec![V_PLAIN]);
+}
+
+#[test]
 fn a_class_committed_after_the_candidates_were_read_stops_the_claim() {
     // The workunit is uncommitted when the request reads it, and committed to
     // Windows (by a claim of another result) before the request writes. The

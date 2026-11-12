@@ -385,7 +385,10 @@ AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND hr_class IN (0, :class)
 ```
 
 and the workunit update already guarded by "this claim succeeded" gains
-`hr_class = :class, app_version_id = :version`. They run in the request's one write batch, one
+`hr_class = :class, app_version_id = :version` and the same condition on its own row
+(`AND hr_class IN (0, :class) AND app_version_id IN (0, :version)`): "this claim succeeded"
+is also true for another request of the same host that claimed the result in the same second,
+and the update of a request whose claim lost must not overwrite the winner's commitment. They run in the request's one write batch, one
 transaction, so a host of another class or version whose claim comes later sees the commitment
 and fails its claim, and a host that read the workunit uncommitted but writes after another host
 committed it gets no result of it.

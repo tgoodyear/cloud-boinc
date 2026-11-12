@@ -460,6 +460,25 @@ impl Commit {
         Some((sql, params))
     }
 
+    /// The same condition on the workunit row itself, for the update that
+    /// follows a claim. `CLAIMED` is true for any request of the same host
+    /// that claimed the result in the same second, so when two requests of one
+    /// host chose different classes or versions for one result, the loser's
+    /// update would pass it and overwrite the winner's commitment.
+    fn row_guard(&self) -> (String, Vec<cb_db::Value>) {
+        let mut sql = String::new();
+        let mut params: Vec<cb_db::Value> = Vec::new();
+        if let Some(c) = self.hr_class {
+            sql.push_str(" AND hr_class IN (0, ?)");
+            params.push(c.into());
+        }
+        if let Some(v) = self.app_version_id {
+            sql.push_str(" AND app_version_id IN (0, ?)");
+            params.push(v.into());
+        }
+        (sql, params)
+    }
+
     /// The assignments the workunit update that follows a claim adds, as
     /// `, hr_class = ?` style text to append to a `SET` list.
     fn set(&self) -> (String, Vec<cb_db::Value>) {
@@ -2621,12 +2640,14 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             // to the version (`update_wu_on_send`): the claim above held only
             // if the workunit was uncommitted or committed to the same.
             let (commit_set, commit_params) = claim.commit.set();
-            let tail: [cb_db::Value; 4] = [
-                c.wu.id.into(),
-                c.result_id.into(),
-                host.id.into(),
-                now.into(),
-            ];
+            // The update also checks the workunit's own commitment: another
+            // request of this host may have claimed the result in the same
+            // second, which `CLAIMED` cannot tell from this request's claim.
+            let (row_guard, guard_params) = claim.commit.row_guard();
+            let tail: Vec<cb_db::Value> = std::iter::once(c.wu.id.into())
+                .chain(guard_params)
+                .chain([c.result_id.into(), host.id.into(), now.into()])
+                .collect();
             if !assigned && app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
                 let mut params: Vec<cb_db::Value> = vec![
                     app.target_nresults.into(),
@@ -2639,7 +2660,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     sql: format!(
                         "UPDATE workunit SET target_nresults = ?, min_quorum = ?, \
                          transition_time = ?, rev = rev + 1{commit_set} \
-                         WHERE id = ? AND {CLAIMED}"
+                         WHERE id = ?{row_guard} AND {CLAIMED}"
                     ),
                     params,
                 });
@@ -2651,7 +2672,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 writes.push(Stmt {
                     sql: format!(
                         "UPDATE workunit SET transition_time = min(transition_time, ?), \
-                         rev = rev + 1{commit_set} WHERE id = ? AND {CLAIMED}"
+                         rev = rev + 1{commit_set} WHERE id = ?{row_guard} AND {CLAIMED}"
                     ),
                     params,
                 });
