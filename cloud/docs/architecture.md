@@ -1192,7 +1192,7 @@ A server made with `tools/make_project` under the short name `<short>` has these
 | --- | --- | --- |
 | Scheduler | `/<short>_cgi/cgi` | `stock_cgi_prefix` |
 | Upload handler | `/<short>_cgi/file_upload_handler` | `stock_upload_prefix`, the directory; the cgi prefix when not given |
-| Downloads | `/<short>/download/<dir>/<name>` | `stock_download_prefix`, and `uldl_dir_fanout` for `<dir>` |
+| Downloads | `/<short>/download/<name>` and `/<short>/download/<dir>/<name>` | `stock_download_prefix`, and `uldl_dir_fanout` for `<dir>` |
 | User pages and web RPCs | `/<short>/<page>.php` | `stock_page_prefix` |
 
 `stock_short_name` only fills in the defaults above; every prefix can be named, because a project
@@ -1218,11 +1218,17 @@ Decisions:
   `config-put`, not a redeploy of every Worker, where vars could differ between Workers. The
   files Worker tries the native paths first (`route_files(path, None)`), so the default
   deployment pays no database read for a download or an upload.
-- **Downloads map to the stored object.** `<download prefix>/<dir>/<name>` serves `download/<name>`
-  from the bucket, with range requests and `HEAD` as before. `<dir>` is verified against the
-  hash: `filename_dir` computes what `filename_hash` in `sched/sched_util_basic.cpp` does (the
-  lowercase hex of hex digits 1 to 7 of the MD5 of the name, modulo the fanout), and a wrong,
-  missing or extra directory is a 404, as on a stock server where the file is not at that path.
+- **Downloads map to the stored object.** Two forms serve `download/<name>` from the bucket, with
+  range requests and `HEAD` as before, because the stock server's Apache serves the download
+  directory as plain files and `dir_hier_path` (`sched/sched_util_basic.cpp`) and
+  `tools/update_versions` put files in both places: `<download prefix>/<name>` (the form
+  `update_versions` writes for an application file, and the only form with no fanout) and
+  `<download prefix>/<dir>/<name>`. `<dir>` is verified against the hash: `filename_dir` computes
+  what `filename_hash` in `sched/sched_util_basic.cpp` does (the lowercase hex of hex digits 1 to 7
+  of the MD5 of the name, modulo the fanout), and a wrong or extra directory is a 404, as on a
+  stock server where the file is not at that path. One segment is always a name, even one that
+  looks like a directory (`319`); a trailing slash, an empty segment or a name that is not a flat
+  name is a 404, so a directory listing request is never answered.
   Verifying also means one object has one URL, so a client cannot make many cache keys for it.
   With `uldl_dir_fanout` 0 the URL is `<prefix>/<name>`.
 - **Upload handler.** The stock path takes every request kind the native one does (size query,

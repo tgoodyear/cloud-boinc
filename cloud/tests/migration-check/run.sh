@@ -1,7 +1,7 @@
 #!/bin/sh
 # The whole migration check.
 #   run.sh --work DIR --clients FILE --image NAME --cboinc FILE --app-binary FILE
-#          [--steps "up drive release probe switch observe down"] [--long-seconds N]
+#          [--steps "up drive release probe switch appfetch observe down"] [--long-seconds N]
 #          [--cloud-config TAG=VALUE]... [--no-uploads] [--importer FILE]
 # The project's URLs name no port, so both servers listen on port 80 and this script takes no
 # --port (the scripts it calls have one for use on their own). --cboinc and --app-binary
@@ -18,18 +18,22 @@
 #            client's host row is copied except the clients of mode `nohost`; job rows only
 #            for the clients of mode `copied` or `nohost`; the files of the stock upload
 #            directory unless --no-uploads is given
+#   appfetch a new client that never had the application, with the first client's account and
+#            version, downloads it through the URL in the stock documents and completes a task
+#            (appfetch.sh). --app-client TAG
+#            takes another client's line
 #   observe  what the clients do next (observe.sh)
 #   down     the clients, cloud-boinc and the stock server are stopped
 usage() { sed -n '2,/^usage()/p' "$0" | sed '$d' >&2; exit 2; }
 set -eu
-work="" clients="" image="" cboinc="" app="" steps="up drive release probe switch observe down"
-long=240 cfg="" uploads="--carry-uploads" importer=""
+work="" clients="" image="" cboinc="" app="" steps="up drive release probe switch appfetch observe down"
+long=240 appclient="" cfg="" uploads="--carry-uploads" importer=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --work) work="$2" ;; --clients) clients="$2" ;; --image) image="$2" ;;
         --cboinc) cboinc="$2" ;; --app-binary) app="$2" ;; --steps) steps="$2" ;;
         --long-seconds) long="$2" ;;
-        --importer) importer="$2" ;;
+        --importer) importer="$2" ;; --app-client) appclient="$2" ;;
         --cloud-config) cfg="$cfg --config-set $2" ;;
         --no-uploads) uploads=""; shift; continue ;;
         *) usage ;;
@@ -43,7 +47,7 @@ export PATH="/opt/node/bin:$PATH"
 tags="$(awk '!/^#/ && NF {printf "%s ", $1}' "$CLIENTS")"
 mkdir -p "$WORK/results"
 has() { case " $steps " in *" $1 "*) return 0 ;; esac; return 1; }
-if has up || has switch || has observe; then
+if has up || has switch || has appfetch || has observe; then
     [ -n "$cboinc" ] && [ -n "$app" ] || die "--cboinc and --app-binary are needed by up, switch and observe"
     [ -x "$cboinc" ] || die "--cboinc $cboinc is not an executable file"
     [ -f "$app" ] || die "--app-binary $app is not a file"
@@ -93,6 +97,11 @@ if has switch; then
     # shellcheck disable=SC2086
     sh "$HERE/switch.sh" --work "$WORK" --clients "$CLIENTS" --tags "$tags" --cboinc "$cboinc" \
         $uploads $args $cfg ${importer:+--importer "$importer"} || die "switch.sh failed"
+fi
+if has appfetch; then
+    [ -n "$appclient" ] || appclient="${tags%% *}"
+    redacted sh "$HERE/appfetch.sh" --work "$WORK" --clients "$CLIENTS" --tag "$appclient" \
+        --cboinc "$cboinc" || die "appfetch.sh failed (its log, if any, is $WORK/results/appfetch.log)"
 fi
 if has observe; then
     sh "$HERE/observe.sh" --work "$WORK" --clients "$CLIENTS" --tags "$tags" --cboinc "$cboinc" \
