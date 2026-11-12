@@ -545,8 +545,10 @@ pub async fn am_set_info(
         // hash are what this RPC compared with. If a site request changed
         // either since, the pair written would not match.
         let credentials = !password_hash.is_empty() || !email.is_empty();
-        let mut guard = String::new();
-        let mut observed: Vec<&str> = Vec::new();
+        // The account key too, every time: a request that authenticated before
+        // `reset_account_key.php` replaced it must not write afterwards.
+        let mut guard = String::from(" AND authenticator = ?");
+        let mut observed: Vec<&str> = vec![user.authenticator.as_str()];
         if credentials {
             guard.push_str(" AND email_addr = ? AND passwd_hash = ?");
             observed.extend([user.email_addr.as_str(), user.passwd_hash.as_str()]);
@@ -580,12 +582,13 @@ pub async fn am_set_info(
             batch.push(stmt!(
                 "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
                  AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
-                 AND (? = '' OR passwd_hash = ?))",
+                 AND authenticator = ? AND (? = '' OR passwd_hash = ?))",
                 now,
                 user.id,
                 if new_email { "E" } else { "L" },
                 user.id,
                 target,
+                user.authenticator.as_str(),
                 new_stored_hash.as_str(),
                 new_stored_hash.as_str()
             ));

@@ -371,16 +371,29 @@ pub async fn edit_user_info_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
     if !is_valid_postal_code(postal_code) {
         return Ok(error_page(project, 400, "Invalid postal code."));
     }
-    ctx.db
+    // Every write below is conditional on the account key read with the
+    // account: a request that authenticated before `reset_account_key.php`
+    // finds the key changed and writes nothing.
+    let updated = ctx
+        .db
         .run(stmt!(
-            "UPDATE user SET name = ?, url = ?, country = ?, postal_code = ? WHERE id = ?",
+            "UPDATE user SET name = ?, url = ?, country = ?, postal_code = ? \
+             WHERE id = ? AND authenticator = ? RETURNING id",
             name,
             url,
             country,
             postal_code,
-            user.id
+            user.id,
+            user.authenticator.as_str()
         ))
         .await?;
+    if updated.rows.is_empty() {
+        return Ok(error_page(
+            project,
+            409,
+            "The account changed meanwhile; please try again.",
+        ));
+    }
     Ok(SitePage::redirect(format!(
         "{}home.php",
         project.config.master_url
@@ -480,19 +493,22 @@ pub async fn edit_passwd_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
         .batch(vec![
             stmt!(
                 "UPDATE user SET passwd_hash = ? WHERE id = ? AND email_addr = ? \
-                 AND passwd_hash = ? RETURNING id",
+                 AND passwd_hash = ? AND authenticator = ? RETURNING id",
                 stored.as_str(),
                 user.id,
                 user.email_addr.as_str(),
-                user.passwd_hash.as_str()
+                user.passwd_hash.as_str(),
+                user.authenticator.as_str()
             ),
             stmt!(
                 "UPDATE token SET used_time = ? WHERE userid = ? AND type = 'L' AND used_time = 0 \
-                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND passwd_hash = ?)",
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND passwd_hash = ? \
+                 AND authenticator = ?)",
                 ctx.now,
                 user.id,
                 user.id,
-                stored.as_str()
+                stored.as_str(),
+                user.authenticator.as_str()
             ),
         ])
         .await?;
@@ -645,7 +661,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
                 "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0, \
                  previous_email_addr = ?, email_addr_change_time = ? \
                  WHERE id = ? AND email_addr = ? AND passwd_hash = ? AND email_addr_change_time = ? \
-                 AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) \
+                 AND authenticator = ? AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) \
                  AND NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
                  AND previous_email_addr != '' AND email_addr_change_time > ? AND id != ?) \
                  RETURNING id",
@@ -657,6 +673,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
                 user.email_addr.as_str(),
                 user.passwd_hash.as_str(),
                 user.email_addr_change_time,
+                user.authenticator.as_str(),
                 email.as_str(),
                 email.as_str(),
                 ctx.now - EMAIL_CHANGE_WAIT_SECS,
@@ -665,7 +682,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         } else {
             stmt!(
                 "UPDATE user SET email_addr = ?, passwd_hash = ?, email_validated = 0 \
-                 WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
+                 WHERE id = ? AND email_addr = ? AND passwd_hash = ? AND authenticator = ? \
                  AND NOT EXISTS (SELECT 1 FROM user WHERE email_addr = ?) \
                  AND NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
                  AND previous_email_addr != '' AND email_addr_change_time > ? AND id != ?) \
@@ -675,6 +692,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
                 user.id,
                 user.email_addr.as_str(),
                 user.passwd_hash.as_str(),
+                user.authenticator.as_str(),
                 email.as_str(),
                 email.as_str(),
                 ctx.now - EMAIL_CHANGE_WAIT_SECS,
@@ -683,13 +701,15 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         },
         stmt!(
             "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
-             AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ?)",
+             AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
+             AND authenticator = ?)",
             ctx.now,
             user.id,
             // With email the new undo token replaces the old ones itself.
             if mail.is_some() { "L" } else { "E" },
             user.id,
-            email.as_str()
+            email.as_str(),
+            user.authenticator.as_str()
         ),
     ];
     let undo_token = mail.as_ref().map(|_| {
@@ -1097,16 +1117,20 @@ pub async fn prefs_edit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let observed = stored_prefs(&user, subset);
     let update = match (subset, venue) {
         (Subset::Global, _) => stmt!(
-            "UPDATE user SET global_prefs = ? WHERE id = ? AND global_prefs IS ? RETURNING id",
+            "UPDATE user SET global_prefs = ? WHERE id = ? AND global_prefs IS ? \
+             AND authenticator = ? RETURNING id",
             xml.as_str(),
             user.id,
-            observed
+            observed,
+            user.authenticator.as_str()
         ),
         (Subset::Project, Some(_)) => stmt!(
-            "UPDATE user SET project_prefs = ? WHERE id = ? AND project_prefs IS ? RETURNING id",
+            "UPDATE user SET project_prefs = ? WHERE id = ? AND project_prefs IS ? \
+             AND authenticator = ? RETURNING id",
             xml.as_str(),
             user.id,
-            observed
+            observed,
+            user.authenticator.as_str()
         ),
         (Subset::Project, None) => {
             let default_venue = str_param(q, "default_venue");
@@ -1116,13 +1140,14 @@ pub async fn prefs_edit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             let flag = |k: &str| i32::from(q.get(k).is_some_and(|v| !v.is_empty()));
             stmt!(
                 "UPDATE user SET project_prefs = ?, send_email = ?, show_hosts = ?, venue = ? \
-                 WHERE id = ? AND project_prefs IS ? RETURNING id",
+                 WHERE id = ? AND project_prefs IS ? AND authenticator = ? RETURNING id",
                 xml.as_str(),
                 flag("send_email"),
                 flag("show_hosts"),
                 default_venue,
                 user.id,
-                observed
+                observed,
+                user.authenticator.as_str()
             )
         }
     };
@@ -1179,10 +1204,14 @@ pub async fn prefs_remove(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
         let updated = ctx
             .db
             .run(stmt!(
-                format!("UPDATE user SET {col} = ? WHERE id = ? AND {col} IS ? RETURNING id"),
+                format!(
+                    "UPDATE user SET {col} = ? WHERE id = ? AND {col} IS ? \
+                     AND authenticator = ? RETURNING id"
+                ),
                 xml.as_str(),
                 user.id,
-                stored_prefs(&user, subset)
+                stored_prefs(&user, subset),
+                user.authenticator.as_str()
             ))
             .await?;
         if updated.rows.is_empty() {

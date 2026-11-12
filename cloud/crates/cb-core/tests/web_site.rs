@@ -1679,23 +1679,41 @@ fn preferences_are_edited_per_venue_and_reach_clients() {
     );
 }
 
-/// A database that, before the first write to `user`, runs one statement of
-/// another request: that request and this one start from the same read.
+/// A database that runs one statement of another request next to the first
+/// batch with a write it watches for (a statement starting with one of
+/// `trigger`): before it, so that this request and the other start from the
+/// same read, or after it, for a request whose later statement then sees what
+/// the other changed.
 struct ChangedMeanwhile<'a> {
     inner: &'a SqliteDb,
     other: RefCell<Option<Stmt>>,
+    trigger: &'static [&'static str],
+    after: bool,
 }
 
 #[async_trait(?Send)]
 impl Db for ChangedMeanwhile<'_> {
     async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
-        if stmts.iter().any(|s| s.sql.starts_with("UPDATE user SET")) {
-            let other = self.other.borrow_mut().take();
+        let fires = stmts
+            .iter()
+            .any(|s| self.trigger.iter().any(|t| s.sql.starts_with(t)));
+        let other = if fires {
+            self.other.borrow_mut().take()
+        } else {
+            None
+        };
+        if !self.after {
+            if let Some(other) = &other {
+                self.inner.run(other.clone()).await?;
+            }
+        }
+        let out = self.inner.batch(stmts).await?;
+        if self.after {
             if let Some(other) = other {
                 self.inner.run(other).await?;
             }
         }
-        self.inner.batch(stmts).await
+        Ok(out)
     }
 }
 
@@ -1720,6 +1738,8 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
             site_hash.as_str(),
             ada.id
         ))),
+        trigger: &["UPDATE user SET"],
+        after: false,
     };
     let params = q(&[
         ("account_key", &ada.auth),
@@ -1748,6 +1768,8 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
             "UPDATE user SET passwd_hash = 'changed' WHERE id = ?",
             ada.id
         ))),
+        trigger: &["UPDATE user SET"],
+        after: false,
     };
     let params = q(&[
         ("account_key", &ada.auth),
@@ -1772,6 +1794,8 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
             "UPDATE user SET passwd_hash = 'again' WHERE id = ?",
             ada.id
         ))),
+        trigger: &["UPDATE user SET"],
+        after: false,
     };
     let params = q(&[("account_key", &ada.auth), ("name", "Ada L")]);
     let reply = block_on(cb_core::web::am_set_info(
@@ -2125,6 +2149,18 @@ fn changed_meanwhile(w: &World, sql: Stmt) -> ChangedMeanwhile<'_> {
     ChangedMeanwhile {
         inner: &w.db,
         other: RefCell::new(Some(sql)),
+        trigger: &["UPDATE user SET"],
+        after: false,
+    }
+}
+
+/// `changed_meanwhile` for the batch that stores a token or uses one.
+fn changed_around_tokens(w: &World, sql: Stmt, after: bool) -> ChangedMeanwhile<'_> {
+    ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(Some(sql)),
+        trigger: &["INSERT INTO token", "UPDATE token SET"],
+        after,
     }
 }
 
@@ -4041,4 +4077,209 @@ fn each_computing_preferences_save_gets_a_later_mod_time() {
     w.at(100);
     save(None);
     assert_eq!(mod_time(), NOW + 100);
+}
+
+// ---------------------------------------------------------------------------
+// Requests under way while the account key or address changes.
+
+const REPLACED_KEY: &str = "ffffffffffffffffffffffffffffffff";
+
+fn key_replaced(id: i64) -> Stmt {
+    stmt!(
+        "UPDATE user SET authenticator = ? WHERE id = ?",
+        REPLACED_KEY,
+        id
+    )
+}
+
+#[test]
+fn a_write_that_authenticated_before_a_key_reset_writes_nothing() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let auth = Some(ada.auth.as_str());
+    let reset = |w: &World| {
+        w.sql(&format!(
+            "UPDATE user SET authenticator = '{}' WHERE id = {}",
+            ada.auth, ada.id
+        ))
+    };
+    let before = w.user(ada.id);
+
+    // The account manager RPC: a new password, from a request that read the
+    // account with the old key.
+    let racing = changed_meanwhile(&w, key_replaced(ada.id));
+    let params: Params = [
+        ("account_key", ada.auth.as_str()),
+        (
+            "password_hash",
+            passwd_hash("attacker1", "ada@example.com").as_str(),
+        ),
+        ("name", "Mallory"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        NOW,
+        &params,
+    ))
+    .unwrap();
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    let u = w.user(ada.id);
+    assert_eq!(
+        (u.passwd_hash.as_str(), u.name.as_str()),
+        (before.passwd_hash.as_str(), "Ada")
+    );
+    reset(&w);
+
+    // The password page.
+    let form = w.get("/edit_passwd_form.php", auth, &[]);
+    let mut sent = hidden_fields(&form.body);
+    sent.extend(
+        [
+            ("old_passwd", "secret"),
+            ("passwd", "attacker1"),
+            ("passwd2", "attacker1"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile(&w, key_replaced(ada.id));
+    let (page, _) = w.page_on(&racing, "/edit_passwd_action.php", auth, true, &pairs);
+    assert_eq!(page.status, 409);
+    assert_eq!(w.user(ada.id).passwd_hash, before.passwd_hash);
+    reset(&w);
+
+    // The account details.
+    let form = w.get("/edit_user_info_form.php", auth, &[]);
+    let mut sent = hidden_fields(&form.body);
+    sent.extend(
+        [
+            ("user_name", "Mallory"),
+            ("url", ""),
+            ("country", ""),
+            ("postal_code", ""),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile(&w, key_replaced(ada.id));
+    let (page, _) = w.page_on(&racing, "/edit_user_info_action.php", auth, true, &pairs);
+    assert_eq!(page.status, 409);
+    assert_eq!(w.user(ada.id).name, "Ada");
+    reset(&w);
+
+    // The address, with email: no change, and no undo token.
+    let form = w.get("/edit_email_form.php", auth, &[]);
+    let mut sent = hidden_fields(&form.body);
+    sent.extend(
+        [("email_addr", "mallory@example.com"), ("passwd", "secret")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile(&w, key_replaced(ada.id));
+    let (page, _) = w.page_on(&racing, "/edit_email_action.php", auth, true, &pairs);
+    assert_eq!(page.status, 409);
+    assert_eq!(w.user(ada.id).email_addr, "ada@example.com");
+    assert_eq!(w.token_rows("E"), 0);
+    assert!(w.mails().is_empty());
+    reset(&w);
+
+    // A preferences save.
+    let form = w.get("/prefs_edit.php", auth, &[("subset", "global")]);
+    let global = cb_core::prefs::PrefsForm::new(cb_core::prefs::Subset::Global, &w.project);
+    let mut sent = hidden_fields(&form.body);
+    sent.extend(global.form_values(&global.defaults()));
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile(&w, key_replaced(ada.id));
+    let (page, _) = w.page_on(&racing, "/prefs_edit.php", auth, true, &pairs);
+    assert_eq!(page.status, 409);
+    assert_eq!(w.user(ada.id).global_prefs, before.global_prefs);
+}
+
+#[test]
+fn a_recovery_request_under_way_cannot_make_a_link_for_a_former_account() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    // After the lookup of the address, the address changes and the key is
+    // replaced; the token batch must find the account is not what was read.
+    let racing = changed_around_tokens(
+        &w,
+        stmt!(
+            "UPDATE user SET email_addr = 'ada@new.example', authenticator = ? WHERE id = ?",
+            REPLACED_KEY,
+            ada.id
+        ),
+        false,
+    );
+    let (page, _) = w.page_on(
+        &racing,
+        "/mail_passwd.php",
+        None,
+        true,
+        &[("email_addr", "ada@example.com")],
+    );
+    assert_eq!(page.status, 200);
+    assert_eq!(w.token_rows("L"), 0);
+    assert!(w.mails().is_empty());
+
+    // The same for a verification message asked for from the account page.
+    w.sql(&format!(
+        "UPDATE user SET email_addr = 'ada@example.com', authenticator = '{}' WHERE id = {}",
+        ada.auth, ada.id
+    ));
+    let home = w.get("/home.php", Some(&ada.auth), &[]);
+    let pairs = hidden_fields(&home.body);
+    let pairs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let racing = changed_around_tokens(
+        &w,
+        stmt!(
+            "UPDATE user SET email_addr = 'ada@new.example' WHERE id = ?",
+            ada.id
+        ),
+        false,
+    );
+    let (page, _) = w.page_on(
+        &racing,
+        "/validate_email_addr.php",
+        Some(&ada.auth),
+        true,
+        &pairs,
+    );
+    assert_ne!(page.status, 200);
+    assert_eq!(w.token_rows("V"), 0);
+    assert!(w.mails().is_empty());
+}
+
+#[test]
+fn a_login_link_used_during_a_key_reset_gets_the_old_key_or_nothing() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.request_login_link("ada@example.com");
+    let login = w.last_link("ada@example.com", "login_action.php");
+    // The key is replaced just after the token was used. The link's own
+    // request must not read the new key.
+    let racing = changed_around_tokens(&w, key_replaced(ada.id), true);
+    let pairs: Vec<(&str, &str)> = login
+        .1
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (page, _) = w.page_on(&racing, &login.0, None, true, &pairs);
+    let cookie = page.set_cookie.unwrap_or_default();
+    assert!(!cookie.contains(REPLACED_KEY), "{cookie}");
+    assert!(
+        cookie.starts_with(&format!("auth={};", ada.auth)),
+        "{cookie}"
+    );
+    assert_eq!(w.user(ada.id).authenticator, REPLACED_KEY);
 }

@@ -824,8 +824,10 @@ refused with `ERR_DB_NOT_UNIQUE` when another account has it, by the `WHERE` cla
 `UPDATE`; as upstream, it does not rehash the password, so an account manager sends
 `password_hash` with it. The stored hash depends on the address, so a request that names the
 address or gives a hash writes only if the address and hash are still the ones read with the
-account (as the site's password and email actions do); if a site request changed them meanwhile,
-nothing is written and the reply is `ERR_RETRY`. A project preferences document without a `<project_specific>`
+account (as the site's password and email actions do); and every write needs the account key to be
+still the one read, so a request that authenticated before `reset_account_key.php` replaced the
+key writes nothing. If a site request changed them meanwhile, nothing is written and the reply
+is `ERR_RETRY`. A project preferences document without a `<project_specific>`
 part inherits the stored one (or has none, if none was stored), so that write is conditional on
 `project_prefs` being still what was read; a site save of the application selection or task limit
 in between, including the first one, is not undone. `teamid` is accepted and ignored until there are
@@ -1066,6 +1068,17 @@ used. An undo token (a week) is replaced by the next one. A verification token i
 while the account has the address it was sent to. A message the transport refuses keeps its
 token and its place in the limit, since it may have got there. Whatever makes the next token
 removes up to twenty rows older than eight days.
+
+A request that reads the account and then writes is conditional on what it read, in the same
+statement or batch as the write. Every site page that changes an account (details, password,
+address, preferences, the key itself) and `am_set_info` add `authenticator = ?` to the `WHERE`
+clause with the key read with the account, together with the address and hash where they apply,
+and the token statements of the same request test the account again (`EXISTS ... authenticator =
+?`). A login or verification token is stored only if the account still has the address, password
+hash and key that were read (`issue_token`), so a recovery request that was under way when the
+address changed or the key was replaced makes no link for what the account was. A login link uses
+its token and reads the account in one batch, so it gets the key as it was when the token was
+good or finds the token ended by a replacement.
 
 **Limits.** An account gets at most one login-link message and at most one verification message
 in any ten minutes (`MAIL_INTERVAL_SECS`). The limit is part of the statement that adds the

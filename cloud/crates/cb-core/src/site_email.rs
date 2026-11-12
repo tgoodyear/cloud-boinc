@@ -88,13 +88,18 @@ fn is_token(s: &str) -> bool {
 /// kept too long go, the row is added unless this account had a token of the
 /// kind within `interval` (the limit on mail), and older unused tokens of the
 /// kind stop working if the kind replaces them. `data` is stored with the
-/// row (see `migrations/0004_email.sql`). `None` when the limit applied.
+/// row (see `migrations/0004_email.sql`). `None` when the limit applied, or
+/// when the account is no longer the one that was read (`user`): the row is
+/// added only if its address, password hash and account key are still those,
+/// so a request that was under way while the address or key changed cannot
+/// make a link for what the account was.
 pub(crate) async fn issue_token(
     ctx: &SiteCtx<'_>,
-    userid: i64,
+    user: &User,
     kind: &TokenKind,
     data: &str,
 ) -> CoreResult<Option<String>> {
+    let userid = user.id;
     let token = new_token(ctx.random);
     let hash = token_hash(&token);
     let mut batch = vec![
@@ -108,6 +113,8 @@ pub(crate) async fn issue_token(
             "INSERT INTO token (userid, type, token_hash, data, create_time, expire_time) \
              SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS \
              (SELECT 1 FROM token WHERE userid = ? AND type = ? AND create_time > ?) \
+             AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? AND passwd_hash = ? \
+             AND authenticator = ? AND blocked = 0) \
              RETURNING id",
             userid,
             kind.code,
@@ -117,7 +124,11 @@ pub(crate) async fn issue_token(
             ctx.now + kind.lifetime,
             userid,
             kind.code,
-            ctx.now - kind.interval
+            ctx.now - kind.interval,
+            userid,
+            user.email_addr.as_str(),
+            user.passwd_hash.as_str(),
+            user.authenticator.as_str()
         ),
     ];
     if kind.supersede {
@@ -349,7 +360,7 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
     // An address the site would not mail (an account made under the looser
     // rule) gets no token either: it would use the account's slot for nothing.
     if let Some(user) = user.filter(|u| is_strict_email(&u.email_addr)) {
-        if let Some(token) = issue_token(ctx, user.id, &LOGIN, "").await? {
+        if let Some(token) = issue_token(ctx, &user, &LOGIN, "").await? {
             let n = name(ctx);
             let body = format!(
                 "This email was sent in response to a request on the {n} web site.\n\n\
@@ -455,26 +466,34 @@ pub async fn login_via_link(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePag
             ),
         ));
     }
-    let used = ctx
+    // The token is used and the account read in one batch: a login link
+    // either gets the key as it was when the token was good, or finds the
+    // token ended by a replacement of the key.
+    let hash = token_hash(t);
+    let out = ctx
         .db
-        .run(stmt!(
-            "UPDATE token SET used_time = ? WHERE token_hash = ? AND userid = ? AND type = ? \
-             AND used_time = 0 AND expire_time > ? RETURNING id",
-            ctx.now,
-            token_hash(t).as_str(),
-            id,
-            LOGIN.code,
-            ctx.now
-        ))
+        .batch(vec![
+            stmt!(
+                "UPDATE token SET used_time = ? WHERE token_hash = ? AND userid = ? AND type = ? \
+                 AND used_time = 0 AND expire_time > ? RETURNING id",
+                ctx.now,
+                hash.as_str(),
+                id,
+                LOGIN.code,
+                ctx.now
+            ),
+            stmt!("SELECT * FROM user WHERE id = ? AND blocked = 0", id),
+        ])
         .await?;
-    if used.rows.is_empty() {
+    if !out.first().is_some_and(|r| !r.rows.is_empty()) {
         return Ok(bad());
     }
-    let user: Option<User> = ctx
-        .db
-        .run(stmt!("SELECT * FROM user WHERE id = ? AND blocked = 0", id))
-        .await?
-        .first()?;
+    let user: Option<User> = out
+        .into_iter()
+        .nth(1)
+        .map(|r| r.first())
+        .transpose()?
+        .flatten();
     let Some(user) = user else {
         return Ok(bad());
     };
@@ -506,7 +525,7 @@ pub(crate) async fn send_verification(
     if !is_strict_email(&user.email_addr) {
         return Ok(Sent::Failed);
     }
-    let Some(token) = issue_token(ctx, user.id, &VERIFY, &user.email_addr).await? else {
+    let Some(token) = issue_token(ctx, user, &VERIFY, &user.email_addr).await? else {
         return Ok(Sent::Recent);
     };
     let n = name(ctx);
