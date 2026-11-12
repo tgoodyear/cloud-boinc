@@ -49,6 +49,7 @@ use cb_proto::web_rpc::err::EXIT_ABORTED_BY_PROJECT;
 use cb_proto::xml::{extract_venue, line};
 use serde::Deserialize;
 
+use crate::host_misc::host_info_json;
 use crate::hr::{app_hr_type, hr_class, hr_unknown_class, HrHost};
 use crate::model::{
     anon_gavid, anon_platform_id, anon_proc_type, anon_uses_gpu, generalized_app_version_id, App,
@@ -68,6 +69,8 @@ const MAX_SEND: usize = 100;
 const MAX_LOST: usize = 50;
 /// Most assigned jobs looked at, and so sent, in one request.
 const MAX_ASSIGNED: usize = 20;
+/// Most windows of unsent results read for one app in one request.
+const MAX_WINDOWS: usize = 4;
 /// Most reported results handled in one request when the project sets no
 /// `max_results_accepted`. The client reports the rest next time.
 const MAX_REPORTED: usize = 500;
@@ -373,12 +376,16 @@ impl Version<'_> {
     }
 }
 
-/// Whether workunits of the app can be pinned to a version, so that versions
-/// no longer sent to anyone are kept for the workunits pinned to them
-/// (`Version::pinned_only`). Today that is an app with homogeneous app
-/// version; a workunit pinned by `app_version_num` would add its own case.
-fn keeps_pinned_versions(app: &App) -> bool {
-    app.homogeneous_app_version != 0
+/// Whether a version that is no longer sent to everyone stays loaded for the
+/// workunits pinned to it. `SCHED_SHMEM::scan_tables` in
+/// `sched/sched_shmem.cpp` loads every version at or above the app's
+/// `min_version` when that is set, and flags the ones that are not the latest
+/// of their platform and plan class; without it only the latest are loaded.
+/// An app with homogeneous app version also keeps the versions its committed
+/// workunits are on, whatever their number
+/// (`check_homogeneous_app_version` in `sched/sched_version.cpp`).
+fn keeps_version(app: &App, av: &AppVersion) -> bool {
+    app.homogeneous_app_version != 0 || (app.min_version > 0 && av.version_num >= app.min_version)
 }
 
 /// What homogeneous redundancy and homogeneous app version ask of one app
@@ -681,6 +688,42 @@ fn proc_index(proc_type: i32) -> usize {
         .unwrap_or(0)
 }
 
+/// `warn_user_if_core_client_upgrade_scheduled` in `sched/handle_request.cpp`:
+/// tell a client below the announced minimum how long it has to upgrade.
+fn warn_if_upgrade_scheduled(
+    out: &mut SchedOutcome,
+    req: &SchedulerRequest,
+    config: &Config,
+    now: i64,
+) {
+    let announced = config.min_core_client_version_announced;
+    if req.core_client_version >= announced {
+        return;
+    }
+    // Hours left, as upstream's integer arithmetic gives them.
+    let remaining = (config.min_core_client_upgrade_deadline - now) / 3600;
+    if remaining <= 0 {
+        return;
+    }
+    let (days, hours) = (remaining / 24, remaining % 24);
+    let message = format!(
+        "In {days} days and {hours} hours, this project will require a minimum \
+         BOINC version of {}.{}.{}.  You are currently using \
+         version {}.{}.{}; please upgrade before this time.",
+        announced / 10000,
+        (announced / 100) % 100,
+        announced % 100,
+        req.core_client_major_version,
+        req.core_client_minor_version,
+        req.core_client_release,
+    );
+    // Low priority until three days are left.
+    out.reply.messages.push(UserMessage::new(
+        message,
+        if days < 3 { "notice" } else { "low" },
+    ));
+}
+
 fn base_reply(ctx: &SchedCtx<'_>) -> SchedulerReply {
     let c = ctx.config;
     SchedulerReply {
@@ -776,6 +819,17 @@ fn estimate_flops(hu: &mut HostUsage, av: &AppVersion, hav: Option<&HostAppVersi
     }
 }
 
+/// A client or version number stored as `major * 100 + minor` is multiplied
+/// by 100, as `SCHED_SHMEM::scan_tables` does for `min_core_version` and
+/// `max_core_version` ("min core version too small - multiplying by 100").
+fn core_version(v: i32) -> i32 {
+    if v > 0 && v < 10000 {
+        v.saturating_mul(100)
+    } else {
+        v
+    }
+}
+
 /// What an app version would use on this host, with the platform it runs
 /// as; or, when the host cannot run it, what to tell the volunteer.
 fn usage_for<'a>(
@@ -790,15 +844,26 @@ fn usage_for<'a>(
         .iter()
         .find(|p| p.id == av.platformid)
         .ok_or(None)?;
-    if av.min_core_version > 0 && req.core_client_version < av.min_core_version {
+    // The volunteer is not told that the client is too old for a particular
+    // version, as upstream does not say it (`get_app_version`).
+    if req.core_client_version < core_version(av.min_core_version) {
         return Err(None);
     }
-    if av.max_core_version > 0 && req.core_client_version > av.max_core_version {
+    let max = core_version(av.max_core_version);
+    if max > 0 && req.core_client_version > max {
         return Err(None);
     }
     let mut hu = plan_classes
         .evaluate(&av.plan_class, plan_host)
         .map_err(|r| r.user_message)?;
+    // A client that does not state that it understands plan classes is sent
+    // only versions that use one CPU.
+    if !av.plan_class.is_empty()
+        && !req.client_cap_plan_class
+        && !(hu.proc_type == PROC_TYPE_CPU && hu.avg_ncpus == 1.0)
+    {
+        return Err(None);
+    }
     estimate_flops(&mut hu, av, hav);
     if !(hu.projected_flops.is_finite() && hu.projected_flops > 0.0) {
         hu.projected_flops = 1e9;
@@ -995,16 +1060,23 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     };
     out.reply.core_client_version = req.core_client_version;
 
-    if req.core_client_version < config.min_core_client_version {
-        refuse(
-            &mut out,
+    // A client below the project's minimum gets no work, but its reports are
+    // still taken and its request still answered: `process_request` in
+    // `sched/handle_request.cpp` clears `ok_to_send_work` and goes on when
+    // the request carries results.
+    let too_old = req.core_client_version < config.min_core_client_version;
+    if too_old {
+        out.reply.messages.push(UserMessage::new(
             "Your BOINC client software is too old.  Please install the current version.",
             "notice",
-            DELAY_BAD_CLIENT_VERSION,
-            "client too old",
-        );
-        return Ok(out);
+        ));
+        out.reply.request_delay = out.reply.request_delay.max(DELAY_BAD_CLIENT_VERSION);
+        if req.results.is_empty() {
+            out.log = "client too old".to_string();
+            return Ok(out);
+        }
     }
+    warn_if_upgrade_scheduled(&mut out, &req, config, now);
     if req.authenticator.is_empty() {
         out.reply.nucleus_only = true;
         refuse(
@@ -1635,7 +1707,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             // one a homogeneous-app-version workunit is committed to.
             let pinned_only =
                 av.deprecated != 0 || catalog.superseded(av) || av.version_num < app.min_version;
-            if pinned_only && !keeps_pinned_versions(app) {
+            if pinned_only && !keeps_version(app, av) {
                 continue;
             }
             if !prefs.app_ids.is_empty() && !prefs.app_ids.contains(&app.id) {
@@ -1712,6 +1784,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         !versions.is_empty()
     };
     let send = work_requested
+        && !too_old
         && !hr_blocked
         && key_ok
         && !config.dont_send_jobs
@@ -1743,7 +1816,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
          os_version = ?, m_nbytes = ?, m_cache = ?, m_swap = ?, d_total = ?, d_free = ?, \
          d_boinc_used_total = ?, d_boinc_used_project = ?, d_boinc_max = ?, n_bwup = ?, \
          n_bwdown = ?, host_cpid = ?, external_ip_addr = ?, product_name = ?, p_ngpus = ?, \
-         p_gpu_fpops = ? WHERE id = ?",
+         p_gpu_fpops = ?, misc = ? WHERE id = ?",
         i64::from(req.rpc_seqno),
         now,
         hi.timezone,
@@ -1783,6 +1856,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         truncate(&hi.product_name, 254),
         ngpus,
         gpu_fpops,
+        host_info_json(&req),
         host.id
     ));
 
@@ -1811,7 +1885,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // (`ok_to_send_work` in `process_request`: the project sends jobs and the
     // request asks for work), so a request that only reports results leaves
     // them be.
-    let may_send_work = work_requested && !config.dont_send_jobs && !req.dont_send_work;
+    let may_send_work = work_requested && !too_old && !config.dont_send_jobs && !req.dont_send_work;
     let lost: Vec<&InProgressRow> =
         if config.resend_lost_results && req.have_other_results_list && key_ok && may_send_work {
             in_progress
@@ -1864,6 +1938,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             })
             .collect();
     }
+    // The replica rule: no two results of a workunit to one user or host.
+    let replica_rule = config.one_result_per_user_per_wu || config.one_result_per_host_per_wu;
+    let replica_who = if config.one_result_per_user_per_wu {
+        ("userid", user.id)
+    } else {
+        ("hostid", host.id)
+    };
     let mut reads = Vec::new();
     if !lost.is_empty() {
         let mut s = Stmt::new(format!(
@@ -1898,45 +1979,69 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     };
     let assigned_apps = id_list(&mut assigned_list.iter().copied());
-    // For an app whose workunits can be pinned to a version, which pins the
-    // host can be sent, as `(IDs, whether an unpinned workunit is also
-    // fine)`. An unpinned workunit is for an app with a version still sent
-    // to everyone; if all the host's versions of the app are kept only for
-    // pinned work, such a workunit cannot be sent and must not use up the
-    // window of a query. The client's own versions are none.
-    let pin_gate = |app_id: i64| -> Option<(String, bool)> {
-        if !catalog.app(app_id).is_some_and(keeps_pinned_versions) {
-            return None;
+    // The workunits of an app this host's versions can be sent, as a
+    // condition on `w`: the same test as `admitted` below, one clause for each
+    // version of the app the host can use, so that a window of unsent results
+    // is never filled with ones the host cannot be sent. See "Dispatch
+    // without a feeder" in `docs/architecture.md`. The IDs and numbers are
+    // integers of the catalog and the plan class file. The client's own
+    // versions are none: an app with a client version has no clause.
+    let version_gate = |app_id: i64| -> String {
+        let hav = catalog
+            .app(app_id)
+            .is_some_and(|a| a.homogeneous_app_version != 0);
+        let mut clauses: Vec<String> = Vec::new();
+        for v in versions.iter().filter(|v| v.appid == app_id) {
+            let Some(av) = v.av else {
+                // The client's own version takes any workunit of a plain
+                // app (`admitted` below).
+                return "1 = 1".to_string();
+            };
+            let vn = av.version_num;
+            // Uncommitted workunits: a pinned one needs this number; one that
+            // is not needs a version still sent to everyone.
+            let free = if v.pinned_only {
+                format!("w.app_version_num = {vn}")
+            } else {
+                format!("w.app_version_num IN (0, {vn})")
+            };
+            let mut clause = if hav {
+                format!(
+                    "((w.app_version_id = {} AND w.app_version_num IN (0, {vn})) \
+                     OR (w.app_version_id = 0 AND {free}))",
+                    av.id
+                )
+            } else {
+                free
+            };
+            if let Some(spec) = ctx.plan_classes.find(&av.plan_class) {
+                for (column, bound, upper) in [
+                    ("w.id", spec.min_wu_id, false),
+                    ("w.id", spec.max_wu_id, true),
+                    ("w.batch", spec.min_batch, false),
+                    ("w.batch", spec.max_batch, true),
+                ] {
+                    if bound != 0 {
+                        clause.push_str(&format!(
+                            " AND {column} {} {bound}",
+                            if upper { "<=" } else { ">=" }
+                        ));
+                    }
+                }
+            }
+            if !clauses.contains(&clause) {
+                clauses.push(clause);
+            }
         }
-        let mine = || versions.iter().filter(move |v| v.appid == app_id);
-        let ids = id_list(&mut mine().filter_map(|v| v.av.map(|a| a.id)));
-        Some((ids, mine().any(|v| !v.pinned_only)))
-    };
-    let pin_sql = |column: &str, gate: &(String, bool)| {
-        let (ids, unpinned) = gate;
-        let list: Vec<&str> = [
-            unpinned.then_some("0"),
-            (!ids.is_empty()).then_some(ids.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if list.is_empty() {
+        if clauses.is_empty() {
             "0 = 1".to_string()
         } else {
-            format!("{column} IN ({})", list.join(","))
+            format!("({})", clauses.join(" OR "))
         }
     };
     let assigned_version_gate: String = assigned_list
         .iter()
-        .filter_map(|id| {
-            pin_gate(*id).map(|g| {
-                format!(
-                    " AND NOT (w.appid = {id} AND NOT {})",
-                    pin_sql("w.app_version_id", &g)
-                )
-            })
-        })
+        .map(|id| format!(" AND (w.appid != {id} OR {})", version_gate(*id)))
         .collect();
     let assigned_class_gate: String = assigned_list
         .iter()
@@ -1972,6 +2077,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         ));
     }
     let fetch = (3 * max_send + 20).min(100);
+    // Each app's query up to its `ORDER BY`, to read the next window with.
+    let mut app_queries: Vec<(i64, String, Vec<cb_db::Value>)> = Vec::new();
     for id in &app_ids {
         // Workunits committed to another class or version are left out in the
         // query, so that a window of them at the head of the queue cannot hide
@@ -1987,9 +2094,18 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             sql.push_str(" AND w.hr_class IN (0, ?)");
             params.push(h.host_class.into());
         }
-        if let Some(gate) = pin_gate(*id) {
-            sql.push_str(&format!(" AND {}", pin_sql("w.app_version_id", &gate)));
+        sql.push_str(&format!(" AND {}", version_gate(*id)));
+        if replica_rule {
+            // A workunit the host or user already has a result of
+            // (`slow_check` in `sched/sched_check.cpp`).
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = w.id \
+                 AND r2.{} = ?)",
+                replica_who.0
+            ));
+            params.push(replica_who.1.into());
         }
+        app_queries.push((*id, sql.clone(), params.clone()));
         sql.push_str(" ORDER BY r.priority DESC, r.id LIMIT ?");
         params.push(fetch.into());
         reads.push(Stmt { sql, params });
@@ -2007,6 +2123,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let mut assigned_rows: Vec<Candidate> = Vec::new();
     let mut apps_with_work: Vec<i64> = Vec::new();
     let mut queues: Vec<(i64, std::collections::VecDeque<Candidate>)> = Vec::new();
+    // Apps whose window came back full, with the priority and ID of its last
+    // row: where the next window starts.
+    let mut windows: Vec<(i64, i32, i64)> = Vec::new();
     if !reads.is_empty() {
         let mut rows = ctx.db.batch(reads).await?.into_iter();
         if !lost.is_empty() {
@@ -2017,6 +2136,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
         for id in &app_ids {
             let mut c: Vec<Candidate> = rows.next().unwrap_or_default().decode()?;
+            // A full window may have more behind it.
+            if let Some(last) = c.last().filter(|_| c.len() >= fetch) {
+                windows.push((*id, last.result_priority, last.result_id));
+            }
             shuffle_within_priority(&mut c, ctx.random);
             queues.push((*id, c.into()));
         }
@@ -2254,39 +2377,37 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     }
 
     // Interleave the apps' candidates in proportion to app weight.
-    let mut merged: Vec<Candidate> = Vec::new();
-    let mut taken: Vec<f64> = vec![0.0; queues.len()];
-    loop {
-        let mut best: Option<(usize, f64)> = None;
-        for (i, (app_id, q)) in queues.iter().enumerate() {
-            if q.is_empty() {
-                continue;
+    let merge = |queues: &mut Vec<(i64, std::collections::VecDeque<Candidate>)>| {
+        let mut merged: Vec<Candidate> = Vec::new();
+        let mut taken: Vec<f64> = vec![0.0; queues.len()];
+        loop {
+            let mut best: Option<(usize, f64)> = None;
+            for (i, (app_id, q)) in queues.iter().enumerate() {
+                if q.is_empty() {
+                    continue;
+                }
+                let weight =
+                    catalog
+                        .app(*app_id)
+                        .map_or(1.0, |a| if a.weight > 0.0 { a.weight } else { 1.0 });
+                let key = (taken[i] + 1.0) / weight;
+                if best.is_none_or(|(_, k)| key < k) {
+                    best = Some((i, key));
+                }
             }
-            let weight =
-                catalog
-                    .app(*app_id)
-                    .map_or(1.0, |a| if a.weight > 0.0 { a.weight } else { 1.0 });
-            let key = (taken[i] + 1.0) / weight;
-            if best.is_none_or(|(_, k)| key < k) {
-                best = Some((i, key));
+            let Some((i, _)) = best else {
+                break;
+            };
+            taken[i] += 1.0;
+            if let Some(c) = queues[i].1.pop_front() {
+                merged.push(c);
             }
         }
-        let Some((i, _)) = best else {
-            break;
-        };
-        taken[i] += 1.0;
-        if let Some(c) = queues[i].1.pop_front() {
-            merged.push(c);
-        }
-    }
+        merged
+    };
+    let mut merged = merge(&mut queues);
 
     // Choose (`send_work`, `wu_is_infeasible_fast`).
-    let replica_rule = config.one_result_per_user_per_wu || config.one_result_per_host_per_wu;
-    let replica_who = if config.one_result_per_user_per_wu {
-        ("userid", user.id)
-    } else {
-        ("hostid", host.id)
-    };
     let gpu_ids = if gpu_version_ids.is_empty() {
         "0".to_string()
     } else {
@@ -2315,146 +2436,199 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let n_candidates = merged.len() + assigned_rows.len();
     let mut n_new = 0;
     let mut n_assigned = 0;
-    let mut excluded: HashSet<i64> = HashSet::new();
     // Assigned jobs first. Like upstream, they skip the feasibility checks
     // and limits but need a usable app version and a request for work; when
     // any is sent, the reply carries no other new work.
-    for assigned in [true, false] {
-        let list = if assigned {
-            std::mem::take(&mut assigned_rows)
-        } else {
-            if n_assigned > 0 {
-                break;
-            }
-            // Batch 4: workunits this user or host already has a result of.
-            if replica_rule && !merged.is_empty() {
-                let (column, who) = replica_who;
-                let mut ids: Vec<i64> = merged.iter().map(|c| c.wu.id).collect();
-                ids.sort_unstable();
-                ids.dedup();
-                let mut reads = Vec::new();
-                for chunk in ids.chunks(MAX_IN_LIST) {
-                    let mut s = Stmt::new(format!(
-                        "SELECT DISTINCT workunitid FROM result WHERE workunitid IN ({}) AND {column} = ?",
-                        in_list(chunk.len())
-                    ));
-                    for id in chunk {
-                        s = s.bind(*id);
-                    }
-                    reads.push(s.bind(who));
+    let mut round = 0;
+    loop {
+        for assigned in [true, false] {
+            let list = if assigned {
+                std::mem::take(&mut assigned_rows)
+            } else {
+                if n_assigned > 0 {
+                    break;
                 }
-                for rows in ctx.db.batch(reads).await? {
-                    for r in rows.decode::<WuIdRow>()? {
-                        excluded.insert(r.workunitid);
-                    }
-                }
-            }
-            std::mem::take(&mut merged)
-        };
-        for c in list {
-            if n_new >= max_send {
-                break;
-            }
-            if (0..NPROC).all(|pt| need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0) {
-                break;
-            }
-            if sent_wus.contains(&c.wu.id) || excluded.contains(&c.wu.id) {
-                continue;
-            }
-            let Some(app) = catalog.app(c.wu.appid) else {
-                continue;
+                std::mem::take(&mut merged)
             };
-            let hom = homog[&app.id];
-            // Homogeneous redundancy (`wu_is_infeasible_fast`): a host the
-            // type cannot place gets no unsent work, and none of a workunit
-            // committed to another class. Assigned jobs skip the first, as
-            // `send_assigned_job` does, and are held to the second by the
-            // claim.
-            if hom.hr_type != 0 {
-                if hom.unknown && !assigned {
+            for c in list {
+                if n_new >= max_send {
+                    break;
+                }
+                if (0..NPROC).all(|pt| need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0) {
+                    break;
+                }
+                if sent_wus.contains(&c.wu.id) {
                     continue;
                 }
-                if hom.other_class(&c.wu) {
-                    skipped.hr_class = true;
+                let Some(app) = catalog.app(c.wu.appid) else {
                     continue;
+                };
+                let hom = homog[&app.id];
+                // Homogeneous redundancy (`wu_is_infeasible_fast`): a host the
+                // type cannot place gets no unsent work, and none of a workunit
+                // committed to another class. Assigned jobs skip the first, as
+                // `send_assigned_job` does, and are held to the second by the
+                // claim.
+                if hom.hr_type != 0 {
+                    if hom.unknown && !assigned {
+                        continue;
+                    }
+                    if hom.other_class(&c.wu) {
+                        skipped.hr_class = true;
+                        continue;
+                    }
                 }
-            }
-            let admitted = |v: &Version<'_>| {
-                v.appid == c.wu.appid
-                    && match v.av {
-                        Some(av) => {
-                            // Homogeneous app version: a committed workunit
-                            // goes only with its version, an uncommitted one
-                            // with any that is still sent.
-                            (if hom.hav && c.wu.app_version_id != 0 {
-                                c.wu.app_version_id == av.id
-                            } else {
-                                !v.pinned_only
-                            }) && ctx.plan_classes.admits_workunit(
-                                &av.plan_class,
-                                c.wu.id,
-                                c.wu.batch,
-                            )
+                let admitted = |v: &Version<'_>| {
+                    v.appid == c.wu.appid
+                        && match v.av {
+                            Some(av) => {
+                                // Homogeneous app version: a committed workunit
+                                // goes only with its version. Otherwise a
+                                // workunit pinned to a version number goes with
+                                // that number, whether or not the version is
+                                // still sent to everyone, and an unpinned one
+                                // with a version that is (`get_app_version` in
+                                // `sched/sched_version.cpp`).
+                                (if hom.hav && c.wu.app_version_id != 0 {
+                                    c.wu.app_version_id == av.id
+                                } else {
+                                    c.wu.app_version_num != 0 || !v.pinned_only
+                                }) && (c.wu.app_version_num == 0
+                                    || av.version_num == c.wu.app_version_num)
+                                    && ctx.plan_classes.admits_workunit(
+                                        &av.plan_class,
+                                        c.wu.id,
+                                        c.wu.batch,
+                                    )
+                            }
+                            // The client's own versions are never used for an
+                            // app with homogeneous app version. A workunit
+                            // pinned to a version number is sent to them
+                            // regardless, as upstream's
+                            // `get_app_version_anonymous` does not look at it.
+                            None => !hom.hav,
                         }
-                        // The client's own versions are never used for an
-                        // app with homogeneous app version.
-                        None => !hom.hav,
-                    }
-            };
-            let mut chosen: Option<(usize, usize, f64)> = None;
-            if anonymous {
-                // The client's own versions: the fastest one that passes
-                // `get_app_version_anonymous`, with no fall back to a slower
-                // one when the job does not fit it (`wu_is_infeasible_fast`
-                // runs on the one version chosen). Assigned jobs skip the
-                // feasibility checks. A resource whose limit on jobs in
-                // progress is reached is one the client no longer needs work
-                // for (`work_needed` clears its request).
-                let at_limit = |pt: usize| {
-                    let (count, limit) = if pt != 0 {
-                        (n_gpu, gpu_limit)
-                    } else {
-                        (n_cpu, cpu_limit)
+                };
+                let mut chosen: Option<(usize, usize, f64)> = None;
+                if anonymous {
+                    // The client's own versions: the fastest one that passes
+                    // `get_app_version_anonymous`, with no fall back to a slower
+                    // one when the job does not fit it (`wu_is_infeasible_fast`
+                    // runs on the one version chosen). Assigned jobs skip the
+                    // feasibility checks. A resource whose limit on jobs in
+                    // progress is reached is one the client no longer needs work
+                    // for (`work_needed` clears its request).
+                    let at_limit = |pt: usize| {
+                        let (count, limit) = if pt != 0 {
+                            (n_gpu, gpu_limit)
+                        } else {
+                            (n_cpu, cpu_limit)
+                        };
+                        (limit > 0 && count >= limit)
+                            || (total_limit > 0 && n_cpu + n_gpu >= total_limit)
                     };
-                    (limit > 0 && count >= limit)
-                        || (total_limit > 0 && n_cpu + n_gpu >= total_limit)
-                };
-                for pt in 0..NPROC {
-                    if !assigned && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && at_limit(pt) {
-                        skipped.in_progress_limit = true;
+                    for pt in 0..NPROC {
+                        if !assigned && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && at_limit(pt)
+                        {
+                            skipped.in_progress_limit = true;
+                        }
                     }
-                }
-                let needed = |pt: usize| {
-                    (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && (assigned || !at_limit(pt))
-                };
-                let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
-                let pick = if !hom.hav {
-                    pick_anonymous(&versions, &rows, app, need_64b, &needed)
+                    let needed = |pt: usize| {
+                        (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && (assigned || !at_limit(pt))
+                    };
+                    let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
+                    let pick = if !hom.hav {
+                        pick_anonymous(&versions, &rows, app, need_64b, &needed)
+                    } else {
+                        AnonPick {
+                            chosen: None,
+                            found: true,
+                            quota_hit: Vec::new(),
+                        }
+                    };
+                    for q in &pick.quota_hit {
+                        skipped.quota = true;
+                        let m = format!("Daily job limit ({q}) has been reached");
+                        if !no_work_messages.contains(&m) {
+                            no_work_messages.push(m);
+                        }
+                    }
+                    if !pick.found && no_usable.insert((app.id, need_64b)) {
+                        no_work_messages.push(format!(
+                            "Your app_info.xml file doesn't have a usable version of {}.",
+                            app.user_friendly_name
+                        ));
+                    }
+                    if let Some(i) = pick.chosen {
+                        let v = &versions[i];
+                        let pt = proc_index(v.hu.proc_type);
+                        let est = est_secs(&c.wu, &v.hu, pt);
+                        let fits = assigned || {
+                            let mem = if v.hu.mem_usage > 0.0 {
+                                v.hu.mem_usage
+                            } else {
+                                c.wu.rsc_memory_bound
+                            };
+                            if ram > 0.0 && mem > ram {
+                                skipped.memory = true;
+                                false
+                            } else if c.wu.rsc_disk_bound > disk {
+                                skipped.disk = true;
+                                false
+                            } else if !config.ignore_delay_bound
+                                && est_delay[pt] + est > c.wu.delay_bound as f64
+                            {
+                                skipped.speed = true;
+                                false
+                            } else {
+                                true
+                            }
+                        };
+                        if fits {
+                            chosen = Some((i, pt, est));
+                        }
+                    }
+                } else if assigned {
+                    // The fastest version, preferring one for a resource the
+                    // client asks for (upstream's `get_app_version` does not
+                    // look at the request for an assigned job).
+                    let wanted = |v: &Version<'_>| {
+                        let pt = proc_index(v.hu.proc_type);
+                        need_secs[pt] > 0.0 || need_inst[pt] > 0.0
+                    };
+                    chosen = versions
+                        .iter()
+                        .position(|v| admitted(v) && wanted(v))
+                        .or_else(|| versions.iter().position(admitted))
+                        .map(|i| {
+                            let pt = proc_index(versions[i].hu.proc_type);
+                            (i, pt, est_secs(&c.wu, &versions[i].hu, pt))
+                        });
                 } else {
-                    AnonPick {
-                        chosen: None,
-                        found: true,
-                        quota_hit: Vec::new(),
-                    }
-                };
-                for q in &pick.quota_hit {
-                    skipped.quota = true;
-                    let m = format!("Daily job limit ({q}) has been reached");
-                    if !no_work_messages.contains(&m) {
-                        no_work_messages.push(m);
-                    }
-                }
-                if !pick.found && no_usable.insert((app.id, need_64b)) {
-                    no_work_messages.push(format!(
-                        "Your app_info.xml file doesn't have a usable version of {}.",
-                        app.user_friendly_name
-                    ));
-                }
-                if let Some(i) = pick.chosen {
-                    let v = &versions[i];
-                    let pt = proc_index(v.hu.proc_type);
-                    let est = est_secs(&c.wu, &v.hu, pt);
-                    let fits = assigned || {
+                    for (i, v) in versions.iter().enumerate() {
+                        if !admitted(v) {
+                            continue;
+                        }
+                        let pt = proc_index(v.hu.proc_type);
+                        if need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0 {
+                            continue;
+                        }
+                        let row = &rows[&v.gavid];
+                        if row.n_today >= row.quota {
+                            skipped.quota = true;
+                            continue;
+                        }
+                        let (count, limit) = if v.gpu {
+                            (n_gpu, gpu_limit)
+                        } else {
+                            (n_cpu, cpu_limit)
+                        };
+                        if (limit > 0 && count >= limit)
+                            || (total_limit > 0 && n_cpu + n_gpu >= total_limit)
+                        {
+                            skipped.in_progress_limit = true;
+                            continue;
+                        }
                         let mem = if v.hu.mem_usage > 0.0 {
                             v.hu.mem_usage
                         } else {
@@ -2462,230 +2636,210 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                         };
                         if ram > 0.0 && mem > ram {
                             skipped.memory = true;
-                            false
-                        } else if c.wu.rsc_disk_bound > disk {
+                            continue;
+                        }
+                        if c.wu.rsc_disk_bound > disk {
                             skipped.disk = true;
-                            false
-                        } else if !config.ignore_delay_bound
+                            continue;
+                        }
+                        let est = est_secs(&c.wu, &v.hu, pt);
+                        if !config.ignore_delay_bound
                             && est_delay[pt] + est > c.wu.delay_bound as f64
                         {
                             skipped.speed = true;
-                            false
-                        } else {
-                            true
+                            continue;
                         }
-                    };
-                    if fits {
                         chosen = Some((i, pt, est));
+                        break;
                     }
                 }
-            } else if assigned {
-                // The fastest version, preferring one for a resource the
-                // client asks for (upstream's `get_app_version` does not
-                // look at the request for an assigned job).
-                let wanted = |v: &Version<'_>| {
-                    let pt = proc_index(v.hu.proc_type);
-                    need_secs[pt] > 0.0 || need_inst[pt] > 0.0
+                let Some((i, pt, est)) = chosen else {
+                    continue;
                 };
-                chosen = versions
-                    .iter()
-                    .position(|v| admitted(v) && wanted(v))
-                    .or_else(|| versions.iter().position(admitted))
-                    .map(|i| {
-                        let pt = proc_index(versions[i].hu.proc_type);
-                        (i, pt, est_secs(&c.wu, &versions[i].hu, pt))
-                    });
-            } else {
-                for (i, v) in versions.iter().enumerate() {
-                    if !admitted(v) {
-                        continue;
-                    }
-                    let pt = proc_index(v.hu.proc_type);
-                    if need_secs[pt] <= 0.0 && need_inst[pt] <= 0.0 {
-                        continue;
-                    }
-                    let row = &rows[&v.gavid];
-                    if row.n_today >= row.quota {
-                        skipped.quota = true;
-                        continue;
-                    }
-                    let (count, limit) = if v.gpu {
-                        (n_gpu, gpu_limit)
-                    } else {
-                        (n_cpu, cpu_limit)
-                    };
-                    if (limit > 0 && count >= limit)
-                        || (total_limit > 0 && n_cpu + n_gpu >= total_limit)
-                    {
-                        skipped.in_progress_limit = true;
-                        continue;
-                    }
-                    let mem = if v.hu.mem_usage > 0.0 {
-                        v.hu.mem_usage
-                    } else {
-                        c.wu.rsc_memory_bound
-                    };
-                    if ram > 0.0 && mem > ram {
-                        skipped.memory = true;
-                        continue;
-                    }
-                    if c.wu.rsc_disk_bound > disk {
-                        skipped.disk = true;
-                        continue;
-                    }
-                    let est = est_secs(&c.wu, &v.hu, pt);
-                    if !config.ignore_delay_bound && est_delay[pt] + est > c.wu.delay_bound as f64 {
-                        skipped.speed = true;
-                        continue;
-                    }
-                    chosen = Some((i, pt, est));
-                    break;
+                let v = &versions[i];
+                let row = rows.get_mut(&v.gavid).expect("a row for every version");
+                let usage = if pt == 0 {
+                    v.hu.avg_ncpus
+                } else {
+                    v.hu.gpu_usage
                 }
-            }
-            let Some((i, pt, est)) = chosen else {
-                continue;
-            };
-            let v = &versions[i];
-            let row = rows.get_mut(&v.gavid).expect("a row for every version");
-            let usage = if pt == 0 {
-                v.hu.avg_ncpus
-            } else {
-                v.hu.gpu_usage
-            }
-            .max(0.01);
-            need_secs[pt] -= est * usage;
-            need_inst[pt] -= usage;
-            est_delay[pt] += est * usage / ninstances[pt].max(1.0);
-            disk -= c.wu.rsc_disk_bound;
-            row.n_today += 1;
-            if v.gpu {
-                n_gpu += 1;
-            } else {
-                n_cpu += 1;
-            }
-            n_new += 1;
-            if assigned {
-                n_assigned += 1;
-            }
-            sent_wus.insert(c.wu.id);
+                .max(0.01);
+                need_secs[pt] -= est * usage;
+                need_inst[pt] -= usage;
+                est_delay[pt] += est * usage / ninstances[pt].max(1.0);
+                disk -= c.wu.rsc_disk_bound;
+                row.n_today += 1;
+                if v.gpu {
+                    n_gpu += 1;
+                } else {
+                    n_cpu += 1;
+                }
+                n_new += 1;
+                if assigned {
+                    n_assigned += 1;
+                }
+                sent_wus.insert(c.wu.id);
 
-            if !row.has_row {
-                row.has_row = true;
-                writes.push(stmt!(
-                    "INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day, \
+                if !row.has_row {
+                    row.has_row = true;
+                    writes.push(stmt!(
+                        "INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day, \
                      n_jobs_today) VALUES (?, ?, ?, 0) ON CONFLICT DO NOTHING",
-                    host.id,
-                    v.gavid,
-                    daily_quota
-                ));
-            }
+                        host.id,
+                        v.gavid,
+                        daily_quota
+                    ));
+                }
 
-            let deadline = now + c.wu.delay_bound;
-            let claim = Claim {
-                result_id: c.result_id,
-                wu_id: c.wu.id,
-                host_id: host.id,
-                user_id: user.id,
-                team_id: user.teamid,
-                now,
-                deadline,
-                result_av_id: v.result_av_id,
-                version_num: if v.anonymous() { 0 } else { v.version_num },
-                gavid: v.gavid,
-                peak_flops: v.hu.peak_flops,
-                from_state: if assigned {
-                    RESULT_SERVER_STATE_INACTIVE
-                } else {
-                    RESULT_SERVER_STATE_UNSENT
-                },
-                limits: (!assigned).then(|| ClaimLimits {
-                    resource: if v.gpu { gpu_limit } else { cpu_limit },
-                    gpu: v.gpu,
-                    gpu_ids: &gpu_ids,
-                    total: total_limit,
-                    quota: row.quota,
-                }),
-                // Upstream sends at most one instance of an assigned job to
-                // a host, whatever the replica rule says.
-                one_per: if assigned {
-                    Some(("hostid", host.id))
-                } else {
-                    replica_rule.then_some(replica_who)
-                },
-                commit: hom.commit(v),
-            };
-            let claim_at = writes.len();
-            writes.push(claim.stmt());
+                let deadline = now + c.wu.delay_bound;
+                let claim = Claim {
+                    result_id: c.result_id,
+                    wu_id: c.wu.id,
+                    host_id: host.id,
+                    user_id: user.id,
+                    team_id: user.teamid,
+                    now,
+                    deadline,
+                    result_av_id: v.result_av_id,
+                    version_num: if v.anonymous() { 0 } else { v.version_num },
+                    gavid: v.gavid,
+                    peak_flops: v.hu.peak_flops,
+                    from_state: if assigned {
+                        RESULT_SERVER_STATE_INACTIVE
+                    } else {
+                        RESULT_SERVER_STATE_UNSENT
+                    },
+                    limits: (!assigned).then(|| ClaimLimits {
+                        resource: if v.gpu { gpu_limit } else { cpu_limit },
+                        gpu: v.gpu,
+                        gpu_ids: &gpu_ids,
+                        total: total_limit,
+                        quota: row.quota,
+                    }),
+                    // Upstream sends at most one instance of an assigned job to
+                    // a host, whatever the replica rule says.
+                    one_per: if assigned {
+                        Some(("hostid", host.id))
+                    } else {
+                        replica_rule.then_some(replica_who)
+                    },
+                    commit: hom.commit(v),
+                };
+                let claim_at = writes.len();
+                writes.push(claim.stmt());
 
-            // What follows the claim happens only if the claim did.
-            const CLAIMED: &str = "EXISTS (SELECT 1 FROM result WHERE id = ? AND hostid = ? \
+                // What follows the claim happens only if the claim did.
+                const CLAIMED: &str = "EXISTS (SELECT 1 FROM result WHERE id = ? AND hostid = ? \
                  AND server_state = 4 AND sent_time = ?)";
-            writes.push(stmt!(
-                format!(
+                // The counter moves only if this request's claim, the statement
+                // just before, changed a row. `CLAIMED` cannot tell it from a
+                // claim of the same result by another request of this host in the
+                // same second, which this request may have lost to.
+                writes.push(stmt!(
                     "UPDATE host_app_version SET n_jobs_today = n_jobs_today + 1 \
-                     WHERE host_id = ? AND app_version_id = ? AND {CLAIMED}"
-                ),
-                host.id,
-                v.gavid,
-                c.result_id,
-                host.id,
-                now
-            ));
-            // A job sent unreplicated to a host that has not earned it gets
-            // the app's replication after all. Not an assigned job: its
-            // extra results could go nowhere but its own host or user.
-            let trusted = row.consecutive_valid >= CONS_VALID_UNREPLICATED
-                && unit(ctx.random) > 1.0 / f64::from(row.consecutive_valid);
-            // The same statement commits the workunit to the host's class and
-            // to the version (`update_wu_on_send`): the claim above held only
-            // if the workunit was uncommitted or committed to the same.
-            let (commit_set, commit_params) = claim.commit.set();
-            // The update also checks the workunit's own commitment: another
-            // request of this host may have claimed the result in the same
-            // second, which `CLAIMED` cannot tell from this request's claim.
-            let (row_guard, guard_params) = claim.commit.row_guard();
-            let tail: Vec<cb_db::Value> = std::iter::once(c.wu.id.into())
-                .chain(guard_params)
-                .chain([c.result_id.into(), host.id.into(), now.into()])
-                .collect();
-            if !assigned && app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
-                let mut params: Vec<cb_db::Value> = vec![
-                    app.target_nresults.into(),
-                    app.target_nresults.into(),
-                    now.into(),
-                ];
-                params.extend(commit_params);
-                params.extend(tail);
-                writes.push(Stmt {
-                    sql: format!(
-                        "UPDATE workunit SET target_nresults = ?, min_quorum = ?, \
+                 WHERE host_id = ? AND app_version_id = ? AND (SELECT changes()) > 0",
+                    host.id,
+                    v.gavid
+                ));
+                // A job sent unreplicated to a host that has not earned it gets
+                // the app's replication after all. Not an assigned job: its
+                // extra results could go nowhere but its own host or user.
+                let trusted = row.consecutive_valid >= CONS_VALID_UNREPLICATED
+                    && unit(ctx.random) > 1.0 / f64::from(row.consecutive_valid);
+                // The same statement commits the workunit to the host's class and
+                // to the version (`update_wu_on_send`): the claim above held only
+                // if the workunit was uncommitted or committed to the same.
+                let (commit_set, commit_params) = claim.commit.set();
+                // The update also checks the workunit's own commitment: another
+                // request of this host may have claimed the result in the same
+                // second, which `CLAIMED` cannot tell from this request's claim.
+                let (row_guard, guard_params) = claim.commit.row_guard();
+                let tail: Vec<cb_db::Value> = std::iter::once(c.wu.id.into())
+                    .chain(guard_params)
+                    .chain([c.result_id.into(), host.id.into(), now.into()])
+                    .collect();
+                if !assigned && app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
+                    let mut params: Vec<cb_db::Value> = vec![
+                        app.target_nresults.into(),
+                        app.target_nresults.into(),
+                        now.into(),
+                    ];
+                    params.extend(commit_params);
+                    params.extend(tail);
+                    writes.push(Stmt {
+                        sql: format!(
+                            "UPDATE workunit SET target_nresults = ?, min_quorum = ?, \
                          transition_time = ?, rev = rev + 1{commit_set} \
                          WHERE id = ?{row_guard} AND {CLAIMED}"
-                    ),
-                    params,
-                });
-            } else {
-                let mut params: Vec<cb_db::Value> =
-                    vec![(deadline + i64::from(config.report_grace_period)).into()];
-                params.extend(commit_params);
-                params.extend(tail);
-                writes.push(Stmt {
-                    sql: format!(
-                        "UPDATE workunit SET transition_time = min(transition_time, ?), \
+                        ),
+                        params,
+                    });
+                } else {
+                    let mut params: Vec<cb_db::Value> =
+                        vec![(deadline + i64::from(config.report_grace_period)).into()];
+                    params.extend(commit_params);
+                    params.extend(tail);
+                    writes.push(Stmt {
+                        sql: format!(
+                            "UPDATE workunit SET transition_time = min(transition_time, ?), \
                          rev = rev + 1{commit_set} WHERE id = ?{row_guard} AND {CLAIMED}"
-                    ),
-                    params,
+                        ),
+                        params,
+                    });
+                }
+                outgoing.push(Outgoing {
+                    result_name: c.result_name,
+                    xml_doc_in: c.xml_doc_in,
+                    wu: c.wu,
+                    version: v.sending(),
+                    deadline,
+                    claim: Some(claim_at),
+                    assigned,
                 });
             }
-            outgoing.push(Outgoing {
-                result_name: c.result_name,
-                xml_doc_in: c.xml_doc_in,
-                wu: c.wu,
-                version: v.sending(),
-                deadline,
-                claim: Some(claim_at),
-                assigned,
-            });
+        }
+
+        // The window of an app can hold only jobs that this host cannot take for
+        // reasons the query does not see: memory, disk or deadline against the
+        // host. While work is still wanted and some window was full, read the
+        // next one, up to `MAX_WINDOWS` in all.
+        round += 1;
+        let still_needed = (0..NPROC).any(|pt| need_secs[pt] > 0.0 || need_inst[pt] > 0.0);
+        if n_assigned > 0
+            || n_new >= max_send
+            || !still_needed
+            || round >= MAX_WINDOWS
+            || windows.is_empty()
+        {
+            break;
+        }
+        let mut reads = Vec::new();
+        let mut ids = Vec::new();
+        for (id, priority, last) in std::mem::take(&mut windows) {
+            let Some((_, base, base_params)) = app_queries.iter().find(|q| q.0 == id) else {
+                continue;
+            };
+            let sql = format!(
+                "{base} AND (r.priority < ? OR (r.priority = ? AND r.id > ?)) \
+             ORDER BY r.priority DESC, r.id LIMIT ?"
+            );
+            let mut params = base_params.clone();
+            params.extend([priority.into(), priority.into(), last.into(), fetch.into()]);
+            reads.push(Stmt { sql, params });
+            ids.push(id);
+        }
+        queues.clear();
+        for (id, rows) in ids.into_iter().zip(ctx.db.batch(reads).await?) {
+            let mut c: Vec<Candidate> = rows.decode()?;
+            if let Some(last) = c.last().filter(|_| c.len() >= fetch) {
+                windows.push((id, last.result_priority, last.result_id));
+            }
+            shuffle_within_priority(&mut c, ctx.random);
+            queues.push((id, c.into()));
+        }
+        merged = merge(&mut queues);
+        if merged.is_empty() {
+            break;
         }
     }
 
@@ -2775,6 +2929,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
 
     if hr_blocked
         && work_requested
+        && !too_old
         && key_ok
         && !too_recent
         && !config.dont_send_jobs
@@ -2787,7 +2942,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             "notice",
         ));
     }
-    if work_requested && out.n_sent == 0 && key_ok && !too_recent {
+    if work_requested && !too_old && out.n_sent == 0 && key_ok && !too_recent {
         out.reply
             .messages
             .push(UserMessage::new("No tasks sent", "low"));
@@ -2816,6 +2971,28 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 .iter()
                 .any(|r| !r.rows.is_empty());
         }
+        // The queries leave out unsent results the host cannot be sent (a
+        // pinned version it lacks, a closed plan class window, a workunit it
+        // already has a result of), so an empty read does not mean the
+        // project has none. One probe on the index of unsent results.
+        let mut unsent_left = false;
+        if send
+            && n_candidates == 0
+            && apps_with_work.is_empty()
+            && !committed_elsewhere
+            && !app_ids.is_empty()
+        {
+            let list = id_list(&mut app_ids.iter().copied());
+            unsent_left = !ctx
+                .db
+                .run(Stmt::new(format!(
+                    "SELECT a.id AS workunitid FROM app a WHERE a.id IN ({list}) AND EXISTS \
+                     (SELECT 1 FROM result r WHERE r.server_state = 2 AND r.appid = a.id)"
+                )))
+                .await?
+                .rows
+                .is_empty();
+        }
         let mut why: Vec<String> = Vec::new();
         if config.dont_send_jobs {
             why.push("Project is not sending tasks".into());
@@ -2826,7 +3003,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if plan_messages.is_empty() && !anonymous {
                 why.push("No app version is available for this computer".into());
             }
-        } else if send && n_candidates == 0 && apps_with_work.is_empty() && !committed_elsewhere {
+        } else if send
+            && n_candidates == 0
+            && apps_with_work.is_empty()
+            && !committed_elsewhere
+            && !unsent_left
+        {
             // Not when the search never ran: a client on the anonymous
             // platform with no version for a resource it asks work for is
             // told only "No tasks sent", as upstream's `work_needed` stops

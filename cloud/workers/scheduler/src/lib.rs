@@ -1,7 +1,9 @@
 //! `POST /sched`: the scheduler RPC.
 
+use cb_core::config::DEFAULT_MAINTENANCE_DELAY;
 use cb_core::scheduler::{handle_request, SchedCtx};
 use cb_core::stock::route_scheduler;
+use cb_core::Config;
 use cb_proto::sched_reply::write_project_down;
 use cb_worker::{config, db, enqueue, now, project, random_u32, read_body, text, xml};
 use worker::{console_error, console_log, event, Context, Env, Method, Request, Response, Result};
@@ -9,10 +11,23 @@ use worker::{console_error, console_log, event, Context, Env, Method, Request, R
 /// A scheduler request with a full host description and a few hundred
 /// reported results is well under this.
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-const DOWN_DELAY_SECS: i32 = 600;
 
-fn down(message: &str) -> Result<Response> {
-    xml(write_project_down(message, DOWN_DELAY_SECS, ""))
+/// The reply for a server that cannot work (`send_message` in
+/// `sched/sched_main.cpp`): the config's `maintenance_delay`, and `<ended>`
+/// for a project that has ended. Before the config is loaded, or when it
+/// cannot be, the default delay.
+fn down(message: &str, config: Option<&Config>) -> Result<Response> {
+    let delay = config.map_or(DEFAULT_MAINTENANCE_DELAY, |c| c.maintenance_delay);
+    let extra = if config.is_some_and(|c| c.ended) {
+        "    <ended>1</ended>\n"
+    } else {
+        ""
+    };
+    xml(write_project_down(
+        message,
+        delay.clamp(0.0, f64::from(i32::MAX)) as i32,
+        extra,
+    ))
 }
 
 #[event(fetch)]
@@ -41,7 +56,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     }
     let started = cb_worker::now_ms();
     let Some(body) = read_body(&mut req, MAX_REQUEST_BYTES).await? else {
-        return down("The request is too large.");
+        return down("The request is too large.", None);
     };
     let body = String::from_utf8_lossy(&body);
     let db = db(&env)?;
@@ -49,7 +64,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         Ok(p) => p,
         Err(e) => {
             console_error!("settings: {e}");
-            return down("The project is temporarily unavailable.");
+            return down("The project is temporarily unavailable.", None);
         }
     };
     let client_ip = req.headers().get("CF-Connecting-IP")?.unwrap_or_default();
@@ -68,14 +83,20 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         Ok(out) => out,
         Err(e) => {
             console_error!("scheduler: {e}");
-            return down("The project is temporarily unavailable.");
+            return down(
+                "The project is temporarily unavailable.",
+                Some(&project.config),
+            );
         }
     };
     let reply = match out.reply.write() {
         Ok(r) => r,
         Err(e) => {
             console_error!("reply: {e}");
-            return down("The project is temporarily unavailable.");
+            return down(
+                "The project is temporarily unavailable.",
+                Some(&project.config),
+            );
         }
     };
     let elapsed = cb_worker::now_ms().saturating_sub(started);

@@ -11,6 +11,10 @@ use crate::{CoreError, CoreResult};
 /// Upper bound on the CPU count used to scale per-host limits.
 pub const MAX_NCPUS: i32 = 64;
 
+/// `maintenance_delay` when the config does not set it
+/// (`SCHED_CONFIG::parse` in `sched/sched_config.cpp`).
+pub const DEFAULT_MAINTENANCE_DELAY: f64 = 3600.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub master_url: String,
@@ -28,6 +32,16 @@ pub struct Config {
     pub min_sendwork_interval: i32,
     pub next_rpc_delay: f64,
     pub min_core_client_version: i32,
+    /// A client older than this is warned that the project will require
+    /// `min_core_client_version_announced` before
+    /// `min_core_client_upgrade_deadline` (`warn_user_if_core_client_upgrade_scheduled`
+    /// in `sched/handle_request.cpp`). 0 for no warning.
+    pub min_core_client_version_announced: i32,
+    /// Unix time at which the announced minimum applies.
+    pub min_core_client_upgrade_deadline: i64,
+    /// Seconds a client waits after a reply sent because the server could not
+    /// work (`maintenance_delay` in `sched/sched_config.cpp`).
+    pub maintenance_delay: f64,
     pub one_result_per_user_per_wu: bool,
     pub one_result_per_host_per_wu: bool,
     pub resend_lost_results: bool,
@@ -102,6 +116,9 @@ impl Default for Config {
             min_sendwork_interval: 0,
             next_rpc_delay: 0.0,
             min_core_client_version: 0,
+            min_core_client_version_announced: 0,
+            min_core_client_upgrade_deadline: 0,
+            maintenance_delay: DEFAULT_MAINTENANCE_DELAY,
             one_result_per_user_per_wu: false,
             one_result_per_host_per_wu: false,
             resend_lost_results: false,
@@ -190,6 +207,12 @@ impl Config {
                 c.min_core_client_version = if v < 10000 { v * 100 } else { v };
                 continue;
             }
+            if let Some(v) = xp.parse_int("min_core_client_version_announced") {
+                c.min_core_client_version_announced = if v != 0 && v < 10000 { v * 100 } else { v };
+                continue;
+            }
+            take!(xp.parse_long("min_core_client_upgrade_deadline") => c.min_core_client_upgrade_deadline);
+            take!(xp.parse_double("maintenance_delay") => c.maintenance_delay);
             take!(xp.parse_bool("one_result_per_user_per_wu") => c.one_result_per_user_per_wu);
             take!(xp.parse_bool("one_result_per_host_per_wu") => c.one_result_per_host_per_wu);
             take!(xp.parse_bool("resend_lost_results") => c.resend_lost_results);

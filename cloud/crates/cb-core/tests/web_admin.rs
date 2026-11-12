@@ -206,7 +206,7 @@ fn a_registered_version_is_sent_to_a_client() {
     assert_eq!(block_on(put_platform(&w.db, 2, &platform)).unwrap().id, pid);
     let app = NewApp {
         name: "worker".into(),
-        user_friendly_name: "Worker".into(),
+        user_friendly_name: Some("Worker".into()),
         ..Default::default()
     };
     let aid = block_on(put_app(&w.db, 1, &app)).unwrap();
@@ -216,7 +216,7 @@ fn a_registered_version_is_sent_to_a_client() {
         2,
         &NewApp {
             name: "w2".into(),
-            validator: "webhook".into(),
+            validator: Some("webhook".into()),
             ..Default::default()
         }
     ))
@@ -354,7 +354,7 @@ fn a_registered_version_is_sent_to_a_client() {
     assert_eq!(jobs[0].error, None);
 
     let request = format!(
-        "<scheduler_request>\n    <authenticator>{auth}</authenticator>\n    <hostid>0</hostid>\n    <rpc_seqno>1</rpc_seqno>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>0</core_client_minor_version>\n    <core_client_release>4</core_client_release>\n    <work_req_seconds>1000</work_req_seconds>\n    <cpu_req_secs>1000</cpu_req_secs>\n    <cpu_req_instances>1</cpu_req_instances>\n    <estimated_delay>0</estimated_delay>\n    <platform_name>{LINUX}</platform_name>\n<host_info>\n    <domain_name>box</domain_name>\n    <host_cpid>c0ffee</host_cpid>\n    <p_ncpus>4</p_ncpus>\n    <p_vendor>GenuineIntel</p_vendor>\n    <p_model>cpu</p_model>\n    <p_fpops>2e9</p_fpops>\n    <m_nbytes>8e9</m_nbytes>\n    <d_total>1e11</d_total>\n    <d_free>5e10</d_free>\n    <os_name>Linux</os_name>\n    <os_version>6.1</os_version>\n</host_info>\n</scheduler_request>\n"
+        "<scheduler_request>\n    <authenticator>{auth}</authenticator>\n    <hostid>0</hostid>\n    <rpc_seqno>1</rpc_seqno>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>0</core_client_minor_version>\n    <core_client_release>4</core_client_release>\n<client_cap_plan_class>1</client_cap_plan_class>\n    <work_req_seconds>1000</work_req_seconds>\n    <cpu_req_secs>1000</cpu_req_secs>\n    <cpu_req_instances>1</cpu_req_instances>\n    <estimated_delay>0</estimated_delay>\n    <platform_name>{LINUX}</platform_name>\n<host_info>\n    <domain_name>box</domain_name>\n    <host_cpid>c0ffee</host_cpid>\n    <p_ncpus>4</p_ncpus>\n    <p_vendor>GenuineIntel</p_vendor>\n    <p_model>cpu</p_model>\n    <p_fpops>2e9</p_fpops>\n    <m_nbytes>8e9</m_nbytes>\n    <d_total>1e11</d_total>\n    <d_free>5e10</d_free>\n    <os_name>Linux</os_name>\n    <os_version>6.1</os_version>\n</host_info>\n</scheduler_request>\n"
     );
     let ctx = SchedCtx {
         db: &w.db,

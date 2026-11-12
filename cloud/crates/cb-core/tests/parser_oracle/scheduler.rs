@@ -118,7 +118,7 @@ impl Req {
 
     fn xml(&self) -> String {
         let mut s = format!(
-            "<scheduler_request>\n    <authenticator>{}</authenticator>\n    <hostid>{}</hostid>\n    <rpc_seqno>{}</rpc_seqno>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>3</core_client_minor_version>\n    <core_client_release>0</core_client_release>\n    <work_req_seconds>{w}</work_req_seconds>\n    <cpu_req_secs>{w}</cpu_req_secs>\n    <cpu_req_instances>{}</cpu_req_instances>\n    <estimated_delay>0</estimated_delay>\n    <platform_name>{}</platform_name>\n",
+            "<scheduler_request>\n    <authenticator>{}</authenticator>\n    <hostid>{}</hostid>\n    <rpc_seqno>{}</rpc_seqno>\n    <core_client_major_version>8</core_client_major_version>\n    <core_client_minor_version>3</core_client_minor_version>\n    <core_client_release>0</core_client_release>\n<client_cap_plan_class>1</client_cap_plan_class>\n    <work_req_seconds>{w}</work_req_seconds>\n    <cpu_req_secs>{w}</cpu_req_secs>\n    <cpu_req_instances>{}</cpu_req_instances>\n    <estimated_delay>0</estimated_delay>\n    <platform_name>{}</platform_name>\n",
             self.auth,
             self.hostid,
             self.seqno,
@@ -171,8 +171,8 @@ impl World {
                 1,
                 &NewApp {
                     name: "worker".into(),
-                    user_friendly_name: "Worker App".into(),
-                    fraction_done_exact: true,
+                    user_friendly_name: Some("Worker App".into()),
+                    fraction_done_exact: Some(true),
                     ..Default::default()
                 },
             )

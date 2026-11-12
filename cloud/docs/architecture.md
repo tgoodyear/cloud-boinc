@@ -219,20 +219,23 @@ deadline, so neither sends a message.
    projected speed. Nothing is chosen yet, because the batch and workunit-ID gates of a plan
    class depend on the job.
 6. Batch 3 (read): candidate unsent results for the apps that have a usable version, joined
-   to their workunits, ordered by priority then age, interleaved across apps by weight (for an app
-   with homogeneous redundancy or homogeneous app version, only workunits not committed to another
-   class or version; see "Homogeneous redundancy and homogeneous app version"); plus,
+   to their workunits, ordered by priority then age, interleaved across apps by weight. The query
+   leaves out what this host cannot be sent: workunits committed to another class or version
+   (see "Homogeneous redundancy and homogeneous app version"), pinned to a version number the
+   host has no version for, or outside a plan class's workunit-ID or batch window (see "Pinned
+   jobs, kept versions and client versions"), and ones the host already has a result of. Plus,
    with `enable_assignment`, assigned jobs for this host or user (see "Assigned jobs").
 7. If an assigned job can be sent, the reply carries assigned jobs and no other new work,
    and steps 8 and 9 are skipped.
-8. Batch 4 (read, only when `one_result_per_host_per_wu` or `one_result_per_user_per_wu` is
-   set): which of the candidate workunits already have a result for this host or user, in
-   any state. A host that returned, failed or timed out on a replica must not get another
-   one (`sched/sched_check.cpp`, `slow_check`), so the in-progress list from batch 2 is not
-   enough.
+8. When `one_result_per_host_per_wu` or `one_result_per_user_per_wu` is set, the candidate
+   query itself leaves out workunits that already have a result for this host or user, in any
+   state (`NOT EXISTS` on `res_wuid`). A host that returned, failed or timed out on a replica
+   must not get another one (`sched/sched_check.cpp`, `slow_check`), so the in-progress list
+   from batch 2 is not enough. This was a read of its own, on the candidates, until a window
+   full of such workunits could hide the ones behind it (see "Dispatch without a feeder").
 9. Filter candidates in memory. For each candidate, narrow the kept versions to the ones
    that can still be sent: the batch and workunit-ID gates admit the job, the workunit is not
-   committed to another app version, the client still
+   committed to or pinned to another app version, the client still
    wants work for the version's resource (seconds or idle instances not yet filled by this
    reply, as `need_this_resource` in `sched/sched_version.cpp`), and the version's daily
    quota and in-progress limits are not used up. Take the fastest version that remains; drop
@@ -260,6 +263,29 @@ and the conditional `UPDATE ... WHERE server_state = 2` is the slot lock: D1 run
 a time, so two schedulers that pick the same result cannot both claim it. The loser sees fewer
 rows returned and sends less work; the client asks again.
 
+The window is a read of at most 100 unsent results of one app (`3 * max_send + 20`, capped),
+and only results the host could be sent are in it. Upstream's feeder fills its cache without
+regard to a host, and its scheduler scans that cache, so a cache full of work that one host
+cannot take (another platform's version, a closed plan-class window, a committed class) starves
+that host there too (`shmem_work_items` in `sched/feeder.cpp`, 100 by default). Here the query carries the host's
+conditions, built from the versions the host can use (`version_gate` in
+`crates/cb-core/src/scheduler.rs`): for each of those versions, which version numbers, pinned
+versions, committed versions and workunit-ID and batch bounds admit a workunit, joined by `OR`.
+The test is the same as the one the loop applies to a row (`admitted`), so the rows read are
+the rows the loop can send. What the query cannot see is what depends on the size of the
+job against the host: memory, disk and the deadline. A window that comes back full while the
+request still wants work and has sent less than the most it may send is followed by the
+next one (`r.priority`, `r.id` after the last row), up to `MAX_WINDOWS` (4) in all, so a host
+reaches 400 rows of an app in one request. Beyond that, jobs the host is too small for in front
+of ones it is not stay in front: the host is told what stopped it ("Tasks need more memory than
+this computer makes available") and the next request reads the same four windows. The remedy
+is to give jobs of very different sizes their own apps; size classes are not ported.
+
+A read that finds no candidate at all does not mean the project has no tasks, since the query
+leaves out what the host cannot take. When a request that wanted work gets none, one probe on
+the index of unsent results says whether there is unsent work of the host's apps: if there is,
+the reply says "No tasks sent" and not "Project has no tasks available".
+
 If D1 read latency or row reads ever limit throughput, the next step is a Durable Object that
 holds the unsent window in memory, which is the feeder again. We build it only if measurements
 show that D1 limits throughput.
@@ -281,7 +307,11 @@ RETURNING id
 ```
 
 Each claim is followed in the batch by the `host_app_version` counter update for that
-result, itself conditional on the claim having succeeded. The batch creates a missing
+result, itself conditional on the claim having succeeded: it adds one only if `SELECT changes()`
+is positive, which in the same transaction is the claim statement just before it. (The test it
+replaced, that the result was in progress for this host since this second, is also true for a
+request that lost the claim to another request of the same host in the same second, which then
+counted a job it did not send.) The batch creates a missing
 `host_app_version` row before the first claim that needs it. D1 applies a batch as one
 transaction and runs writes one at a time, so a later claim in the same batch, or in a
 concurrent request, sees the earlier ones. A request that loses the race claims fewer
@@ -426,8 +456,8 @@ another class, to give upstream's message "Tasks are committed to other platform
 - The feeder's `hr_info` balancing (`sched/hr_info.cpp`, the job cache's per-class slots and
   `hr_info.txt`) is not ported: there is no job cache, each request reads candidates for its own
   class, so nothing needs balancing. The statistics pages (`html/ops/hrclass_summary.php`,
-  `reset_hrclass.php`) are not ported; `cboinc job --name` shows a workunit's `hr_class` and
-  `app_version_id`.
+  `reset_hrclass.php`) are not ported as pages: `cboinc job --name` shows a workunit's
+  `hr_class` and `app_version_id`, and `cboinc reset-hr` releases them (see "Admin API and CLI").
 - `already_sent_to_different_hr_class` sets `hr_reject_temp` for the last job it looked at;
   the message here is given when any job was passed over for its class, or the probe above
   finds work committed elsewhere.
@@ -443,13 +473,73 @@ another class, to give upstream's message "Tasks are committed to other platform
 - `homogeneous_redundancy` outside 0 to 2 in the config is refused when the config is saved;
   upstream's feeder exits at start. Setting both a project type and an app type is
   allowed and the app's wins; upstream's feeder refuses to start with both.
-- There is no `--hr_class` for job submission, so a job cannot start out committed.
+- A job can start out committed: `hr_class` in a job object, `cboinc submit --hr-class`
+  (`create_work --hr_class`).
 - Validation does not look at a version or class: upstream's validator does not either.
 
 An app is set with `PUT /admin/v1/apps` or `cboinc app-put --name NAME --homogeneous-redundancy 0|1|2
---homogeneous-app-version true|false`. Unlike the other settings of an app, which a put replaces,
-these two stay as they are when the request leaves them out, so a put that changes a URL
-does not end a project's HR. `deploy.md` has the steps to switch it on for a running project.
+--homogeneous-app-version true|false`. Like every setting of an app, they stay as they are when
+the request leaves them out, so a put that changes a URL does not end a project's HR. `deploy.md` has the steps to switch it on for a running project.
+
+### Pinned jobs, kept versions and client versions
+
+**Pinned jobs.** `workunit.app_version_num` (`create_work --app_version_num`; `app_version_num`
+in a job object, `cboinc submit --app-version-num`) restricts a job to one version number of its
+app: `get_app_version` in `sched/sched_version.cpp` skips every version with another number,
+and takes the pinned one whether or not a newer version exists. It applies to ordinary and
+assigned jobs, and together with a homogeneous app version commitment (`app_version_id`): both
+must name the version. A job pinned to a number the host has no usable version of (another
+platform, a plan class the host fails, an older client than the version allows) waits for a host
+that has one; it is never sent with another version. A client on the anonymous platform is sent a pinned job as
+any other, as upstream's `get_app_version_anonymous` does not look at the number.
+
+**Kept versions.** Which versions the scheduler holds follows `SCHED_SHMEM::scan_tables` in
+`sched/sched_shmem.cpp`. Without `min_version` only the latest version of each platform and plan
+class is held, so a job pinned to an older one is not sent. With it, every version at or above
+`min_version` is held, and the ones that are not the latest are marked deprecated: they go
+only to jobs pinned to them (or, with homogeneous app version, committed to them), while jobs that
+are not pinned get the latest (`Catalog::superseded` and `keeps_version` in
+`crates/cb-core/src/scheduler.rs`). `cboinc app-put --min-version N` sets it. A version
+deprecated by hand is not loaded at all, as upstream (an app with homogeneous app version also
+loads those, for the workunits committed to them).
+
+**Client versions.**
+
+- `<min_core_client_version>`: a client below it gets no work and the message "Your BOINC client
+  software is too old.  Please install the current version." with a delay of a day. Its reports
+  are still accepted and its request answered: upstream's `process_request` clears
+  `ok_to_send_work` and returns early only when the request has no results. (An earlier version
+  of this server turned the client away before it read the database, so such a client could
+  not report.)
+- `<min_core_client_version_announced>` with `<min_core_client_upgrade_deadline>` (a Unix time)
+  warns a client below the announced version, in upstream's words, with the days and hours left:
+  low priority until three days remain, then a notice.
+- `app_version.min_core_version` and `max_core_version` (`cboinc version-add --min-core-version
+  --max-core-version`): a client outside the range is not sent the version, and is not told why.
+  A number below 10000 is multiplied by 100, as `scan_tables` does.
+- A plan class's `min_core_client_version` and `max_core_client_version` were handled already
+  (`PlanClassSpec::check_client_version`): "A newer BOINC may be required for some tasks." for the
+  minimum.
+- A client that does not state `<client_cap_plan_class>` is sent only versions that use one
+  CPU and no GPU (`usage_for` in `crates/cb-core/src/scheduler.rs`; `is_sequential_app`). Every
+  client since 6.x states it.
+
+**`host.misc`.** Every request writes the JSON of `host_info_json` in `sched/sched_host.cpp` to
+`host.misc`: `client_version`, `gpus` (type, model, count, RAM in MB, driver version, OpenCL
+version), `wsl`, `docker`, `vbox` and `config` (`dont_use_docker`, `dont_use_wsl`), with
+upstream's layout and key order (`crates/cb-core/src/host_misc.rs`). Differences: strings are
+JSON-escaped (upstream's are not, so a quote in a GPU name breaks its document), each is cut
+at 200 bytes, and the value is held to 8 KiB by dropping the GPU list if it grows past that
+(upstream's limit is its column's 64 KiB, cut anywhere). `host.serialnum`, the older summary
+string, is still written, as `host_summary_regex` reads it.
+
+**`maintenance_delay`.** The scheduler Worker's "project is temporarily unavailable" replies
+(settings cannot be read, the request failed, the reply could not be written) carry the config's
+`maintenance_delay`, 3600 seconds when it is not set or the config cannot be read, and
+`<ended>1</ended>` for an ended project, as `send_message` in `sched/sched_main.cpp` does. They
+carried a fixed 600 seconds before. A request that is too large is answered the same way with
+the default delay. Upstream's other use of the option, the reply while `stop_sched` exists, has
+no counterpart: nothing here stops the scheduler from answering.
 
 ### Plan classes and admission gates
 
@@ -468,6 +558,18 @@ not finite, from any plan class or from an anonymous-platform version, with `DEF
 (1e9), before the usage is used. The peak speed is stored as the result's `flops_estimate`, and
 the database keeps a NaN as 0, which would leave a result with no credit from its run time.
 Upstream has no such guard.
+
+Apple GPUs. A current client reports an Apple silicon GPU as `<coproc_apple_gpu>` (model, core
+count, `available_ram`, Metal level `metal_support`, and OpenCL properties when it has them),
+parsed by `CoprocApple` in `crates/cb-proto/src/coproc.rs` and stored in `host.misc` as a GPU of
+type `apple` (`driver_version` is the Metal level). A plan class selects it with
+`<gpu_type>apple_gpu</gpu_type>` or `<gpu_type>apple</gpu_type>`; both check `min_metal_support`
+and `min_gpu_ram_mb` against the client's `available_ram`, and both make the version an Apple GPU
+version that counts against the host's GPU limits. Upstream's host check knows only `apple`
+(a version of such a class runs as a CPU version there, since its processor type comes from
+`apple_gpu`) and finds `apple_gpu` as a generic coprocessor with no Metal check and no RAM figure.
+`<max_gpu_ram_mb>` is an addition: the most GPU RAM a host may have for the class, to keep
+a small-memory version off hosts that suit a larger one; a GPU whose RAM is not known passes it.
 
 ### Anonymous platform
 
@@ -1580,9 +1682,9 @@ trip on D1.
 | `status`, `catalog` | project counts; platforms, apps and app versions |
 | `platforms`, `apps` | create, update; an app's homogeneous redundancy type and homogeneous app version switch are set here |
 | `app-versions` | upload signed files and register, deprecate, restore |
-| `config` | project settings, plan classes, public keys |
+| `config` | project settings, plan classes, public keys; one tag of the config at a time |
 | `files` | stage inputs (upload, or register an object already in the bucket); a stored name keeps its contents unless the caller asks to replace them |
-| `jobs` | submit a batch of workunits in one call, query, cancel |
+| `jobs` | submit a batch of workunits in one call, query, cancel, release from an HR class or app version |
 | `assimilate`, `outputs` | list finished work, fetch output files, acknowledge |
 | `users`, `hosts` | create an account, block a user, set a host's daily result limit |
 
@@ -1611,12 +1713,16 @@ Differences:
   `project.xml` into SQL as it is), which covers every name in upstream's `tools/project.xml`.
 - A name has one row, by a unique index and one upsert; upstream's `platform` table has no
   unique key on the name, and `xadd` relies on looking first.
-- `put_app` replaces the whole app row: a field the request leaves out goes back to its default,
-  including `min_version`, `beta`, `weight` and `deprecated`, and `cboinc app-put` sends only
-  the name, user-friendly name, validator, its URLs and `target_nresults`. `xadd` updates only
-  the user-friendly name or `min_version` of an existing app (one of them per run: its
-  `else if` skips `min_version` when the name also changed) and never changes the other
-  fields. This is not changed: an app is put with every field it should have, through the API.
+- `put_app` writes the settings the request states and keeps the rest of an existing app's
+  row (every field of `NewApp` is optional; `cboinc app-put` sends only the flags it is given).
+  A new app takes the defaults: weight 1, the name as its friendly name, the `trivial`
+  validator. The validator is checked against what the app will have, so `--weight 2` on an app
+  with a webhook validator does not need the URL again, and clearing the URL of a webhook
+  validator is refused. `xadd` updates only the user-friendly name or `min_version` of an
+  existing app (one of them per run: its `else if` skips `min_version` when the name also
+  changed) and never changes the other fields; here any stated field of an existing app is
+  changed. (An earlier version replaced the whole row, so a put that left `min_version`, `beta`,
+  `weight` or `deprecated` out reset it.)
 
 Job submission takes many workunits per request and writes them in batched statements, since
 the reference pipeline submits in chunks of hundreds. `POST /admin/v1/jobs` takes
@@ -1627,7 +1733,38 @@ bounds, `delay_bound`, `min_quorum`, `target_nresults`, the `max_*_results` limi
 (see "Assigned jobs"). Unset numbers come from the input template, then from the upstream
 `create_work` defaults (`JobSpec` in `crates/cb-core/src/work.rs`). `cboinc submit` builds the
 job objects from its flags, with `--target-host` and `--target-user` for `assign`, or reads
-them from a file given with `--jobs`.
+them from a file given with `--jobs`. A job object also takes `app_version_num` (the job goes
+only with that version number of its app; see "Pinned jobs, kept versions and client versions")
+and `hr_class` (the job starts committed to a homogeneous redundancy class), as `create_work`'s
+`--app_version_num` and `--hr_class`; `cboinc submit` has `--app-version-num` and `--hr-class`.
+Neither is checked against the project's versions or classes, as upstream does not: a job pinned
+to a version number nobody has waits.
+
+`cboinc reset-hr` (`POST /admin/v1/jobs/reset-hr`) releases workunits from the class or app
+version their first sent result committed them to, so their remaining results may go to any
+host. `--hr-class N` releases every workunit committed to that class, which is what
+`html/ops/reset_hrclass.php` does (it sets `hr_class` to 0 for the class and nothing else). `--name
+NAME` (repeatable) releases single workunits, and `--app-version` also releases the app
+version commitment (`--keep-hr-class` with it releases only that), which the upstream page
+cannot do. Results already sent stay where they are. Only workunits with something committed are
+changed, and the reply counts them.
+
+**One tag of the config.** `PUT /admin/v1/config` replaces the whole document, so two operators
+who each read it, change a tag and write it back undo each other. `cboinc config-set --tag T
+--value V` and `config-unset --tag T` (`PUT` and `DELETE /admin/v1/config/config/tags/<tag>`) read
+the stored config on the server, change that one top-level element of `<config>` in place (the
+rest of the text is not touched, including the `<daemons>` list and comments), and write it back
+only if the document is still the one read; if another write got in between, the change is made
+again to the new document, up to five times, and then refused with a conflict. The result must
+pass the same checks as a whole-config write, so an edit that would leave the config unparseable,
+without a master URL, or with a bad sender address is refused and nothing is stored. A tag stated
+twice keeps the first and loses the rest. The reply gives the value the tag had and whether the
+document changed. A flag is set with `--value 1`.
+
+An app version takes up to 1000 files (`MAX_VERSION_FILES` in `crates/cb-core/src/admin.rs`; it
+was 40) and a description of at most 1 MiB, under D1's limit of a row. The lookups and the
+`no_delete` updates run 90 names to a statement in one batch, so a version of 1000 files is 12
+statements each way.
 
 ## Cost model
 
@@ -1738,6 +1875,11 @@ removed by hand.
 certificates are checked.
 
 Not implemented yet:
+
+- `stop_sched` and `stop_upload` equivalents (a freeze that refuses every request).
+- `wu_is_infeasible_custom`, the hook where a project edits `sched/sched_customize.cpp`.
+- Gates on the size of a job against the host in the candidate query (memory, disk, deadline);
+  they apply to the rows read, up to four windows.
 
 - In the scheduler: assigned jobs for teams and broadcast (`multi`) assignments, locality
   scheduling, size classes, and the client workload simulation behind upstream's deadline check.

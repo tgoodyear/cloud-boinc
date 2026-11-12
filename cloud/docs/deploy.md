@@ -184,6 +184,12 @@ for `config`, `code_sign_public_key` and `upload_public_key`, then `platform-put
 finished work. The pipeline deletes a workunit's files once it is acknowledged and
 `delete_delay_hours` have passed.
 
+To change one option of a running project's config, use `cboinc config-set --tag <tag> --value
+<value>` (and `config-unset --tag <tag>`), not `config-put`: `config-put` replaces the whole
+document with the file's, so an operator who read the config before another changed it writes
+the old values back. `config-set` edits the stored text on the server and writes it only if
+nothing changed it meanwhile.
+
 ## Purge
 
 Set `<purge_days>` in the config to have finished workunits and their results removed from

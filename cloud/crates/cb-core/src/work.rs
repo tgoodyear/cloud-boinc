@@ -40,6 +40,12 @@ pub struct JobSpec {
     pub max_error_results: Option<i32>,
     pub max_total_results: Option<i32>,
     pub max_success_results: Option<i32>,
+    /// Send the job only with this version number of its app
+    /// (`create_work --app_version_num`; `workunit.app_version_num`).
+    pub app_version_num: Option<i32>,
+    /// Start the job committed to this homogeneous redundancy class
+    /// (`create_work --hr_class`).
+    pub hr_class: Option<i32>,
     /// Send the job only to this host, or only to this user's hosts
     /// (`create_work --target_host` and `--target_user`).
     pub assign: Option<Assign>,
@@ -159,8 +165,18 @@ fn build_workunit(
         target_nresults,
         max_error_results,
         max_total_results,
-        max_success_results
+        max_success_results,
+        app_version_num,
+        hr_class
     );
+    if wu.app_version_num < 0 {
+        return Err(CoreError::Invalid(
+            "app_version_num must not be negative".into(),
+        ));
+    }
+    if wu.hr_class < 0 {
+        return Err(CoreError::Invalid("hr_class must not be negative".into()));
+    }
     // The checks of create_work() in tools/backend_lib.cpp.
     let bad = |what: &str| Err(CoreError::Invalid(format!("{what} must be positive")));
     if wu.rsc_fpops_est <= 0.0 {
@@ -255,8 +271,8 @@ fn insert_workunit_stmt(wu: &Workunit) -> Stmt {
         "INSERT INTO workunit (create_time, appid, name, xml_doc, batch, rsc_fpops_est, rsc_fpops_bound, \
          rsc_memory_bound, rsc_disk_bound, transition_time, delay_bound, min_quorum, target_nresults, \
          max_error_results, max_total_results, max_success_results, result_template, priority, mod_time, \
-         rsc_bandwidth_bound, transitioner_flags) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         rsc_bandwidth_bound, transitioner_flags, app_version_num, hr_class) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         wu.create_time,
         wu.appid,
         wu.name.as_str(),
@@ -277,7 +293,9 @@ fn insert_workunit_stmt(wu: &Workunit) -> Stmt {
         wu.priority,
         wu.mod_time,
         wu.rsc_bandwidth_bound,
-        wu.transitioner_flags
+        wu.transitioner_flags,
+        wu.app_version_num,
+        wu.hr_class
     )
 }
 

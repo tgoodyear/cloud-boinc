@@ -1,6 +1,8 @@
 //! Project administration: what upstream does with `xadd`, `update_versions`
 //! and the ops pages. Every function is one admin API operation.
 
+use std::collections::HashMap;
+
 use cb_crypto::{verify_md5, PublicKey};
 use cb_db::{query, query_one, stmt, Db, Stmt, Value};
 use cb_proto::upload::is_valid_filename;
@@ -10,6 +12,17 @@ use serde::{Deserialize, Serialize};
 use crate::hr::HR_NTYPES;
 use crate::model::{App, AppVersion, JobResult, Platform, Workunit};
 use crate::{Config, CoreError, CoreResult};
+
+/// Most names in one `IN (...)` list; D1 allows 100 bound parameters.
+const MAX_IN_LIST: usize = 90;
+/// Most files in one app version. Each statement takes 90 names, and a
+/// request may run about 50 statements on D1's free plan, so this leaves the
+/// batches of `add_app_version` well within that.
+pub const MAX_VERSION_FILES: usize = 1000;
+/// Longest description of an app version. D1 limits a row to 2 MB; the
+/// scheduler keeps every version's description in memory and sends it in
+/// replies.
+pub const MAX_VERSION_XML: usize = 1024 * 1024;
 
 fn invalid<T>(msg: impl Into<String>) -> CoreResult<T> {
     Err(CoreError::Invalid(msg.into()))
@@ -119,65 +132,66 @@ pub async fn put_platform(db: &dyn Db, now: i64, p: &NewPlatform) -> CoreResult<
     })
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// An app to create or change. A setting left out (`None`) keeps the stored
+/// value of an existing app, and takes the default for a new one.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct NewApp {
     pub name: String,
-    pub user_friendly_name: String,
-    pub weight: f64,
-    pub beta: bool,
+    /// New apps: the name.
+    pub user_friendly_name: Option<String>,
+    /// New apps: 1.
+    pub weight: Option<f64>,
+    pub beta: Option<bool>,
     /// Above 1 turns on adaptive replication for the app.
-    pub target_nresults: i32,
-    pub non_cpu_intensive: bool,
-    pub fraction_done_exact: bool,
-    pub min_version: i32,
-    pub deprecated: bool,
-    /// `trivial`, `bitwise` or `webhook`.
-    pub validator: String,
-    pub validator_url: String,
-    pub assimilate_url: String,
-    /// Homogeneous redundancy type: 0 for none, 1 fine, 2 coarse. Left as it
-    /// is when absent, unlike the other settings, which a put replaces: a put
-    /// that only changes a URL must not end a project's HR.
+    pub target_nresults: Option<i32>,
+    pub non_cpu_intensive: Option<bool>,
+    pub fraction_done_exact: Option<bool>,
+    pub min_version: Option<i32>,
+    pub deprecated: Option<bool>,
+    /// `trivial`, `bitwise` or `webhook`. New apps: `trivial`.
+    pub validator: Option<String>,
+    pub validator_url: Option<String>,
+    pub assimilate_url: Option<String>,
+    /// Homogeneous redundancy type: 0 for none, 1 fine, 2 coarse.
     pub homogeneous_redundancy: Option<i32>,
-    /// Send all results of a workunit with one app version. Left as it is
-    /// when absent.
+    /// Send all results of a workunit with one app version.
     pub homogeneous_app_version: Option<bool>,
 }
 
-impl Default for NewApp {
-    fn default() -> Self {
-        NewApp {
-            name: String::new(),
-            user_friendly_name: String::new(),
-            weight: 1.0,
-            beta: false,
-            target_nresults: 0,
-            non_cpu_intensive: false,
-            fraction_done_exact: false,
-            min_version: 0,
-            deprecated: false,
-            validator: "trivial".into(),
-            validator_url: String::new(),
-            assimilate_url: String::new(),
-            homogeneous_redundancy: None,
-            homogeneous_app_version: None,
-        }
-    }
-}
-
-/// Creates the app or updates the one with this name.
+/// Creates the app or updates the one with this name. The settings the call
+/// states are written; the others stay as they are. (`xadd` has no such
+/// call: it rewrites the app from `project.xml`.)
 pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
     if !is_name(&a.name) {
         return invalid("app: bad name");
     }
-    if !["trivial", "bitwise", "webhook"].contains(&a.validator.as_str()) {
+    let existing: Option<App> = query_one(
+        db,
+        stmt!("SELECT * FROM app WHERE name = ?", a.name.as_str()),
+    )
+    .await?;
+    // What the app will have: the validators are checked against the whole.
+    let validator = a
+        .validator
+        .clone()
+        .or_else(|| existing.as_ref().map(|e| e.validator.clone()))
+        .unwrap_or_else(|| "trivial".into());
+    let validator_url = a
+        .validator_url
+        .clone()
+        .or_else(|| existing.as_ref().map(|e| e.validator_url.clone()))
+        .unwrap_or_default();
+    if !["trivial", "bitwise", "webhook"].contains(&validator.as_str()) {
         return invalid("app: validator must be trivial, bitwise or webhook");
     }
-    if a.validator == "webhook" && !a.validator_url.starts_with("https://") {
+    if validator == "webhook" && !validator_url.starts_with("https://") {
         return invalid("app: the webhook validator needs an https validator_url");
     }
-    if !a.assimilate_url.is_empty() && !a.assimilate_url.starts_with("https://") {
+    if a.assimilate_url
+        .as_ref()
+        .is_some_and(|u| !u.is_empty() && !u.starts_with("https://"))
+    {
         return invalid("app: assimilate_url must be https");
     }
     if let Some(t) = a.homogeneous_redundancy {
@@ -185,48 +199,62 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
             return invalid("app: homogeneous_redundancy must be 0 (none), 1 (fine) or 2 (coarse)");
         }
     }
-    let friendly = if a.user_friendly_name.is_empty() {
-        &a.name
-    } else {
-        &a.user_friendly_name
-    };
-    // NULL keeps the stored value of an existing app, and is 0 for a new one.
-    let hr_type = a.homogeneous_redundancy.map_or(Value::Null, Value::from);
-    let hav = a
-        .homogeneous_app_version
-        .map_or(Value::Null, |b| Value::from(i32::from(b)));
+    let friendly = a
+        .user_friendly_name
+        .as_deref()
+        .filter(|f| !f.is_empty())
+        .unwrap_or(&a.name);
+    // NULL keeps the stored value of an existing app.
+    fn keep<T: Into<Value>>(x: Option<T>) -> Value {
+        x.map_or(Value::Null, Into::into)
+    }
+    let flag = |x: Option<bool>| x.map(i32::from);
     let rows = db
         .run(stmt!(
             "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, target_nresults, \
              non_cpu_intensive, fraction_done_exact, min_version, deprecated, validator, validator_url, \
              assimilate_url, homogeneous_redundancy, homogeneous_app_version) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, 0), coalesce(?, 0)) \
-             ON CONFLICT (name) DO UPDATE SET user_friendly_name = excluded.user_friendly_name, \
-             weight = excluded.weight, beta = excluded.beta, target_nresults = excluded.target_nresults, \
-             non_cpu_intensive = excluded.non_cpu_intensive, \
-             fraction_done_exact = excluded.fraction_done_exact, min_version = excluded.min_version, \
-             deprecated = excluded.deprecated, validator = excluded.validator, \
-             validator_url = excluded.validator_url, assimilate_url = excluded.assimilate_url, \
+             VALUES (?, ?, ?, coalesce(?, 1.0), coalesce(?, 0), coalesce(?, 0), coalesce(?, 0), \
+             coalesce(?, 0), coalesce(?, 0), coalesce(?, 0), ?, ?, coalesce(?, ''), coalesce(?, 0), \
+             coalesce(?, 0)) \
+             ON CONFLICT (name) DO UPDATE SET \
+             user_friendly_name = coalesce(?, app.user_friendly_name), \
+             weight = coalesce(?, app.weight), beta = coalesce(?, app.beta), \
+             target_nresults = coalesce(?, app.target_nresults), \
+             non_cpu_intensive = coalesce(?, app.non_cpu_intensive), \
+             fraction_done_exact = coalesce(?, app.fraction_done_exact), \
+             min_version = coalesce(?, app.min_version), deprecated = coalesce(?, app.deprecated), \
+             validator = excluded.validator, validator_url = excluded.validator_url, \
+             assimilate_url = coalesce(?, app.assimilate_url), \
              homogeneous_redundancy = coalesce(?, app.homogeneous_redundancy), \
              homogeneous_app_version = coalesce(?, app.homogeneous_app_version) \
              RETURNING id",
             now,
             a.name.as_str(),
-            friendly.as_str(),
-            a.weight,
-            a.beta,
-            a.target_nresults,
-            a.non_cpu_intensive,
-            a.fraction_done_exact,
-            a.min_version,
-            a.deprecated,
-            a.validator.as_str(),
-            a.validator_url.as_str(),
-            a.assimilate_url.as_str(),
-            hr_type.clone(),
-            hav.clone(),
-            hr_type,
-            hav
+            friendly,
+            keep(a.weight),
+            keep(flag(a.beta)),
+            keep(a.target_nresults),
+            keep(flag(a.non_cpu_intensive)),
+            keep(flag(a.fraction_done_exact)),
+            keep(a.min_version),
+            keep(flag(a.deprecated)),
+            validator.as_str(),
+            validator_url.as_str(),
+            keep(a.assimilate_url.clone()),
+            keep(a.homogeneous_redundancy),
+            keep(flag(a.homogeneous_app_version)),
+            keep(a.user_friendly_name.clone().filter(|f| !f.is_empty())),
+            keep(a.weight),
+            keep(flag(a.beta)),
+            keep(a.target_nresults),
+            keep(flag(a.non_cpu_intensive)),
+            keep(flag(a.fraction_done_exact)),
+            keep(a.min_version),
+            keep(flag(a.deprecated)),
+            keep(a.assimilate_url.clone()),
+            keep(a.homogeneous_redundancy),
+            keep(flag(a.homogeneous_app_version))
         ))
         .await?;
     Ok(rows.scalar_i64().unwrap_or(0))
@@ -290,8 +318,10 @@ pub async fn add_app_version(
     if !v.plan_class.is_empty() && !is_name(&v.plan_class) {
         return invalid("app version: bad plan class name");
     }
-    if v.files.is_empty() || v.files.len() > 40 {
-        return invalid("app version: between 1 and 40 files");
+    if v.files.is_empty() || v.files.len() > MAX_VERSION_FILES {
+        return invalid(format!(
+            "app version: between 1 and {MAX_VERSION_FILES} files"
+        ));
     }
     if v.files.iter().filter(|f| f.main_program).count() != 1 {
         return invalid("app version: exactly one file must be the main program");
@@ -300,17 +330,22 @@ pub async fn add_app_version(
         stmt!("SELECT * FROM app WHERE name = ?", v.app.as_str()),
         stmt!("SELECT * FROM platform WHERE name = ?", v.platform.as_str()),
     ];
-    let mut files = Stmt::new(format!(
-        "SELECT name, nbytes, md5 FROM job_file WHERE name IN ({})",
-        vec!["?"; v.files.len()].join(", ")
-    ));
     for f in &v.files {
         if !is_valid_filename(&f.name) || f.name.contains('/') || f.name.is_empty() {
             return invalid(format!("app version: bad file name {:?}", f.name));
         }
-        files = files.bind(f.name.as_str());
     }
-    lookups.push(files);
+    // D1 binds at most 100 values to a statement.
+    for chunk in v.files.chunks(MAX_IN_LIST) {
+        let mut files = Stmt::new(format!(
+            "SELECT name, nbytes, md5 FROM job_file WHERE name IN ({})",
+            vec!["?"; chunk.len()].join(", ")
+        ));
+        for f in chunk {
+            files = files.bind(f.name.as_str());
+        }
+        lookups.push(files);
+    }
     let mut out = db.batch(lookups).await?.into_iter();
     let app: App = out
         .next()
@@ -322,11 +357,15 @@ pub async fn add_app_version(
         .unwrap_or_default()
         .first()?
         .ok_or_else(|| CoreError::NotFound(format!("platform {}", v.platform)))?;
-    let staged: Vec<StagedRow> = out.next().unwrap_or_default().decode()?;
+    let mut staged: Vec<StagedRow> = Vec::new();
+    for rows in out {
+        staged.extend(rows.decode::<StagedRow>()?);
+    }
+    let staged: HashMap<&str, &StagedRow> = staged.iter().map(|r| (r.name.as_str(), r)).collect();
 
     let mut xml = String::new();
     for f in &v.files {
-        let Some(s) = staged.iter().find(|s| s.name == f.name) else {
+        let Some(s) = staged.get(f.name.as_str()) else {
             return Err(CoreError::NotFound(format!(
                 "file {} is not staged",
                 f.name
@@ -399,6 +438,12 @@ pub async fn add_app_version(
         }
     }
     xml.push_str("</app_version>\n");
+    if xml.len() > MAX_VERSION_XML {
+        return invalid(format!(
+            "app version: its description is {} bytes, over the {MAX_VERSION_XML} a row holds",
+            xml.len()
+        ));
+    }
 
     let mut writes = vec![stmt!(
         "INSERT INTO app_version (create_time, appid, version_num, platformid, xml_doc, \
@@ -415,14 +460,16 @@ pub async fn add_app_version(
         v.beta
     )];
     // App files outlive the jobs that use them.
-    let mut keep = Stmt::new(format!(
-        "UPDATE job_file SET no_delete = 1 WHERE name IN ({})",
-        vec!["?"; v.files.len()].join(", ")
-    ));
-    for f in &v.files {
-        keep = keep.bind(f.name.as_str());
+    for chunk in v.files.chunks(MAX_IN_LIST) {
+        let mut keep = Stmt::new(format!(
+            "UPDATE job_file SET no_delete = 1 WHERE name IN ({})",
+            vec!["?"; chunk.len()].join(", ")
+        ));
+        for f in chunk {
+            keep = keep.bind(f.name.as_str());
+        }
+        writes.push(keep);
     }
-    writes.push(keep);
     let done = db.batch(writes).await?;
     match done.first().and_then(|r| r.scalar_i64()) {
         Some(id) => Ok(id),
@@ -490,6 +537,8 @@ pub struct JobStatus {
     pub hr_class: i32,
     /// The app version it is committed to (homogeneous app version); 0 if none.
     pub app_version_id: i64,
+    /// The version number the workunit is pinned to; 0 if none.
+    pub app_version_num: i32,
     pub results: Vec<ResultStatus>,
 }
 
@@ -541,6 +590,7 @@ pub async fn job_status(db: &dyn Db, name: &str) -> CoreResult<Option<JobStatus>
         transition_time: wu.transition_time,
         hr_class: wu.hr_class,
         app_version_id: wu.app_version_id,
+        app_version_num: wu.app_version_num,
         results: results
             .into_iter()
             .map(|r| ResultStatus {
@@ -562,6 +612,86 @@ pub async fn job_status(db: &dyn Db, name: &str) -> CoreResult<Option<JobStatus>
             })
             .collect(),
     }))
+}
+
+/// Which workunits `reset_homogeneous` releases.
+#[derive(Debug, Clone)]
+pub enum ResetTarget {
+    /// Every workunit committed to this homogeneous redundancy class.
+    Class(i32),
+    /// These workunits, by name.
+    Names(Vec<String>),
+}
+
+/// What to release.
+#[derive(Debug, Clone, Copy)]
+pub struct ResetWhat {
+    /// The homogeneous redundancy class the workunit is committed to.
+    pub hr_class: bool,
+    /// The app version it is committed to (homogeneous app version).
+    pub app_version: bool,
+}
+
+/// Releases workunits from the class or app version their first sent result
+/// committed them to, so the next result may go to any host. For a class this
+/// is `html/ops/reset_hrclass.php`, which sets `hr_class` to 0 for every
+/// workunit in it; that page cannot release a single workunit or an app
+/// version, which this can. A result already sent stays where it is; only
+/// the choice for the results still to be sent changes. Returns the number of
+/// workunits changed.
+pub async fn reset_homogeneous(
+    db: &dyn Db,
+    target: &ResetTarget,
+    what: ResetWhat,
+    now: i64,
+) -> CoreResult<usize> {
+    if !what.hr_class && !what.app_version {
+        return invalid("reset: nothing to reset");
+    }
+    let mut set = String::from("mod_time = ?, rev = rev + 1");
+    let mut cond = Vec::new();
+    if what.hr_class {
+        set.push_str(", hr_class = 0");
+        cond.push("hr_class != 0");
+    }
+    if what.app_version {
+        set.push_str(", app_version_id = 0");
+        cond.push("app_version_id != 0");
+    }
+    // Only workunits that have something to release.
+    let committed = format!("({})", cond.join(" OR "));
+    let mut stmts = Vec::new();
+    match target {
+        ResetTarget::Class(class) => {
+            if *class <= 0 {
+                return invalid("reset: hr_class must be positive");
+            }
+            stmts.push(stmt!(
+                format!(
+                    "UPDATE workunit SET {set} WHERE hr_class = ? AND {committed} RETURNING id"
+                ),
+                now,
+                *class
+            ));
+        }
+        ResetTarget::Names(names) => {
+            for chunk in names.chunks(MAX_IN_LIST) {
+                let mut s = Stmt::new(format!(
+                    "UPDATE workunit SET {set} WHERE name IN ({}) AND {committed} RETURNING id",
+                    vec!["?"; chunk.len()].join(", ")
+                ))
+                .bind(now);
+                for n in chunk {
+                    s = s.bind(n.as_str());
+                }
+                stmts.push(s);
+            }
+        }
+    }
+    if stmts.is_empty() {
+        return Ok(0);
+    }
+    Ok(db.batch(stmts).await?.iter().map(|r| r.rows.len()).sum())
 }
 
 /// Blocks or unblocks an account; a blocked account's scheduler requests
