@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use cb_core::feed::parse_feed;
 use cb_core::mail::Mailer;
 use cb_core::site::{
-    auth_from_cookie, robots_txt, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS,
+    auth_from_cookie, not_found_headers, not_found_page, robots_txt, site_page, wants_html_404,
+    SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS,
 };
 use cb_core::site_boards::{public_cache_key, CACHE_SECS, PUBLIC_PATHS};
 use cb_core::site_work::{work, FeedState};
@@ -53,6 +54,15 @@ fn cacheable_xml(body: String) -> Result<Response> {
 
 /// A site page. These depend on the visitor's cookie, so no cache keeps them.
 fn site_response(page: SitePage, robots_tag: &str) -> Result<Response> {
+    site_response_with(page, robots_tag, &[])
+}
+
+/// [`site_response`] with more headers, set last.
+fn site_response_with(
+    page: SitePage,
+    robots_tag: &str,
+    extra: &[(&str, &str)],
+) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", page.content_type)?;
     headers.set("Cache-Control", &html_cache_control("private, no-store"))?;
@@ -70,6 +80,9 @@ fn site_response(page: SitePage, robots_tag: &str) -> Result<Response> {
     // One header line per cookie: they cannot be joined.
     for cookie in page.set_cookie.iter().chain(&page.more_cookies) {
         headers.append("Set-Cookie", cookie)?;
+    }
+    for (name, value) in extra {
+        headers.set(name, value)?;
     }
     Ok(Response::builder()
         .with_status(page.status)
@@ -469,6 +482,27 @@ async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
                 }
             }
         }
-        _ => text(404, "not found\n"),
+        // A browser asking for a page that does not exist gets the styled page;
+        // clients, tools and every method but GET keep the plain text.
+        _ => {
+            let accept = req.headers().get("Accept")?;
+            let html = wants_html_404(req.method() == Method::Get, &path, accept.as_deref());
+            let extra = not_found_headers(html);
+            if html {
+                site_response_with(
+                    not_found_page(&project, &base),
+                    &project.config.robots_tag,
+                    extra,
+                )
+            } else {
+                let mut builder = Response::builder()
+                    .with_status(404)
+                    .with_header("Content-Type", "text/plain; charset=utf-8")?;
+                for (name, value) in extra {
+                    builder = builder.with_header(name, value)?;
+                }
+                Ok(builder.fixed(b"not found\n".to_vec()))
+            }
+        }
     }
 }

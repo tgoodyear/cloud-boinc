@@ -100,7 +100,7 @@ impl SitePage {
         }
     }
 
-    fn xml(body: String) -> SitePage {
+    pub(crate) fn xml(body: String) -> SitePage {
         SitePage {
             status: 200,
             content_type: XML,
@@ -177,7 +177,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 33] = [
+pub const SITE_PATHS: [&str; 34] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -211,6 +211,7 @@ pub const SITE_PATHS: [&str; 33] = [
     "/activity.php",
     "/delete_account_request.php",
     "/delete_account_confirm.php",
+    "/apps.php",
 ];
 
 /// Headers every site page is sent with: no framing by another site (the
@@ -308,6 +309,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/activity.php" => site_work::activity(ctx, q).await?,
         "/delete_account_request.php" => site_delete::delete_account_request(ctx, q).await?,
         "/delete_account_confirm.php" => site_delete::delete_account_confirm(ctx, q).await?,
+        "/apps.php" => crate::site_apps::apps(ctx, q),
         _ => return Ok(None),
     }))
 }
@@ -464,6 +466,107 @@ pub(crate) fn error_page(project: &Project, status: u16, msg: &str) -> SitePage 
             &format!("<p class=\"error\">{}</p>\n", html_escape(msg)),
         ),
     )
+}
+
+/// Whether `path` is one a BOINC client, an account manager or a tool calls
+/// and not a person: the web RPCs (`lookup_account.php`, `create_account.php`
+/// and any `*_account.php`, `am_*.php`, `get_project_config.php`,
+/// `server_status.php`) and the scheduler, upload and download paths. An
+/// unknown path of this kind gets the plain-text 404, so that a program that
+/// parses the reply does not get a page.
+pub fn is_rpc_path(path: &str) -> bool {
+    // Compared in lower case and without trailing slashes: a path that is
+    // only spelled differently from an RPC path is not a person's page.
+    let path = path.to_ascii_lowercase();
+    let path = path.trim_end_matches('/');
+    let name = path.rsplit('/').next().unwrap_or_default();
+    name.ends_with("_account.php")
+        || name.starts_with("am_")
+        || name == "get_project_config.php"
+        || name == "server_status.php"
+        || name == "file_upload_handler"
+        || path.split('/').any(|seg| {
+            matches!(seg, "cgi" | "cgi-bin" | "download" | "upload" | "sched")
+                || seg.ends_with("_cgi")
+        })
+}
+
+/// The quality value of an `Accept` parameter list is usable: `0` or `1`,
+/// optionally followed by a point and up to three digits (RFC 9110, weight).
+fn parse_q(v: &str) -> Option<f64> {
+    let (int, frac) = v.split_once('.').unwrap_or((v, ""));
+    if !matches!(int, "0" | "1") || frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    format!("{int}.{frac}0").parse().ok().filter(|q| *q <= 1.0)
+}
+
+/// Whether an `Accept` header asks for `text/html` by name. Only an explicit
+/// `text/html` counts: `text/*` and `*/*`, which tools send, do not. The
+/// media type and the parameter name `q` are compared without regard to case,
+/// and white space around `;` and `=` is ignored. An entry is refused when its
+/// weight is 0 (`0`, `0.0`, `0.000`), and also when its weight is malformed (a
+/// missing or non-numeric value, a sign, more than three decimals, a value
+/// above 1): a request that sends a broken header is treated as a tool and
+/// gets the plain text. Another entry of the list can still ask for HTML.
+fn accepts_html(accept: &str) -> bool {
+    accept.split(',').any(|item| {
+        let mut parts = item.split(';');
+        let kind = parts.next().unwrap_or_default().trim();
+        if !kind.eq_ignore_ascii_case("text/html") {
+            return false;
+        }
+        parts.all(|param| match param.split_once('=') {
+            Some((name, value)) if name.trim().eq_ignore_ascii_case("q") => {
+                parse_q(value.trim()).is_some_and(|q| q > 0.0)
+            }
+            // `q` with no `=`, or another parameter (`charset`, `level`).
+            None => !param.trim().eq_ignore_ascii_case("q") || param.trim().is_empty(),
+            Some(_) => true,
+        })
+    })
+}
+
+/// Whether the 404 for an unknown path is the styled page: a `GET` that
+/// accepts `text/html` (a browser does; `curl`, a BOINC client and most
+/// tools send `*/*` or nothing) for a path that is not an RPC path. Every
+/// other request, whatever its method, gets the plain-text form. See
+/// [`accepts_html`] for how the header is read.
+pub fn wants_html_404(is_get: bool, path: &str, accept: Option<&str>) -> bool {
+    is_get && !is_rpc_path(path) && accept.is_some_and(accepts_html)
+}
+
+/// Headers a 404 for an unknown path carries besides its content type. The
+/// answer depends on the `Accept` header, so every one names it in `Vary`, and
+/// a cache that stored the plain-text form for a tool's request cannot hand it
+/// to a browser. The plain-text form is also `no-store` (the styled page gets
+/// `private, no-store, no-transform` from `site_response`).
+pub fn not_found_headers(html: bool) -> &'static [(&'static str, &'static str)] {
+    if html {
+        &[("Vary", "Accept")]
+    } else {
+        &[("Cache-Control", "no-store"), ("Vary", "Accept")]
+    }
+}
+
+/// The 404 page of a path the site does not have, in the site shell. It does
+/// not name the path that was asked for, and it needs nothing but the
+/// settings the Worker has loaded already: no statement. The links in the
+/// header are relative, so the page sets its base to the directory pages are
+/// served from (`base`, as in [`SiteCtx::base`]); without that, an unknown
+/// path in a subdirectory would send "Jobs" to a page below it.
+pub fn not_found_page(project: &Project, base: &str) -> SitePage {
+    let head = format!(
+        "<base href=\"{}/\">\n",
+        html_escape(crate::stock::url_path(base))
+    );
+    let body = format!(
+        "{}<h1>Page not found</h1>\n<p>There is no page at this address. It may have moved, or \
+         the address may have a typo.</p>\n{}",
+        site_header(project),
+        site_ui::actions(&[site_ui::button_link("Go to the home page", "./", false)])
+    );
+    SitePage::html(404, page("Page not found", &head, &body))
 }
 
 fn int_param(q: &Params, name: &str) -> Option<i64> {
