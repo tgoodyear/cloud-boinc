@@ -50,6 +50,67 @@ fn certificates(reply: &str, key: &cb_crypto::PublicKey) -> (usize, usize) {
     out
 }
 
+/// The files a scheduler reply names in `<file_ref>` that it has no
+/// `<file_info>` for. The client links a result to its files by these names
+/// (`CLIENT_STATE::handle_scheduler_reply`), so a reference to a name that is
+/// not described is a reply it cannot use.
+fn unresolved_file_refs(reply: &str) -> Vec<String> {
+    fn walk(n: &xmltree::Node, refs: &mut Vec<String>, infos: &mut Vec<String>) {
+        if n.name == "file_ref" {
+            if let Some(f) = n.children.iter().find(|c| c.name == "file_name") {
+                refs.push(f.text.clone());
+            }
+        }
+        if n.name == "file_info" {
+            if let Some(f) = n.children.iter().find(|c| c.name == "name") {
+                infos.push(f.text.clone());
+            }
+        }
+        for c in &n.children {
+            walk(c, refs, infos);
+        }
+    }
+    let Ok(root) = xmltree::parse(reply) else {
+        return Vec::new();
+    };
+    let (mut refs, mut infos) = (Vec::new(), Vec::new());
+    walk(&root, &mut refs, &mut infos);
+    refs.retain(|r| !infos.contains(r));
+    refs
+}
+
+/// One scheduler step: the references in each reply are checked on the real
+/// names, then the replies are compared with job and file names replaced by
+/// placeholders (`names.rs`). Returns what is wrong.
+fn compare_sched(
+    step: &str,
+    stock: &str,
+    ours: &str,
+    stock_names: &mut Names,
+    our_names: &mut Names,
+    used: &mut Used,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    for (who, text) in [("stock", stock), ("ours", ours)] {
+        for r in unresolved_file_refs(text) {
+            findings.push(format!(
+                "{step}: the {who} reply has a file_ref to {r}, which no file_info describes"
+            ));
+        }
+    }
+    stock_names.learn(stock);
+    our_names.learn(ours);
+    let (stock, ours) = (
+        stock_names.canonicalize(stock),
+        our_names.canonicalize(ours),
+    );
+    match compare(step, &stock, &ours, used) {
+        Ok(diffs) => findings.extend(diffs.into_iter().map(|d| format!("{step}: {d}"))),
+        Err(e) => findings.push(format!("{step}: cannot compare: {e}")),
+    }
+    findings
+}
+
 fn answer(world: &World, step: &Value, dir: &Path, time: i64, names: &Names) -> Answer {
     let request =
         |step: &Value| std::fs::read(dir.join(step["request"].as_str().unwrap())).unwrap();
@@ -109,8 +170,8 @@ fn replies_match_the_stock_server() {
                 std::fs::create_dir_all(&out).unwrap();
                 std::fs::write(out.join(format!("{step_name}.ours")), &ours.body).unwrap();
             }
-            let mut stock = String::from_utf8_lossy(&stock).into_owned();
-            let mut ours = String::from_utf8_lossy(&ours.body).into_owned();
+            let stock = String::from_utf8_lossy(&stock).into_owned();
+            let ours = String::from_utf8_lossy(&ours.body).into_owned();
             if step["kind"].as_str() == Some("sched") {
                 for (who, text, total) in [
                     ("stock", &stock, &mut stock_certs),
@@ -126,10 +187,15 @@ fn replies_match_the_stock_server() {
                     }
                     *total += found;
                 }
-                stock_names.learn(&stock);
-                our_names.learn(&ours);
-                stock = stock_names.to_canon(&stock);
-                ours = our_names.to_canon(&ours);
+                findings.extend(compare_sched(
+                    &format!("{name}/{step_name}"),
+                    &stock,
+                    &ours,
+                    &mut stock_names,
+                    &mut our_names,
+                    &mut used,
+                ));
+                continue;
             }
             if step["compare"].as_str() == Some("master") {
                 let (a, b) = (scheduler_links(&stock), scheduler_links(&ours));
@@ -219,4 +285,78 @@ fn replies_match_the_stock_server() {
         }
         panic!("{} findings:\n{}", findings.len(), findings.join("\n"));
     }
+}
+
+/// A work reply with one output file, named `info` in its `file_info` and
+/// `file_ref` in the reference from its result.
+#[cfg(test)]
+fn work_reply(info: &str, file_ref: &str) -> String {
+    format!(
+        "<scheduler_reply>\n<file_info>\n<name>{info}</name>\n</file_info>\n\
+         <workunit>\n<name>diff_0001</name>\n</workunit>\n\
+         <result>\n<name>diff_0001_0</name>\n<file_ref>\n<file_name>{file_ref}</file_name>\n\
+         </file_ref>\n</result>\n</scheduler_reply>\n"
+    )
+}
+
+#[cfg(test)]
+fn findings_for(stock: &str, ours: &str) -> Vec<String> {
+    compare_sched(
+        "t/01",
+        stock,
+        ours,
+        &mut Names::new(),
+        &mut Names::new(),
+        &mut Used::default(),
+    )
+}
+
+/// Random numbers in output file names do not matter when both replies are
+/// consistent, whatever the numbers are.
+#[test]
+fn consistent_file_names_with_other_random_parts_compare_equal() {
+    let stock = work_reply("diff_0001_0_r123_0", "diff_0001_0_r123_0");
+    let ours = work_reply("diff_0001_0_r987_0", "diff_0001_0_r987_0");
+    assert_eq!(findings_for(&stock, &ours), Vec::<String>::new());
+}
+
+/// A reply whose `file_ref` names another file than its `file_info` is one
+/// the client cannot link, and must fail, however it looks after the random
+/// part is dropped.
+#[test]
+fn a_file_ref_that_does_not_match_its_file_info_fails() {
+    let good = work_reply("diff_0001_0_r123_0", "diff_0001_0_r123_0");
+    let broken = work_reply("diff_0001_0_r123_0", "diff_0001_0_r456_0");
+    let f = findings_for(&good, &broken);
+    assert!(
+        f.iter()
+            .any(|m| m.contains("ours reply has a file_ref to diff_0001_0_r456_0")),
+        "{f:?}"
+    );
+    assert!(
+        f.iter().any(|m| m.contains("differs")),
+        "the comparison must differ too: {f:?}"
+    );
+    // The same fault on the stock side.
+    let f = findings_for(&broken, &good);
+    assert!(
+        f.iter().any(|m| m.contains("stock reply has a file_ref")),
+        "{f:?}"
+    );
+    assert!(f.iter().any(|m| m.contains("differs")), "{f:?}");
+}
+
+/// The same name gets the same placeholder in a later reply (a resend), and
+/// another name for the same output file gets another.
+#[test]
+fn placeholders_follow_the_complete_name_across_replies() {
+    let mut n = Names::new();
+    let first = work_reply("diff_0001_0_r123_0", "diff_0001_0_r123_0");
+    n.learn(&first);
+    let a = n.canonicalize(&first);
+    let again = n.canonicalize(&first);
+    assert_eq!(a, again);
+    let other = n.canonicalize(&work_reply("diff_0001_0_r555_0", "diff_0001_0_r555_0"));
+    assert_ne!(a, other);
+    assert!(a.contains("diff_0001_0_r1_0") && other.contains("diff_0001_0_r2_0"));
 }

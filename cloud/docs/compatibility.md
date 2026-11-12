@@ -264,9 +264,16 @@ which job a request gets differs from run to run, and this server picks in an or
 The corpus therefore names jobs in the order a host was first sent them, `diff_0001`, `diff_0002`,
 and so on (the jobs of one reply in the order of their real names). `replay.py` and the test learn
 the real names from the replies and write them into the requests that follow (`names.py` and
-`names.rs`); the replies are compared with the real names replaced by those. The random number in
-output file names (`diff_0001_0_r1013884258_0`) is dropped from both sides. All jobs use the same
-input file, so that nothing else differs between jobs.
+`names.rs`); the replies are compared with the real names replaced by those. Output file names
+(`diff_0001_0_r1013884258_0`) carry a random number. Each complete name becomes a placeholder:
+the job's canonical name and `r1` for the first different name that output file has had, `r2`
+for the next. The same name gets the same placeholder everywhere, in a reply and in a resend,
+and different names get different ones, so a `<file_ref>` that does not match its `<file_info>`
+stays visible. Before any renaming the test also checks that every `file_ref/file_name` in a
+scheduler reply, from either server, has a `file_info/name` in the same reply, which is what the
+client needs to link a result to its files; two tests in `main.rs` show that a reply with a
+mismatched reference fails. All jobs use the same input file, so that nothing else differs between
+jobs.
 
 ### What is compared
 
