@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<user>
+    <id>1</id>
+    <cpid>79a1c6a5cc87a9bfe7aca063270e0a69</cpid>
+    <create_time>1700000000</create_time>
+    <name>Test User</name>
+    <total_credit>0</total_credit>
+    <expavg_credit>0</expavg_credit>
+    <expavg_time>1700000000</expavg_time>
+    <teamid>0</teamid>
+    <has_profile>0</has_profile>
+     <country>United States</country>
+</user>

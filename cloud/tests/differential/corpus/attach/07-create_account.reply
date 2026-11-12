@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<error>
+    <error_num>-137</error_num>
+    <error_msg>Name or email address is not unique</error_msg>
+</error>

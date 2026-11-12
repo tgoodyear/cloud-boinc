@@ -1,0 +1,70 @@
+[
+  {
+    "name": "01-sched-first",
+    "kind": "sched",
+    "request": "01-sched-first.request.xml"
+  },
+  {
+    "name": "02-get_project_config",
+    "kind": "web",
+    "method": "GET",
+    "url": "get_project_config.php",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "03-server_status",
+    "kind": "web",
+    "method": "GET",
+    "url": "server_status.php?xml=1",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "04-show_user-id",
+    "kind": "web",
+    "method": "GET",
+    "url": "show_user.php?format=xml&userid=1",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "05-show_user-auth",
+    "kind": "web",
+    "method": "GET",
+    "url": "show_user.php?format=xml&auth=5a1f0c3b9d7e42a6b8c0d1e2f3a4b5c6",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "06-show_user-unknown",
+    "kind": "web",
+    "method": "GET",
+    "url": "show_user.php?format=xml&userid=999",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "07-am_get_info",
+    "kind": "web",
+    "method": "GET",
+    "url": "am_get_info.php?account_key=5a1f0c3b9d7e42a6b8c0d1e2f3a4b5c6",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "08-am_get_info-bad-key",
+    "kind": "web",
+    "method": "GET",
+    "url": "am_get_info.php?account_key=00000000000000000000000000000000",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "09-lookup_account-no-hash",
+    "kind": "web",
+    "method": "GET",
+    "url": "lookup_account.php?email_addr=tester%40example.org&passwd_hash=",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  },
+  {
+    "name": "10-am_set_info",
+    "kind": "web",
+    "method": "GET",
+    "url": "am_set_info.php?account_key=5a1f0c3b9d7e42a6b8c0d1e2f3a4b5c6&name=Renamed%20User&venue=work&send_email=0",
+    "derived": "written by hand: the request an account manager or a browser sends"
+  }
+]

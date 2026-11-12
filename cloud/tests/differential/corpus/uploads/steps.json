@@ -1,0 +1,85 @@
+[
+  {
+    "name": "01-size-before",
+    "kind": "upload",
+    "request": "01-size-before.request",
+    "derived": "a get_file_size request in the form of FILE_XFER::init_upload in the client's file_xfer.cpp, for a file not yet uploaded"
+  },
+  {
+    "name": "02-offset-beyond",
+    "kind": "upload",
+    "request": "02-offset-beyond.request",
+    "derived": "an offset for a file of which the server holds nothing"
+  },
+  {
+    "name": "03-upload",
+    "kind": "upload",
+    "request": "03-upload.request"
+  },
+  {
+    "name": "04-size-after",
+    "kind": "upload",
+    "request": "04-size-after.request",
+    "derived": "a get_file_size request in the form of FILE_XFER::init_upload in the client's file_xfer.cpp, for the file just uploaded"
+  },
+  {
+    "name": "05-upload-again",
+    "kind": "upload",
+    "request": "05-upload-again.request",
+    "derived": "the same request sent a second time, as a client does after a lost reply"
+  },
+  {
+    "name": "06-other-contents",
+    "kind": "upload",
+    "request": "06-other-contents.request",
+    "derived": "the data and the checksum changed, same file name"
+  },
+  {
+    "name": "07-bad-signature",
+    "kind": "upload",
+    "request": "07-bad-signature.request",
+    "derived": "the first digit of the upload certificate changed"
+  },
+  {
+    "name": "08-other-name",
+    "kind": "upload",
+    "request": "08-other-name.request",
+    "derived": "the file name changed, the certificate kept"
+  },
+  {
+    "name": "09-too-large",
+    "kind": "upload",
+    "request": "09-too-large.request",
+    "derived": "nbytes above the certificate's max_nbytes"
+  },
+  {
+    "name": "10-resume-part-1",
+    "kind": "upload",
+    "request": "10-resume-part-1.request",
+    "derived": "the request cut after ten bytes of data, as when a connection drops"
+  },
+  {
+    "name": "11-resume-size",
+    "kind": "upload",
+    "request": "11-resume-size.request",
+    "derived": "a get_file_size request in the form of FILE_XFER::init_upload in the client's file_xfer.cpp, after the interrupted upload"
+  },
+  {
+    "name": "12-resume-part-2",
+    "kind": "upload",
+    "request": "12-resume-part-2.request",
+    "derived": "the rest of the data, from offset 10"
+  },
+  {
+    "name": "13-no-data-tag",
+    "kind": "upload",
+    "request": "13-no-data-tag.request",
+    "derived": "a request without a file_info or data"
+  },
+  {
+    "name": "14-garbage",
+    "kind": "upload",
+    "request": "14-garbage.request",
+    "derived": "not a request"
+  }
+]
