@@ -431,7 +431,7 @@ read by the stock parser: `HOST::parse` and `SCHEDULER_REQUEST::parse` (`dont_us
    using Docker", `check_docker`), as in `PLAN_CLASS_SPEC::check`.
 10. D17, fixed. The computer page (`show_host_detail.php`) described the host from the
     summary string in `host.serialnum`, where stock's `html/inc/host.inc` reads the JSON in
-    `host.misc` (`gpu_desc`, `docker_desc`, `vbox_desc`, `boinc_version`). The macOS host showed
+    `host.misc` (`gpu_desc`, `docker_desc`, `vbox_desc`, `boinc_version`). The macOS client's host showed
     "[1] apple_gpu (12124MB)" for the GPU and "6.1.4" for Docker, where stock shows the
     count, model, memory, driver (for an Apple GPU, the Metal support value) and OpenCL level of
     the GPU, and "Podman version 6.1.4" with a second line "Config: don't use Docker", as the
