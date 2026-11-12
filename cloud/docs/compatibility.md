@@ -847,6 +847,13 @@ anything by hand. The scripts, how to run them and what they need are in
 - A second run with four clients, 7.16.6 and 8.0.4 each `copied` and `notcopied`, with
   `send_result_abort` set to 0 in the config and the files of the stock upload directory not
   carried. Its results are in D21, D22 and D28.
+- The host matching of the scheduler changed after the first two runs (the low `rpc_seqno`
+  and other-account host ID steps and the write-off of a matched host's tasks; see "Scheduler
+  request path" in [architecture.md](architecture.md)). The part of the check that
+  depends on it was run again on the merged tree with four clients, 7.16.6 `copied`, 8.0.4
+  `copied`, 8.0.4 `notcopied` and 8.0.4 `nohost`: the outcomes were the same (the `nohost` client got
+  a new host and logged the same line, the `notcopied` client's tasks were aborted, the others
+  finished and validated, and all 40 results of the new work came back valid).
 
 ### What the row copy carried
 

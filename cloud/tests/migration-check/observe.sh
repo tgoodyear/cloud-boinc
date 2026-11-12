@@ -82,6 +82,9 @@ nudge
 d1_n "SELECT count(*) FROM result WHERE name LIKE 'post%'"
 total="$N"
 [ "$total" -gt 0 ] || die "post-work.sh made no results"
+# The project refuses work to a computer that asks again within `min_sendwork_interval` of its
+# last request ("Last request too recent"), and the refused request counts as the last one, so
+# the clients are asked to update only every 45 seconds, more than the interval plus the delay.
 i=0
 while :; do
     /bin/sleep 15
@@ -90,7 +93,7 @@ while :; do
     [ "$got" -eq "$total" ] && break
     i=$((i + 15))
     [ "$i" -le "$work_wait" ] || { log "TIMEOUT: $got of $total results of the new work received after $work_wait seconds"; failed=1; break; }
-    nudge
+    [ $((i % 45)) -ne 0 ] || nudge
 done
 log "results of the new work received: $got of $total"
 
