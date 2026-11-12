@@ -130,6 +130,7 @@ fn manifest_names_every_file() {
 fn fixtures_are_scrubbed() {
     let hex = Regex::new(r"[0-9a-fA-F]{32,}").unwrap();
     let ipv4 = Regex::new(r"(?:^|[^0-9.])((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?:[^0-9]|$)").unwrap();
+    let mac = mac_regex();
     let email = Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}").unwrap();
     for (_, _, file, text) in fixtures() {
         assert!(
@@ -148,11 +149,74 @@ fn fixtures_are_scrubbed() {
         for word in ["usnewsmap", "/root/", "/home/"] {
             assert!(!text.contains(word), "{file}: contains {word:?}");
         }
+        assert!(!mac.is_match(&text), "{file}: a MAC address");
         assert!(!email.is_match(&text), "{file}: an e-mail address");
         let r = parse(&text).unwrap();
         assert_eq!(r.host_info.domain_name, "fixture-host", "{file}");
         assert_eq!(r.host_info.host_cpid, "fixture-host-cpid", "{file}");
     }
+}
+
+/// The scrub script replaces a MAC address wherever the client writes it (`<mac_address>` in
+/// `HOST_INFO::write`) and, if one is left in an element it does not know, refuses the file.
+/// The script is Python; the test skips with a message when `python3` is not installed.
+#[test]
+fn scrub_script_removes_and_refuses_mac_addresses() {
+    use std::process::Command;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/scrub-sched-request.py");
+    let dir = std::env::temp_dir().join(format!("cb-corpus-scrub-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&str]| {
+        Command::new("python3")
+            .arg("-I")
+            .arg(&script)
+            .args(args)
+            .output()
+    };
+    let input = dir.join("in.xml");
+    let output = dir.join("out.xml");
+    let known = "<scheduler_request>\n<host_info>\n    <mac_address>02:00:5e:00:53:01</mac_address>\n</host_info>\n<coprocs>\n<coproc_cuda>\n   <name>Some GPU</name>\n</coproc_cuda>\n</coprocs>\n</scheduler_request>\n";
+    std::fs::write(&input, known).unwrap();
+    let (i, o) = (input.to_str().unwrap(), output.to_str().unwrap());
+    let Ok(done) = run(&["--input", i, "--output", o]) else {
+        eprintln!("python3 is not installed; the scrub script was not run");
+        return;
+    };
+    assert!(
+        done.status.success(),
+        "{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+    let scrubbed = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        scrubbed.contains("<mac_address>fixture-mac</mac_address>"),
+        "{scrubbed}"
+    );
+    assert!(scrubbed.contains("<name>Fixture GPU</name>"), "{scrubbed}");
+    assert!(!mac_regex().is_match(&scrubbed));
+
+    // An address in an element the script has no rule for is refused, not written.
+    std::fs::write(
+        &input,
+        "<scheduler_request>\n<host_info>\n    <hw_addr>02-00-5e-00-53-01</hw_addr>\n</host_info>\n</scheduler_request>\n",
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&output);
+    let refused = run(&["--input", i, "--output", o]).unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("MAC address"));
+    assert!(!output.exists());
+    let checked = run(&["--check-only", "--input", i]).unwrap();
+    assert!(!checked.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Six pairs of hex digits joined by colons, or by dashes, not part of a longer run.
+fn mac_regex() -> Regex {
+    Regex::new(
+        r"(?i)(?:^|[^0-9a-f])(?:(?:[0-9a-f]{2}:){5}|(?:[0-9a-f]{2}-){5})[0-9a-f]{2}(?:[^0-9a-f]|$)",
+    )
+    .unwrap()
 }
 
 // ---------------------------------------------------------------------------------------------

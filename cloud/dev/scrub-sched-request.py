@@ -14,6 +14,7 @@ After scrubbing, the output is checked, and nothing is written if a check fails:
 
   * no run of 32 or more hexadecimal digits (keys, CPIDs, MD5 sums);
   * no IPv4 address outside the documentation ranges of RFC 5737;
+  * no MAC address (six hex pairs joined by colons or dashes), whatever element it is in;
   * none of the words given with `--forbid` (for example the capture machine's host name), and none
     of the built-in ones (`usnewsmap`, `/root/`, `/home/`).
 
@@ -44,16 +45,60 @@ TEXT_ELEMENTS = {
     "product_name": "fixture-product",
     "serialnum": "fixture-serial",
     "md5_cksum": "fixture-md5",
-    "mac_addr": "fixture-mac",
+    # `HOST_INFO::write` in lib/hostinfo.cpp (the client has no `mac_addr`).
+    "mac_address": "fixture-mac",
+    # Written by older clients' project and account sections, and by account manager requests.
+    "email_hash": "fixture-email-hash",
+    "external_cpid": "fixture-external-cpid",
+    "user_name": "fixture-user",
+    "team_name": "fixture-team",
+    "project_name": "fixture-project",
+    "client_brand": "fixture-brand",
 }
 
+# Elements that name a device or a distribution, replaced only inside the block that holds them,
+# because `name` means something else elsewhere in a request (task, file and platform names).
+#   coprocs: GPU names and models (`COPROC_*::write_xml` in lib/coproc.cpp), the OpenCL device
+#       name (`OPENCL_DEVICE_PROP::write_xml`), PCI bus, device and domain numbers
+#   opencl_cpu_prop: the OpenCL CPU device name (`OPENCL_CPU_PROP::write_xml`)
+#   wsl: the names of the Windows Subsystem for Linux distributions (`WSL_DISTRO::write_xml`)
+BLOCK_ELEMENTS = {
+    "coprocs": {
+        "name": "Fixture GPU",
+        "model": "Fixture GPU",
+        "bus_id": "0",
+        "device_id": "0",
+        "domain_id": "0",
+    },
+    "opencl_cpu_prop": {"name": "Fixture CPU"},
+    "wsl": {"distro_name": "fixture-distro"},
+}
+
+# Six pairs of hex digits joined by colons or by dashes.
+MAC = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}(?![0-9A-Fa-f])")
 ALLOWED_V4 = re.compile(r"^(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)")
 HEX32 = re.compile(r"[0-9a-fA-F]{32,}")
 IPV4 = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 BUILTIN_FORBIDDEN = ["usnewsmap", "/root/", "/home/"]
 
 
+def scrub_block(text, block, elements):
+    def inside(m):
+        body = m.group(0)
+        for tag, value in elements.items():
+            body = re.sub(
+                r"(<%s>)[^<]+(</%s>)" % (tag, tag),
+                lambda n, v=value: n.group(1) + v + n.group(2),
+                body,
+            )
+        return body
+
+    return re.sub(r"(?s)<%s>.*?</%s>" % (block, block), inside, text)
+
+
 def scrub(text, project_url):
+    for block, elements in BLOCK_ELEMENTS.items():
+        text = scrub_block(text, block, elements)
     for tag, value in TEXT_ELEMENTS.items():
         # `[^<]+` leaves an empty element empty.
         text = re.sub(
@@ -81,6 +126,8 @@ def check(text, forbid):
     problems = []
     for m in HEX32.finditer(text):
         problems.append("a run of %d hex digits: %s..." % (len(m.group(0)), m.group(0)[:6]))
+    for m in MAC.finditer(text):
+        problems.append("a MAC address: %s" % m.group(0))
     for m in IPV4.finditer(text):
         if not ALLOWED_V4.match(m.group(0)):
             problems.append("IPv4 address %s" % m.group(0))

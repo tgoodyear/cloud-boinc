@@ -38,7 +38,9 @@ Windows, macOS and Android clients, and GPU hosts, are not in the corpus.
   recorded as over with a success outcome, that a first contact gets a host ID, that a
   re-attach finds the existing host and does not make a second, and that work is sent when
   there is some and refused with "Project has no tasks available" when there is none.
-- `fixtures_are_scrubbed` runs the checks of the scrub script over the committed files.
+- `fixtures_are_scrubbed` runs the checks of the scrub script over the committed files, among them
+  that no MAC address (six hex pairs joined by colons or dashes) is left under any element name.
+  `scrub_script_removes_and_refuses_mac_addresses` runs the script itself on a made-up request.
 
 The recorded host ID (100 for 7.16.6, 105 for 8.2.15) is not the ID the test world gives its host,
 so the test replaces a non-zero `<hostid>` before replaying. The request's code-signing key is a placeholder, and the test world
@@ -70,13 +72,17 @@ cloud/dev/scrub-sched-request.py --input RAW.xml --output cloud/tests/client-cor
 
 The script replaces the account key, the cross-project ID, the host CPID, the email hash, the
 domain name, the address, the CPU model and features, the kernel release, product and serial
-strings, MAC address, output file checksums, paths, the project's URLs and the echoed code-signing
-key. It leaves element names, numbers, counts, task names and timing as they were. It then refuses
-to write the file if the result still has a run of 32 or more hex digits, an IPv4 address outside
-the RFC 5737 ranges, or a word given with `--forbid`. Give it the capture machine's host name, and
-the name of any user or machine that is not in its list, with `--forbid` (it can be repeated).
+strings, the MAC address (`<mac_address>`), GPU and OpenCL device names and PCI numbers, WSL
+distribution names, user and team names, the client brand, output file checksums, paths, the
+project's URLs and the echoed code-signing key. It leaves element names, numbers, counts, task
+names and timing as they were. It then refuses to write the file if the result still has a run of
+32 or more hex digits, a MAC address (six hex pairs joined by colons or dashes) in any element, an
+IPv4 address outside the RFC 5737 ranges, or a word given with `--forbid`. Give it the capture
+machine's host name, and the name of any user or machine that is not in its list, with `--forbid`
+(it can be repeated).
 
-To check files by hand:
+To check files by hand (a file with `<mac_address>02:00:5e:00:53:01</mac_address>` in it fails
+the first command):
 
 ```
 for f in cloud/tests/client-corpus/*/*.xml; do cloud/dev/scrub-sched-request.py --check-only --input "$f"; done
