@@ -162,31 +162,17 @@ pub struct NewApp {
 /// Creates the app or updates the one with this name. The settings the call
 /// states are written; the others stay as they are. (`xadd` has no such
 /// call: it rewrites the app from `project.xml`.)
+///
+/// An update writes only the columns the call states, so a call that states
+/// one setting cannot undo another operator's change to another. The
+/// validator is the one setting that is checked against the rest of the row
+/// (a webhook needs a URL): the check runs on the row as it was read, and
+/// the update carries the values it read of the validator and URL it did not
+/// itself state, so it changes nothing if either has changed since. It reads
+/// again and checks again, up to five times, as `change_config_tag` does.
 pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
     if !is_name(&a.name) {
         return invalid("app: bad name");
-    }
-    let existing: Option<App> = query_one(
-        db,
-        stmt!("SELECT * FROM app WHERE name = ?", a.name.as_str()),
-    )
-    .await?;
-    // What the app will have: the validators are checked against the whole.
-    let validator = a
-        .validator
-        .clone()
-        .or_else(|| existing.as_ref().map(|e| e.validator.clone()))
-        .unwrap_or_else(|| "trivial".into());
-    let validator_url = a
-        .validator_url
-        .clone()
-        .or_else(|| existing.as_ref().map(|e| e.validator_url.clone()))
-        .unwrap_or_default();
-    if !["trivial", "bitwise", "webhook"].contains(&validator.as_str()) {
-        return invalid("app: validator must be trivial, bitwise or webhook");
-    }
-    if validator == "webhook" && !validator_url.starts_with("https://") {
-        return invalid("app: the webhook validator needs an https validator_url");
     }
     if a.assimilate_url
         .as_ref()
@@ -203,61 +189,129 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
         .user_friendly_name
         .as_deref()
         .filter(|f| !f.is_empty())
-        .unwrap_or(&a.name);
-    // NULL keeps the stored value of an existing app.
-    fn keep<T: Into<Value>>(x: Option<T>) -> Value {
-        x.map_or(Value::Null, Into::into)
-    }
+        .map(str::to_string);
     let flag = |x: Option<bool>| x.map(i32::from);
-    let rows = db
-        .run(stmt!(
-            "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, target_nresults, \
-             non_cpu_intensive, fraction_done_exact, min_version, deprecated, validator, validator_url, \
-             assimilate_url, homogeneous_redundancy, homogeneous_app_version) \
-             VALUES (?, ?, ?, coalesce(?, 1.0), coalesce(?, 0), coalesce(?, 0), coalesce(?, 0), \
-             coalesce(?, 0), coalesce(?, 0), coalesce(?, 0), ?, ?, coalesce(?, ''), coalesce(?, 0), \
-             coalesce(?, 0)) \
-             ON CONFLICT (name) DO UPDATE SET \
-             user_friendly_name = coalesce(?, app.user_friendly_name), \
-             weight = coalesce(?, app.weight), beta = coalesce(?, app.beta), \
-             target_nresults = coalesce(?, app.target_nresults), \
-             non_cpu_intensive = coalesce(?, app.non_cpu_intensive), \
-             fraction_done_exact = coalesce(?, app.fraction_done_exact), \
-             min_version = coalesce(?, app.min_version), deprecated = coalesce(?, app.deprecated), \
-             validator = excluded.validator, validator_url = excluded.validator_url, \
-             assimilate_url = coalesce(?, app.assimilate_url), \
-             homogeneous_redundancy = coalesce(?, app.homogeneous_redundancy), \
-             homogeneous_app_version = coalesce(?, app.homogeneous_app_version) \
-             RETURNING id",
-            now,
-            a.name.as_str(),
-            friendly,
-            keep(a.weight),
-            keep(flag(a.beta)),
-            keep(a.target_nresults),
-            keep(flag(a.non_cpu_intensive)),
-            keep(flag(a.fraction_done_exact)),
-            keep(a.min_version),
-            keep(flag(a.deprecated)),
-            validator.as_str(),
-            validator_url.as_str(),
-            keep(a.assimilate_url.clone()),
-            keep(a.homogeneous_redundancy),
-            keep(flag(a.homogeneous_app_version)),
-            keep(a.user_friendly_name.clone().filter(|f| !f.is_empty())),
-            keep(a.weight),
-            keep(flag(a.beta)),
-            keep(a.target_nresults),
-            keep(flag(a.non_cpu_intensive)),
-            keep(flag(a.fraction_done_exact)),
-            keep(a.min_version),
-            keep(flag(a.deprecated)),
-            keep(a.assimilate_url.clone()),
-            keep(a.homogeneous_redundancy),
-            keep(flag(a.homogeneous_app_version))
-        ))
+    // Column, value, for each setting the call states.
+    let mut stated: Vec<(&str, Value)> = Vec::new();
+    {
+        let mut add = |column: &'static str, v: Option<Value>| {
+            if let Some(v) = v {
+                stated.push((column, v));
+            }
+        };
+        add("user_friendly_name", friendly.clone().map(Value::from));
+        add("weight", a.weight.map(Value::from));
+        add("beta", flag(a.beta).map(Value::from));
+        add("target_nresults", a.target_nresults.map(Value::from));
+        add("non_cpu_intensive", flag(a.non_cpu_intensive).map(Value::from));
+        add(
+            "fraction_done_exact",
+            flag(a.fraction_done_exact).map(Value::from),
+        );
+        add("min_version", a.min_version.map(Value::from));
+        add("deprecated", flag(a.deprecated).map(Value::from));
+        add("validator", a.validator.clone().map(Value::from));
+        add("validator_url", a.validator_url.clone().map(Value::from));
+        add("assimilate_url", a.assimilate_url.clone().map(Value::from));
+        add(
+            "homogeneous_redundancy",
+            a.homogeneous_redundancy.map(Value::from),
+        );
+        add(
+            "homogeneous_app_version",
+            flag(a.homogeneous_app_version).map(Value::from),
+        );
+    }
+    let check = |validator: &str, url: &str| -> CoreResult<()> {
+        if !["trivial", "bitwise", "webhook"].contains(&validator) {
+            return invalid("app: validator must be trivial, bitwise or webhook");
+        }
+        if validator == "webhook" && !url.starts_with("https://") {
+            return invalid("app: the webhook validator needs an https validator_url");
+        }
+        Ok(())
+    };
+    for _ in 0..5 {
+        let existing: Option<App> = query_one(
+            db,
+            stmt!("SELECT * FROM app WHERE name = ?", a.name.as_str()),
+        )
         .await?;
-    Ok(rows.scalar_i64().unwrap_or(0))
+        let Some(e) = existing else {
+            // A new app: what is left out takes its default.
+            let validator = a.validator.clone().unwrap_or_else(|| "trivial".into());
+            let url = a.validator_url.clone().unwrap_or_default();
+            check(&validator, &url)?;
+            let rows = db
+                .run(stmt!(
+                    "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, \
+                     target_nresults, non_cpu_intensive, fraction_done_exact, min_version, \
+                     deprecated, validator, validator_url, assimilate_url, \
+                     homogeneous_redundancy, homogeneous_app_version) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT (name) DO NOTHING RETURNING id",
+                    now,
+                    a.name.as_str(),
+                    friendly.clone().unwrap_or_else(|| a.name.clone()),
+                    a.weight.unwrap_or(1.0),
+                    flag(a.beta).unwrap_or(0),
+                    a.target_nresults.unwrap_or(0),
+                    flag(a.non_cpu_intensive).unwrap_or(0),
+                    flag(a.fraction_done_exact).unwrap_or(0),
+                    a.min_version.unwrap_or(0),
+                    flag(a.deprecated).unwrap_or(0),
+                    validator,
+                    url,
+                    a.assimilate_url.clone().unwrap_or_default(),
+                    a.homogeneous_redundancy.unwrap_or(0),
+                    flag(a.homogeneous_app_version).unwrap_or(0)
+                ))
+                .await?;
+            match rows.scalar_i64() {
+                Some(id) => return Ok(id),
+                // Created by another call meanwhile: read it and update.
+                None => continue,
+            }
+        };
+        if stated.is_empty() {
+            return Ok(e.id);
+        }
+        let mut sql = String::new();
+        let mut set: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        for (column, v) in &stated {
+            set.push(format!("{column} = ?"));
+            params.push(v.clone());
+        }
+        sql.push_str(&format!("UPDATE app SET {} WHERE id = ?", set.join(", ")));
+        params.push(e.id.into());
+        // The validator and URL are checked together, so the update holds
+        // the ones it did not state to what the check read.
+        if a.validator.is_some() || a.validator_url.is_some() {
+            let validator = a.validator.clone().unwrap_or_else(|| e.validator.clone());
+            let url = a
+                .validator_url
+                .clone()
+                .unwrap_or_else(|| e.validator_url.clone());
+            check(&validator, &url)?;
+            if a.validator.is_none() {
+                sql.push_str(" AND validator = ?");
+                params.push(e.validator.clone().into());
+            }
+            if a.validator_url.is_none() {
+                sql.push_str(" AND validator_url = ?");
+                params.push(e.validator_url.clone().into());
+            }
+        }
+        sql.push_str(" RETURNING id");
+        let rows = db.run(Stmt { sql, params }).await?;
+        if let Some(id) = rows.scalar_i64() {
+            return Ok(id);
+        }
+    }
+    Err(CoreError::Conflict(
+        "the app kept changing under the update; try again".into(),
+    ))
 }
 
 /// A file of an app version. The file itself is staged under `download/`
