@@ -74,6 +74,10 @@ start)
     [ -n "$state" ] || state="$(mktemp -d "${TMPDIR:-/tmp}/cloud-boinc-stock.XXXXXX")"
     mkdir -p "$state"
     state="$(cd "$state" && pwd)"
+    # A source without a slash is a named volume to the container engine, so --fixtures is
+    # made absolute, as --state is.
+    [ -d "$fixtures" ] || { echo "stock.sh: --fixtures $fixtures is not a directory" >&2; exit 1; }
+    fixtures="$(cd "$fixtures" && pwd)"
     rm -f "$state/serving"
     "$engine" rm -f "$name" >/dev/null 2>&1 || true
     "$engine" run -d --name "$name" --network host \

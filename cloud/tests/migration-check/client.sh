@@ -50,6 +50,7 @@ start)
     [ -n "$boinc" ] && [ -n "$port" ] && [ -n "$name" ] || { usage; }
     mkdir -p "$dir"
     dir="$(cd "$dir" && pwd)"
+    boinc="$(cd "$(dirname "$boinc")" && pwd)/$(basename "$boinc")"
     if [ ! -f "$dir/cc_config.xml" ]; then
         cat > "$dir/cc_config.xml" <<XML
 <cc_config>

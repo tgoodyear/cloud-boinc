@@ -69,3 +69,12 @@ ensure_cloud_secrets() {
     [ -f "$WORK/cloud-state/token" ] ||
         (umask 077; od -An -N24 -tx1 /dev/urandom | tr -d ' \n' > "$WORK/cloud-state/token")
 }
+
+# Paths given as flags are made absolute here, before any script changes directory: the
+# work directory (made if it is missing), the clients file, and the --cboinc and --app-binary
+# files when the sourcing script has them in `cboinc` and `app`.
+_abs() { _d="$(cd "$(dirname "$1")" 2>/dev/null && pwd)" || die "no such directory for $1"; echo "$_d/$(basename "$1")"; }
+if [ -n "${WORK:-}" ]; then mkdir -p "$WORK" && WORK="$(cd "$WORK" && pwd)"; fi
+[ -z "${CLIENTS:-}" ] || CLIENTS="$(_abs "$CLIENTS")"
+[ -z "${cboinc:-}" ] || cboinc="$(_abs "$cboinc")"
+[ -z "${app:-}" ] || app="$(_abs "$app")"
