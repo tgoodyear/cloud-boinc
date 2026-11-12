@@ -419,8 +419,10 @@ lines on a fresh install: "WSL: registry key not found; assuming no WSL distros 
 "WSL: no usable distros found", "No usable GPUs found" (the virtual machine's display adapter is not
 a coprocessor), and the notice "Some projects require Docker; we recommend that you install it."
 
-The request, compared with the Wine run's (the set of element paths is the same; only values
-differ) and with the 64-bit Linux 8.2.15 client's (`<alt_platform>` and `<wsl>` are added;
+The request, compared with the Wine run's (the set of element paths is the same except for three
+elements in a reported result, `<final_peak_working_set_size>`, `<final_peak_swap_size>` and
+`<final_peak_disk_usage>`, described below; otherwise only values differ) and with the 64-bit
+Linux 8.2.15 client's (`<alt_platform>` and `<wsl>` are added;
 `<docker_version>`, `<docker_type>` and `<stderr_txt>` are absent):
 
 - `os_name` is "Microsoft Windows 11" and `os_version` is "x64 Edition, (10.00.26300.00)"; under Wine they were
