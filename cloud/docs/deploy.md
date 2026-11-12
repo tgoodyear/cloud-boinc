@@ -231,14 +231,14 @@ or with one app version (homogeneous app version, HAV). The behaviour is describ
 "Homogeneous redundancy and homogeneous app version" in `architecture.md`.
 
 `migrations/0004_homogeneous.sql` adds `app.homogeneous_redundancy`,
-`app.homogeneous_app_version` and `workunit.hr_class`. It only adds columns, so the Workers of
+`app.homogeneous_app_version` and `workunit.hr_class`. It adds columns and nothing else, so the Workers of
 an earlier release keep working on the migrated database. Apply it first, then deploy the
 `scheduler`, `pipeline` and `admin` Workers (the scheduler reads the new columns, the pipeline
 releases a commitment when a workunit's results fail, and the admin Worker sets them). `files`
-and `web` need no new deployment. Turn the settings on only when all three are deployed.
+and `web` need no new deployment. Deploy all three, then turn the settings on.
 
 ```
-npx wrangler d1 migrations apply cloud-boinc-dev --remote
+cd workers/scheduler && npx wrangler d1 migrations apply cloud-boinc-dev --remote
 cboinc app-put --name myapp --user-friendly-name "My app" --homogeneous-redundancy 2
 cboinc app-put --name myapp --user-friendly-name "My app" --homogeneous-app-version true
 ```
@@ -252,7 +252,8 @@ coarse ones (OS and CPU vendor, AMD counted as Intel). Both flags are left as th
 a later `app-put` leaves them out, unlike the other settings of an app. Without an app-level
 type, the `<homogeneous_redundancy>` option of the config applies to all apps, and
 `<hr_class_static/>` keeps a workunit committed after all its results have failed. A host that
-HR cannot place gets no work from the app; if every app of the project uses HR, it is told so.
+HR cannot place gets no work from the app; if every app of the project uses HR, it is told
+"Your computer type is not supported by this project".
 
 The settings act on the next result sent. A workunit that already has a result in progress when
 HR is switched on is uncommitted and takes its class from the next result that is sent, so
@@ -262,9 +263,10 @@ by the pipeline when it has results with errors and none in progress, succeeded 
 to release one that is stuck on a class with no hosts left, set its `hr_class` to 0 in the
 database.
 
-A deprecated version of an HAV app keeps being sent for the workunits committed to it, so
-deprecate an old version when it should stop taking new workunits, and expect its files to be
-fetched until those workunits are done.
+A deprecated version of an HAV app, a version superseded by a newer one and one below the
+app's minimum version keep being sent for the workunits committed to them, so deprecate an old
+version when it should stop taking new workunits, and expect its files to be fetched until
+those workunits are done.
 
 ## Checks
 

@@ -352,9 +352,8 @@ Two app settings keep the results of one workunit comparable. Both are off by de
   Intel, AMD or PowerPC CPU. The type of an app is its own `homogeneous_redundancy` if nonzero,
   else the project's `<homogeneous_redundancy>` (`app_hr_type` in `sched/sched_hr.h`).
 - **Homogeneous app version (HAV)** sends every result of a workunit with one app version. The
-  first send decides it. An anonymous-platform client is never sent a job of such an app, which
-  `get_app_version` in `sched/sched_version.cpp` does too: its own versions are not known to
-  the project, so they cannot be matched.
+  first send decides it. An anonymous-platform client is never sent a job of such an app, as in
+  `get_app_version` in `sched/sched_version.cpp`.
 
 The commitment is `workunit.hr_class` (migration `0004_homogeneous.sql`) and
 `workunit.app_version_id`, 0 while the workunit is uncommitted.
@@ -365,9 +364,9 @@ where the versions are those this host can run (as integers of the cached catalo
 parameters). A queue whose first rows are committed to other classes therefore cannot hide
 the ones this host can take, as it would if the window of `fetch` rows were cut first and
 filtered after. The in-memory loop then repeats the check against the row it read, picks the
-version for a committed workunit (only its own, which can be a deprecated version, or one
-superseded by a newer version of the same platform and plan class, as
-`check_homogeneous_app_version` allows) or, for an uncommitted one, the fastest version still
+version for a committed workunit (only its own, which can be a deprecated version, one
+superseded by a newer version of the same platform and plan class, or one below the app's
+`min_version`, as `check_homogeneous_app_version` allows) or, for an uncommitted one, the fastest version still
 sent, and applies the memory, disk, deadline, quota and in-progress checks to it as for any
 job. A host the type cannot place is left out of the app's queue altogether, and when every app
 uses HR and none can place the host, the request sends nothing and the reply carries
@@ -385,12 +384,13 @@ and the workunit update already guarded by "this claim succeeded" gains
 `hr_class = :class, app_version_id = :version`. They run in the request's one write batch, one
 transaction, so a host of another class or version whose claim comes later sees the commitment
 and fails its claim, and a host that read the workunit uncommitted but writes after another host
-committed it gets no result of it, never a result of a workunit committed to something else.
-Because the commitment is written only together with a claim that held, a workunit is never
-committed without a result having been sent, unlike upstream's `update_wu_on_send`, which
+committed it gets no result of it.
+The commitment is written in the same batch as the claim and the claim guards it, so a
+workunit is never committed without a result having been sent. Upstream's `update_wu_on_send`
 commits before it updates the result and can leave a commitment behind when that update fails
-(upstream's feeder undoes such commitments in `purge_stale`; nothing here needs to). A lost
-claim sends less work and the client asks again.
+(`add_result_to_reply` notes this and does not undo it). Upstream's feeder also zeroes the class
+of a work item that sat in its cache too long (`purge_stale`); there is no cache here, so that
+has no equivalent. A lost claim sends less work and the client asks again.
 
 **Releasing.** The transition (`transitioner_pass` in `crates/cb-core/src/pipeline.rs`) sets
 both fields back to 0 when a workunit has results with errors and none successful, in
@@ -400,17 +400,17 @@ transition's update guarded by `rev`, and every claim bumps `rev`, so a transiti
 from a read that a claim has overtaken is retried and cannot undo the claim's commitment.
 
 **Lost results.** A resend runs the same tests as upstream's `wu_is_infeasible_fast`: if the
-host's class is not the workunit's, or the type no longer places it, the result is let go
+host's class is not the workunit's, or the type no longer places it, the result is allowed to expire
 ("Didn't resend lost task ... (expired)"); a client on the anonymous platform is not resent a
 result of an app with HAV. A resend does not commit: a workunit with a result in progress is
 never released by the transition, so the commitment is still there.
 
-**Cost per request.** No statement is added to a request that sends work. The candidate
+**Cost per request.** A request that sends work gets no extra statement. The candidate
 statement for an app has one more condition; the claim and the workunit update gain a few bound
 parameters (the claim stays well under D1's 100). For an app that uses HAV the catalog also
-carries the deprecated versions of such apps, in the statement that already reads versions. One
-round trip is added only to a request that sends nothing: when an HR app's candidate query came
-back empty, a probe, `SELECT 1 ... LIMIT 1`, asks whether unsent work of the app is committed to
+carries the deprecated versions of such apps, in the statement that already reads versions. A
+request that sends nothing gets one extra round trip when an HR app's candidate query came
+back empty: a probe, `SELECT 1 ... LIMIT 1`, asks whether unsent work of the app is committed to
 another class, to give upstream's message "Tasks are committed to other platforms"
 (`hr_reject_temp`). It stops at the first such row, or on an empty queue.
 
@@ -434,7 +434,7 @@ another class, to give upstream's message "Tasks are committed to other platform
 - A resend does not commit the workunit (see above). Upstream's `add_result_to_reply` does, and
   fails the resend if the workunit is committed to something else.
 - `homogeneous_redundancy` outside 0 to 2 in the config is refused when the config is saved;
-  upstream's feeder exits at start. Setting both a project type and a different app type is
+  upstream's feeder exits at start. Setting both a project type and an app type is
   allowed and the app's wins; upstream's feeder refuses to start with both.
 - There is no `--hr_class` for job submission, so a job cannot start out committed.
 - Validation does not look at a version or class: upstream's validator does not either.
@@ -573,9 +573,8 @@ Differences from upstream:
   limit has room, counting the results already moved in the request.
 - An app with homogeneous app version (`app.homogeneous_app_version`) is never sent to an
   anonymous client, committed workunit or not, and a result of one is not resent to it: the
-  client's versions cannot be matched with a version of the project, as `get_app_version` in
-  `sched/sched_version.cpp` has it. A client that has a version of such an app is not told that
-  its `app_info.xml` lacks one. See "Homogeneous redundancy and homogeneous app version".
+  client, as `get_app_version` in `sched/sched_version.cpp` has it. An anonymous-platform client
+  is never told that its `app_info.xml` lacks a version of such an app. See "Homogeneous redundancy and homogeneous app version".
 - A missing `host_app_version` row is created when the job is sent. Upstream's `hav_lookup` also
   creates one when a result is validated or times out; here those steps leave a missing row alone.
 - The project preferences that switch a resource off do not apply to the client's own versions,
