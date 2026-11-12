@@ -239,6 +239,128 @@ fn scrub_script_removes_and_refuses_mac_addresses() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A Windows task's stderr can name the user's profile or the data directory. A profile name can
+/// hold spaces and apostrophes, so the script replaces the path to the end of the line, the end of
+/// the element text, or a double quote, refuses a path it cannot bound, and refuses a part of a
+/// forbidden name that is left behind.
+#[test]
+fn scrub_script_replaces_windows_paths() {
+    use std::process::Command;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/scrub-sched-request.py");
+    let dir = std::env::temp_dir().join(format!("cb-corpus-scrub-win-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (input, output) = (dir.join("in.xml"), dir.join("out.xml"));
+    // The scrubbed output, or the error text when the script refuses the file; None when
+    // python3 is not installed.
+    let run = |body: &str, forbid: &[&str]| -> Option<Result<String, String>> {
+        std::fs::write(
+            &input,
+            format!("<scheduler_request>\n{body}\n</scheduler_request>\n"),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&output);
+        let mut cmd = Command::new("python3");
+        cmd.arg("-I").arg(&script);
+        cmd.args(["--input", input.to_str().unwrap()]);
+        cmd.args(["--output", output.to_str().unwrap()]);
+        for f in forbid {
+            cmd.args(["--forbid", f]);
+        }
+        let done = cmd.output().ok()?;
+        Some(if done.status.success() {
+            Ok(std::fs::read_to_string(&output).unwrap())
+        } else {
+            assert!(!output.exists(), "a refused file was written");
+            Err(String::from_utf8_lossy(&done.stderr).into_owned())
+        })
+    };
+    let path = "C:\\ProgramData\\BOINC\\path";
+
+    // A profile name with a space, in element text: no part of the name is left.
+    let Some(r) = run(
+        "<stderr_txt>\ncan't open C:\\Users\\Jane Doe\\AppData\\x.txt\n</stderr_txt>",
+        &["Jane Doe"],
+    ) else {
+        eprintln!("python3 is not installed; the scrub script was not run");
+        return;
+    };
+    let scrubbed = r.unwrap();
+    assert!(
+        !scrubbed.contains("Doe") && !scrubbed.contains("AppData"),
+        "{scrubbed}"
+    );
+    assert!(
+        scrubbed.contains(&format!("can't open {path}\n")),
+        "{scrubbed}"
+    );
+
+    // An apostrophe in the name.
+    let scrubbed = run(
+        "<stderr_txt>\nC:\\Users\\O'Connor\\AppData\\x.txt\n</stderr_txt>",
+        &["O'Connor"],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        !scrubbed.contains("Connor") && !scrubbed.contains("AppData"),
+        "{scrubbed}"
+    );
+
+    // A path in double quotes: the closing quote stays, the text after it is kept.
+    let scrubbed = run(
+        "<stderr_txt>\n\"C:\\Users\\Jane Doe\\x.txt\" failed\n</stderr_txt>",
+        &["Jane Doe"],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        scrubbed.contains(&format!("\"{path}\" failed")),
+        "{scrubbed}"
+    );
+    assert!(!scrubbed.contains("Doe"), "{scrubbed}");
+
+    // A path in an attribute value: the tag stays well formed.
+    let scrubbed = run(
+        "<file name=\"C:\\Users\\Jane Doe\\x.txt\" size=\"3\"/>",
+        &["Jane Doe"],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        scrubbed.contains(&format!("<file name=\"{path}\" size=\"3\"/>")),
+        "{scrubbed}"
+    );
+
+    // The data directory with a space in a name, in lower case.
+    let scrubbed = run("<x>c:\\programdata\\My Co\\boinc\\slots</x>", &["My Co"])
+        .unwrap()
+        .unwrap();
+    assert!(scrubbed.contains(&format!("<x>{path}</x>")), "{scrubbed}");
+
+    // A single-quoted path with an apostrophe inside: the end is unknown, so the file is refused.
+    let refused = run("<x a='C:\\Users\\O'Connor\\x'/>", &[])
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        refused.contains("cannot tell where the path ends"),
+        "{refused}"
+    );
+
+    // A part of a forbidden name that is left anywhere is refused.
+    let refused = run("<x>Mr Doe</x>", &["Jane Doe"]).unwrap().unwrap_err();
+    assert!(
+        refused.contains("a part 'Doe' of the forbidden text 'Jane Doe'"),
+        "{refused}"
+    );
+    let refused = run("<x>Connor</x>", &["O'Connor"]).unwrap().unwrap_err();
+    assert!(refused.contains("'Connor'"), "{refused}");
+
+    // A profile path in a form the replacement does not match is refused, not written.
+    let refused = run("<x>d:/Users/jsmith/x</x>", &[]).unwrap().unwrap_err();
+    assert!(refused.contains("forbidden text"), "{refused}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The script replaces the CPU model and features with a placeholder of the kind of platform
 /// the request names, so that a fixture keeps the shape the client sends, and the capture
 /// machine's time zone with UTC. The test skips when `python3` is not installed.
@@ -655,6 +777,16 @@ impl World {
         }
     }
 
+    /// A held task can be a later result of its workunit (`plwinexe_0_1`: the server made another
+    /// result of a job whose first one was lost). `submit` makes `<workunit>_0`; this renames it.
+    fn rename_result(&self, old: &str, new: &str) {
+        block_on(
+            self.db
+                .run(stmt!("UPDATE result SET name = ? WHERE name = ?", new, old)),
+        )
+        .unwrap();
+    }
+
     /// Makes the result `name` one the server sent to `host` earlier.
     fn mark_sent(&self, name: &str, host: i64) {
         block_on(self.db.run(stmt!(
@@ -796,6 +928,10 @@ fn replay(f: &Fixture) {
     let wus: Vec<String> = held.iter().map(|n| workunit_of(n)).collect();
     w.submit(&wus);
     for name in &held {
+        let first = format!("{}_0", workunit_of(name));
+        if *name != first {
+            w.rename_result(&first, name);
+        }
         w.mark_sent(name, host);
     }
     // Work for the request, unless the scenario is one where there is none.
