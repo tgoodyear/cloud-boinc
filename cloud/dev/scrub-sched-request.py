@@ -18,7 +18,7 @@ After scrubbing, the output is checked, and nothing is written if a check fails:
   * no IPv4 address outside the documentation ranges of RFC 5737;
   * no MAC address (six hex pairs joined by colons or dashes), whatever element it is in;
   * none of the words given with `--forbid` (for example the capture machine's host name), and none
-    of the built-in ones (`usnewsmap`, `/root/`, `/home/`).
+    of the built-in ones (`usnewsmap`, `/root/`, `/home/`, `\\Users\\`, `/Users/`).
 
 `--check-only` runs the checks on `--input` itself, without changing it, which is how the committed
 fixtures are verified (see `cloud/tests/client-corpus/README.md`).
@@ -107,7 +107,7 @@ MAC = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0
 ALLOWED_V4 = re.compile(r"^(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)")
 HEX32 = re.compile(r"[0-9a-fA-F]{32,}")
 IPV4 = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
-BUILTIN_FORBIDDEN = ["usnewsmap", "/root/", "/home/"]
+BUILTIN_FORBIDDEN = ["usnewsmap", "/root/", "/home/", "\\users\\", "/users/"]
 
 
 def scrub_block(text, block, elements):
@@ -152,6 +152,12 @@ def scrub(text, project_url):
     text = re.sub(r"\[[^|\]\n]*\|libc", "[6.12.0|libc", text)
     # Absolute paths a task's stderr may carry.
     text = re.sub(r"/(?:root|home|var/lib|opt|usr)/[^\s<\"']*", "/var/lib/boinc/path", text)
+    # The same on Windows: a task's stderr may name a user's profile or the data directory.
+    text = re.sub(
+        r"[A-Za-z]:\\(?:Users|ProgramData|Documents and Settings)\\[^\s<\"']*",
+        lambda m: "C:\\ProgramData\\BOINC\\path",
+        text,
+    )
     # The code-signing key the client echoes back: key size, then hex lines, then a dot.
     text = re.sub(
         r"(<code_sign_key>\s*\n)\s*[0-9]+\s*\n(?:[0-9a-fA-F]+\s*\n)+(\.\s*\n</code_sign_key>)",

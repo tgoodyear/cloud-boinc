@@ -239,6 +239,57 @@ fn scrub_script_removes_and_refuses_mac_addresses() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A Windows task's stderr can name the user's profile or the data directory; the script
+/// replaces such paths, and refuses a file that still has a `\Users\` path.
+#[test]
+fn scrub_script_replaces_windows_paths() {
+    use std::process::Command;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/scrub-sched-request.py");
+    let dir = std::env::temp_dir().join(format!("cb-corpus-scrub-win-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (input, output) = (dir.join("in.xml"), dir.join("out.xml"));
+    let run = |args: &[&str]| {
+        Command::new("python3")
+            .arg("-I")
+            .arg(&script)
+            .args(args)
+            .output()
+    };
+    std::fs::write(
+        &input,
+        "<scheduler_request>\n<result>\n<stderr_out>\n<stderr_txt>\ncan't open C:\\Users\\jsmith\\AppData\\x.txt and C:\\ProgramData\\BOINC\\slots\\0\\out\n</stderr_txt>\n</stderr_out>\n</result>\n</scheduler_request>\n",
+    )
+    .unwrap();
+    let (i, o) = (input.to_str().unwrap(), output.to_str().unwrap());
+    let Ok(done) = run(&["--input", i, "--output", o]) else {
+        eprintln!("python3 is not installed; the scrub script was not run");
+        return;
+    };
+    assert!(
+        done.status.success(),
+        "{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+    let scrubbed = std::fs::read_to_string(&output).unwrap();
+    assert!(!scrubbed.contains("jsmith"), "{scrubbed}");
+    assert!(!scrubbed.contains("slots"), "{scrubbed}");
+    assert!(
+        scrubbed.contains("C:\\ProgramData\\BOINC\\path"),
+        "{scrubbed}"
+    );
+    // A profile path in a form the replacement does not match is refused, not written.
+    std::fs::write(
+        &input,
+        "<scheduler_request>\n<x>d:/Users/jsmith/x</x>\n</scheduler_request>\n",
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&output);
+    let refused = run(&["--input", i, "--output", o]).unwrap();
+    assert!(!refused.status.success());
+    assert!(!output.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The script replaces the CPU model and features with a placeholder of the kind of platform
 /// the request names, so that a fixture keeps the shape the client sends, and the capture
 /// machine's time zone with UTC. The test skips when `python3` is not installed.
@@ -655,6 +706,16 @@ impl World {
         }
     }
 
+    /// A held task can be a later result of its workunit (`plwinexe_0_1`: the server made another
+    /// result of a job whose first one was lost). `submit` makes `<workunit>_0`; this renames it.
+    fn rename_result(&self, old: &str, new: &str) {
+        block_on(
+            self.db
+                .run(stmt!("UPDATE result SET name = ? WHERE name = ?", new, old)),
+        )
+        .unwrap();
+    }
+
     /// Makes the result `name` one the server sent to `host` earlier.
     fn mark_sent(&self, name: &str, host: i64) {
         block_on(self.db.run(stmt!(
@@ -796,6 +857,10 @@ fn replay(f: &Fixture) {
     let wus: Vec<String> = held.iter().map(|n| workunit_of(n)).collect();
     w.submit(&wus);
     for name in &held {
+        let first = format!("{}_0", workunit_of(name));
+        if *name != first {
+            w.rename_result(&first, name);
+        }
         w.mark_sent(name, host);
     }
     // Work for the request, unless the scenario is one where there is none.

@@ -468,6 +468,53 @@
       ]
     },
     {
+      "version": "8.2.15",
+      "platform": "windows_x86_64",
+      "binary": "the stock Windows client 8.2.15 on a Windows host: boinc_8.2.15_windows_x86_64.exe from boinc.berkeley.edu/dl, run through its installer (silent install, default folders), on a Windows 11 Enterprise evaluation virtual machine; the client was started the way the Manager starts it (boinc.exe --redirectio --launched_by_manager) in the installer's data directory",
+      "files": [
+        {
+          "file": "8.2.15-windows_x86_64/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15-windows_x86_64/10-report-after-resumed-upload.request.xml",
+          "scenario": "report"
+        }
+      ]
+    },
+    {
       "version": "8.0.4",
       "platform": "x86_64-pc-linux-gnu",
       "version_platform": "i686-pc-linux-gnu",

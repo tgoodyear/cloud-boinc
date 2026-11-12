@@ -1,7 +1,7 @@
 # Client request corpus
 
 Scheduler requests recorded from stock BOINC clients of six versions on 64-bit Linux, and of
-clients on five other platforms, scrubbed, and replayed by
+clients on six other platforms, scrubbed, and replayed by
 `cloud/crates/cb-core/tests/client_corpus.rs`. They show what each client version and platform
 sends, and that this server's request parser and `handle_request` accept it.
 
@@ -20,6 +20,7 @@ sends in `<platform_name>`. The directory of a client holds one file per scenari
 | `07-report-after-restart` | `report` | Reports the task that was running at the restart |
 | `08-reattach-first-contact` | `reattach` | After detach and attach in the same data directory: host ID 0 again, same host CPID (the scrubbed files carry a placeholder) |
 | `09-reattach-work-request-task-held` | `work_request` | The next request after the re-attach |
+| `10-report-after-resumed-upload` | `report` | Only in `8.2.15-windows_x86_64`: reports a task whose 20 MB output upload was cut and resumed (`final_peak_*` elements, `max_nbytes` 30000000) |
 
 The directories named by a version alone are the 64-bit Linux clients: 7.16.6, 7.18.1, 7.20.5,
 7.24.1, 8.0.4 and 8.2.15, all `x86_64-pc-linux-gnu`. The others are named by version and platform:
@@ -31,7 +32,10 @@ The directories named by a version alone are the 64-bit Linux clients: 7.16.6, 7
 | `8.0.4-arm-unknown-linux-gnueabihf` | Debian package for armhf, under qemu-user | `arm-unknown-linux-gnueabihf` |
 | `8.2.11-arm64-apple-darwin` | macOS client on an Apple-silicon Mac | `arm64-apple-darwin` |
 | `8.2.15-windows_x86_64-wine` | the Windows client binary under Wine, not a Windows host | `windows_x86_64` |
+| `8.2.15-windows_x86_64` | the stock Windows client, installed with its installer on a Windows 11 virtual machine | `windows_x86_64` |
 | `8.0.4-i386-on-64-bit-kernel` | the i386 package on a 64-bit kernel, for an alternate platform | `x86_64-pc-linux-gnu`, alternate `i686-pc-linux-gnu` |
+
+In `8.2.15-windows_x86_64`, file `03` reports one task with four held, and file `04` reports four tasks, where the other clients' files have two held and two reported: two jobs of earlier runs were sent to that host again.
 
 Android clients, 32-bit Windows and macOS clients, and GPU hosts other than the Apple GPU of the
 macOS client are not in the corpus. The last directory has first-contact, work-request, report and no-work files only, and
@@ -111,6 +115,18 @@ Other platforms:
   bundle holding an MSI, whose `boinc.cab` holds `boinc.exe` and `boinccmd.exe`), run with Wine in
   an amd64 container: `wine boinc.exe --dir Z:/work/wine ...`, `boinccmd.exe` through Wine too.
   Label every file "Windows client binary under Wine, not a Windows host".
+- A Windows host: the stock installer (`boinc_8.2.15_windows_x86_64.exe`, from
+  `boinc.berkeley.edu/dl/`) with `/quiet`, on a Windows 11 Enterprise evaluation virtual machine
+  (Microsoft's evaluation image, installed unattended with an answer file). The installer's silent mode
+  starts no client. Put the log flags in `C:\ProgramData\BOINC\cc_config.xml`, start
+  `boinc.exe --redirectio --launched_by_manager` in that directory as the logged-in user (a
+  scheduled task with `/IT` does it from a remote session), and run `boinccmd.exe` with the password
+  in `gui_rpc_auth.cfg`. A PowerShell loop that copies `sched_request_*.xml` and `sched_reply_*.xml` each
+  time their modification time changes does the capture (open them with `FileShare.ReadWrite`). Windows Update
+  runs for a long time on a new virtual machine and slows everything; stop `wuauserv` and `TrustedInstaller`
+  once the system is installed. To cut an upload, `Disable-NetAdapter` and `Enable-NetAdapter` a
+  few seconds apart, with `<max_bytes_sec_up>` in `global_prefs_override.xml` low enough that the
+  upload lasts a minute; a file of 8 MiB or less restarts from offset 0 (D5).
 
 ## Scrubbing
 
@@ -122,12 +138,12 @@ cloud/dev/scrub-sched-request.py --input RAW.xml --output cloud/tests/client-cor
 The script replaces the account key, the cross-project ID, the host CPID, the email hash, the
 domain name, the address, the time zone, the CPU model and features (by a placeholder of the kind
 of the request's platform: x86, 64-bit ARM, 32-bit ARM, Apple silicon), the kernel release, product and serial
-strings, the MAC address (`<mac_address>`), GPU and OpenCL device names and PCI numbers, WSL
+strings, absolute Windows paths (`C:\Users\...`, `C:\ProgramData\...`), the MAC address (`<mac_address>`), GPU and OpenCL device names and PCI numbers, WSL
 distribution names, user and team names, the client brand, output file checksums, paths, the
 project's URLs and the echoed code-signing key. It leaves element names, numbers, counts, task
 names and timing as they were. It then refuses to write the file if the result still has a run of
 32 or more hex digits, a MAC address (six hex pairs joined by colons or dashes) in any element, an
-IPv4 address outside the RFC 5737 ranges, or a word given with `--forbid`. Give it the capture
+IPv4 address outside the RFC 5737 ranges, a `\Users\` or `/Users/` path, or a word given with `--forbid`. Give it the capture
 machine's host name, and the name of any user or machine that is not in its list, with `--forbid`
 (it can be repeated).
 

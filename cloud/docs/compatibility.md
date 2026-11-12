@@ -295,10 +295,10 @@ the parser reads both.
 
 ### Other platforms
 
-The steps above were run again with stock clients of five more kinds, and with the i386 package a
+The steps above were run again with stock clients of six more kinds, and with the i386 package a
 second way, against the same dev deployment and the same test account, each in a new data directory
-and on its own GUI RPC port. Only what could be run from one x86-64 Linux machine and one
-Apple-silicon Mac was run.
+and on its own GUI RPC port. The Windows host ran one client, in the installer's data directory. Only what could be run from one x86-64 Linux machine, one
+Apple-silicon Mac and one Windows virtual machine was run.
 
 | Client | Platform it names | How it was obtained and run | Jobs validated | Re-attach, same host ID |
 |--------|-------------------|-----------------------------|----------------|-------------------------|
@@ -306,6 +306,7 @@ Apple-silicon Mac was run.
 | 8.0.4 | `aarch64-unknown-linux-gnu` | The same package for arm64, in an arm64 container, run under qemu-user 10.0 | 5 of 5 | yes |
 | 8.0.4 | `arm-unknown-linux-gnueabihf` | The same package for armhf, in a linux/arm/v7 container, under qemu-user | 5 of 6 (item 8) | yes |
 | 8.2.11 | `arm64-apple-darwin` | The macOS client from the BOINC Mac installer, on an Apple-silicon Mac, as a second client instance in a new data directory: `--allow_multiple_clients`, its own GUI RPC port, `-insecure`, one CPU (`max_ncpus_pct` in `global_prefs_override.xml`) | 5 of 5 | yes |
+| 8.2.15 | `windows_x86_64` (a Windows host) | The official installer, run on a Windows 11 Enterprise evaluation virtual machine; see "A Windows host" below | 9 of 9 | yes |
 | 8.2.15 | `windows_x86_64` | The Windows client binary under Wine, not a Windows host: `boinc.exe` of the official 8.2.15 Windows x86-64 installer, taken out of it with 7z without running it, and run by Wine 10.0 (Debian 13) in an amd64 container | 5 of 6 (item 8) | yes |
 | 8.0.4 | `x86_64-pc-linux-gnu`, alternate `i686-pc-linux-gnu` | The i386 package run as it is, on a 64-bit kernel. The project had an app version for `i686-pc-linux-gnu` only | 1 of 1 | not run |
 
@@ -325,8 +326,7 @@ static for `i686-unknown-linux-musl`, `aarch64-unknown-linux-musl` and
 which does the same, built with the Xcode command line tools (`arm64-apple-darwin`) and with
 mingw-w64 (`x86_64-pc-windows-gnu`). Each was signed and registered with `cboinc version-add`. The
 Windows file is stored as `upperx_1.00_windows_x86_64`, with no `.exe`, which is how `version-add`
-names a main program; Wine ran it. Whether a Windows host runs a main program with no extension
-was not checked.
+names a main program; Wine ran it, and so did the Windows host (see "A Windows host").
 
 #### Steps and result
 
@@ -369,6 +369,76 @@ already send and the parser ignores: every new element is read by `cb-proto` (th
 container, with nothing in it, is listed with the other containers in the test). Each is also
 read by the stock parser: `HOST::parse` and `SCHEDULER_REQUEST::parse` (`dont_use_docker`, `dont_use_wsl`) in
 `sched/sched_types.cpp`, and `COPROCS::parse` and `COPROC_APPLE::parse` in `lib/coproc.cpp`. No element is read by the stock parser and ignored here.
+
+#### A Windows host
+
+The Windows client was also run on a Windows host: a Windows 11 Enterprise evaluation virtual
+machine (build 26300, 4 CPUs, 8 GB of memory), installed from Microsoft's evaluation image
+`win11-ent-eval-26300.9457-en-us.iso` (SHA-256
+`bc3f24086ebadc94489066b5ad78089e2cf5c3491e90e790bb81a2b199c10e38`; Microsoft publishes no checksum
+for it, so the value is the one the image had when it was downloaded from the Evaluation Center).
+The client is the stock `boinc_8.2.15_windows_x86_64.exe` from `boinc.berkeley.edu/dl/` (SHA-256
+`89cbad087ee1ee1009aafcd61ae8f14ed09d81827f1cbd791eecd70e5d0e050c`, Authenticode signature valid,
+signer `CN=BOINC`), installed silently with the installer's defaults: `C:\Program Files\BOINC`, data
+directory `C:\ProgramData\BOINC`, no service, the Manager and tray program started at logon. No
+VirtualBox, Docker or WSL was installed. The client was started as the Manager starts it
+(`boinc.exe --redirectio --launched_by_manager`, in the data directory) by the logged-in account, and
+was driven with `boinccmd`, so the Manager's own requests to the client were not part of the run.
+`cc_config.xml` had the log flags of the capture procedure and `<no_info_fetch>` and
+`<dont_contact_ref_site>`, so that the client contacted only the dev deployment.
+
+Steps, as for the other platforms: first contact, work, report with tasks held, a request with nothing
+to report, `--get_project_config` and `--lookup_account` with a wrong password (`bad password`), a
+40 second task with the client quit while it ran and started again, a detach and attach in the same
+data directory, and two uploads cut by taking the network adapter down. The application is a new
+version, 1.01, of `upperx` for `windows_x86_64`, built from the current
+`cloud/tests/app/c/upper.c` with mingw-w64 and registered with `cboinc version-add`.
+
+| Step | Result |
+|------|--------|
+| Attach, first contact | host ID made; the request asked for one second of work and got one task, with the application and input file downloaded (the client accepted the signature and the MD5 sum) |
+| Tasks run | 9 tasks (7 jobs of this run and 2 sent again, below), every one exit status 0, output uploaded, validated and canonical, assimilation pending as with the other clients. Credit was granted to the tasks that reported an elapsed time (the 5.8, 7.3 and 20.3 second ones, 0.08 to 0.29 each); the test application finishes the others in under a second and they reported 0 |
+| Restart | the 40 second task had finished by the time the new client started; the client logged "Found finish file for <task>; exit code 0" and "no shared memory segment" (as the Linux clients did), uploaded its output and reported it |
+| Re-attach | `<hostid>0</hostid>`, same host CPID; the server answered with the host ID the host had, no second host |
+| Upload of 4.9 MB (max 5 MB), adapter down 11 s into a throttled upload | `<get_file_size>` answered 0 both times; after the back-off the client sent the file again from offset 0 and it completed (D5) |
+| Upload of 20 MB (max 30 MB), adapter down after about 74 s at 250 kB/s | the client backed off 2 min 20 s, asked `<get_file_size>`, got 16777216 (two pieces of 8 MiB) and sent the rest with offset 16777216; the server accepted the file and the task validated |
+
+Two jobs of earlier runs (one of the Wine run and one of the armhf run, whose first results had been
+lost at a detach and had timed out) were sent to this host as their second results, `plwinexe_0_1`
+and `plarmhfxe_0_1`, and ran there; so the fixtures `03` and `04` report one task with four held and
+four tasks, not one with two held and two. The corpus test names the held results of a workunit as
+the server made them (`rename_result` in `client_corpus.rs`).
+
+What the client logged about the server: nothing out of the ordinary. With `<sched_op_debug>`,
+`<unparsed_xml>`, `<task>`, `<file_xfer>` and `<file_xfer_debug>` on, no line reported an
+unrecognized element, a parse warning, a signature or file-verification failure, a time-zone or
+operating-system complaint, "no work for your platform", or a back-off from a scheduler reply. The
+only back-off was the transient upload error after the adapter was taken down. Each reply to a
+request for work that had none said "Project has no tasks available". The client's own start-up
+lines on a fresh install: "WSL: registry key not found; assuming no WSL distros are installed",
+"WSL: no usable distros found", "No usable GPUs found" (the virtual machine's display adapter is not
+a coprocessor), and the notice "Some projects require Docker; we recommend that you install it."
+
+The request, compared with the Wine run's (the set of element paths is the same; only values
+differ) and with the 64-bit Linux 8.2.15 client's (`<alt_platform>` and `<wsl>` are added;
+`<docker_version>`, `<docker_type>` and `<stderr_txt>` are absent):
+
+- `os_name` is "Microsoft Windows 11" and `os_version` is "x64 Edition, (10.00.26300.00)"; under Wine they were
+  "Microsoft Windows 10" and "Ultimate N x64 Edition, (10.00.19043.00)". `p_model` carries the
+  family, model and stepping after the CPU name, and `p_features` joins two feature names without a
+  space; both are the client's own formats.
+  `<m_cache>` is 4194304 where Wine gave 262144, and the benchmark values are the client's own.
+- `<alt_platform>` names `windows_intelx86`, as under Wine. The dev project has no such platform.
+- `<wsl>` is empty, with no WSL installed; there is no `<wsl_version>`, `<wsl_available>` or Docker element, and no
+  `<coprocs>`. The host page shows "---" for coprocessors, virtualization and Docker.
+- A task that ran for more than a moment is reported with `<final_peak_working_set_size>`,
+  `<final_peak_swap_size>` and `<final_peak_disk_usage>`; one that reported an elapsed time of 0 has none of them. The Wine
+  run's reported tasks had none (fixture `10` has them). `cb-proto` reads all three.
+- `unread_elements_are_the_documented_ones` finds no element that the corpus did not already have.
+  The stored host row's fields come out as sent: the computer page (`show_host_detail.php`) shows the
+  CPU type (vendor, then model), 4 cores, the operating system on two lines, 7.93 GB, the 4096 KB cache and the measured speeds, and
+  "Number of times client has contacted server" 4, which is the host's `rpc_seqno` after the re-attach, as
+  in stock.
 
 #### Differences found
 
@@ -446,10 +516,23 @@ read by the stock parser: `HOST::parse` and `SCHEDULER_REQUEST::parse` (`dont_us
     clients sent them (an arm64 host shows "ARM", then qemu's model; a Windows host "Microsoft
     Windows 10", then the version string).
 
+11. Not a difference. A main program named `upperx_1.01_windows_x86_64`, with no `.exe`, runs on a
+    real Windows host. The client passes the path to `CreateProcess` as the application name
+    (`ACTIVE_TASK::start` in `client/app_start.cpp`; `CreateProcessAsUser` when a sandbox account is
+    in use, which this install did not have), which does not need an extension, and the file has the
+    `<executable/>` flag the main program needs. `cboinc version-add` stores a main program as
+    `<app>_<version>_<platform>`. No change to the server or the command is needed.
+12. Known difference, D5; no new one. An upload cut short restarts from offset 0 when the file is no
+    larger than one piece (8 MiB), and from the last 8 MiB boundary it crossed otherwise. The stock
+    Windows client behaved this way here.
+13. Not a difference. The jobs of earlier runs whose results had timed out were sent again, as new
+    results, to the next host that asked. The stock server does the same (`sched/transitioner.cpp`
+    makes another result when one has no reply by its deadline).
+
 ### What this does not cover
 
 - Android clients, 32-bit Windows and macOS clients, 32-bit ARM and arm64 clients on real hardware,
-  and a real Windows host: the Windows client ran under Wine, the ARM clients under qemu-user,
+  and Windows on real hardware (the Windows host was a virtual machine): the ARM clients ran under qemu-user,
   and the macOS client on one Apple-silicon Mac without the `detect_rosetta_cpu` helper. GPU hosts
   other than the Apple GPU of the macOS client, which was sent no GPU work, and plan classes.
 - Windows hosts with WSL distributions, and macOS or Linux hosts with Docker: the `<wsl>` and
