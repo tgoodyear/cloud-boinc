@@ -50,6 +50,49 @@ pub fn is_valid_email(addr: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
+/// A tighter test than [`is_valid_email`], for addresses the site is given
+/// from now on (sign-up and address changes) and the ones it mails: a local
+/// part of at most 64 characters from letters, digits and `._+-` that does not
+/// start with `-` or `.`, end with `.` or have `..`; a domain of at least two
+/// non-empty labels of at most 63 letters, digits and hyphens that neither
+/// start nor end with a hyphen, whose last label has a letter (so no IP-like
+/// domain); at most 254 characters in all. Accounts made under the looser rule
+/// keep working; they just get no mail.
+pub fn is_strict_email(addr: &str) -> bool {
+    if addr.len() > MAX_EMAIL {
+        return false;
+    }
+    let Some((local, domain)) = addr.split_once('@') else {
+        return false;
+    };
+    let local_ok = !local.is_empty()
+        && local.len() <= 64
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+        && !local.starts_with(['-', '.'])
+        && !local.ends_with('.')
+        && !local.contains("..");
+    let labels: Vec<&str> = domain.split('.').collect();
+    local_ok
+        && labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
+        && labels
+            .last()
+            .is_some_and(|l| l.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
+/// How long the address an account has just changed away from stays reserved
+/// for it, and the wait before its next change: seven days, as upstream's
+/// `edit_email_action.php`.
+pub const EMAIL_CHANGE_WAIT_SECS: i64 = 604800;
+
 /// `is_valid_user_name` (`html/inc/user_util.inc`): printable, no markup,
 /// no leading or trailing space.
 pub fn is_valid_user_name(name: &str) -> bool {
@@ -219,10 +262,14 @@ pub async fn make_user(
     } else {
         pepper_passwd_hash(pepper, &passwd_hash)
     };
+    // Not an address another account changed away from within the week: that
+    // account's undo link has to find it free.
     let inserted = db
         .run(stmt!(
             "INSERT INTO user (create_time, email_addr, name, authenticator, cross_project_id, \
-             passwd_hash, expavg_time, country, postal_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             passwd_hash, expavg_time, country, postal_code) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             WHERE NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
+             AND previous_email_addr != '' AND email_addr_change_time > ?) \
              ON CONFLICT (email_addr) DO NOTHING RETURNING id",
             now,
             email.as_str(),
@@ -232,7 +279,9 @@ pub async fn make_user(
             stored.as_str(),
             now,
             account.country,
-            account.postal_code
+            account.postal_code,
+            email.as_str(),
+            now - EMAIL_CHANGE_WAIT_SECS
         ))
         .await?;
     if inserted.rows.is_empty() {
@@ -346,6 +395,7 @@ pub async fn am_set_info(
     db: &dyn Db,
     config: &Config,
     pepper: &[u8],
+    now: i64,
     q: &crate::site::Params,
 ) -> CoreResult<String> {
     let get = |k: &str| q.get(k).map(String::as_str).unwrap_or_default();
@@ -407,9 +457,14 @@ pub async fn am_set_info(
             ));
         }
         let merged = crate::prefs::keep_project_specific(&project_prefs, &user.project_prefs);
-        // The stored block came from the row read above; a site save of the
-        // application selection or task limit since would be undone.
-        keeps_stored_prefs = merged != project_prefs;
+        // A document without its own `<project_specific>` replaces whatever
+        // the account has there now: the block read above if there was one
+        // (it is kept), or none (a site save that adds the first task limit
+        // or application selection since would be lost). Either way the write
+        // is conditional on `project_prefs` being still what was read.
+        keeps_stored_prefs = !project_prefs
+            .to_ascii_lowercase()
+            .contains("<project_specific>");
         let project_prefs = merged;
         if project_prefs.len() > crate::prefs::MAX_PREFS_BYTES {
             return Ok(write_error(err::ERR_BUFFER_OVERFLOW, None));
@@ -445,8 +500,22 @@ pub async fn am_set_info(
                 Some("Invalid email address"),
             ));
         }
+        // The week's wait of the site's change applies here too: this call
+        // needs only the account key, and must not get round the window in
+        // which the previous address can undo a change.
+        if user.email_addr_change_time + EMAIL_CHANGE_WAIT_SECS > now {
+            return Ok(write_error(
+                -1,
+                Some("The email address was changed within the past 7 days"),
+            ));
+        }
         set("email_addr", email.as_str().into());
         set("email_validated", 0.into());
+        // Recorded as the site's change records it, so the old address stays
+        // reserved; no undo mail goes from here (there is no mailer in this
+        // call), so no undo token is made.
+        set("previous_email_addr", user.email_addr.as_str().into());
+        set("email_addr_change_time", now.into());
     }
     let password_hash = get("password_hash").trim().to_lowercase();
     if !password_hash.is_empty() {
@@ -459,6 +528,12 @@ pub async fn am_set_info(
         );
     }
 
+    let credentials_changed = new_email || !password_hash.is_empty();
+    let new_stored_hash = if password_hash.is_empty() {
+        String::new()
+    } else {
+        pepper_passwd_hash(pepper, &password_hash)
+    };
     if !sets.is_empty() {
         let assignments: Vec<String> = sets.iter().map(|c| format!("{c} = ?")).collect();
         let target = if new_email {
@@ -470,8 +545,10 @@ pub async fn am_set_info(
         // hash are what this RPC compared with. If a site request changed
         // either since, the pair written would not match.
         let credentials = !password_hash.is_empty() || !email.is_empty();
-        let mut guard = String::new();
-        let mut observed: Vec<&str> = Vec::new();
+        // The account key too, every time: a request that authenticated before
+        // `reset_account_key.php` replaced it must not write afterwards.
+        let mut guard = String::from(" AND authenticator = ?");
+        let mut observed: Vec<&str> = vec![user.authenticator.as_str()];
         if credentials {
             guard.push_str(" AND email_addr = ? AND passwd_hash = ?");
             observed.extend([user.email_addr.as_str(), user.passwd_hash.as_str()]);
@@ -482,21 +559,63 @@ pub async fn am_set_info(
         }
         update.sql = format!(
             "UPDATE user SET {} WHERE id = ?{guard} AND NOT EXISTS \
-             (SELECT 1 FROM user WHERE email_addr = ? AND id != ?) RETURNING id",
+             (SELECT 1 FROM user WHERE email_addr = ? AND id != ?) AND NOT EXISTS \
+             (SELECT 1 FROM user WHERE previous_email_addr = ? AND previous_email_addr != '' \
+             AND email_addr_change_time > ? AND id != ?) RETURNING id",
             assignments.join(", ")
         );
         update = update.bind(user.id);
         for v in observed {
             update = update.bind(v);
         }
-        update = update.bind(target).bind(user.id);
-        if db.run(update).await?.rows.is_empty() {
+        update = update
+            .bind(target)
+            .bind(user.id)
+            .bind(target)
+            .bind(now - EMAIL_CHANGE_WAIT_SECS)
+            .bind(user.id);
+        // The update and, for a change of credentials, the end of the login
+        // links mailed before it (and of undo links, for an address) go in
+        // one batch. The second statement runs only if the update just before
+        // it changed a row (`changes()`, which is for the statement before),
+        // not merely because the account looks like the target: a newer
+        // change by another request can make it look so while this update was
+        // refused, and its tokens must stay.
+        let mut batch = vec![update];
+        if credentials_changed {
+            batch.push(stmt!(
+                "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
+                 AND used_time = 0 AND changes() > 0 \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
+                 AND authenticator = ? AND (? = '' OR passwd_hash = ?))",
+                now,
+                user.id,
+                if new_email { "E" } else { "L" },
+                user.id,
+                target,
+                user.authenticator.as_str(),
+                new_stored_hash.as_str(),
+                new_stored_hash.as_str()
+            ));
+        }
+        if !db
+            .batch(batch)
+            .await?
+            .first()
+            .is_some_and(|r| !r.rows.is_empty())
+        {
             // Refused: the address is taken, or the account changed since it
             // was read. Only this path asks which.
             let taken = db
                 .run(stmt!(
-                    "SELECT count(*) AS n FROM user WHERE email_addr = ? AND id != ?",
+                    "SELECT (SELECT count(*) FROM user WHERE email_addr = ? AND id != ?) + \
+                     (SELECT count(*) FROM user WHERE previous_email_addr = ? \
+                     AND previous_email_addr != '' AND email_addr_change_time > ? \
+                     AND id != ?) AS n",
                     target,
+                    user.id,
+                    target,
+                    now - EMAIL_CHANGE_WAIT_SECS,
                     user.id
                 ))
                 .await?

@@ -1,6 +1,8 @@
 //! What the Workers share: the bindings by name, R2 behind the core's
 //! [`Files`] trait, `fetch` behind [`Webhook`], and the per-isolate cache of
-//! project settings.
+//! project settings, and the email binding behind the core's `Mailer` trait.
+
+mod email;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,6 +13,7 @@ use cb_core::{CoreError, CoreResult, FileKind, FileStat, Files, Webhook};
 use cb_crypto::account::constant_time_eq;
 use cb_crypto::{PrivateKey, Signer};
 pub use cb_d1::D1Db;
+pub use email::{mailer, EmailBinding, EMAIL};
 use futures_util::StreamExt;
 use worker::wasm_bindgen::JsValue;
 use worker::{Bucket, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result};
@@ -41,11 +44,13 @@ pub fn now_ms() -> u64 {
     Date::now().as_millis()
 }
 
-/// 32 bits from the runtime's cryptographic generator.
+/// 32 bits from the runtime's cryptographic generator. These become account
+/// keys and the tokens in mail, so a failure must not return a constant: it
+/// ends the request (a panic in a Worker is an error response). In practice
+/// `crypto.getRandomValues` does not fail.
 pub fn random_u32() -> u32 {
     let mut b = [0u8; 4];
-    // `crypto.getRandomValues` does not fail in a Worker.
-    let _ = getrandom::getrandom(&mut b);
+    getrandom::getrandom(&mut b).expect("no source of random numbers");
     u32::from_le_bytes(b)
 }
 

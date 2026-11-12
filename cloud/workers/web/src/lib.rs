@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_PATHS};
+use cb_core::mail::Mailer;
+use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
     project_config, server_status, server_status_page, server_status_xml, NewAccount,
@@ -13,7 +14,7 @@ use cb_core::web::{
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
-    db, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
+    db, mailer, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
     SECRET_PASSWD_PEPPER,
 };
 use worker::{
@@ -48,12 +49,10 @@ fn site_response(page: SitePage) -> Result<Response> {
     let mut builder = Response::builder()
         .with_status(page.status)
         .with_header("Content-Type", page.content_type)?
-        .with_header("Cache-Control", "private, no-store")?
-        .with_header("X-Content-Type-Options", "nosniff")?
-        // The pages hold forms that change the account; no other site may
-        // put them in a frame.
-        .with_header("Content-Security-Policy", "frame-ancestors 'none'")?
-        .with_header("X-Frame-Options", "DENY")?;
+        .with_header("Cache-Control", "private, no-store")?;
+    for (name, value) in SITE_HEADERS {
+        builder = builder.with_header(name, value)?;
+    }
     if let Some(location) = &page.location {
         builder = builder.with_header("Location", location)?;
     }
@@ -197,7 +196,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         "/am_set_info.php" => {
             let q = params(&mut req).await?;
             let pepper = secret_bytes(&env, SECRET_PASSWD_PEPPER)?;
-            match am_set_info(&db, &project.config, &pepper, &q).await {
+            match am_set_info(&db, &project.config, &pepper, now(), &q).await {
                 Ok(reply) => xml(reply),
                 Err(e) => {
                     console_error!("am_set_info: {e}");
@@ -225,6 +224,9 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             let q = params(&mut req).await?;
             let pepper = secret_bytes(&env, SECRET_PASSWD_PEPPER).ok();
             let random = random_u32;
+            // `None` without an `EMAIL` binding: the pages that need email
+            // say the project sends none.
+            let mail = mailer(&env);
             let ctx = SiteCtx {
                 db: &db,
                 project: &project,
@@ -233,6 +235,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 pepper: pepper.as_deref(),
                 now: now(),
                 random: &random,
+                mailer: mail.as_ref().map(|m| m as &dyn Mailer),
             };
             match site_page(&ctx, p, &q).await {
                 Ok(Some(page)) => site_response(page),
