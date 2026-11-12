@@ -209,18 +209,47 @@ deadline, so neither sends a message.
 2. Batch 1 (read): user by authenticator or weak authenticator, host by ID, config version.
    If the config version changed, reload apps, app versions, platforms, plan classes and
    project settings; otherwise use the copy cached in the isolate.
-3. Authenticate, find or create the host (same rules as `handle_request.cpp`). A request whose
-   host ID is one of the account's hosts, with an `rpc_seqno` not below the stored one, gets that
-   host. When no host ID is sent, or it is not the account's, or the `rpc_seqno` is too low, the
-   account's newest host with the request's host CPID is used, unless it is obviously another
-   computer (`obviously_different`: processor count, vendor and model, OS name
-   and version): a CPID is made from the MAC address and the data directory, so two computers
-   cloned from one image share it. Failing that, and unless the client says it is one of several
-   on its computer (`<allow_multiple_clients>`), the newest host with the same name, address, OS
-   name, processor model and memory is used, as `find_host_by_other` does when the request has
-   all of the first four. Otherwise a new host is made. Stock skips the CPID lookup when the host
-   ID is the account's but the `rpc_seqno` is too low (a copied state file) and goes straight to
-   the second search; here the CPID lookup runs for that request too.
+3. Authenticate, find or create the host, in the order of `authenticate_user` in
+   `sched/handle_request.cpp`:
+   - A host ID that names a host with no user is a host merged into another on the web; its
+     `rpc_seqno` holds the ID of the host it became, and the links are followed, ten at most
+     (`authenticate_user`, the `while` over `host.userid==0`). The reply names the host the chain
+     ends at. A chain that is longer or breaks is an unknown host ID.
+   - A host ID that names a host of the account, with an `rpc_seqno` not below the stored one,
+     is that host, and nothing else is looked up.
+   - A host ID that names no host: the reply carries the message "Can't find host record" (low
+     priority) and the request is handled as one with no host ID, which is the next step
+     (`lookup_user_and_make_new_host`).
+   - No host ID: the account's newest host with the request's host CPID is used
+     (`find_host_by_cpid`), unless it is obviously another computer (`obviously_different`:
+     processor count, vendor and model, OS name and version): a CPID is made from the MAC address
+     and the data directory, so two computers cloned from one image share it. If the request
+     lists no results it still holds (`<other_results>`) and the client does not say it is one of
+     several on its computer (`<allow_multiple_clients>`), the host's tasks in progress are
+     marked over with outcome `CLIENT_DETACHED` (`mark_results_over`).
+   - A host ID that is another account's, or an `rpc_seqno` below the stored one (the state file
+     was copied to another computer): the CPID lookup is skipped (`didnt_find_host`), so a host
+     of the account that has the request's CPID is not used.
+   - Then, for every request that has not found a host yet and unless the client says it is one of
+     several on its computer, the newest host of the account with the same name, address, OS name,
+     processor model and memory is used (`find_host_by_other`, which runs only when the request
+     has all of the first four). Its tasks in progress are marked over when the request lists no
+     results it holds, as above. This is also where a copied state file on a computer that looks
+     like the one it came from gets that computer's host.
+   - Otherwise a new host is made (`host.insert()` in `authenticate_user`).
+   - A host that was found by a lookup or made is stored with `rpc_seqno` 0 and named in the reply
+     (`got_host`), so the client takes the ID and starts its sequence from 0 again; a host named by
+     the request keeps the request's `rpc_seqno`. The reply names the host even when a lookup finds
+     the one the request already named. The same holds for the destination of a merged host: the
+     reply names it, so `rpc_seqno` 0 is stored. Stock stores the request's value there
+     (`g_reply->host.rpc_seqno = g_request->rpc_seqno` in `handle_request`, after the zombie loop
+     of `authenticate_user`), and the client starts from 0 when the reply carries a host ID
+     (`handle_scheduler_reply` in `client/cs_scheduler.cpp`), so stock treats the client's next
+     request as a copied state file (D20 in [compatibility.md](compatibility.md)).
+   - A weak authenticator is accepted only with a host ID of its own account; with another
+     account's it finds no key and the request is refused, as in stock.
+   - Stock's `stdin_reqs` exception to the `rpc_seqno` test belongs to a scheduler run from a file
+     of requests in batch; the Worker has no such mode.
 4. Batch 2 (read): reported results by name, this host's in-progress results, its
    `host_app_version` rows.
 5. Find the app versions the host can run: platform match and the host-dependent part of
@@ -570,8 +599,10 @@ no counterpart: nothing here stops the scheduler from answering.
 A request names a primary platform in `<platform_name>` and may list others in `<alt_platform>`:
 a 64-bit Linux client with 32-bit libraries lists `i686-pc-linux-gnu`, a 32-bit client on a
 64-bit kernel names `x86_64-pc-linux-gnu` first and `i686-pc-linux-gnu` second, an Apple-silicon
-Mac lists `x86_64-apple-darwin` when the helper that detects Rosetta runs, and a Windows client
-lists `windows_intelx86` as an alternate (a 64-bit x86 Windows client). The host's platforms are the ones the project has, primary first, as
+Mac names `arm64-apple-darwin` and lists `x86_64-apple-darwin` when the helper that detects Rosetta
+runs and exits with status 0, and a 64-bit x86 Windows client names `windows_x86_64` and lists
+`windows_intelx86` as an alternate (`detect_platforms` in `client/cs_platforms.cpp`). The host's
+platforms are the ones the project has, primary first, as
 `process_request` in `sched/handle_request.cpp` builds them; the alternates of an anonymous-platform
 client are ignored. A version for any of them can be sent, and `handle_request` in
 `crates/cb-core/src/scheduler.rs` chooses among them as `get_app_version` in
@@ -579,14 +610,22 @@ client are ignored. A version for any of them can be sent, and `handle_request` 
 
 - of versions with the same projected speed the one for the earlier platform in the client's list
   wins (stock scans the platforms in order and replaces its choice only by a faster version), and
-  after that the one added first. The option `version_select_random_factor` defaults to 1, which
-  adds random noise to each speed (here 0.1 times the factor times a normal sample; stock divides
-  the factor by the host's job count for the version instead), so the platform order decides only
-  for a project that sets it to 0.
-- with `prefer_primary_platform`, the scan stops at the first platform that has a version
-  that passes every check before the speed comparison (plan class, preferences, daily quota, jobs
-  in progress, resource wanted, client version), so another platform's version is used only when
-  none of the earlier platform's is.
+  after that the one added first. `version_select_random_factor` defaults to 1, which adds random
+  noise to each speed, so the platform order decides only for a project that sets it to 0. The
+  noise is not stock's: stock multiplies the speed by `r = 1 + factor * N / n`, with `N` a normal
+  sample and `n` the number of samples in the host's `host_app_version` row for the version (at
+  least 1), and keeps `r` at 0.1 or more; here the speed is multiplied by `1 + 0.1 * factor * N`,
+  whatever the host's history (D18 in [compatibility.md](compatibility.md)).
+- with `prefer_primary_platform`, the scan stops at the first platform that has a version that
+  passes every check that comes before the speed comparison in `get_app_version`: the version
+  number the job is pinned to, or not being deprecated; beta work allowed in the preferences for
+  a beta version; a plan class the host can run, and a client that knows plan classes unless the
+  version uses one CPU; the preferences' processor types; the daily quota of the host's version;
+  the limit on jobs in progress; a resource the client still wants work for; and the client
+  version within the version's range (stock also skips a version that is not reliable when it
+  runs the reliable-host pass, which this server has no counterpart of). Another platform's
+  version is used only when none of the earlier platform's passes them all. Stock sets `found_feasible_version` after the last of these,
+  not before the resource and client-version checks.
 - a job whose `rsc_memory_bound` is more than a 32-bit app can address is sent only with a
   version for a platform with `64` in its name (`is_64b_platform`). The limit is set by the
   client's primary platform: 3 GiB for Linux, 2 GiB for Windows, 4 GiB for macOS and Solaris, 2 GiB
