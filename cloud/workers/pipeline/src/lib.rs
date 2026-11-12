@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
 use cb_core::purge::{purge_pass, MAX_PURGE_BATCH};
-use cb_core::stats::{rollup_pass, FREE_PLAN_QUERIES};
+use cb_core::site_delete::delete_account_steps;
+use cb_core::stats::{deletion_room, rollup_budget, rollup_pass};
+use cb_core::status::record_sweep;
 use cb_core::CoreResult;
 use cb_worker::{db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Files, BUCKET};
 use worker::{
@@ -94,6 +96,10 @@ async fn queue(batch: MessageBatch<i64>, env: Env, _ctx: Context) -> Result<()> 
 
 async fn sweep(env: Env) -> Result<()> {
     let runner = Runner::new(&env).await?;
+    // The status pages report from this whether the pipeline runs.
+    if let Err(e) = record_sweep(&runner.db, now()).await {
+        console_error!("sweep time: {e}");
+    }
     let due = due_workunits(&runner.db, now(), SWEEP_LIMIT)
         .await
         .map_err(cb_worker::core_err)?;
@@ -115,6 +121,32 @@ async fn sweep(env: Env) -> Result<()> {
         inline,
         errors
     );
+    Ok(())
+}
+
+/// Statements one run of the purge cron spends on account deletions at most. The
+/// invocation may run 50 queries on the Free plan; the purge's own passes cost
+/// up to 24 and the rollup needs `MIN_BUDGET`, so the deletions get what is
+/// left of that (see `deletions`).
+const DELETION_STATEMENTS: usize = 22;
+
+/// Continues the account deletions that the site started (see
+/// `cb_core::site_delete`); every pass is bounded, so a large account is
+/// removed over several runs.
+async fn deletions(db: &cb_worker::D1Db) -> Result<()> {
+    // What the purge and the settings load have used is already counted on
+    // this handle; the rollup after this is kept a share of the 50.
+    let room = deletion_room(db.statements() as usize, DELETION_STATEMENTS);
+    let report = delete_account_steps(db, now(), room)
+        .await
+        .map_err(cb_worker::core_err)?;
+    if report.finished > 0 || report.pending > 0 {
+        console_log!(
+            "account deletions: {} finished, {} pending",
+            report.finished,
+            report.pending
+        );
+    }
     Ok(())
 }
 
@@ -157,7 +189,7 @@ async fn rollup(db: &cb_worker::D1Db) -> Result<()> {
     // The Free plan allows 50 queries an invocation, and the purge and the
     // settings load before this have used some of them. What is not done now is
     // done by the next pass.
-    let budget = FREE_PLAN_QUERIES.saturating_sub(db.statements() as usize + 2);
+    let budget = rollup_budget(db.statements() as usize);
     let report = rollup_pass(db, now, not_before, budget)
         .await
         .map_err(cb_worker::core_err)?;
@@ -192,6 +224,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         };
         if let Err(e) = purge(&env, &db).await {
             console_error!("purge: {e}");
+        }
+        if let Err(e) = deletions(&db).await {
+            console_error!("account deletions: {e}");
         }
         if let Err(e) = rollup(&db).await {
             console_error!("rollup: {e}");

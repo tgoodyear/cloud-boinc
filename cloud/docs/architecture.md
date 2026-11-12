@@ -1102,11 +1102,8 @@ A deployment generates its own keys. A dev deployment never holds another projec
 The `web` Worker serves the master URL page, which carries the scheduler URL in the
 `<link rel="boinc_scheduler">` form the client looks for, `get_project_config.php`,
 `lookup_account.php` and `create_account.php` with the stock XML shapes and error numbers, and
-`server_status.php` in HTML and XML. The account and computer counts on the status page
-(`server_status` in `cloud/crates/cb-core/src/web.rs`) are a snapshot stored in the `config`
-table under `status_counts` and refreshed after `STATUS_COUNTS_TTL` (10 minutes), so a poll does
-not scan the `user` and `host` tables. PHP file names are kept in the URLs because clients have
-them built in.
+`server_status.php` in HTML and XML, and `robots.txt`. PHP file names are kept in the URLs
+because clients have them built in. The status page is described under "Server status" below.
 
 The account manager RPCs are in `cloud/crates/cb-core/src/web.rs`. `am_get_info` returns the
 account a key belongs to, in the upstream reply shape. `am_set_host_info` sets a computer's venue;
@@ -1118,7 +1115,16 @@ but its code is still in `html/user/am_set_info.php`, and that code is what `am_
 empty. Every value is checked before anything is written: names, countries (upstream's list,
 `cloud/crates/cb-core/src/countries.rs`), URLs and postal codes as on the site, venues as for
 `am_set_host_info`, and the two
-preference documents with upstream's `bad_xml` test and a 64 KB limit. Project preferences
+preference documents with upstream's `bad_xml` test and a 64 KB limit. A global preferences
+document whose `<mod_time>` is not a finite number or is more than a day after the server's
+clock is refused with `ERR_XML_PARSE` (`mod_time_error` in `cloud/crates/cb-core/src/prefs.rs`), whether
+it reads that way as the whole text or as the number the scheduler takes from the start of it
+(`1e30junk` is 1e30 to `handle_request`);
+zero, negative, past and slightly future times are stored as sent. Upstream's
+`html/user/am_set_info.php` stores any value, but every reader of it clamps it to the current time
+(`GLOBAL_PREFS::parse_override` in `lib/prefs.cpp`, `handle_request` in
+`sched/handle_request.cpp`), so a far-future time would only make the project send the
+preferences with every request, and the site's next save stamps the current time over it (see below). Project preferences
 without a `<project_specific>` part keep the stored one, as upstream. A new email address is
 refused with `ERR_DB_NOT_UNIQUE` when another account has it, by the `WHERE` clause of the one
 `UPDATE`; as upstream, it does not rehash the password, so an account manager sends
@@ -1316,7 +1322,9 @@ periods that have been counted; the overview says how many of how many, and the 
 sums "+" and say so while the week is being filled in (or part of it has been purged).
 
 **Statement budget.** A Worker invocation may make 50 queries on the Free plan, and the cron's
-purge shares it. `rollup_pass` is given a budget (50 minus what the invocation has used, less a
+purge and its account deletions share it (the cron runs the purge, then the deletions with what is
+left once the rollup has its minimum, then the rollup: `deletion_room` and `rollup_budget` in
+`stats.rs`, with a test over every purge cost). `rollup_pass` is given a budget (50 minus what the invocation has used, less a
 margin), counts as many of the due periods as fit, newest first, and leaves the rest for the next
 pass (`postponed` in its report); with less than `MIN_BUDGET` (18) it does nothing. Its fixed
 statements are 14 (two reads, six counts, the queue gauges, the retention delete, the sums, three
@@ -1374,10 +1382,12 @@ The pages that change an account are in `cloud/crates/cb-core/src/site_account.r
 | `prefs.php?subset=global\|project` | GET | |
 | `prefs_edit.php?subset=...&venue=...` | GET form, POST to save | `global_prefs`, or `project_prefs` and, for the main set, `send_email`, `show_hosts` and `venue` |
 | `prefs_remove.php?subset=...&venue=...` | GET to confirm, POST to remove | one venue's set from `global_prefs` or `project_prefs` |
+| `delete_account_request.php` | GET, POST | the confirmation link is mailed; see Account deletion |
+| `delete_account_confirm.php?id=&token=` | GET, POST | deletes the account; see Account deletion |
 
-Sign-up and the `create_account.php` RPC share `make_user` and `account_creation_refusal` in
-`cloud/crates/cb-core/src/web.rs`, so the `account_creation` setting closes both. Upstream's
-invitation codes (`INVITE_CODES`) have no setting here yet. The site asks for a password of at
+Sign-up and the `create_account.php` RPC share `make_user` in
+`cloud/crates/cb-core/src/web.rs`; which of them is open follows the stock options, see "Stock
+site options" below. Upstream's invitation codes (`INVITE_CODES`) have no setting here yet. The site asks for a password of at
 least six ASCII characters (`MIN_PASSWD_LENGTH`), which the RPC cannot check because it gets
 only the hash. A sign-up for an address that has an account with the same password logs in to
 it, as the RPC does; any other sign-up for a known address is refused. The account gets the
@@ -1419,7 +1429,11 @@ least one second more than the `<mod_time>` it replaces (`PrefsForm::write`), so
 within a second still differ and the scheduler's comparison with the client's copy
 (`handle_request` in `cloud/crates/cb-core/src/scheduler.rs`, which sends preferences only when the
 stored one is newer) sends the new set on the next request; removing a venue's set stamps the same
-way; project
+way. A stored `<mod_time>` more than a day after the clock (`MOD_TIME_FUTURE_SLACK_SECS`) is not
+believed: the save stamps the current time over it, and the increment saturates, so a stored
+`1e30`, `NaN` or a time near `i64::MAX` can neither overflow nor keep the preferences from ever
+being replaced. Upstream's form writes the current time whatever was stored, and its readers clamp
+a future time to now; this follows the same rule while keeping the same-second guarantee. Project
 preferences go out in every reply. Each document has a main set and optional sets for the
 venues `home`, `school` and `work`; a computer whose venue matches uses that set. A new venue set
 starts as a copy of the main one, as upstream's `add_venue.php`. The default venue for new
@@ -1683,6 +1697,27 @@ token only, since after an undo the password is unknown. Because an address some
 registered first can receive recovery mail for that account (as upstream), this is also the
 remedy for it.
 
+The password goes with the key, in the same `UPDATE`. The old key is all `am_set_info.php` and
+the password page ask for, so whoever held it could have set a password they know and then asked
+`lookup_account.php` for the new key with it. The statement sets `passwd_hash` to the peppered
+hash of a random value nobody knows (as an address undo does), but only `CASE WHEN passwd_hash =
+'' THEN '' ELSE ... END` at write time: an account with no password stays without one, and a
+password that a request racing the replacement wrote a moment before is replaced as well, while
+one written after it fails the key condition every write carries. The holder, logged in with the
+new key, sets a new password on the password page, which takes the account key in place of the
+current password; `home.php` shows the key, and a login link mailed to the address leads to the
+same place. The page text and the success page say so.
+
+What the eviction does and does not cover. It ends the old key (cookie, RPCs, the weak key),
+every password set before, and the login, verification and deletion-confirmation links already mailed. It does not
+change the email address. If the old-key holder also changed the address (through `am_set_info`,
+which needs only the key, or the site), the new address can ask `mail_passwd.php` for a login
+link after the replacement and get the new key: the remedy for that is the undo link mailed to the
+previous address, which restores the address and ends every unused link (see Address change),
+used before the replacement. Beyond seven days an address change cannot be undone by link and the
+account needs the project's help. Clients that were attached with the old key are not told; they
+have to be attached again.
+
 **Round trips.** The account pages run the account by cookie and one write, except where this
 section says otherwise: a password change and an address change run a batch (up to five
 statements for an address change with email); each counted send is preceded by one statement for the
@@ -1721,7 +1756,8 @@ trip on D1.
   undo sets the change time to now.
 - Replacing the account key (`reset_account_key.php`) is not in upstream. After an undo the
   account key is unchanged, so a session or key held by whoever made the change stays valid until
-  the key is replaced; the undo page and mail point to the page for that reason.
+  the key is replaced; the undo page and mail point to the page for that reason. The replacement
+  also replaces the password (see Account key).
 - Upstream checks an address's syntax only (`is_valid_email_syntax` in `html/inc/email.inc`, which
   is `filter_var` with `FILTER_VALIDATE_EMAIL`, plus the optional `is_valid_email_sfs` lookup) and
   sends whatever it is given. That filter accepts the reserved names and domain literals above and
@@ -1741,7 +1777,248 @@ trip on D1.
   or edged with a hyphen, and a last label with a letter; at most 254 characters. An existing
   account with a looser address keeps working and is not mailed.
 - `SHOW_NONVALIDATED_EMAIL_ADDR`, HTML mail, `EMAIL_USE_CMD`, PHPMailer settings, banned and
-  `stopforumspam.com` address checks, and the account deletion mail are not implemented.
+  `stopforumspam.com` address checks are not implemented. The account deletion mail is below.
+
+### Account deletion
+
+`cloud/crates/cb-core/src/site_delete.rs`, after `html/user/delete_account_request.php`,
+`delete_account_confirm.php`, `html/inc/delete_account.inc` and `send_confirm_delete_email` in
+`html/inc/email.inc`. `enable_delete_account` in the config chooses the method, as upstream: 0 or
+absent is off (both pages answer 404 "This feature is disabled"), 1 obfuscates, 2 wipes. Upstream's
+3 (`project_delete_account`, project PHP) and any other value are off here, since no project code
+runs; upstream with 3 shows the forms and then fails.
+
+The flow is upstream's. `delete_account_request.php` needs a login, is refused within seven days of
+an address change, and with the form token and the password (the account key for an account with
+no password) mails a link, a `D` token of the `token` table valid for a day (`DELETE` in
+`site_email.rs`), at most one message every ten minutes, counted in the daily mail cap. The project
+must send email: without it the page says to contact the project administrator. The link
+(`delete_account_confirm.php?id=&token=`) needs no login; a GET shows the form if the token is
+live, and the POST with the password deletes. A wrong password does not use the token up, and the
+seven-day rule is checked again. `home.php` links to the request page when deletion is on and the
+project sends email.
+
+*Start.* `start_deletion` is one guarded batch: only if the account is still as read (key, address,
+password hash, address change time), is not blocked, and the token is live and unused, it sets the
+account key and the address to `deleted_<time>_<random>`, name `deleted`, clears country, postal
+code, URL, both preference documents, venue, password hash, `show_hosts`, `send_email`,
+`email_validated`, the previous address and the cross-project ID, sets `blocked`, adds a row to
+`user_deletion` (`migrations/0007_site_ops.sql`) and deletes the account's tokens, the one just used
+included. The later statements run only if the update before them changed a row. Upstream first
+invalidates the authenticator and then sleeps two seconds so that a scheduler request under way can
+finish; this code has no timer, so the guards and the last-step check below stand in for it.
+
+*Steps.* `delete_account_steps` runs queued accounts under a statement budget. Every statement
+touches at most `TASKS_PER_STATEMENT` (500) rows of tasks or assignments, or `HOSTS_PER_STATEMENT`
+(100) computers, selected inside the statement (`WHERE id IN (SELECT id ... LIMIT ?)`), so the
+parameters per statement are a handful whatever the size of the account, and a round is one batch.
+The confirm page runs a few statements' worth (`INLINE_STATEMENTS`), so a small account is gone when
+it answers; the pipeline Worker's purge cron (every five minutes) runs 22 statements' worth, which is
+two rounds of up to 500 tasks, 500 assignments and 100 computers each, so an account with a hundred
+thousand tasks takes many hours.
+
+*Stale and overlapping passes.* The confirm page and the cron can both read the same queue row.
+Every statement of a step ends with the same condition (`LIVE` in `site_delete.rs`): the queue row
+exists with the `gen` the pass read (the value the account's key and address were set to, unique to
+this deletion) and the account is still the blocked one that carries it. A pass whose deletion
+another pass has finished finds no row, every statement of it changes nothing, and it reports
+nothing to do. This does not depend on IDs: a test puts an account, a computer, a task, assignments,
+a batch and a token under the finished account's ID and runs the stale pass.
+
+*Wipe.* One batch of eight statements per round, over a window of the account's tasks, a chunk of
+assignments and a chunk of computers.
+
+- The window is the next 500 of the account's tasks by ID, whatever state they are in (`res_user`,
+  `WHERE userid = ? AND userid > 0 ORDER BY id LIMIT 500` reads that many entries). The statements
+  that use it leave the window's rows alone until the last of them, which gives the whole window
+  `userid` 0, so it leaves the index and the next window is the next rows: there is no cursor and no
+  search by state. A task in progress or waiting for validation is cancelled by a `CASE` in the
+  `UPDATE` that detaches it (`server_state` over, outcome `CLIENT_DETACHED`, `validate_state`
+  invalid), as `cancel_results_for_user`, and the others are only detached. Each round therefore
+  reads the same number of rows whatever the tasks are, and the total reads are linear in the number
+  of tasks (a search for cancelable tasks among thousands of finished ones would read them all in
+  every round). `the_work_of_a_pass_does_not_grow_with_the_tasks_left` runs an account of 6,000
+  validated tasks and checks that a pass costs the same in SQLite virtual machine steps at the end as
+  at the start, and that the window's plan is a search of `res_user` with no sort.
+- The workunits of the window get `rev = rev + 1` (those of cancelable tasks also become due) before
+  the tasks change. `transition` (`cloud/crates/cb-core/src/pipeline.rs`) commits a workunit only
+  `WHERE rev = ?`, so a transition that read the tasks earlier cannot write them back. The test
+  `a_transition_that_read_the_tasks_of_a_deleted_account_does_not_commit_over_the_deletion` makes the
+  commit lose the race and checks that the cancellation stands.
+- Assignments that target the account, and those that target a computer of the chunk, are deleted.
+- Tasks that still name a computer of the chunk (of any user) lose that `hostid`, so a computer is never
+  kept for ever by a task that was written off with its IDs.
+- A computer of the chunk is deleted only if no assignment and no task names it, checked in the
+  statement. With one computer and 501 tasks in progress, the first round cancels 500, the
+  computer's remaining task loses the computer's ID in the same batch, and the computer goes; no task
+  is left that names an ID that is gone (`no_task_is_left_naming_a_computer_that_is_gone`).
+
+When no statement filled its window or chunk, the account row is tried: it is deleted only if no
+computer, task or assignment refers to it, together with the queue row and the tokens, and the `batch`
+rows it submitted are given no owner.
+
+*IDs.* IDs of users and computers are never given out twice, as on stock BOINC, whose MySQL
+`AUTO_INCREMENT` does not reuse them. Here `id INTEGER PRIMARY KEY` gives a new row the largest ID
+plus one, which would be a deleted row's ID. So `migrations/0007_site_ops.sql` adds `id_floor`
+(`name`, `last_id`), kept by `AFTER DELETE` triggers on `user` and `host` (so any delete raises it,
+an operator's included), and the two statements that insert into those tables, `make_user` and the
+scheduler's computer insert, take their ID from `next_id_sql` in `cloud/crates/cb-core/src/web.rs`:
+`max(max(id), last_id) + 1` in the `SELECT` of the same `INSERT`, one statement, so two inserts
+cannot get the same one. Those are the only inserts into either table; the sign-up page, the RPC and
+the admin API's account creation all go through `make_user`. The test fixtures that add computers use
+`next_id_sql` too. `user_and_host_ids_are_not_reused_after_deletes` deletes the highest row, a row
+that is not the highest and every row, and checks the IDs only grow.
+
+The deletion still removes what names an ID before the row goes, because stale references are
+wrong whether or not an ID comes back: the columns that name a user or computer are `host.userid`,
+`result.userid`, `result.hostid`, `host_app_version.host_id`, `assignment.target_id` (for both target
+types), `batch.user_id`, `token.userid` and `user_deletion.userid`. The workunit of an assignment keeps
+its reserved result, which is never sent: cancel the workunit through the admin API.
+
+*Obfuscate.* The computers lose their names and addresses (`anonymize_hosts`; `external_ip_addr` is
+an address of the same kind, so it goes too) in windows of 100 by ID, behind a cursor: the queue row's
+`host_cursor` is the ID of the last computer handled, a window is `WHERE userid = ? AND id > cursor
+ORDER BY id LIMIT 100` (a search of `host_user` from the cursor, no sort), and the same batch moves the
+cursor to the window's last ID. The computers stay in `host_user` once anonymized, so without the
+cursor each pass would read the finished ones again and the work would grow with the square of their
+number (`an_obfuscation_reads_each_computer_once` runs 1,200 computers and checks the cost of a pass
+stays the same and the passes are as many as the windows). The tasks are left as upstream leaves them,
+to time out; the rows stay, so no ID is freed, and the queue row goes at the end.
+
+*Why each loop reads a bounded amount.* A loop is bounded when the rows it has dealt with no longer
+match what it looks for, or when a cursor skips them, so a pass reads a window and not the history.
+- Tasks (wipe): the window leaves `res_user` (`userid` becomes 0) in the batch that handles it.
+- Assignments to the account: deleted, so the next `asgn_target` search starts at the first left;
+  those of the computers of the chunk are deleted in a `LIMIT` subquery with no `ORDER BY`, which stops
+  after 500 index entries (a sort would read all of them).
+- Computers (wipe): deleted, so they leave `host_user`; a computer that is kept for an assignment or a
+  task being detached is among the first 100 of the next round, and what keeps it is handled in that
+  round.
+- Computers (obfuscate): the cursor, above.
+- `host_app_version`: a primary-key range of the chunk's computers; the rows are deleted.
+- Tasks that still name a computer of the chunk: `res_host`, 500 at a time, and they stop matching.
+- `batch` rows: `batch_user`, a partial index on owned batches, in the last batch; the rows lose their
+  owner. The `token` rows of the account are deleted at the start in one statement; there are few (a
+  message of each kind per account every ten minutes, and rows older than eight days are removed by
+  whatever issues the next).
+- The queue read is `LIMIT 5` of a table with a row per deletion in progress.
+
+*Requests under way.* The scheduler reads the account at the start of a request and writes at the
+end, and a deletion can commit between them. Every write the scheduler makes for an authenticated
+account is guarded: the computer insert is `INSERT ... SELECT ... WHERE EXISTS (account with this
+key, not blocked)`, and the one batch of writes (reports, computer update, preferences, claims, and
+their bookkeeping) starts with `account_guard` in `cloud/crates/cb-core/src/site_delete.rs`, a
+statement that raises an error, and so rolls the whole batch back, unless the account still has the
+key the request used and is not blocked (`abs` of the smallest integer, "integer overflow", in
+SQLite and in D1). `start_deletion` changes the key and sets `blocked` in one transaction, so a
+write authenticated before it and committed after it does nothing, and the reply is "Invalid or
+missing account key". This is also what keeps a request from putting a computer's name and address
+back after the obfuscation, or from making a computer for a wiped account. The tests
+(`cloud/crates/cb-core/tests/scheduler.rs`) start the deletion between the read and each write.
+
+Differences from upstream: no `user_deleted` and `host_deleted` rows (they feed the `db_dump`
+stats export, which does not exist here); no teams, forum, private messages, profiles, friends,
+credited jobs, donations or consent rows (none of those tables exist); `assignment` rows are
+deleted and `batch` rows lose their owner (upstream's wipe leaves both, and stock IDs are not reused,
+as here); `external_ip_addr` of a
+computer is cleared by the obfuscate method too, and the account's URL, venue, both preference
+documents, password hash, cross-project ID, previous address, `show_hosts`, `send_email`,
+`email_validated` and `teamid` are cleared and the account is blocked, where upstream's obfuscate
+changes only the email address, key, name, country and postal code; the wipe deletes in bounded
+statements over several runs instead of one pass. The confirmation message goes through the mail
+abstraction (`Mailer`), so on a deployment without the `EMAIL` binding the request page says the
+project cannot send the link.
+
+### Stock site options
+
+Read from an imported `config.xml` by `Config::parse` (`cloud/crates/cb-core/src/config.rs`):
+
+| Option | Effect here | Upstream |
+| --- | --- | --- |
+| `disable_account_creation` | closes the sign-up page and `create_account.php` ("The project is not accepting new accounts.") and `get_project_config.php` reports `<account_creation_disabled/>` | `create_account.php`, `create_account_form.php`, `get_project_config.php` |
+| `disable_account_creation_rpc` | `create_account.php` answers "Please visit the project web site to create an account, then try again."; the sign-up page stays open | `create_account.php` |
+| `no_web_account_creation`, `disable_web_account_creation` | closes the sign-up page and, with the RPC option, the RPC says the project takes no accounts; the RPC stays open otherwise | upstream's PHP reads `no_web_account_creation`; `py/Boinc/setup_project.py` writes `disable_web_account_creation`, which nothing reads, so both are accepted |
+| `enable_privacy_by_default` | `0` makes new accounts show their computers (`show_hosts` 1); `1` or the bare tag keeps them private | `default_show_hosts` in `html/inc/user_util.inc`: shown unless the option is set |
+| `show_results` | `0` makes `results.php` answer 404 and removes the task links from `home.php`, `hosts_user.php` and `show_host_detail.php` | `html/user/results.php`, `html/inc/host.inc` |
+| `enable_delete_account` | see Account deletion | `html/inc/delete_account.inc` |
+| `robots_tag` | value of an `X-Robots-Tag` header on the account pages | not in upstream, which sets no such header |
+
+Three of these differ on purpose from the upstream default for an option that is not stated, so
+that a deployment made before they were read does not change: with none of `account_creation`,
+`disable_account_creation` there, sign-up is **closed** (upstream: open); with no
+`enable_privacy_by_default` new accounts are **private** (upstream: public); with no `show_results`
+the task pages are **served** (upstream: refused). A config written by `make_project` states all
+three. `account_creation` (the fork's own option) still decides when it is stated and
+`disable_account_creation` is not set to a non-zero value; `disable_account_creation` set to 1 wins
+over it. `maintenance_delay` is the scheduler's and is not read here. The tags are read as the
+client parser reads booleans (`<tag/>` is true, `<tag>N</tag>` is true for non-zero N).
+
+`robots.txt` is served by the web Worker from `robots_txt` in `cloud/crates/cb-core/src/site.rs`,
+built from `ROBOTS_DISALLOW`: upstream's `html/user/sample_robots.txt` (a file a project copies by
+hand) plus the pages this site has that show or change an account. A directive names a path from
+the root of the host, so with a stock page prefix every directive is also written under the prefix
+(`/short/result` covers `/short/results.php`); a test checks that each page the root rules exclude
+is excluded under the prefix too. The master page, `get_project_config.php` and `server_status.php`
+are not listed. The `X-Robots-Tag` header is off unless
+`robots_tag` is set (for example `noindex, nofollow`); it goes on the account pages that
+`site_response` sends and not on the master page, the project config, the status page or `robots.txt`.
+
+### Server status
+
+`server_status.php` (HTML), `?xml=1` and `GET /admin/v1/status` read one snapshot, `ServerStatus` in
+`cloud/crates/cb-core/src/status.rs`, which follows `get_job_status` in `html/user/server_status.php`.
+It is computed by one batch of grouped queries and stored in the `config` table under
+`status_counts`; a request within `STATUS_COUNTS_TTL` (ten minutes) reads that row and the row
+holding the last pipeline sweep, two statements. Upstream caches the same figures for an hour
+(`STATUS_PAGE_TTL`). A request that finds the snapshot expired computes it itself, so requests
+that arrive together at expiry each do. Every state is written into the SQL as a number, because a
+partial index is used only when the query's own `WHERE` shows it applies and a bound parameter
+does not; `cloud/crates/cb-core/tests/status.rs` runs `EXPLAIN QUERY PLAN` on each statement that reads
+`result` or `workunit` and fails on a scan of either without an index. The plans: unsent per application scans
+`res_unsent` (covering), in progress `res_host_inprog`, the 24-hour figures the range of
+`res_received` (a partial index of tasks with `received_time` over 0, added by
+`migrations/0007_site_ops.sql`, one more index entry written when a task is reported), workunits
+waiting to assimilate `wu_assim`, waiting to validate `wu_need_validate` (new, normally empty: the
+state is set and cleared within one transition), the transition backlog and files waiting for
+deletion `wu_transition`. The reads of a refresh grow with the tasks received in 24 hours and the
+tasks in progress (a row lookup each) plus a scan of `user` and `host` for the credit counts.
+
+The XML has upstream's elements: `results_ready_to_send`, `results_in_progress`,
+`workunits_waiting_for_validation`, `workunits_waiting_for_assimilation`,
+`workunits_waiting_for_deletion`, `results_waiting_for_deletion`, `transitioner_backlog_hours`,
+`users_with_recent_credit`, `users_with_credit`, `users_registered_in_past_24_hours`,
+`hosts_with_recent_credit`, `hosts_with_credit`, `hosts_registered_in_past_24_hours`,
+`current_floating_point_speed` (the sum of `expavg_credit` over 200) and `<tasks_by_app>` with, for
+each application that is not deprecated, `id`, `name`, `unsent`, `in_progress` and, when it has
+valid tasks received in the last 24 hours, `avg_runtime`, `min_runtime`, `max_runtime` (hours,
+`ceil(x / 3600 * 100) / 100`, over those tasks' `elapsed_time`) and `users` (distinct accounts). The
+HTML page has the same figures and the "Tasks by application" table.
+
+Differences: `update_time` and `software_version` are added. The daemon list is the scheduler (the
+Worker answering; `disabled` when the config says `ended`) and the pipeline, which is "not running"
+when the last sweep of its cron, recorded in the `config` row `last_sweep` by `record_sweep` (the
+pipeline Worker's sweep, every minute), is more than five minutes old, and "running" when it is
+newer or none was ever recorded; upstream lists each daemon from `config.xml`. A workunit "waiting for
+deletion" is one whose files were marked ready (`file_delete_state` 1) and whose transition is due,
+which is where the pipeline leaves it for the next transition; a task waiting for deletion is
+counted among the tasks of those workunits, not among all. The transitioner backlog is hours since
+the earliest pending `transition_time` (upstream: since the minimum over all workunits). The
+HTML page does not show the server version, the database schema version or the start button, and
+there is no `?counts=1` form or BUDA section.
+
+### Operator summary
+
+`GET /admin/v1/summary?max_age=<secs>` (admin Worker) and `cboinc summary [--max-age N] [--app NAME]
+[--check]` return one entry per application from the same snapshot (default age 600 seconds, 0
+computes again): `unsent`, `in_progress`, `oldest_unsent_age_secs` (the creation time of the
+lowest-ID unsent task: IDs grow with time; null when none), `received_24h`, `validated_24h` (of those
+received, how many have validated), `errors_24h` by outcome (`client_error`, `couldnt_send`,
+`no_reply`, `didnt_need`, `validate_error`, `client_detached`, and `invalid` for tasks that ran and
+failed validation), `workunits_awaiting_validation` and `workunits_awaiting_assimilation`; totals;
+and `pipeline` with the last sweep time, whether it is running, the transitions due and the backlog in
+hours. Tasks are counted by when the server received them, so a task that timed out without a
+report (`no_reply`) appears only if it was reported late. `--check` exits non-zero when the pipeline
+is not running (a sweep older than five minutes; none recorded counts as running). See `deploy.md`, "Health read".
 
 ## Admin API and CLI
 
@@ -1749,7 +2026,7 @@ trip on D1.
 
 | Resource | Operations |
 | --- | --- |
-| `status`, `catalog` | project counts; platforms, apps and app versions |
+| `status`, `summary`, `catalog` | project counts; per-application work summary (see Operator summary); platforms, apps and app versions |
 | `platforms`, `apps` | create, update; an app's homogeneous redundancy type and homogeneous app version switch are set here |
 | `app-versions` | upload signed files and register, deprecate, restore |
 | `config` | project settings, plan classes, public keys |
@@ -1922,8 +2199,8 @@ Not implemented yet:
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
 - On the site: invitation codes, consent records, merging and deleting computers, per-app
-  details of a computer, cross-project statistics links and certificates, account deletion, and
-  any email beyond the messages under Email.
+  details of a computer, cross-project statistics links and certificates, the project-defined
+  method of account deletion, and any email beyond the messages under Email.
 - Rate limiting. Nothing limits how often an address may try to log in, sign up or call
   `lookup_account.php`; upstream sleeps after a failed login (`LOGIN_FAIL_SLEEP_SEC`). A
   deployment can put a Cloudflare rate-limiting rule on those paths.

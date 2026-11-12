@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 
 use cb_proto::consts::*;
-use cb_proto::xml::extract_venue;
+use cb_proto::xml::{extract_venue, line};
 
 use crate::project::Project;
 use crate::web::html_escape;
@@ -43,6 +43,41 @@ pub const VENUES: [&str; 3] = ["home", "work", "school"];
 
 /// Longest preferences document stored, as the scheduler's `MAX_BLOB`.
 pub const MAX_PREFS_BYTES: usize = 64 * 1024;
+
+/// How far past the server's clock a `<mod_time>` may be in a document an
+/// account manager sends (`am_set_info`): a day, for clocks that disagree.
+/// Upstream stores any value, but every reader of it (`GLOBAL_PREFS::parse_override`
+/// in `lib/prefs.cpp`, `handle_request` in `sched/handle_request.cpp`) clamps it
+/// to the current time, so a far-future one only makes the project send the
+/// preferences with every request.
+pub const MOD_TIME_FUTURE_SLACK_SECS: i64 = 86_400;
+
+/// Why the `<mod_time>` of a global preferences document is refused: it is
+/// not a finite number, or it is more than [`MOD_TIME_FUTURE_SLACK_SECS`]
+/// after `now`. Zero, negative and missing values are accepted (they are
+/// older than every other copy, so the next save or the client's own copy
+/// wins), as upstream does.
+pub fn mod_time_error(xml: &str, now: i64) -> Option<&'static str> {
+    let limit = now.saturating_add(MOD_TIME_FUTURE_SLACK_SECS) as f64;
+    // What the scheduler reads: the number at the start of the text after the
+    // first `<mod_time>`, whatever follows it (`1e30junk` is 1e30). A time it
+    // takes must be within the limit, so that junk after a number does not
+    // slip a far-future time past a stricter reading.
+    if line::parse_double(xml, "<mod_time>").is_some_and(|t| t > limit) {
+        return Some("mod_time is in the future");
+    }
+    // And the element read as a whole number: a value that is a number but not
+    // a finite one is refused.
+    let text = element(xml, "mod_time")?;
+    let t = text.trim().parse::<f64>().ok()?;
+    if !t.is_finite() {
+        Some("mod_time is not a finite number")
+    } else if t > limit {
+        Some("mod_time is in the future")
+    } else {
+        None
+    }
+}
 
 /// Which of the two documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -733,8 +768,13 @@ impl PrefsForm {
     pub fn parse(&self, xml: &str) -> Prefs {
         let main = self.parse_set(&extract_venue(xml, ""));
         let venues = VENUES.map(|v| venue_body(xml, v).map(|body| self.parse_set(body)));
+        // The whole text as a number, or else what the scheduler reads there
+        // (the number a text starts with), so that a time stored as `1e30junk`
+        // is seen here as the scheduler sees it.
         let mod_time = element(xml, "mod_time")
             .and_then(|t| t.trim().parse::<f64>().ok())
+            .filter(|t| t.is_finite())
+            .or_else(|| line::parse_double(xml, "<mod_time>"))
             .unwrap_or(0.0);
         Prefs {
             subset: self.subset,
@@ -793,9 +833,21 @@ impl PrefsForm {
     /// the `<mod_time>` they replace (`p.mod_time`, as stored): the scheduler
     /// sends preferences only when the stored `<mod_time>` is greater than
     /// the one the client has, and two saves within a second would otherwise
-    /// carry the same one.
+    /// carry the same one. A stored `<mod_time>` more than
+    /// [`MOD_TIME_FUTURE_SLACK_SECS`] after `now` is not believed (every
+    /// reader clamps such a time to the current one, see the constant), so an
+    /// absurd one, which an import can hold, is replaced by the save instead
+    /// of being kept or overflowing.
     pub fn write(&self, p: &Prefs, now: i64) -> String {
-        let now = now.max(p.mod_time.floor() as i64 + 1);
+        let believable = p.mod_time.is_finite()
+            && p.mod_time <= now.saturating_add(MOD_TIME_FUTURE_SLACK_SECS) as f64;
+        let stored = if believable {
+            // A float to integer cast saturates, and the increment does too.
+            (p.mod_time.floor() as i64).saturating_add(1)
+        } else {
+            now
+        };
+        let now = now.max(stored);
         let root = match self.subset {
             Subset::Global => "global_preferences",
             Subset::Project => "project_preferences",
@@ -1199,6 +1251,134 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    fn with_mod_time(form: &PrefsForm, text: &str) -> Prefs {
+        form.parse(&format!(
+            "<global_preferences>\n<mod_time>{text}</mod_time>\n</global_preferences>\n"
+        ))
+    }
+
+    fn written_mod_time(form: &PrefsForm, p: &Prefs, now: i64) -> i64 {
+        let out = form.write(p, now);
+        let at = out.find("<mod_time>").unwrap() + "<mod_time>".len();
+        out[at..at + out[at..].find('<').unwrap()].parse().unwrap()
+    }
+
+    #[test]
+    fn a_save_stamps_a_sane_mod_time_over_whatever_was_stored() {
+        let form = PrefsForm::new(Subset::Global, &project(1, false));
+        let now = 1_800_000_000;
+        // The normal cases: a past time gives now; the same second gives one
+        // more, so two saves within a second still differ.
+        assert_eq!(
+            written_mod_time(&form, &with_mod_time(&form, "1700000000"), now),
+            now
+        );
+        assert_eq!(
+            written_mod_time(&form, &with_mod_time(&form, &now.to_string()), now),
+            now + 1
+        );
+        // A time a little ahead (clocks differ) is kept ahead; one more than
+        // a day ahead is not believed.
+        assert_eq!(
+            written_mod_time(&form, &with_mod_time(&form, &(now + 500).to_string()), now),
+            now + 501
+        );
+        assert_eq!(
+            written_mod_time(
+                &form,
+                &with_mod_time(&form, &(now + MOD_TIME_FUTURE_SLACK_SECS + 1).to_string()),
+                now
+            ),
+            now
+        );
+        // Absurd stored values: no overflow, and the result is near now.
+        for text in [
+            "1e30",
+            "-1e30",
+            "NaN",
+            "nan",
+            "inf",
+            "-inf",
+            "9223372036854775807",
+            "9223372036854775806",
+            "9.3e18",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "",
+            "garbage",
+            "1e30junk",
+            "9223372036854775807x",
+            "1e30 1e30",
+        ] {
+            let p = with_mod_time(&form, text);
+            assert!(p.mod_time.is_finite(), "{text}: {}", p.mod_time);
+            let t = written_mod_time(&form, &p, now);
+            assert!(
+                (now..=now + 1).contains(&t),
+                "{text} gave {t} for a save at {now}"
+            );
+        }
+        // Even a save at the top of the range cannot overflow.
+        let p = with_mod_time(&form, "9223372036854775807");
+        assert_eq!(written_mod_time(&form, &p, i64::MAX), i64::MAX);
+        assert_eq!(
+            mod_time_error("<global_preferences><mod_time>1e30</mod_time>", now),
+            Some("mod_time is in the future")
+        );
+    }
+
+    #[test]
+    fn mod_time_of_a_document_from_an_account_manager_is_checked() {
+        let now = 1_800_000_000;
+        let doc = |t: &str| {
+            format!("<global_preferences>\n<mod_time>{t}</mod_time>\n</global_preferences>")
+        };
+        // Accepted: absent, zero, negative, in the past, a little ahead.
+        assert_eq!(
+            mod_time_error("<global_preferences></global_preferences>", now),
+            None
+        );
+        for ok in [
+            "0",
+            "-5",
+            "-1e30",
+            "1700000000.5",
+            "1800000000",
+            "1800086400",
+        ] {
+            assert_eq!(mod_time_error(&doc(ok), now), None, "{ok}");
+        }
+        // Refused: more than a day ahead, or not a finite number.
+        for bad in [
+            "1800086401",
+            "1e30",
+            "9223372036854775807",
+            "inf",
+            "-inf",
+            "NaN",
+        ] {
+            assert!(mod_time_error(&doc(bad), now).is_some(), "{bad}");
+        }
+        // Text that is not a number is not this check's business.
+        assert_eq!(mod_time_error(&doc("soon"), now), None);
+        // A number with text after it: the scheduler reads the number.
+        for bad in [
+            "1e30junk",
+            "9223372036854775807x",
+            "1800086401 soon",
+            "1e30 1e30",
+        ] {
+            assert_eq!(
+                mod_time_error(&doc(bad), now),
+                Some("mod_time is in the future"),
+                "{bad}"
+            );
+        }
+        for ok in ["1700000000junk", "5x", "-1e30x"] {
+            assert_eq!(mod_time_error(&doc(ok), now), None, "{ok}");
+        }
     }
 
     #[test]

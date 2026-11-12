@@ -25,10 +25,11 @@ use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
 use crate::site_account;
 use crate::site_boards;
+use crate::site_delete;
 use crate::site_email;
 use crate::site_ui::{self, site_header};
 use crate::site_work;
-use crate::web::{account_creation_refusal, html_escape, page, show_user_xml, weak_account_key};
+use crate::web::{html_escape, page, show_user_xml, weak_account_key, web_account_creation_closed};
 use crate::CoreResult;
 
 #[derive(serde::Deserialize)]
@@ -176,7 +177,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 31] = [
+pub const SITE_PATHS: [&str; 33] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -208,6 +209,8 @@ pub const SITE_PATHS: [&str; 31] = [
     "/top_hosts.php",
     "/work.php",
     "/activity.php",
+    "/delete_account_request.php",
+    "/delete_account_confirm.php",
 ];
 
 /// Headers every site page is sent with: no framing by another site (the
@@ -220,6 +223,50 @@ pub const SITE_HEADERS: [(&str, &str); 4] = [
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
 ];
+
+/// The path prefixes `robots.txt` disallows, as paths at the root: upstream's
+/// `html/user/sample_robots.txt`, a file a project copies by hand, plus the
+/// pages this site has that change or show an account.
+pub const ROBOTS_DISALLOW: [&str; 20] = [
+    "/account",
+    "/add_venue",
+    "/am_",
+    "/bug_report",
+    "/create_account",
+    "/delete_account",
+    "/edit_",
+    "/home.php",
+    "/host_",
+    "/hosts_user.php",
+    "/login_",
+    "/logout.php",
+    "/prefs.php",
+    "/prefs_",
+    "/reset_account_key.php",
+    "/result",
+    "/show_host_detail.php",
+    "/team",
+    "/validate_email_addr.php",
+    "/workunit",
+];
+
+/// `robots.txt`. A directive names a path from the root of the host, so with
+/// a stock page prefix (`/short`, see `cb_core::stock`) the pages that answer
+/// under it need their own: each directive is written for the root and for the
+/// prefix. The master page, `get_project_config.php` and `server_status.php`
+/// are not listed.
+pub fn robots_txt(stock: Option<&crate::stock::StockLayout>) -> String {
+    let mut out = String::from("User-agent: *\n");
+    for d in ROBOTS_DISALLOW {
+        out.push_str(&format!("Disallow: {d}\n"));
+    }
+    if let Some(s) = stock.filter(|s| !s.page_prefix.is_empty()) {
+        for d in ROBOTS_DISALLOW {
+            out.push_str(&format!("Disallow: {}{d}\n", s.page_prefix));
+        }
+    }
+    out
+}
 
 /// Answers one of [`SITE_PATHS`]; `None` for any other path.
 pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<Option<SitePage>> {
@@ -259,6 +306,8 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
             site_work::work(ctx, q, &feed).await?
         }
         "/activity.php" => site_work::activity(ctx, q).await?,
+        "/delete_account_request.php" => site_delete::delete_account_request(ctx, q).await?,
+        "/delete_account_confirm.php" => site_delete::delete_account_confirm(ctx, q).await?,
         _ => return Ok(None),
     }))
 }
@@ -540,7 +589,7 @@ pub fn login_form(project: &Project, q: &Params, can_mail: bool) -> SitePage {
         } else {
             ""
         },
-        if account_creation_refusal(&project.config).is_none() {
+        if !web_account_creation_closed(&project.config) {
             "<p>No account yet? <a href=\"create_account_form.php\">Create one</a>.</p>\n"
         } else {
             ""
@@ -719,12 +768,16 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
             ));
         }
     }
-    let computing_links: Vec<(&str, String)> = vec![
-        ("Computers on this account", "hosts_user.php".into()),
-        ("Tasks", format!("results.php?userid={}", user.id)),
-        ("Computing preferences", "prefs.php?subset=global".into()),
-        ("Project preferences", "prefs.php?subset=project".into()),
-    ];
+    if project.config.enable_delete_account != 0 && ctx.mail().is_some() {
+        account_links.push(("Delete the account", "delete_account_request.php".into()));
+    }
+    let mut computing_links: Vec<(&str, String)> =
+        vec![("Computers on this account", "hosts_user.php".into())];
+    if project.config.show_results {
+        computing_links.push(("Tasks", format!("results.php?userid={}", user.id)));
+    }
+    computing_links.push(("Computing preferences", "prefs.php?subset=global".into()));
+    computing_links.push(("Project preferences", "prefs.php?subset=project".into()));
     let mut logout = String::from("<form method=\"post\" action=\"logout.php\">\n");
     logout.push_str(&site_account::token_fields(&user, ctx.now));
     logout.push_str("<p><input type=\"submit\" value=\"Log out\"></p>\n</form>\n");
@@ -1035,9 +1088,13 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let mut i = 0;
     for h in &hosts {
         i += 1;
+        let tasks = if ctx.project.config.show_results {
+            format!(" | <a href=\"results.php?hostid={}\">Tasks</a>", h.id)
+        } else {
+            String::new()
+        };
         b.push_str(&format!(
-            "<tr><td>{0}<br><a href=\"show_host_detail.php?hostid={0}\">Details</a> | \
-             <a href=\"results.php?hostid={0}\">Tasks</a></td>",
+            "<tr><td>{0}<br><a href=\"show_host_detail.php?hostid={0}\">Details</a>{tasks}</td>",
             h.id
         ));
         if private {
@@ -1244,11 +1301,13 @@ pub async fn show_host_detail(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
             &time_diff(h.avg_turnaround),
         );
     }
-    row2(
-        &mut b,
-        "Tasks",
-        &format!("<a href=\"results.php?hostid={}\">View</a>", h.id),
-    );
+    if ctx.project.config.show_results {
+        row2(
+            &mut b,
+            "Tasks",
+            &format!("<a href=\"results.php?hostid={}\">View</a>", h.id),
+        );
+    }
     row2(
         &mut b,
         "Number of times client has contacted server",
@@ -1613,6 +1672,10 @@ fn result_row(
 /// three with a filter.
 pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
+    // `html/user/results.php` refuses unless `show_results` is set.
+    if !project.config.show_results {
+        return Ok(error_page(project, 404, "This feature is disabled."));
+    }
     let hostid = int_param(q, "hostid").filter(|&id| id > 0);
     let userid = int_param(q, "userid").filter(|&id| id > 0);
     let state = int_param(q, "state")

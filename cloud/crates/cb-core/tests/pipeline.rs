@@ -13,7 +13,7 @@ use cb_core::work::{
 };
 use cb_core::{Config, CoreError, CoreResult, FileKind, FileStat, Files, Webhook, NEVER};
 use cb_crypto::Signer;
-use cb_db::{query, query_one, stmt, Db};
+use cb_db::{query, query_one, stmt, Db, DbResult, Rows, Stmt};
 use cb_proto::consts::*;
 use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
@@ -1113,4 +1113,91 @@ fn reserved_results_time_out_and_fail_as_upstream() {
         .results(wu)
         .iter()
         .all(|r| r.server_state == RESULT_SERVER_STATE_OVER));
+}
+
+// ---------------------------------------------------------------------------
+// A transition that read a workunit's tasks before an account was deleted.
+
+/// A database that, before the first batch that writes a workunit under a
+/// revision check (the commit of a transition), runs the deletion steps of the
+/// accounts that are queued: the transition read its tasks, the deletion
+/// committed, then the transition commits.
+struct DeletionInBetween<'a> {
+    inner: &'a SqliteDb,
+    now: i64,
+    fired: Cell<bool>,
+}
+
+#[async_trait(?Send)]
+impl Db for DeletionInBetween<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        let commits = stmts
+            .iter()
+            .any(|s| s.sql.starts_with("UPDATE workunit SET") && s.sql.contains("AND rev = ?"));
+        if commits && !self.fired.replace(true) {
+            cb_core::site_delete::delete_account_steps(self.inner, self.now, 14)
+                .await
+                .unwrap();
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn a_transition_that_read_the_tasks_of_a_deleted_account_does_not_commit_over_the_deletion() {
+    let w = World::new("trivial");
+    let wu = w.submit("j1", 1000, 1, 1);
+    let r = w.results(wu).remove(0);
+    w.dispatch(&r, 1, 1100);
+    // The deadline has passed: a transition now writes the task off.
+    let late = 5000;
+    let rev = w.wu(wu).rev;
+    // Account 1 is being deleted (wipe): blocked, and in the queue.
+    block_on(w.db.batch(vec![
+        stmt!("UPDATE user SET blocked = 1, authenticator = 'deleted_1_x', email_addr = 'deleted_1_x' WHERE id = 1"),
+        stmt!("INSERT INTO user_deletion (userid, mode, create_time, gen) VALUES (1, 2, 1, 'deleted_1_x')"),
+    ]))
+    .unwrap();
+    let racing = DeletionInBetween {
+        inner: &w.db,
+        now: late,
+        fired: Cell::new(false),
+    };
+    let random = || w.rand();
+    let ctx = Ctx {
+        db: &racing,
+        files: &w.files,
+        webhook: &NoWebhook,
+        config: &w.config,
+        signer: Some(&w.signer),
+        now: late,
+        random: &random,
+    };
+    let rep = block_on(transition(&ctx, wu)).unwrap();
+    assert!(racing.fired.get());
+    // The first commit found another revision and read again.
+    assert_eq!(rep.attempts, 2, "{rep:?}");
+    // The deletion's cancellation stands: the stale transition did not turn it
+    // into a timeout.
+    let r = &w.results(wu)[0];
+    assert_eq!(
+        (
+            r.server_state,
+            r.outcome,
+            r.validate_state,
+            r.userid,
+            r.hostid
+        ),
+        (
+            RESULT_SERVER_STATE_OVER,
+            RESULT_OUTCOME_CLIENT_DETACHED,
+            VALIDATE_STATE_INVALID,
+            0,
+            0
+        )
+    );
+    assert!(w.wu(wu).rev > rev + 1);
+    // And the account is gone.
+    assert_eq!(w.scalar("SELECT count(*) FROM user WHERE id = 1"), 0.0);
+    assert_eq!(w.scalar("SELECT count(*) FROM user_deletion"), 0.0);
 }

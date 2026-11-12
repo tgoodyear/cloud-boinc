@@ -69,8 +69,34 @@ pub struct Config {
     /// sends none. A cloud-boinc option, for cost and abuse.
     pub email_max_per_day: i32,
     // cloud-boinc options without an upstream counterpart.
-    /// Whether `create_account` is open to anyone.
+    /// Whether accounts may be created at all (the sign-up page and
+    /// `create_account.php`). Resolved by [`Config::parse`]: `<disable_account_creation>`
+    /// closes it; otherwise an explicit `<account_creation>` decides; otherwise
+    /// a config that states `<disable_account_creation>0` (as the one
+    /// `make_project` writes) opens it; with none of them it is closed.
     pub account_creation: bool,
+    /// `disable_account_creation_rpc`: `create_account.php` refuses and tells
+    /// the client to use the web site; the sign-up page stays open.
+    pub disable_account_creation_rpc: bool,
+    /// `no_web_account_creation` (the tag upstream's PHP reads) or
+    /// `disable_web_account_creation` (the tag `py/Boinc/setup_project.py`
+    /// writes): the sign-up page is closed; `create_account.php` stays open
+    /// unless `disable_account_creation_rpc` is also set.
+    pub disable_web_account_creation: bool,
+    /// What new accounts get for `show_hosts`: 1 only when the config says
+    /// `<enable_privacy_by_default>0` (upstream's `default_show_hosts` gives 1
+    /// unless the option is set; an unstated option keeps accounts private
+    /// here, as before).
+    pub default_show_hosts: bool,
+    /// `show_results`: `results.php` and the task links of computer pages.
+    /// On unless the config says `<show_results>0` (upstream: off unless set).
+    pub show_results: bool,
+    /// `enable_delete_account`: 0 off, 1 obfuscate, 2 wipe. Upstream's 3
+    /// (project-defined) and other values are off here.
+    pub enable_delete_account: i32,
+    /// Value of an `X-Robots-Tag` header on account pages, empty for none.
+    /// Not in upstream, which sets none.
+    pub robots_tag: String,
     /// Upper bound on the credit of one job; 0 is no bound.
     pub max_granted_credit: f64,
     /// Upper bound in bytes on one uploaded file, whatever its certificate says.
@@ -140,6 +166,12 @@ impl Default for Config {
             email_from_name: String::new(),
             email_max_per_day: 200,
             account_creation: false,
+            disable_account_creation_rpc: false,
+            disable_web_account_creation: false,
+            default_show_hosts: false,
+            show_results: true,
+            enable_delete_account: 0,
+            robots_tag: String::new(),
             max_granted_credit: 200.0 * 1000.0 * 365.0,
             max_upload_nbytes: 100e6,
             purge_days: 0.0,
@@ -167,6 +199,9 @@ impl Config {
         let mut xp = XmlParser::new(xml);
         let mut in_config = false;
         let mut spec = StockSpec::default();
+        // What the three tags say about account creation, until `finish`.
+        let mut disable: Option<bool> = None;
+        let mut explicit: Option<bool> = None;
         while xp.get_tag() {
             if !xp.is_tag() {
                 continue;
@@ -180,6 +215,12 @@ impl Config {
             if xp.match_tag("/config") {
                 c.stock = spec.resolve(c.uldl_dir_fanout)?;
                 c.finish();
+                c.account_creation = match (disable, explicit) {
+                    (Some(true), _) => false,
+                    (_, Some(open)) => open,
+                    (Some(false), None) => true,
+                    (None, None) => false,
+                };
                 return Ok(c);
             }
             take!(xp.parse_str("master_url") => c.master_url);
@@ -245,7 +286,32 @@ impl Config {
             take!(xp.parse_str("email_from") => c.email_from);
             take!(xp.parse_str("email_from_name") => c.email_from_name);
             take!(xp.parse_int("email_max_per_day") => c.email_max_per_day);
-            take!(xp.parse_bool("account_creation") => c.account_creation);
+            if let Some(v) = xp.parse_bool("account_creation") {
+                explicit = Some(v);
+                continue;
+            }
+            if let Some(v) = xp.parse_bool("disable_account_creation") {
+                disable = Some(v);
+                continue;
+            }
+            take!(xp.parse_bool("disable_account_creation_rpc") => c.disable_account_creation_rpc);
+            if let Some(v) = xp
+                .parse_bool("no_web_account_creation")
+                .or_else(|| xp.parse_bool("disable_web_account_creation"))
+            {
+                c.disable_web_account_creation |= v;
+                continue;
+            }
+            if let Some(v) = xp.parse_bool("enable_privacy_by_default") {
+                c.default_show_hosts = !v;
+                continue;
+            }
+            take!(xp.parse_bool("show_results") => c.show_results);
+            if let Some(v) = xp.parse_int("enable_delete_account") {
+                c.enable_delete_account = if (1..=2).contains(&v) { v } else { 0 };
+                continue;
+            }
+            take!(xp.parse_str("robots_tag") => c.robots_tag);
             take!(xp.parse_double("max_granted_credit") => c.max_granted_credit);
             take!(xp.parse_double("max_upload_nbytes") => c.max_upload_nbytes);
             take!(xp.parse_double("purge_days") => c.purge_days);
@@ -600,6 +666,74 @@ mod tests {
             (none.email_from.as_str(), none.email_from_name.as_str()),
             ("", "")
         );
+    }
+
+    fn account_creation_of(tags: &str) -> bool {
+        Config::parse(&format!(
+            "<config><master_url>https://example.org/</master_url>{tags}</config>"
+        ))
+        .unwrap()
+        .account_creation
+    }
+
+    #[test]
+    fn account_creation_follows_the_stock_tags() {
+        // Nothing stated: closed, as before this option was read.
+        assert!(!account_creation_of(""));
+        // A stock config states it.
+        assert!(account_creation_of(
+            "<disable_account_creation>0</disable_account_creation>"
+        ));
+        assert!(!account_creation_of("<disable_account_creation/>"));
+        assert!(!account_creation_of(
+            "<disable_account_creation>1</disable_account_creation>"
+        ));
+        // The fork's own option, when the stock one is not there.
+        assert!(account_creation_of(
+            "<account_creation>1</account_creation>"
+        ));
+        assert!(!account_creation_of(
+            "<account_creation>0</account_creation>"
+        ));
+        // The stock disable wins over an open `account_creation`.
+        assert!(!account_creation_of(
+            "<account_creation>1</account_creation><disable_account_creation>1</disable_account_creation>"
+        ));
+        // And an explicit `account_creation` of 0 stays closed whatever the
+        // order and the stock tag at 0.
+        assert!(!account_creation_of(
+            "<disable_account_creation>0</disable_account_creation><account_creation>0</account_creation>"
+        ));
+    }
+
+    #[test]
+    fn parses_the_site_options() {
+        let c = Config::parse(
+            "<config><master_url>https://example.org/</master_url>\n\
+             <disable_account_creation_rpc>1</disable_account_creation_rpc>\n\
+             <no_web_account_creation/><enable_privacy_by_default>0</enable_privacy_by_default>\n\
+             <show_results>0</show_results><enable_delete_account>2</enable_delete_account>\n\
+             <robots_tag>noindex, nofollow</robots_tag></config>",
+        )
+        .unwrap();
+        assert!(c.disable_account_creation_rpc && c.disable_web_account_creation);
+        assert!(c.default_show_hosts && !c.show_results);
+        assert_eq!(
+            (c.enable_delete_account, c.robots_tag.as_str()),
+            (2, "noindex, nofollow")
+        );
+        let c = Config::parse(
+            "<config><master_url>https://example.org/</master_url>\n\
+             <disable_web_account_creation>1</disable_web_account_creation>\n\
+             <enable_privacy_by_default/><enable_delete_account>3</enable_delete_account></config>",
+        )
+        .unwrap();
+        assert!(c.disable_web_account_creation && !c.default_show_hosts);
+        assert_eq!(c.enable_delete_account, 0);
+        let c = Config::parse("<config><master_url>https://example.org/</master_url></config>")
+            .unwrap();
+        assert!(!c.disable_account_creation_rpc && !c.disable_web_account_creation);
+        assert!(!c.default_show_hosts && c.show_results && c.robots_tag.is_empty());
     }
 
     #[test]

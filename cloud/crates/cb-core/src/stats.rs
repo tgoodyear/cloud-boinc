@@ -80,11 +80,28 @@ const QUEUED_ROWS_PER_STMT: usize = 30;
 pub const FREE_PLAN_QUERIES: usize = 50;
 /// The least budget a pass can work with: its fixed statements and one period.
 pub const MIN_BUDGET: usize = 18;
+/// Statements kept back for what the cron does after the rollup and for slack.
+const BUDGET_MARGIN: usize = 2;
 const SNAPSHOT_VERSION: u32 = 2;
 
 const SNAP_OVERVIEW: &str = "overview";
 const SNAP_INFLIGHT: &str = "inflight";
 const SNAP_RUN: &str = "rollup_run";
+
+/// What a cron invocation that has sent `used` statements may still spend on
+/// the account deletions (at most `wanted`): what is left of the Free plan's 50
+/// once the rollup has its [`MIN_BUDGET`] and the margin.
+pub fn deletion_room(used: usize, wanted: usize) -> usize {
+    FREE_PLAN_QUERIES
+        .saturating_sub(used)
+        .saturating_sub(MIN_BUDGET + BUDGET_MARGIN)
+        .min(wanted)
+}
+
+/// What the rollup may spend when the invocation has sent `used` statements.
+pub fn rollup_budget(used: usize) -> usize {
+    FREE_PLAN_QUERIES.saturating_sub(used + BUDGET_MARGIN)
+}
 
 /// Start of the period holding `t`.
 pub fn bucket_start(t: i64) -> i64 {
@@ -815,6 +832,26 @@ mod tests {
 
     fn counted(at: i64, pending: i64) -> Counted {
         Counted { at, pending }
+    }
+
+    #[test]
+    fn the_cron_shares_fifty_statements_between_purge_deletions_and_rollup() {
+        // The purge sends at most 24 and the settings load 2; account deletions
+        // want 22. Whatever the purge used, the three together stay within 50 and
+        // the rollup always gets its minimum.
+        for purge in 0..=26 {
+            let deletions = deletion_room(purge, 22);
+            let rollup = rollup_budget(purge + deletions);
+            assert!(rollup >= MIN_BUDGET, "purge {purge}: rollup {rollup}");
+            assert!(
+                purge + deletions + rollup + BUDGET_MARGIN <= FREE_PLAN_QUERIES,
+                "purge {purge}"
+            );
+        }
+        // An ordinary run: the deletions get all they want.
+        assert_eq!(deletion_room(5, 22), 22);
+        // A heavy purge leaves the deletions what is left, for the next run.
+        assert_eq!(deletion_room(26, 22), 4);
     }
 
     #[test]
