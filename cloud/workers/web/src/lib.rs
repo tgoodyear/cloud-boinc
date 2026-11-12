@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use cb_core::feed::parse_feed;
 use cb_core::mail::Mailer;
 use cb_core::site::{
-    auth_from_cookie, robots_txt, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS,
+    auth_from_cookie, not_found_page, robots_txt, site_page, wants_html_404, SiteCtx, SitePage,
+    SITE_HEADERS, SITE_PATHS,
 };
 use cb_core::site_boards::{public_cache_key, CACHE_SECS, PUBLIC_PATHS};
 use cb_core::site_work::{work, FeedState};
@@ -469,6 +470,15 @@ async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
                 }
             }
         }
-        _ => text(404, "not found\n"),
+        // A browser asking for a page that does not exist gets the styled page;
+        // clients, tools and every method but GET keep the plain text.
+        _ => {
+            let accept = req.headers().get("Accept")?;
+            if wants_html_404(req.method() == Method::Get, &path, accept.as_deref()) {
+                site_response(not_found_page(&project, &base), &project.config.robots_tag)
+            } else {
+                text(404, "not found\n")
+            }
+        }
     }
 }

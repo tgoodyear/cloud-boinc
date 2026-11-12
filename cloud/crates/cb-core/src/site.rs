@@ -100,7 +100,7 @@ impl SitePage {
         }
     }
 
-    fn xml(body: String) -> SitePage {
+    pub(crate) fn xml(body: String) -> SitePage {
         SitePage {
             status: 200,
             content_type: XML,
@@ -177,7 +177,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 33] = [
+pub const SITE_PATHS: [&str; 34] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -211,6 +211,7 @@ pub const SITE_PATHS: [&str; 33] = [
     "/activity.php",
     "/delete_account_request.php",
     "/delete_account_confirm.php",
+    "/apps.php",
 ];
 
 /// Headers every site page is sent with: no framing by another site (the
@@ -308,6 +309,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/activity.php" => site_work::activity(ctx, q).await?,
         "/delete_account_request.php" => site_delete::delete_account_request(ctx, q).await?,
         "/delete_account_confirm.php" => site_delete::delete_account_confirm(ctx, q).await?,
+        "/apps.php" => crate::site_apps::apps(ctx, q),
         _ => return Ok(None),
     }))
 }
@@ -464,6 +466,66 @@ pub(crate) fn error_page(project: &Project, status: u16, msg: &str) -> SitePage 
             &format!("<p class=\"error\">{}</p>\n", html_escape(msg)),
         ),
     )
+}
+
+/// Whether `path` is one a BOINC client, an account manager or a tool calls
+/// and not a person: the web RPCs (`lookup_account.php`, `create_account.php`
+/// and any `*_account.php`, `am_*.php`, `get_project_config.php`,
+/// `server_status.php`) and the scheduler, upload and download paths. An
+/// unknown path of this kind gets the plain-text 404, so that a program that
+/// parses the reply does not get a page.
+pub fn is_rpc_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or_default();
+    name.ends_with("_account.php")
+        || name.starts_with("am_")
+        || name == "get_project_config.php"
+        || name == "server_status.php"
+        || name == "file_upload_handler"
+        || path.split('/').any(|seg| {
+            matches!(seg, "cgi" | "cgi-bin" | "download" | "upload" | "sched")
+                || seg.ends_with("_cgi")
+        })
+}
+
+/// Whether the 404 for an unknown path is the styled page: a `GET` that
+/// accepts `text/html` (a browser does; `curl`, a BOINC client and most
+/// tools send `*/*` or nothing) for a path that is not an RPC path. Every
+/// other request, whatever its method, gets the plain-text form.
+pub fn wants_html_404(is_get: bool, path: &str, accept: Option<&str>) -> bool {
+    is_get
+        && !is_rpc_path(path)
+        && accept.is_some_and(|a| {
+            a.split(',').any(|item| {
+                let mut parts = item.split(';');
+                let kind = parts.next().unwrap_or_default().trim();
+                let refused = parts.any(|p| {
+                    p.trim()
+                        .strip_prefix("q=")
+                        .is_some_and(|q| q.trim().parse::<f64>().is_ok_and(|q| q <= 0.0))
+                });
+                kind.eq_ignore_ascii_case("text/html") && !refused
+            })
+        })
+}
+
+/// The 404 page of a path the site does not have, in the site shell. It does
+/// not name the path that was asked for, and it needs nothing but the
+/// settings the Worker has loaded already: no statement. The links in the
+/// header are relative, so the page sets its base to the directory pages are
+/// served from (`base`, as in [`SiteCtx::base`]); without that, an unknown
+/// path in a subdirectory would send "Jobs" to a page below it.
+pub fn not_found_page(project: &Project, base: &str) -> SitePage {
+    let head = format!(
+        "<base href=\"{}/\">\n",
+        html_escape(crate::stock::url_path(base))
+    );
+    let body = format!(
+        "{}<h1>Page not found</h1>\n<p>There is no page at this address. It may have moved, or \
+         the address may have a typo.</p>\n{}",
+        site_header(project),
+        site_ui::actions(&[site_ui::button_link("Go to the home page", "./", false)])
+    );
+    SitePage::html(404, page("Page not found", &head, &body))
 }
 
 fn int_param(q: &Params, name: &str) -> Option<i64> {

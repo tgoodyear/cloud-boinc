@@ -25,6 +25,7 @@ pub mod purge;
 pub mod scheduler;
 pub mod site;
 pub mod site_account;
+pub mod site_apps;
 pub mod site_boards;
 pub mod site_delete;
 pub mod site_email;
