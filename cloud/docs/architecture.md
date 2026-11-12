@@ -1073,8 +1073,12 @@ A request that reads the account and then writes is conditional on what it read,
 statement or batch as the write. Every site page that changes an account (details, password,
 address, preferences, the key itself) and `am_set_info` add `authenticator = ?` to the `WHERE`
 clause with the key read with the account, together with the address and hash where they apply,
-and the token statements of the same request test the account again (`EXISTS ... authenticator =
-?`). A login or verification token is stored only if the account still has the address, password
+and the token statements of the same request run only if the update before them changed a row
+(`changes()`, which is for the statement just before; it works the same on SQLite and D1, where
+a batch cannot branch). The account merely looking like the target is not enough: a newer change
+by another request can leave it so while this request's update was refused, and that change's
+undo and login tokens must stay. The undo token of an address change is stored right after the
+update for the same reason, and the login links end on that token being there. A login or verification token is stored only if the account still has the address, password
 hash and key that were read (`issue_token`), so a recovery request that was under way when the
 address changed or the key was replaced makes no link for what the account was. A login link uses
 its token and reads the account in one batch, so it gets the key as it was when the token was

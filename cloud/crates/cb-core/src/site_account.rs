@@ -501,9 +501,12 @@ pub async fn edit_passwd_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
                 user.authenticator.as_str()
             ),
             stmt!(
+                // Only if the update before it changed a row: a newer change
+                // by another request can leave the account looking as this one
+                // meant it, and its links must stay.
                 "UPDATE token SET used_time = ? WHERE userid = ? AND type = 'L' AND used_time = 0 \
-                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND passwd_hash = ? \
-                 AND authenticator = ?)",
+                 AND changes() > 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? \
+                 AND passwd_hash = ? AND authenticator = ?)",
                 ctx.now,
                 user.id,
                 user.id,
@@ -699,24 +702,28 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
                 user.id
             )
         },
-        stmt!(
-            "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
-             AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
-             AND authenticator = ?)",
+    ];
+    // What follows the update runs only if this request's update changed a
+    // row. With email the undo token is stored right after it (`changes()`
+    // refers to the statement before), and the login links end after that,
+    // on the token being there; without email the links end right after it.
+    let undo_token = if mail.is_some() {
+        let (token, stmts) = site_email::change_token_stmts(ctx, user.id, &user.email_addr, &email);
+        batch.extend(stmts);
+        Some(token)
+    } else {
+        batch.push(stmt!(
+            "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', 'E') \
+             AND used_time = 0 AND changes() > 0 \
+             AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? AND authenticator = ?)",
             ctx.now,
             user.id,
-            // With email the new undo token replaces the old ones itself.
-            if mail.is_some() { "L" } else { "E" },
             user.id,
             email.as_str(),
             user.authenticator.as_str()
-        ),
-    ];
-    let undo_token = mail.as_ref().map(|_| {
-        let (token, stmts) = site_email::change_token_stmts(ctx, user.id, &user.email_addr, &email);
-        batch.extend(stmts);
-        token
-    });
+        ));
+        None
+    };
     let out = ctx.db.batch(batch).await?;
     let taken = out.first().and_then(|r| r.scalar_i64()).unwrap_or(0) > 0;
     let updated = out.get(1).is_some_and(|r| !r.rows.is_empty());

@@ -576,12 +576,17 @@ pub async fn am_set_info(
             .bind(user.id);
         // The update and, for a change of credentials, the end of the login
         // links mailed before it (and of undo links, for an address) go in
-        // one batch.
+        // one batch. The second statement runs only if the update just before
+        // it changed a row (`changes()`, which is for the statement before),
+        // not merely because the account looks like the target: a newer
+        // change by another request can make it look so while this update was
+        // refused, and its tokens must stay.
         let mut batch = vec![update];
         if credentials_changed {
             batch.push(stmt!(
                 "UPDATE token SET used_time = ? WHERE userid = ? AND type IN ('L', ?) \
-                 AND used_time = 0 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
+                 AND used_time = 0 AND changes() > 0 \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_addr = ? \
                  AND authenticator = ? AND (? = '' OR passwd_hash = ?))",
                 now,
                 user.id,

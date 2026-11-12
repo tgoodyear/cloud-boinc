@@ -149,9 +149,12 @@ pub(crate) async fn issue_token(
 
 /// The undo token of an address change, with the statements that store it,
 /// for the batch that makes the change: they add the token only if the change
-/// happened (the account has the new address, set at `ctx.now`) and no undo
-/// token of the account was made at `ctx.now` yet, and end the older undo
-/// tokens. The second condition is for a duplicate of the same request that
+/// happened and no undo token of the account was made at `ctx.now` yet, and
+/// end the older undo tokens and the login links. The batch must have the
+/// guarded update of the address as the statement before the first of these:
+/// the token is stored only if that update changed a row (`changes()`), so a
+/// request whose update was refused stores and ends nothing, even if another
+/// request's change leaves the account looking like this one's. The second condition is for a duplicate of the same request that
 /// ran at the same time: its own change matched nothing, but the first's
 /// state looks like its own, and it must neither add a token nobody holds nor
 /// end the one the first request mails. A crash after the batch leaves the
@@ -169,7 +172,7 @@ pub(crate) fn change_token_stmts(
             "INSERT INTO token (userid, type, token_hash, data, create_time, expire_time) \
              SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS \
              (SELECT 1 FROM user WHERE id = ? AND email_addr = ? AND email_addr_change_time = ?) \
-             AND NOT EXISTS \
+             AND changes() > 0 AND NOT EXISTS \
              (SELECT 1 FROM token WHERE userid = ? AND type = ? AND create_time = ?)",
             userid,
             CHANGE.code,
@@ -191,6 +194,16 @@ pub(crate) fn change_token_stmts(
             userid,
             CHANGE.code,
             hash.as_str(),
+            hash.as_str()
+        ),
+        // The login links mailed to the address end with the change: this
+        // request's token being there is the sign that its update ran.
+        stmt!(
+            "UPDATE token SET used_time = ? WHERE userid = ? AND type = ? AND used_time = 0 \
+             AND EXISTS (SELECT 1 FROM token WHERE token_hash = ?)",
+            ctx.now,
+            userid,
+            LOGIN.code,
             hash.as_str()
         ),
     ];
@@ -631,7 +644,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
                 ),
                 stmt!(
                     "UPDATE token SET used_time = ? WHERE token_hash = ? AND userid = ? \
-                     AND type = ? AND used_time = 0 \
+                     AND type = ? AND used_time = 0 AND changes() > 0 \
                      AND EXISTS (SELECT 1 FROM user WHERE id = ? AND email_validated = 1 \
                      AND email_addr = token.data)",
                     ctx.now,
@@ -914,14 +927,20 @@ mod tests {
     #[test]
     fn a_duplicate_address_change_does_not_end_the_first_undo_token() {
         let db = SqliteDb::with_schema().unwrap();
-        // The state both requests see after the first one's update.
+        // The account both requests read.
         block_on(db.run(stmt!(
-            "INSERT INTO user (id, create_time, email_addr, name, authenticator, \
-             previous_email_addr, email_addr_change_time) \
-             VALUES (1, 1, 'new@x.example', 'U', 'k1', 'old@x.example', ?)",
-            NOW
+            "INSERT INTO user (id, create_time, email_addr, name, authenticator) \
+             VALUES (1, 1, 'old@x.example', 'U', 'k1')"
         )))
         .unwrap();
+        // The guarded update of the address that each batch starts with.
+        let update = || {
+            stmt!(
+                "UPDATE user SET email_addr = 'new@x.example', previous_email_addr = 'old@x.example', \
+                 email_addr_change_time = ? WHERE id = 1 AND email_addr = 'old@x.example'",
+                NOW
+            )
+        };
         let project = Project::default();
         let seq = Cell::new(1u32);
         let random = || {
@@ -941,8 +960,15 @@ mod tests {
         let (first, first_stmts) = change_token_stmts(&ctx, 1, "old@x.example", "new@x.example");
         let (second, second_stmts) = change_token_stmts(&ctx, 1, "old@x.example", "new@x.example");
         assert_ne!(first, second);
-        block_on(db.batch(first_stmts)).unwrap();
-        block_on(db.batch(second_stmts)).unwrap();
+        // The first request's update changes the row; the second one's, which
+        // read the same account, matches nothing, but the account now looks
+        // like its target.
+        let mut batch = vec![update()];
+        batch.extend(first_stmts);
+        block_on(db.batch(batch)).unwrap();
+        let mut batch = vec![update()];
+        batch.extend(second_stmts);
+        block_on(db.batch(batch)).unwrap();
         let rows = block_on(db.run(stmt!(
             "SELECT token_hash, used_time FROM token WHERE type = 'E'"
         )))

@@ -1686,7 +1686,7 @@ fn preferences_are_edited_per_venue_and_reach_clients() {
 /// the other changed.
 struct ChangedMeanwhile<'a> {
     inner: &'a SqliteDb,
-    other: RefCell<Option<Stmt>>,
+    other: RefCell<Vec<Stmt>>,
     trigger: &'static [&'static str],
     after: bool,
 }
@@ -1698,20 +1698,16 @@ impl Db for ChangedMeanwhile<'_> {
             .iter()
             .any(|s| self.trigger.iter().any(|t| s.sql.starts_with(t)));
         let other = if fires {
-            self.other.borrow_mut().take()
+            std::mem::take(&mut *self.other.borrow_mut())
         } else {
-            None
+            Vec::new()
         };
-        if !self.after {
-            if let Some(other) = &other {
-                self.inner.run(other.clone()).await?;
-            }
+        if !self.after && !other.is_empty() {
+            self.inner.batch(other.clone()).await?;
         }
         let out = self.inner.batch(stmts).await?;
-        if self.after {
-            if let Some(other) = other {
-                self.inner.run(other).await?;
-            }
+        if self.after && !other.is_empty() {
+            self.inner.batch(other).await?;
         }
         Ok(out)
     }
@@ -1733,11 +1729,11 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
     let site_hash = passwd_hash("secret", "ada@site.example");
     let racing = ChangedMeanwhile {
         inner: &w.db,
-        other: RefCell::new(Some(stmt!(
+        other: RefCell::new(vec![stmt!(
             "UPDATE user SET email_addr = 'ada@site.example', passwd_hash = ? WHERE id = ?",
             site_hash.as_str(),
             ada.id
-        ))),
+        )]),
         trigger: &["UPDATE user SET"],
         after: false,
     };
@@ -1764,10 +1760,10 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
     // A new address with its hash, against a hash changed meanwhile.
     let racing = ChangedMeanwhile {
         inner: &w.db,
-        other: RefCell::new(Some(stmt!(
+        other: RefCell::new(vec![stmt!(
             "UPDATE user SET passwd_hash = 'changed' WHERE id = ?",
             ada.id
-        ))),
+        )]),
         trigger: &["UPDATE user SET"],
         after: false,
     };
@@ -1790,10 +1786,10 @@ fn am_set_info_does_not_pair_a_hash_with_a_new_address() {
     // A change that does not touch the credentials is not held up by one.
     let racing = ChangedMeanwhile {
         inner: &w.db,
-        other: RefCell::new(Some(stmt!(
+        other: RefCell::new(vec![stmt!(
             "UPDATE user SET passwd_hash = 'again' WHERE id = ?",
             ada.id
-        ))),
+        )]),
         trigger: &["UPDATE user SET"],
         after: false,
     };
@@ -2148,7 +2144,18 @@ fn clearing_every_application_is_refused() {
 fn changed_meanwhile(w: &World, sql: Stmt) -> ChangedMeanwhile<'_> {
     ChangedMeanwhile {
         inner: &w.db,
-        other: RefCell::new(Some(sql)),
+        other: RefCell::new(vec![sql]),
+        trigger: &["UPDATE user SET"],
+        after: false,
+    }
+}
+
+/// `changed_meanwhile` with several statements, run as one batch: a whole
+/// request that commits before this one writes.
+fn changed_meanwhile_by(w: &World, stmts: Vec<Stmt>) -> ChangedMeanwhile<'_> {
+    ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(stmts),
         trigger: &["UPDATE user SET"],
         after: false,
     }
@@ -2158,7 +2165,7 @@ fn changed_meanwhile(w: &World, sql: Stmt) -> ChangedMeanwhile<'_> {
 fn changed_around_tokens(w: &World, sql: Stmt, after: bool) -> ChangedMeanwhile<'_> {
     ChangedMeanwhile {
         inner: &w.db,
-        other: RefCell::new(Some(sql)),
+        other: RefCell::new(vec![sql]),
         trigger: &["INSERT INTO token", "UPDATE token SET"],
         after,
     }
@@ -4282,4 +4289,147 @@ fn a_login_link_used_during_a_key_reset_gets_the_old_key_or_nothing() {
         "{cookie}"
     );
     assert_eq!(w.user(ada.id).authenticator, REPLACED_KEY);
+}
+
+// ---------------------------------------------------------------------------
+// A refused request must not end the tokens of the change that was not refused.
+
+/// Two unused tokens as another request's change leaves them: a login link
+/// and an undo link, made a moment ago.
+fn newer_tokens(userid: i64) -> Vec<Stmt> {
+    ["L", "E"]
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            let hash = cb_crypto::account::token_hash(&format!("newer-{kind}-{i}"));
+            stmt!(
+                "INSERT INTO token (userid, type, token_hash, data, create_time, expire_time) \
+                 VALUES (?, ?, ?, 'ada@example.com', ?, ?)",
+                userid,
+                *kind,
+                hash.as_str(),
+                NOW - 5,
+                NOW + 100_000
+            )
+        })
+        .collect()
+}
+
+fn unused_tokens(w: &World) -> i64 {
+    block_on(w.db.run(stmt!("SELECT count(*) AS n FROM token WHERE used_time = 0")))
+        .unwrap()
+        .scalar_i64()
+        .unwrap()
+}
+
+#[test]
+fn a_refused_request_leaves_the_tokens_of_the_change_that_won() {
+    // am_set_info: both read address A and want B; the other one, a site
+    // change, commits first with its login and undo links. The RPC's update is
+    // refused, and the account now has B, as it wanted.
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let mut others = vec![stmt!(
+        "UPDATE user SET email_addr = 'ada@b.example', previous_email_addr = 'ada@example.com', \
+         email_addr_change_time = ? WHERE id = ?",
+        NOW,
+        ada.id
+    )];
+    others.extend(newer_tokens(ada.id));
+    let racing = changed_meanwhile_by(&w, others);
+    let params: Params = [
+        ("account_key", ada.auth.as_str()),
+        ("email_addr", "ada@b.example"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let reply = block_on(cb_core::web::am_set_info(
+        &racing,
+        &w.project.config,
+        PEPPER,
+        NOW,
+        &params,
+    ))
+    .unwrap();
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    assert_eq!(unused_tokens(&w), 2, "am_set_info");
+
+    // The password page: the other request set the same new password, with
+    // its login link.
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let stored = cb_crypto::account::pepper_passwd_hash(
+        PEPPER,
+        &passwd_hash("newer-pass", "ada@example.com"),
+    );
+    let mut others = vec![stmt!(
+        "UPDATE user SET passwd_hash = ? WHERE id = ?",
+        stored.as_str(),
+        ada.id
+    )];
+    others.extend(newer_tokens(ada.id));
+    let form = w.get("/edit_passwd_form.php", Some(&ada.auth), &[]);
+    let mut sent = hidden_fields(&form.body);
+    sent.extend(
+        [
+            ("old_passwd", "secret"),
+            ("passwd", "newer-pass"),
+            ("passwd2", "newer-pass"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_meanwhile_by(&w, others);
+    let (page, _) = w.page_on(
+        &racing,
+        "/edit_passwd_action.php",
+        Some(&ada.auth),
+        true,
+        &pairs,
+    );
+    assert_eq!(page.status, 409);
+    assert_eq!(unused_tokens(&w), 2, "edit_passwd_action");
+
+    // The address page, with and without email.
+    for with_mail in [true, false] {
+        let w = if with_mail {
+            World::with_mail()
+        } else {
+            World::new()
+        };
+        let ada = w.account("ada@example.com", "secret", "Ada");
+        let mut others = vec![stmt!(
+            "UPDATE user SET email_addr = 'ada@b.example', previous_email_addr = 'ada@example.com', \
+             email_addr_change_time = ? WHERE id = ?",
+            NOW,
+            ada.id
+        )];
+        others.extend(newer_tokens(ada.id));
+        let form = w.get("/edit_email_form.php", Some(&ada.auth), &[]);
+        let mut sent = hidden_fields(&form.body);
+        sent.extend(
+            [("email_addr", "ada@b.example"), ("passwd", "secret")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let racing = changed_meanwhile_by(&w, others);
+        let (page, _) = w.page_on(
+            &racing,
+            "/edit_email_action.php",
+            Some(&ada.auth),
+            true,
+            &pairs,
+        );
+        assert_eq!(page.status, 409, "mail: {with_mail}");
+        assert_eq!(unused_tokens(&w), 2, "edit_email_action, mail: {with_mail}");
+        assert_eq!(
+            w.token_rows("E"),
+            1,
+            "no second undo token, mail: {with_mail}"
+        );
+        assert!(w.mails().is_empty());
+    }
 }
