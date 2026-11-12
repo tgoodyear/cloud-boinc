@@ -23,6 +23,7 @@ pub mod plan_class;
 pub mod prefs;
 pub mod project;
 pub mod purge;
+pub mod routing;
 pub mod scheduler;
 pub mod site;
 pub mod site_account;

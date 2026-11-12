@@ -262,8 +262,9 @@ deadline, so neither sends a message.
    to their workunits, ordered by priority then age, interleaved across apps by weight. The query
    leaves out what this host cannot be sent: workunits committed to another class or version
    (see "Homogeneous redundancy and homogeneous app version"), pinned to a version number the
-   host has no version for, or outside a plan class's workunit-ID or batch window (see "Pinned
-   jobs, kept versions and client versions"), and ones the host already has a result of. Plus,
+   host has no version for, outside a plan class's workunit-ID or batch window (see "Pinned
+   jobs, kept versions and client versions"), refused for the version by a routing rule (see
+   "Routing rules"), and ones the host already has a result of. Plus,
    with `enable_assignment`, assigned jobs for this host or user (see "Assigned jobs").
 7. If an assigned job can be sent, the reply carries assigned jobs and no other new work,
    and steps 8 and 9 are skipped.
@@ -632,6 +633,68 @@ client are ignored. A version for any of them can be sent, and `handle_request` 
   client's primary platform: 3 GiB for Linux, 2 GiB for Windows, 4 GiB for macOS and Solaris, 2 GiB
   otherwise (`max_32b_address_space`). The rule is not applied to a job already committed to an
   app version (homogeneous app version): stock returns for that case before it makes the check.
+
+### Routing rules
+
+`wu_is_infeasible_custom` in `sched/sched_customize.cpp` is the hook where a stock project
+compiles in its own test of a workunit against the app version chosen for a host.
+`wu_is_infeasible_fast` in `sched/sched_check.cpp` calls it for every candidate. No project code
+is compiled in here, so the hook is a rule set: the `routing_rules` setting in the `config`
+table, a JSON document that `crates/cb-core/src/routing.rs` (`RoutingRules`) parses, checks and
+evaluates. A project that calibrates hosts with known-answer jobs can use it to bind each job to
+one build of the app.
+
+```json
+{"rules": [
+  {"app": "calibrate", "name": "calibrate_set1_*", "assigned": true,
+   "allow": [
+     {"platform": "x86_64-pc-linux-gnu", "min_version": 4, "max_version": 4},
+     {"platform": "arm64-apple-darwin", "plan_class": "", "min_version": 6}
+   ]},
+  {"app": "calibrate", "name": "calibrate_*", "assigned": true, "allow": []}
+]}
+```
+
+A rule selects workunits of one app (`app`), by an optional name pattern (`name`, where `*`
+matches any run of characters and `?` any one) and an optional batch range (`min_batch`,
+`max_batch`, 0 for no bound). The first rule that selects a workunit decides; a workunit no rule
+selects is not restricted. The rule lists the versions the workunit may be sent with: a version is
+allowed when one entry of `allow` matches. An entry sets any of `platform` (the version's platform
+name), `plan_class` (`""` means only the version with no plan class) and `min_version` and
+`max_version` (inclusive bounds on `version_num`, 0 for none); every field that is set must match.
+An empty `allow` list allows nothing, so a closing rule like the second one above refuses what no
+earlier rule admitted. A workunit refused for one version may still go with another version the
+host can run. If no version is allowed, the job is skipped for that host, as for any other
+infeasibility.
+
+Where it applies, in `handle_request` in `crates/cb-core/src/scheduler.rs`:
+
+- Unsent results: the `admitted` test that picks a version for each candidate, next to the plan
+  class windows. The candidate and assigned-job queries carry the same decision as a condition on
+  the workunit (`RoutingRules::sql_condition`, a `GLOB` on `workunit.name` and bounds on
+  `workunit.batch`, written into the `version_gate` clause of each version), so a window of
+  results no version of the host can take does not hide the ones it can (see "Dispatch without a
+  feeder").
+- Lost results: a resend is skipped, and the result allowed to expire, when a rule refuses the
+  version it would go with. Stock calls `wu_is_infeasible_fast` for resends too.
+- Assigned jobs: a rule applies to them only when it sets `"assigned": true`. Stock's hook is
+  not reached for an assigned job, because `send_assigned_job` in `sched/sched_assign.cpp` does
+  not call `wu_is_infeasible_fast`; projects that need the check there patch the assignment path.
+  The default matches stock, and the flag is the opt-in.
+- A client's own versions (anonymous platform) have no registered payload, so a rule that selects
+  the workunit refuses them.
+
+Cost. The rules are loaded with the other settings in the one query of `Project::load` and kept
+for the 30-second cache lifetime, so there is no extra query. With no rule the setting is absent
+and the checks return at once; no SQL text changes. With rules, the candidate query text is longer
+and each candidate costs a few string comparisons; the number of statements and bound parameters
+is the same. A rule set is limited to 256 rules of 256 entries each.
+
+Managed with `cboinc routing-show`, `routing-set --file F` and `routing-clear`
+(`GET`, `PUT` and `DELETE /admin/v1/routing`). `PUT` replaces the whole document after it has been
+checked (unknown fields, bad names or patterns and bounds out of order are refused); the setting
+can also be read and written as `config/routing_rules`. The difference from the stock hook is D38
+in `compatibility.md`.
 
 ### Plan classes and admission gates
 
@@ -2909,7 +2972,6 @@ certificates are checked.
 Not implemented yet:
 
 - `stop_sched` and `stop_upload` equivalents (a freeze that refuses every request).
-- `wu_is_infeasible_custom`, the hook where a project edits `sched/sched_customize.cpp`.
 - Gates on the size of a job against the host in the candidate query (memory, disk, deadline);
   they apply to the rows read, up to four windows.
 

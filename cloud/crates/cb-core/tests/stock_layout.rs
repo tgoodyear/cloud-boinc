@@ -203,6 +203,7 @@ fn run_with(config_xml: &str) -> Run {
         db: &db,
         config: &project.config,
         plan_classes: &project.plan_classes,
+        routing: &cb_core::routing::NONE,
         catalog: &project.catalog,
         code_sign_key: &project.code_sign_key,
         now: 300,

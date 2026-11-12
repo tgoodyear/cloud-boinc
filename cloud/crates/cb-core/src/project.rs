@@ -7,6 +7,7 @@ use cb_proto::xml::{xml_unescape, XmlParser};
 use serde::Deserialize;
 
 use crate::plan_class::PlanClassSpecs;
+use crate::routing::RoutingRules;
 use crate::scheduler::Catalog;
 use crate::{Config, CoreError, CoreResult};
 
@@ -14,14 +15,17 @@ use crate::{Config, CoreError, CoreResult};
 pub const SETTING_CONFIG: &str = "config";
 /// The upstream `plan_class_spec.xml` document.
 pub const SETTING_PLAN_CLASSES: &str = "plan_class_spec";
+/// The routing rules (`crate::routing`), a JSON document.
+pub const SETTING_ROUTING_RULES: &str = "routing_rules";
 /// The code-signing public key, in the BOINC key file format.
 pub const SETTING_CODE_SIGN_KEY: &str = "code_sign_public_key";
 /// The upload public key, in the BOINC key file format.
 pub const SETTING_UPLOAD_KEY: &str = "upload_public_key";
 
-pub const SETTINGS: [&str; 4] = [
+pub const SETTINGS: [&str; 5] = [
     SETTING_CONFIG,
     SETTING_PLAN_CLASSES,
+    SETTING_ROUTING_RULES,
     SETTING_CODE_SIGN_KEY,
     SETTING_UPLOAD_KEY,
 ];
@@ -30,6 +34,7 @@ pub const SETTINGS: [&str; 4] = [
 pub struct Project {
     pub config: Config,
     pub plan_classes: PlanClassSpecs,
+    pub routing: RoutingRules,
     pub catalog: Catalog,
     /// Text of the code-signing public key; empty when not set.
     pub code_sign_key: String,
@@ -51,6 +56,7 @@ impl Project {
             match row.name.as_str() {
                 SETTING_CONFIG => p.config = Config::parse(&row.value)?,
                 SETTING_PLAN_CLASSES => p.plan_classes = PlanClassSpecs::parse(&row.value)?,
+                SETTING_ROUTING_RULES => p.routing = RoutingRules::parse(&row.value)?,
                 SETTING_CODE_SIGN_KEY => p.code_sign_key = row.value,
                 SETTING_UPLOAD_KEY => p.upload_public_key = Some(PublicKey::parse(&row.value)?),
                 _ => {}
@@ -97,6 +103,9 @@ fn validate_setting(name: &str, value: &str) -> CoreResult<()> {
         SETTING_PLAN_CLASSES => {
             PlanClassSpecs::parse(value)?;
         }
+        SETTING_ROUTING_RULES => {
+            RoutingRules::parse(value)?;
+        }
         SETTING_CODE_SIGN_KEY | SETTING_UPLOAD_KEY => {
             PublicKey::parse(value)?;
         }
@@ -120,6 +129,21 @@ pub async fn put_setting(db: &dyn Db, name: &str, value: &str, now: i64) -> Core
     ))
     .await?;
     Ok(())
+}
+
+/// Removes a setting; a project without it behaves as one that never had it.
+/// The `config` setting cannot be removed.
+pub async fn delete_setting(db: &dyn Db, name: &str) -> CoreResult<bool> {
+    if !SETTINGS.contains(&name) {
+        return Err(CoreError::NotFound(format!("setting {name}")));
+    }
+    if name == SETTING_CONFIG {
+        return Err(CoreError::Invalid("the config setting cannot be removed".into()));
+    }
+    let rows = db
+        .run(stmt!("DELETE FROM config WHERE name = ? RETURNING name", name))
+        .await?;
+    Ok(!rows.rows.is_empty())
 }
 
 /// A top-level element of the active `<config>`, with where it sits in the

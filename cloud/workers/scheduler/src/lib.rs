@@ -73,6 +73,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         db: &db,
         config: &project.config,
         plan_classes: &project.plan_classes,
+        routing: &project.routing,
         catalog: &project.catalog,
         code_sign_key: &project.code_sign_key,
         now: now(),
