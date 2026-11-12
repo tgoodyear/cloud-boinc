@@ -10,9 +10,9 @@ use cb_core::mail::Mailer;
 use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS};
 use cb_core::stock::{route_web, url_origin, WebRoute};
 use cb_core::web::{
-    am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
-    project_config, server_status, server_status_page, server_status_xml, NewAccount,
-    MAX_FORM_BYTES,
+    am_get_info, am_set_host_info, am_set_info, create_account, html_cache_control, lookup_account,
+    master_page, project_config, server_status, server_status_page, server_status_xml, NewAccount,
+    FAVICON_SVG, MAX_FORM_BYTES,
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
@@ -31,7 +31,7 @@ fn html(body: String) -> Result<Response> {
         .with_header("Content-Type", "text/html; charset=utf-8")?
         .with_header(
             "Cache-Control",
-            &format!("public, max-age={PAGE_CACHE_SECS}"),
+            &html_cache_control(&format!("public, max-age={PAGE_CACHE_SECS}")),
         )?
         .fixed(body.into_bytes()))
 }
@@ -50,7 +50,7 @@ fn cacheable_xml(body: String) -> Result<Response> {
 fn site_response(page: SitePage) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", page.content_type)?;
-    headers.set("Cache-Control", "private, no-store")?;
+    headers.set("Cache-Control", &html_cache_control("private, no-store"))?;
     for (name, value) in SITE_HEADERS {
         headers.set(name, value)?;
     }
@@ -103,9 +103,18 @@ async fn cached(key: &str) -> Result<Option<Response>> {
     if let Some(kind) = hit.headers().get("Content-Type")? {
         headers.set("Content-Type", &kind)?;
     }
+    let base = format!("public, max-age={PAGE_CACHE_SECS}");
+    let is_html = hit
+        .headers()
+        .get("Content-Type")?
+        .is_some_and(|k| k.starts_with("text/html"));
     headers.set(
         "Cache-Control",
-        &format!("public, max-age={PAGE_CACHE_SECS}"),
+        &if is_html {
+            html_cache_control(&base)
+        } else {
+            base
+        },
     )?;
     Ok(Some(
         Response::from_body(hit.body().clone())?.with_headers(headers),
@@ -118,6 +127,13 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         return text(405, "method not allowed\n");
     }
     let raw_path = req.path();
+    if raw_path == "/favicon.ico" && matches!(req.method(), Method::Get | Method::Head) {
+        return Ok(Response::builder()
+            .with_header("Content-Type", "image/svg+xml")?
+            .with_header("Cache-Control", "public, max-age=86400")?
+            .with_header("X-Content-Type-Options", "nosniff")?
+            .fixed(FAVICON_SVG.as_bytes().to_vec()));
+    }
     // Pages at the root need no database read when the cache has them.
     let mut cache_key = is_static_page(&req, &raw_path)
         .then(|| req.url().map(|u| u.to_string()))

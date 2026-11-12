@@ -4572,6 +4572,10 @@ fn every_site_page_goes_through_the_shell() {
                     "{path}"
                 );
                 assert!(body.contains("<style>:root{"), "{path}");
+                assert!(
+                    body.contains("<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg"),
+                    "{path}"
+                );
                 assert!(body.contains("<header class=\"top\">"), "{path}");
                 assert!(body.contains("<h1>"), "{path}");
                 for external in ["src=\"", "url(", "@import", "<link rel=\"stylesheet"] {
@@ -4599,4 +4603,26 @@ fn the_account_page_links_the_email_functions() {
     assert!(body.contains("href=\"get_passwd.php\""));
     assert!(!body.contains("href=\"validate_email_addr.php\""));
     assert!(body.contains("(verified)"));
+}
+
+/// A project name with markup or a character reference is shown as the text
+/// it is, once escaped: in the header, the title, the account page and the
+/// label that carries it (`site_ui::kv` escapes labels itself).
+#[test]
+fn a_project_name_with_markup_is_shown_as_text() {
+    let config = CONFIG.replace(
+        "<long_name>Test Project</long_name>",
+        "<long_name>A &lt;b&gt;&amp;amp; Co</long_name>",
+    );
+    let w = World::with_config(&config);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let body = w.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("A &lt;b&gt;&amp;amp; Co member since"));
+    assert!(body.contains("<a class=\"brand\" href=\"./\">A &lt;b&gt;&amp;amp; Co</a>"));
+    assert!(!body.contains("<b>"));
+    assert!(!body.contains("&amp;amp;amp;"));
+    let home = cb_core::web::master_page(&w.project);
+    assert!(home.contains("<title>A &lt;b&gt;&amp;amp; Co</title>"));
+    assert!(home.contains("<h1>A &lt;b&gt;&amp;amp; Co</h1>"));
+    assert!(!home.contains("<b>"));
 }
