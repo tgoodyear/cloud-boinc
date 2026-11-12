@@ -19,9 +19,10 @@
 use cb_db::Stmt;
 
 use crate::avg::decayed;
+use crate::host_desc::HostMisc;
 use crate::model::User;
 use crate::project::Project;
-use crate::site::{gpu_desc, layout, number_format, str_param, Params, SiteCtx, SitePage};
+use crate::site::{layout, number_format, str_param, Params, SiteCtx, SitePage};
 use crate::web::html_escape;
 use crate::CoreResult;
 
@@ -342,6 +343,7 @@ struct HostRow {
     os_name: String,
     os_version: String,
     serialnum: String,
+    misc: String,
     owner_name: Option<String>,
     owner_show_hosts: Option<i64>,
     owner_blocked: Option<i64>,
@@ -358,7 +360,7 @@ fn hardware(h: &HostRow) -> String {
         ),
         format!("{} {}", html_escape(&h.os_name), html_escape(&h.os_version)),
     ];
-    let gpu = gpu_desc(&h.serialnum);
+    let gpu = HostMisc::read(&h.misc, &h.serialnum).gpu_desc();
     if gpu != "---" {
         lines.push(gpu);
     }
@@ -380,10 +382,10 @@ pub async fn top_hosts(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             sql: format!(
                 "SELECT h.id, h.userid, h.total_credit, h.expavg_credit, h.expavg_time, \
                  h.valid_results, h.recent_key, h.p_vendor, h.p_model, h.p_ncpus, h.os_name, h.os_version, \
-                 h.serialnum, u.name AS owner_name, u.show_hosts AS owner_show_hosts, \
+                 h.serialnum, h.misc, u.name AS owner_name, u.show_hosts AS owner_show_hosts, \
                  u.blocked AS owner_blocked \
                  FROM (SELECT id, userid, total_credit, expavg_credit, expavg_time, valid_results, \
-                       recent_key, p_vendor, p_model, p_ncpus, os_name, os_version, serialnum FROM host \
+                       recent_key, p_vendor, p_model, p_ncpus, os_name, os_version, serialnum, misc FROM host \
                        WHERE total_credit > 0 ORDER BY {key} DESC, id LIMIT ? OFFSET ?) h \
                  LEFT JOIN user u ON u.id = h.userid ORDER BY h.{key} DESC, h.id"
             ),

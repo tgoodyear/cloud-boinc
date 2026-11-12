@@ -549,7 +549,13 @@ upstream's layout and key order (`crates/cb-core/src/host_misc.rs`). Differences
 JSON-escaped (upstream's are not, so a quote in a GPU name breaks its document), each is cut
 at 200 bytes, and the value is held to 8 KiB by dropping the GPU list if it grows past that
 (upstream's limit is its column's 64 KiB, cut anywhere). `host.serialnum`, the older summary
-string, is still written, as `host_summary_regex` reads it.
+string, is still written, as `host_summary_regex` reads it. The computer page
+(`show_host_detail.php`) describes a host's GPUs, Docker or Podman, VirtualBox and client version from
+`host.misc`, as `gpu_desc`, `vbox_desc`, `docker_desc` and `boinc_version` in `html/inc/host.inc` do
+(`crates/cb-core/src/host_desc.rs`); `hosts_user.php` and `top_hosts.php` show the GPUs, and
+`hosts_user.php` the client version. They use `host.serialnum` for a row whose `misc` is empty or
+not a non-empty JSON object (D17 in
+[compatibility.md](compatibility.md)).
 
 **`maintenance_delay`.** The scheduler Worker's "project is temporarily unavailable" replies
 (settings cannot be read, the request failed, the reply could not be written) carry the config's
@@ -1418,7 +1424,7 @@ that is not bounded by the limits below.
 | Page | Shows | Reads |
 | --- | --- | --- |
 | `top_users.php` | Rank, name, total credit, recent average credit, jobs completed (tasks that passed validation), country when the project shows it. Sorted by `sort=total_credit` (default), `expavg_credit` or `valid_results`; `page=` of 50 rows, at most 40 pages. Accounts with no credit and blocked accounts are left out | the first rows of one partial index |
-| `top_hosts.php` | The same for computers, with CPU, operating system and GPU summary (from `host.serialnum`). The owner is named and linked for every computer (see `host_owner_public` below); with that option off, only when the account has `show_hosts` on, and "Anonymous" otherwise | the first rows of one partial index, and each owner by ID |
+| `top_hosts.php` | The same for computers, with CPU, operating system and GPU summary (from `host.misc`, or `host.serialnum` when that is empty). The owner is named and linked for every computer (see `host_owner_public` below); with that option off, only when the account has `show_hosts` on, and "Anonymous" otherwise | the first rows of one partial index, and each owner by ID |
 | `work.php` | Per application and in total: tasks waiting to send, in progress, workunits awaiting validation and awaiting assimilation, tasks completed and failed in the last 24 hours and 7 days; a week of three-hour periods as three SVG charts (queue, completed, active volunteers and computers) with a table of the same numbers; the project's own panels | the `overview` snapshot and 56 rows of `stats_bucket` |
 | `activity.php` | Volunteers holding tasks, with tasks per application, number of computers, last contact; computers are listed under their volunteers, subject to `host_owner_public`; and for each application its largest holders | the `inflight` snapshot and the accounts on the page by ID |
 

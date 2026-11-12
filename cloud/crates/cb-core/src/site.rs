@@ -20,6 +20,7 @@ use cb_db::{stmt, Db, Stmt};
 use cb_proto::consts::*;
 use cb_proto::web_rpc::{err, write_error};
 
+use crate::host_desc::HostMisc;
 use crate::mail::{Mail, Mailer};
 use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
@@ -1025,55 +1026,6 @@ async fn public_user(db: &dyn Db, id: i64) -> CoreResult<Option<User>> {
 // ---------------------------------------------------------------------------
 // Computers.
 
-/// The parts of the host summary the scheduler keeps in `host.serialnum`
-/// (`host_summary` in `scheduler.rs`): `[BOINC|8.0.4][CUDA|1|8192MB]...`.
-fn summary_parts(serialnum: &str) -> Vec<Vec<&str>> {
-    serialnum
-        .split('[')
-        .filter_map(|p| p.strip_suffix(']'))
-        .map(|p| p.split('|').collect())
-        .collect()
-}
-
-/// `boinc_version`, from the host summary. Escaped.
-fn boinc_version(serialnum: &str) -> String {
-    summary_parts(serialnum)
-        .into_iter()
-        .find(|p| p.first() == Some(&"BOINC"))
-        .and_then(|p| p.get(1).map(|v| html_escape(v)))
-        .unwrap_or_else(|| "---".into())
-}
-
-/// `gpu_desc`, from the host summary. Escaped.
-pub(crate) fn gpu_desc(serialnum: &str) -> String {
-    let gpus: Vec<String> = summary_parts(serialnum)
-        .into_iter()
-        .filter(|p| p.len() == 3 && !matches!(p[0], "BOINC" | "vbox" | "docker"))
-        .map(|p| {
-            format!(
-                "[{}] {} ({})",
-                html_escape(p[1]),
-                html_escape(p[0]),
-                html_escape(p[2])
-            )
-        })
-        .collect();
-    if gpus.is_empty() {
-        "---".into()
-    } else {
-        gpus.join("<br>")
-    }
-}
-
-/// The version a host reported for `vbox` or `docker`. Escaped.
-fn runtime_desc(serialnum: &str, name: &str) -> String {
-    summary_parts(serialnum)
-        .into_iter()
-        .find(|p| p.first() == Some(&name))
-        .and_then(|p| p.get(1).map(|v| html_escape(v)))
-        .unwrap_or_else(|| "---".into())
-}
-
 fn cpu_desc(h: &Host) -> String {
     format!(
         "{}<br>{}<br>({} cores)",
@@ -1239,13 +1191,14 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         } else {
             b.push_str(&format!("<td>{i}</td>"));
         }
+        let misc = HostMisc::read(&h.misc, &h.serialnum);
         b.push_str(&format!(
             "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}<br><small>{}</small></td><td>{}</td></tr>\n",
             number_format(h.expavg_credit, 2),
             number_format(h.total_credit, 0),
-            boinc_version(&h.serialnum),
+            misc.boinc_version(),
             cpu_desc(h),
-            gpu_desc(&h.serialnum),
+            misc.gpu_desc(),
             html_escape(&h.os_name),
             html_escape(&h.os_version),
             date_str(h.rpc_time),
@@ -1372,13 +1325,10 @@ pub async fn show_host_detail(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
         ),
     );
     row2(&mut b, "Number of cores", &h.p_ncpus.to_string());
-    row2(&mut b, "Coprocessors", &gpu_desc(&h.serialnum));
-    row2(
-        &mut b,
-        "Virtualization",
-        &runtime_desc(&h.serialnum, "vbox"),
-    );
-    row2(&mut b, "Docker", &runtime_desc(&h.serialnum, "docker"));
+    let misc = HostMisc::read(&h.misc, &h.serialnum);
+    row2(&mut b, "Coprocessors", &misc.gpu_desc());
+    row2(&mut b, "Virtualization", &misc.vbox_desc());
+    row2(&mut b, "Docker", &misc.docker_desc());
     row2(
         &mut b,
         "Operating System",
@@ -1388,7 +1338,7 @@ pub async fn show_host_detail(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
             html_escape(&h.os_version)
         ),
     );
-    row2(&mut b, "BOINC version", &boinc_version(&h.serialnum));
+    row2(&mut b, "BOINC version", &misc.boinc_version());
     row2(&mut b, "Memory", &format!("{:.2} GB", h.m_nbytes / GIGA));
     if h.m_cache > 0.0 {
         row2(&mut b, "Cache", &format!("{:.2} KB", h.m_cache / KILO));
@@ -2435,16 +2385,6 @@ mod tests {
         );
         assert!(!plausible_account_key("1_abcdef"));
         assert!(plausible_account_key("0123456789abcdef0123456789abcdef"));
-    }
-
-    #[test]
-    fn host_summary_is_read_and_escaped() {
-        let s = "[BOINC|8.0.4][CUDA|2|8192MB][vbox|7.0<b>][docker|24]";
-        assert_eq!(boinc_version(s), "8.0.4");
-        assert_eq!(gpu_desc(s), "[2] CUDA (8192MB)");
-        assert_eq!(runtime_desc(s, "vbox"), "7.0&lt;b&gt;");
-        assert_eq!(runtime_desc(s, "docker"), "24");
-        assert_eq!(gpu_desc(""), "---");
     }
 
     #[test]

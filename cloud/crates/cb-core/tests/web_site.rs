@@ -974,7 +974,7 @@ fn computers_are_private_unless_the_account_shows_them() {
     assert!(!mine.body.contains("ada-old-laptop"));
     assert!(mine.body.contains("Model &lt;script&gt;"));
     assert!(!mine.body.contains("<script>"));
-    assert!(mine.body.contains("[1] CUDA (8192MB)"));
+    assert!(mine.body.contains("1 CUDA; 8.00 GB RAM"));
     let all = w.get("/hosts_user.php", Some(&ada.auth), &[("show_all", "1")]);
     assert!(all.body.contains("ada-old-laptop"));
     assert!(!all.body.contains("bob-desk"));
