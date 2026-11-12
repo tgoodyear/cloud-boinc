@@ -106,6 +106,7 @@ cloud/
     cb-sqlite/   Db trait on rusqlite, for native tests and tools
     cb-d1/       Db trait on D1
     cb-worker/   what the five Workers share: bindings, the settings cache, replies
+    cb-import/   cb-import: reads a stock MySQL database, writes this schema as SQLite or D1 SQL files (native only; see migration.md)
   workers/
     scheduler/  files/  pipeline/  web/  admin/
   cli/           cboinc: admin client, key tools, app signing, load generator
@@ -1937,8 +1938,8 @@ default. `<disable_team_creation/>` and `<team_create_need_credit/>` restrict cr
 `project_config_bool("disable_team_creation")` and `TEAM_CREATE_NEED_CREDIT` do. A change to the config
 shows within the settings cache's 30 seconds, and `top_teams.php` for up to its 60 seconds in the edge
 cache. Moving the `team` rows of a stock server is by SQL: the columns above have upstream's names and
-meanings; `name_lc` (the lower-case name) and `recent_key` (`-1e9` for no average) must be set. There is no
-importer.
+meanings; `name_lc` (the lower-case name) and `recent_key` (`-1e9` for no average) must be set. The importer
+(`cloud/crates/cb-import`, [migration.md](migration.md)) does both.
 
 ### Email
 

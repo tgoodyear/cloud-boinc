@@ -62,6 +62,38 @@ jobs:
           cargo install worker-build --version 0.8.7 --locked
           dev/build.sh
 
+  # The importer reads a stock MariaDB database. The test creates its own
+  # databases and a SELECT-only account on the service, and skips itself when
+  # CB_IMPORT_TEST_ADMIN_URL is not set (as in the `check` job).
+  importer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: ci-synthetic-only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cloud
+      - name: Importer tests against MariaDB
+        env:
+          CB_IMPORT_TEST_ADMIN_URL: mysql://root:ci-synthetic-only@127.0.0.1:3306/
+        run: cargo test -p cb-import
+
   # The client's own parsers read the replies the server writes. The oracle
   # is built from the upstream sources in this tree, so the job also runs
   # when a merge from upstream changes client/ or lib/.

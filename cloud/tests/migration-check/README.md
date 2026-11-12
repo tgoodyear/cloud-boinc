@@ -113,7 +113,20 @@ the stock rows or part of them. It needs no stock server, no client and no Worke
 
 ## What the scripts do not do
 
-They are not an importer (issue #17). `copy_rows.py` is the smallest row copy that lets the check
-run; it prints, for each table, how many columns it carried and which ones cloud-boinc fills with
+`copy_rows.py` is not the importer (`cloud/crates/cb-import`, `docs/migration.md`). It is the smallest
+row copy that lets the check run; it prints, for each table, how many columns it carried and which ones cloud-boinc fills with
 defaults and which it drops. It copies from a running stock database through its socket, one project,
 with the conversions described in its header.
+
+## Running the switch with the importer
+
+`switch.sh --importer FILE` (FILE is a built `cb-import`) copies the rows with the importer in place of
+`copy_rows.py` (`import-rows.sh`): it opens a SELECT-only account on the stock database and a short-lived
+TCP forward to its socket (`fwd.py`, run inside the stock container, which listens on a socket only),
+runs `cb-import config`, `import --target-sql-dir` with the stock project directory, `config.xml`, the
+code-signing public key and the local server's password pepper, loads the files into a scratch SQLite
+file and runs `verify` on it. `cloud-load.sh --manifest` then stores the files of the importer's manifest
+under their bucket keys and applies `rows.sql` (the `.sql` files in order). Jobs are chosen by state
+(`--finished leave|all|recent`), not by `--copy-jobs` or `--skip-host`. The importer's output is in
+`DIR/import-summary.txt`, `import-verify.txt`, `import-config-set.txt` and `import-manifest.tsv`; it
+holds counts and names only, and `rows.sql` holds the project's rows like the other dump.

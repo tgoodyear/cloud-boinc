@@ -1,7 +1,7 @@
 #!/bin/sh
 # Gives the local cloud-boinc the stock project's settings, keys and files, and then its rows.
 #   cloud-load.sh --work DIR [--port N] [--cboinc FILE] [--skip-rows] [--carry-uploads]
-#                 [--config-set TAG=VALUE]...
+#                 [--config-set TAG=VALUE]... [--manifest FILE]
 # Reads the stock project's config.xml and keeps its <config> element as it is, except the
 # database credentials and host name, and adds stock_short_name. The two public keys and
 # every file under the stock download directory (application files and job inputs)
@@ -9,15 +9,18 @@
 # are applied to the local database with `wrangler d1 execute --local`.
 # --carry-uploads stores every file under the stock upload directory (the output files
 # tasks have uploaded, in the stock server's hash directories) in the bucket as
-# upload/<name>. --config-set changes one tag of the config after it is stored.
+# upload/<name>. --manifest FILE (the importer's --files-manifest) replaces both file loops:
+# each listed file is stored under its bucket key and no job_file row is made (the rows
+# come from the importer). --config-set changes one tag of the config after it is stored.
 usage() { sed -n '2,/^usage()/p' "$0" | sed '$d' >&2; exit 2; }
 set -eu
-work="" port=80 cboinc="" rows=1 uploads=0 sets=""
+work="" port=80 cboinc="" rows=1 uploads=0 sets="" manifest=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --skip-rows) rows=0; shift; continue ;;
         --carry-uploads) uploads=1; shift; continue ;;
         --config-set) sets="$sets $2" ;;
+        --manifest) manifest="$2" ;;
         --work) work="$2" ;; --port) port="$2" ;; --cboinc) cboinc="$2" ;;
         *) usage ;;
     esac
@@ -42,15 +45,24 @@ PY
 "$cboinc" config-put --name config --file "$WORK/cloud-config.xml"
 "$cboinc" config-put --name code_sign_public_key --file "$WORK/fixtures/keys/code_sign_public"
 "$cboinc" config-put --name upload_public_key --file "$WORK/fixtures/keys/upload_public"
-# The stock server caches the MD5 of each file in a .md5 file beside it; they are not job files.
 list="$(mktemp)"
 trap 'rm -f "$list"' EXIT
-find "$WORK/stock-state/project/download" -type f ! -name '*.md5' | sort > "$list"
-while read -r f; do
-    "$cboinc" file-put --file "$f" --name "$(basename "$f")" --no-delete > /dev/null ||
-        die "file-put of $f failed"
-    echo "file $(basename "$f")"
-done < "$list"
+if [ -n "$manifest" ]; then
+    # `stock path<TAB>bucket key<TAB>bytes<TAB>md5`, paths relative to the stock project directory.
+    while IFS="$(printf '\t')" read -r rel key nbytes md5; do
+        out="$(cd "$cloud/workers/files" && npx wrangler r2 object put "cloud-boinc-dev/$key" \
+            --file "$WORK/stock-state/project/$rel" --local --persist-to "$state/wrangler" 2>&1)" ||
+            { echo "$out" | tail -5 >&2; die "storing $rel in the bucket failed"; }
+        echo "stored $key"
+    done < "$manifest"
+else
+    find "$WORK/stock-state/project/download" -type f ! -name '*.md5' | sort > "$list"
+    while read -r f; do
+        "$cboinc" file-put --file "$f" --name "$(basename "$f")" --no-delete > /dev/null ||
+            die "file-put of $f failed"
+        echo "file $(basename "$f")"
+    done < "$list"
+fi
 for kv in $sets; do
     "$cboinc" config-set --tag "${kv%%=*}" --value "${kv#*=}"
 done

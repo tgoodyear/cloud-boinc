@@ -2,7 +2,7 @@
 resolver = "2"
 members = ["crates/*", "workers/*", "cli", "tests/app"]
 # The Workers build for wasm32-unknown-unknown only.
-default-members = ["crates/cb-proto", "crates/cb-crypto", "crates/cb-db", "crates/cb-sqlite", "crates/cb-core", "cli"]
+default-members = ["crates/cb-proto", "crates/cb-crypto", "crates/cb-db", "crates/cb-sqlite", "crates/cb-core", "crates/cb-import", "cli"]
 
 [workspace.package]
 edition = "2021"

@@ -1,0 +1,362 @@
+//! Compares the source with a target SQLite file: row counts per table and
+//! field-by-field equality on a sample chosen by ID. Prints counts and column
+//! names, never a value.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags};
+
+use crate::error::{ImportError, Result};
+use crate::import::{preflight, run, Options, Preflight};
+use crate::schema::{all_tables, TableInfo};
+use crate::sink::Sink;
+use crate::source::Source;
+use crate::summary::Summary;
+use crate::value::{same_as_sqlite, Value};
+
+#[derive(Debug, Default)]
+pub struct VerifyReport {
+    /// table: (rows the import maps from the source, rows in the target)
+    pub counts: BTreeMap<String, (u64, u64)>,
+    pub sampled: BTreeMap<String, u64>,
+    /// "table.column": number of sampled rows that differ
+    pub field_mismatches: BTreeMap<String, u64>,
+    /// table: sampled rows the target does not have
+    pub missing_rows: BTreeMap<String, u64>,
+    pub other: Vec<String>,
+}
+
+impl VerifyReport {
+    pub fn ok(&self) -> bool {
+        self.counts.values().all(|(a, b)| a == b)
+            && self.field_mismatches.is_empty()
+            && self.missing_rows.is_empty()
+            && self.other.is_empty()
+    }
+
+    pub fn render(&self) -> String {
+        let mut o = String::new();
+        o.push_str(&format!(
+            "{:<18} {:>12} {:>12} {:>9}  {}\n",
+            "table", "source rows", "target rows", "sampled", "result"
+        ));
+        for (t, (a, b)) in &self.counts {
+            let bad_fields: Vec<&str> = self
+                .field_mismatches
+                .keys()
+                .filter(|k| k.starts_with(&format!("{t}.")))
+                .map(|k| k.as_str())
+                .collect();
+            let missing = self.missing_rows.get(t).copied().unwrap_or(0);
+            let res = if a == b && bad_fields.is_empty() && missing == 0 {
+                "ok".to_string()
+            } else {
+                let mut p = Vec::new();
+                if a != b {
+                    p.push("row count differs".to_string());
+                }
+                if missing > 0 {
+                    p.push(format!("{missing} sampled rows missing in the target"));
+                }
+                if !bad_fields.is_empty() {
+                    p.push(format!("differs in {}", bad_fields.join(", ")));
+                }
+                format!("MISMATCH: {}", p.join("; "))
+            };
+            o.push_str(&format!(
+                "{:<18} {:>12} {:>12} {:>9}  {}\n",
+                t,
+                a,
+                b,
+                self.sampled.get(t).copied().unwrap_or(0),
+                res
+            ));
+        }
+        for (k, n) in &self.field_mismatches {
+            o.push_str(&format!("column {k}: {n} sampled rows differ\n"));
+        }
+        for s in &self.other {
+            o.push_str(&format!("MISMATCH: {s}\n"));
+        }
+        o.push_str(if self.ok() {
+            "verify: ok\n"
+        } else {
+            "verify: FAILED\n"
+        });
+        o
+    }
+}
+
+/// A hash of the complete primary key (every column, in key order), so which rows are
+/// sampled does not depend on how IDs were allocated or on a composite key's first column.
+fn key_of(t: &TableInfo, vals: &[Value]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    for &i in &t.pk_cols() {
+        match &vals[i] {
+            Value::Int(n) => n.to_le_bytes().into_iter().for_each(&mut eat),
+            Value::Text(s) => s.bytes().for_each(&mut eat),
+            Value::Real(r) => r.to_bits().to_le_bytes().into_iter().for_each(&mut eat),
+            Value::Null => eat(0),
+        }
+        eat(0xff);
+    }
+    // The low bits of FNV are poor for small steps.
+    h ^ (h >> 29)
+}
+
+struct VerifySink<'a> {
+    conn: &'a Connection,
+    sample: u64,
+    step: u64,
+    n: u64,
+    sampled: u64,
+    target_count: u64,
+    report: VerifyReport,
+}
+
+impl Sink for VerifySink<'_> {
+    fn begin_table(&mut self, t: &TableInfo) -> Result<()> {
+        self.target_count =
+            self.conn
+                .query_row(&format!("SELECT count(*) FROM {}", t.name), [], |r| {
+                    r.get::<_, i64>(0)
+                })? as u64;
+        self.step = self
+            .target_count
+            .checked_div(self.sample)
+            .map_or(u64::MAX, |s| s.max(1));
+        self.n = 0;
+        self.sampled = 0;
+        Ok(())
+    }
+
+    fn row(&mut self, t: &TableInfo, vals: &[Value]) -> Result<()> {
+        self.n += 1;
+        let k = key_of(t, vals);
+        // The first row is always compared, so a non-empty table never goes unchecked.
+        if !(self.n == 1 || k.is_multiple_of(self.step)) {
+            return Ok(());
+        }
+        self.sampled += 1;
+        let pk = t.pk_cols();
+        let wh: Vec<String> = pk
+            .iter()
+            .enumerate()
+            .map(|(n, &i)| format!("{} = ?{}", t.cols[i].name, n + 1))
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {}",
+            t.col_names().join(", "),
+            t.name,
+            wh.join(" AND ")
+        );
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let keys: Vec<&Value> = pk.iter().map(|&i| &vals[i]).collect();
+        let mut rows = st.query(rusqlite::params_from_iter(keys))?;
+        match rows.next()? {
+            None => {
+                *self.report.missing_rows.entry(t.name.clone()).or_insert(0) += 1;
+            }
+            Some(r) => {
+                for (i, c) in t.cols.iter().enumerate() {
+                    // The member count is kept by triggers, checked below.
+                    if t.name == "team" && c.name == "nusers" {
+                        continue;
+                    }
+                    if !same_as_sqlite(&vals[i], r.get_ref(i)?) {
+                        *self
+                            .report
+                            .field_mismatches
+                            .entry(format!("{}.{}", t.name, c.name))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn end_table(&mut self, t: &TableInfo) -> Result<u64> {
+        self.report
+            .counts
+            .insert(t.name.clone(), (self.n, self.target_count));
+        self.report.sampled.insert(t.name.clone(), self.sampled);
+        if self.sample > 0 && self.n > 0 && self.sampled == 0 {
+            self.report
+                .other
+                .push(format!("no row of {} was compared", t.name));
+        }
+        Ok(self.n)
+    }
+
+    fn finish(&mut self, floors: &[(String, i64)]) -> Result<()> {
+        for (name, id) in floors {
+            let got: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT last_id FROM id_floor WHERE name = ?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .ok();
+            if got.is_none_or(|g| g < *id) {
+                self.report.other.push(format!(
+                    "id_floor for {name} is below the highest imported id"
+                ));
+            }
+        }
+        let bad: i64 = self.conn.query_row(
+            "SELECT count(*) FROM team t WHERE nusers != (SELECT count(*) FROM user WHERE teamid = t.id AND teamid > 0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if bad > 0 {
+            self.report
+                .other
+                .push(format!("team.nusers is wrong for {bad} teams"));
+        }
+        Ok(())
+    }
+}
+
+/// Compares the source with the SQLite file at `target`, as the source is now.
+pub fn verify(
+    src: &mut Source,
+    target: &Path,
+    opts: &Options,
+    sample: u64,
+    summary: &mut Summary,
+) -> Result<VerifyReport> {
+    verify_with(src, target, opts, sample, summary, None)
+}
+
+/// As [`verify`]. With `pre`, the facts the import took at the start of its snapshot
+/// (workunit scope, counts, `AUTO_INCREMENT`, which is live metadata outside the
+/// snapshot) are reused, so a verification inside the import's transaction cannot
+/// differ because the source moved.
+pub fn verify_with(
+    src: &mut Source,
+    target: &Path,
+    opts: &Options,
+    sample: u64,
+    summary: &mut Summary,
+    pre: Option<&Preflight>,
+) -> Result<VerifyReport> {
+    let conn = Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| ImportError::usage("cannot open the --target-sqlite file"))?;
+    // The mapping needs the table layouts; they come from the migrations.
+    let mem = Connection::open_in_memory()?;
+    crate::schema::apply_migrations(&mem)?;
+    let tables = all_tables(&mem)?;
+    let mut vopts = opts.clone();
+    vopts.files_manifest = None;
+    // The import wrote its time into the file (`user_version`): the open workunits'
+    // `transition_time` and the `recent` window were derived from it, not from now. It is put
+    // back before the preflight, which chooses the workunits with that window.
+    let recorded: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if recorded > 0 {
+        vopts.now = recorded;
+    }
+    let own;
+    let pre = match pre {
+        Some(p) => p,
+        None => {
+            own = preflight(src, &vopts, summary)?;
+            &own
+        }
+    };
+    let mut sink = VerifySink {
+        conn: &conn,
+        sample,
+        step: 1,
+        n: 0,
+        sampled: 0,
+        target_count: 0,
+        report: VerifyReport::default(),
+    };
+    run(src, &mut sink, &vopts, pre, &tables, summary)?;
+    let mut report = sink.report;
+    // A table the source does not have is imported as empty: the target must hold no rows of it.
+    for t in crate::schema::TABLES.iter().filter(|t| **t != "job_file") {
+        if pre.src_cols.get(*t).is_some_and(|c| c.is_empty()) {
+            let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?;
+            report.counts.insert(t.to_string(), (0, n as u64));
+        }
+    }
+    // Tables the import never fills hold nothing.
+    for (t, _) in crate::schema::NOT_IMPORTED
+        .iter()
+        .filter(|(t, _)| !matches!(*t, "config" | "id_floor"))
+    {
+        let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?;
+        if n > 0 {
+            report
+                .other
+                .push(format!("{t} has {n} rows; the import writes none"));
+        }
+    }
+    if let Some(text) = &opts.code_sign_public_key {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM config WHERE name = 'code_sign_public_key'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        match stored {
+            Some(s) if s.trim() != text.trim() => report.other.push(
+                "the code_sign_public_key row of the target differs from the given key file".into(),
+            ),
+            Some(_) => {
+                summary.note("the target's code_sign_public_key row matches the given key file")
+            }
+            None => summary.note(
+                "the target has no code_sign_public_key row yet; the given key was checked against the app version signatures",
+            ),
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::table_info;
+
+    fn info(t: &str) -> TableInfo {
+        let c = Connection::open_in_memory().unwrap();
+        crate::schema::apply_migrations(&c).unwrap();
+        table_info(&c, t).unwrap()
+    }
+
+    #[test]
+    fn sampling_does_not_depend_on_id_allocation() {
+        // 2,000 rows with odd IDs only, asked for about 1,000.
+        let t = info("user");
+        let step = 2u64;
+        let n = (0..2000i64)
+            .filter(|i| {
+                let mut v: Vec<Value> = (0..t.cols.len()).map(|c| t.default_of(c)).collect();
+                v[t.index("id").unwrap()] = Value::Int(i * 2 + 1);
+                key_of(&t, &v).is_multiple_of(step)
+            })
+            .count();
+        assert!((800..1200).contains(&n), "{n}");
+    }
+
+    #[test]
+    fn a_composite_key_uses_every_column() {
+        let t = info("host_app_version");
+        let n = (0..400i64)
+            .filter(|i| {
+                let mut v: Vec<Value> = (0..t.cols.len()).map(|c| t.default_of(c)).collect();
+                v[t.index("host_id").unwrap()] = Value::Int(7);
+                v[t.index("app_version_id").unwrap()] = Value::Int(*i);
+                key_of(&t, &v).is_multiple_of(4)
+            })
+            .count();
+        assert!((50..150).contains(&n), "{n}");
+    }
+}

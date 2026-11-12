@@ -1,0 +1,29 @@
+[package]
+name = "cb-import"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Imports a stock BOINC project's MySQL database into cloud-boinc's schema (SQLite file or D1 SQL files)"
+publish = false
+
+[lib]
+name = "cb_import"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cb-import"
+path = "src/main.rs"
+
+[dependencies]
+cb-core = { path = "../cb-core" }
+cb-crypto = { path = "../cb-crypto" }
+cb-proto = { path = "../cb-proto" }
+clap = { version = "4", features = ["derive"] }
+fallible-iterator = "0.3"
+hex = "0.4"
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "buffer-pool", "rustls-tls-ring"] }
+rusqlite = { version = "0.42", features = ["bundled", "functions"] }
+tempfile = "3"
+
+[dev-dependencies]
+cb-crypto = { path = "../cb-crypto", features = ["keygen"] }
