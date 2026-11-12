@@ -21,6 +21,7 @@
 
 use cb_crypto::md5::md5_hex;
 
+use crate::upload::is_flat_name;
 use crate::{CoreError, CoreResult};
 
 /// Last path segment of the upload handler URL. A client takes a `<url>` for
@@ -314,23 +315,31 @@ impl StockLayout {
             == Some(UPLOAD_HANDLER)
     }
 
-    /// The file a download path names: `<download_prefix>/<dir>/<name>`, or
-    /// `<download_prefix>/<name>` without fanout. `<dir>` must be the one
-    /// `filename_dir` gives. A wrong directory is `None`, as a stock server
-    /// answers 404 for a file that is not where the hierarchy puts it. The
-    /// check also keeps one object from having many cacheable URLs.
+    /// The file a download path names. Two forms are served, as the stock
+    /// server's Apache serves the download directory as plain files:
+    /// `<download_prefix>/<name>` (what `update_versions` writes for an
+    /// application file, and the only form without fanout) and, with fanout,
+    /// `<download_prefix>/<dir>/<name>` (`dir_hier_path`, what `create_work`
+    /// writes) where `<dir>` must be the one `filename_dir` gives. A wrong
+    /// directory is `None`, as a stock server answers 404 for a file that is
+    /// not where the hierarchy puts it; the check keeps one object from
+    /// having many cacheable URLs. One segment is always a name, even when it
+    /// looks like a directory: a request for the directory itself, with a
+    /// trailing slash, has an empty name and is `None`. Deeper paths, empty
+    /// segments and names that are not flat names are `None`.
     pub fn download_name<'a>(&self, path: &'a str) -> Option<&'a str> {
         let tail = path
             .strip_prefix(&self.download_prefix)?
             .strip_prefix('/')?;
-        if self.fanout == 0 {
-            return (!tail.is_empty() && !tail.contains('/')).then_some(tail);
+        match tail.split_once('/') {
+            None => is_flat_name(tail).then_some(tail),
+            Some((dir, name)) => {
+                if !is_flat_name(name) || self.fanout == 0 {
+                    return None;
+                }
+                (filename_dir(name, self.fanout).as_deref() == Some(dir)).then_some(name)
+            }
         }
-        let (dir, name) = tail.split_once('/')?;
-        if name.is_empty() || name.contains('/') {
-            return None;
-        }
-        (filename_dir(name, self.fanout).as_deref() == Some(dir)).then_some(name)
     }
 
     /// The URL clients use for a download file, on the master URL's host.
@@ -1032,7 +1041,6 @@ mod tests {
         );
         // A wrong directory, a missing one, an extra one, another prefix.
         assert_eq!(s.download_name("/testproj/download/318/wu_1_0"), None);
-        assert_eq!(s.download_name("/testproj/download/wu_1_0"), None);
         assert_eq!(s.download_name("/testproj/download/319/x/wu_1_0"), None);
         assert_eq!(s.download_name("/testproj/download/319/"), None);
         assert_eq!(s.download_name("/testproj/download/"), None);
@@ -1049,6 +1057,48 @@ mod tests {
         );
         assert_eq!(flat.download_name("/testproj/download/319/wu_1_0"), None);
         assert_eq!(flat.download_name("/testproj/download/"), None);
+    }
+
+    #[test]
+    fn downloads_without_a_directory_are_served_with_fanout() {
+        for fanout in [0, 1, 1024] {
+            let s = layout(fanout);
+            // The flat form `update_versions` writes for application files.
+            assert_eq!(
+                s.download_name("/testproj/download/app_1.0_x86_64"),
+                Some("app_1.0_x86_64"),
+                "{fanout}"
+            );
+            // A name that is also a valid directory name is still a name.
+            assert_eq!(s.download_name("/testproj/download/319"), Some("319"));
+            assert_eq!(s.download_name("/testproj/download/0"), Some("0"));
+            // Directory listings and empty segments.
+            assert_eq!(s.download_name("/testproj/download/"), None, "{fanout}");
+            assert_eq!(s.download_name("/testproj/download"), None);
+            assert_eq!(s.download_name("/testproj/download/319/"), None);
+            assert_eq!(s.download_name("/testproj/download//wu_1_0"), None);
+            assert_eq!(s.download_name("/testproj/download/319//wu_1_0"), None);
+            // Too deep, or not a flat name.
+            assert_eq!(s.download_name("/testproj/download/319/x/wu_1_0"), None);
+            assert_eq!(s.download_name("/testproj/download/a/b/c"), None);
+            assert_eq!(s.download_name("/testproj/download/.."), None);
+            assert_eq!(s.download_name("/testproj/download/319/.."), None);
+            assert_eq!(s.download_name("/testproj/download/../wu_1_0"), None);
+        }
+        // With fanout the two-segment form still needs the right directory.
+        let s = layout(1024);
+        assert_eq!(
+            s.download_name("/testproj/download/319/wu_1_0"),
+            Some("wu_1_0")
+        );
+        assert_eq!(s.download_name("/testproj/download/1/wu_1_0"), None);
+        let one = layout(1);
+        assert_eq!(
+            one.download_name("/testproj/download/0/wu_1_0"),
+            Some("wu_1_0")
+        );
+        assert_eq!(one.download_name("/testproj/download/1/wu_1_0"), None);
+        assert_eq!(layout(0).download_name("/testproj/download/0/wu_1_0"), None);
     }
 
     #[test]
@@ -1084,6 +1134,7 @@ mod tests {
             FilesRoute::NotFound
         );
         assert_eq!(r("/testproj/download/1b9/a", None), FilesRoute::NotFound);
+        assert_eq!(r("/testproj/download/a", None), FilesRoute::NotFound);
         // With the layout the stock paths answer too.
         assert_eq!(
             r("/testproj_cgi/file_upload_handler", Some(&s)),
@@ -1094,6 +1145,12 @@ mod tests {
             FilesRoute::Download("a")
         );
         assert_eq!(r("/download/a", Some(&s)), FilesRoute::Download("a"));
+        assert_eq!(
+            r("/testproj/download/a", Some(&s)),
+            FilesRoute::Download("a")
+        );
+        assert_eq!(r("/testproj/download/", Some(&s)), FilesRoute::NotFound);
+        assert_eq!(r("/testproj/download/1b9/", Some(&s)), FilesRoute::NotFound);
         assert_eq!(
             r("/testproj/download/000/a", Some(&s)),
             FilesRoute::NotFound

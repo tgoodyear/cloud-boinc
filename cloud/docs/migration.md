@@ -470,6 +470,7 @@ D1 with `wrangler d1 execute --local`; and the client's network came back.
 | `verify`, on the SQLite file loaded from the `.sql` files | `ok` for every table, all rows compared |
 | Local D1 after loading | the row counts of `user`, `host`, `workunit` and `result` equal the number of `INSERT` lines for each table (`cloud-load.sh` checks them) |
 | The client after the switch | kept host ID 1 and its account key; no detach, no new host; reported its three tasks (the finished one and the other two when they had run), all of which validated here (`server_state` 5, `outcome` 1, `validate_state` 1) |
+| A client that never had the application (`appfetch.sh`, run after the switch) | A new client of the same version, attached with the second account's key (a new host, ID 2), was given one job of application version 1.00 while the first client was set to fetch no work. The signed documents were the stock ones. It downloaded the application file from `/proj/download/upper_1.00_x86_64-pc-linux-gnu` (no hash directory, the URL in `app_version.xml_doc`; the bucket key is the manifest's `download/upper_1.00_x86_64-pc-linux-gnu`) and the input file from `/proj/download/<dir>/flat_input.txt`, ran the task, and the result was received and valid (`server_state` 5, `outcome` 1, `validate_state` 1) |
 | New work | application version 1.01 signed with the stock code-signing key and 20 jobs: 40 results, all valid (40 of 40) |
 | Detach and attach again | the same host ID, found by the user and host CPID |
 | Web RPCs | the account whose address has capitals is found (D25 gave `-136` with the old row copy); the bare-MD5 account's right password hash is accepted and a wrong one refused; the two PHP-hash accounts get `-206` for the right hash (D23), and their site sign-in is refused |
@@ -478,18 +479,7 @@ An earlier run of the same steps, before the importer looked for application fil
 download directory (D32), listed no application file in the manifest and warned about it in the summary; the client
 did not need the file. That is why D32 is there.
 
-The check ran one client and one version. The multi-client matrix of `compatibility.md` was not rerun.
-
-## Known gap: application file URLs without a hash directory
-
-With a non-zero `uldl_dir_fanout`, the stock `update_versions` writes the URL of an application file without a hash
-directory (`<download URL>/<name>`, D32), and a client that does not have the file cached fetches it from that URL.
-This server answers a stock download path only when it has the hash directory: `StockLayout::download_name` in
-`cloud/crates/cb-core/src/stock.rs` returns nothing for `<download prefix>/<name>` when the fan-out is not 0, and
-`route_files` then has no route for it. Checked with `route_files`: `/<short>/download/<dir>/<name>` is routed to the
-download, `/<short>/download/<name>` is `NotFound`, so a request for an application file by its stored URL
-gets a 404. (Not run against a stack; the routing function is the whole decision.) A move of a project whose
-clients may need to download an application file again needs that fixed first. Input files are unaffected: `create_work` writes them with the hash directory.
+The check ran one client and one version, plus the new client of the row above. The multi-client matrix of `compatibility.md` was not rerun.
 
 ## Not covered
 

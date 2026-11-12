@@ -54,7 +54,7 @@ cloud/tests/migration-check/run.sh --work /some/empty/dir --clients FILE \
     --app-binary cloud/target/x86_64-unknown-linux-musl/release/cb-test-app
 ```
 
-`--steps` runs some of the steps, in this order: `up drive release probe switch observe down`.
+`--steps` runs some of the steps, in this order: `up drive release probe switch appfetch observe down`.
 `--long-seconds` is how long the two long tasks of each client take (default 240). `--cloud-config
 TAG=VALUE` changes one tag of the config that cloud-boinc gets (for example
 `send_result_abort=0`). A step that fails stops the run with its output kept; `--steps down`
@@ -81,11 +81,18 @@ cleans up. The scripts it calls can be used alone; each prints its flags when ca
    `copy_rows.py`), the stock server is stopped, cloud-boinc starts (`cloud-up.sh`) and gets the
    stock `<config>` element, the two public keys, the files of the stock download directory and
    the upload directory (`cloud-load.sh`), and the rows. The clients' network is switched on.
-6. `observe` (`observe.sh`): waits for the long tasks to end, adds new work (an application version
+6. `appfetch` (`appfetch.sh`): a new client of the first client's version, attached with the same
+   account's key, has never had the application. One job is made for application version 1.00, whose
+   documents are the stock ones, and the client is asked for work. The script checks, in the client's
+   log, that the application file was fetched from its URL with no hash directory (the form stock
+   `update_versions` writes, D32 in compatibility.md) and the input file from one with it, that no
+   download failed, and that the result was received with a success outcome. `--app-client TAG` picks
+   another client's line.
+7. `observe` (`observe.sh`): waits for the long tasks to end, adds new work (an application version
    1.01 signed with the stock code-signing key, and jobs), asks for it and waits until the database shows every result of the new work received (an
    empty task list on a client does not count, and a wait that runs out is reported and fails the
    step), detaches and attaches every client again, and repeats the web probe on cloud-boinc.
-7. `down`: stops the clients, cloud-boinc and the stock server.
+8. `down`: stops the clients, cloud-boinc and the stock server.
 
 ## What it leaves in the work directory
 
