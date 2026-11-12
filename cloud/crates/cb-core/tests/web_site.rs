@@ -845,6 +845,31 @@ fn home_shows_the_account_to_its_holder_only() {
         .body
         .contains(&format!("results.php?userid={}", ada.id)));
     assert!(page.body.contains("account_p.example.xml"));
+
+    // The card for attaching a computer: the project URL, the key shown once
+    // as before, the weak key and the page that replaces the key. The key is
+    // never in a link.
+    let body = &page.body;
+    assert!(body.contains("<h2>Attach a computer</h2>"));
+    assert!(body.contains("<code class=\"key\">https://p.example/</code>"));
+    assert!(body.contains("boinccmd --project_attach https://p.example/ ACCOUNT_KEY"));
+    assert!(body.contains("href=\"reset_account_key.php\""));
+    assert_eq!(body.matches(ada.auth.as_str()).count(), 1);
+    assert!(!body.contains(&format!("={}", ada.auth)));
+    for link in [
+        "edit_user_info_form.php",
+        "edit_email_form.php",
+        "edit_passwd_form.php",
+        "hosts_user.php",
+        "prefs.php?subset=global",
+        "prefs.php?subset=project",
+    ] {
+        assert!(body.contains(&format!("href=\"{link}\"")), "{link}");
+    }
+    assert!(
+        !body.contains("get_passwd.php"),
+        "no mail, no recovery link"
+    );
 }
 
 #[test]
@@ -4518,4 +4543,60 @@ fn a_refused_request_leaves_the_tokens_of_the_change_that_won() {
         );
         assert!(w.mails().is_empty());
     }
+}
+
+/// Every HTML page of the site, logged in or not, comes out of the one
+/// shell: a document with the viewport meta, the inline stylesheet and no
+/// external request. Redirects have no body.
+#[test]
+fn every_site_page_goes_through_the_shell() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let mut shell_pages = 0;
+    for path in cb_core::site::SITE_PATHS {
+        for auth in [None, Some(ada.auth.as_str())] {
+            for post in [false, true] {
+                let (page, _) = w.page(path, auth, post, &[]);
+                if page.content_type.starts_with("text/xml") || page.body.is_empty() {
+                    continue;
+                }
+                let body = &page.body;
+                assert!(
+                    body.starts_with("<!DOCTYPE html>\n<html lang=\"en\">"),
+                    "{path}"
+                );
+                assert!(
+                    body.contains(
+                        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                    ),
+                    "{path}"
+                );
+                assert!(body.contains("<style>:root{"), "{path}");
+                assert!(body.contains("<header class=\"top\">"), "{path}");
+                assert!(body.contains("<h1>"), "{path}");
+                for external in ["src=\"", "url(", "@import", "<link rel=\"stylesheet"] {
+                    assert!(!body.contains(external), "{path}: {external}");
+                }
+                shell_pages += 1;
+            }
+        }
+    }
+    assert!(shell_pages >= 40, "only {shell_pages} pages checked");
+}
+
+/// With email the account page links the recovery page and, until the
+/// address is verified, the verification page.
+#[test]
+fn the_account_page_links_the_email_functions() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let body = w.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("href=\"get_passwd.php\""));
+    assert!(body.contains("href=\"validate_email_addr.php\""));
+    assert!(body.contains("(not verified)"));
+    w.sql("UPDATE user SET email_validated = 1");
+    let body = w.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("href=\"get_passwd.php\""));
+    assert!(!body.contains("href=\"validate_email_addr.php\""));
+    assert!(body.contains("(verified)"));
 }
