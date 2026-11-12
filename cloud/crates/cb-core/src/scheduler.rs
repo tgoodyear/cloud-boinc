@@ -340,6 +340,13 @@ struct Version<'a> {
     /// deprecated or superseded version, or one below the app's minimum, of
     /// an app that uses homogeneous app version.
     pinned_only: bool,
+    /// A version stock does not load at all (`SCHED_SHMEM::scan_tables`):
+    /// deprecated by hand, below the app's `min_version`, or superseded when
+    /// there is no `min_version`. It is kept only for workunits already
+    /// committed to it under homogeneous app version
+    /// (`check_homogeneous_app_version`), never for a new workunit, pinned
+    /// to its number or not.
+    commit_only: bool,
 }
 
 /// What a request keeps for one `host_app_version` row. Several versions of
@@ -1733,6 +1740,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 gpu,
                 score: projected_flops,
                 pinned_only: false,
+                commit_only: false,
             });
         }
     } else {
@@ -1742,8 +1750,14 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             };
             // A version that is no longer sent to anyone can still be the
             // one a homogeneous-app-version workunit is committed to.
-            let pinned_only =
-                av.deprecated != 0 || catalog.superseded(av) || av.version_num < app.min_version;
+            let superseded = catalog.superseded(av);
+            let pinned_only = av.deprecated != 0 || superseded || av.version_num < app.min_version;
+            // `scan_tables` loads a version unless it is deprecated by hand,
+            // below `min_version`, or (with no `min_version`) not the latest
+            // of its platform and plan class.
+            let commit_only = av.deprecated != 0
+                || av.version_num < app.min_version
+                || (superseded && app.min_version == 0);
             if pinned_only && !keeps_version(app, av) {
                 continue;
             }
@@ -1789,6 +1803,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 gpu,
                 score,
                 pinned_only,
+                commit_only,
             });
         }
     }
@@ -2056,19 +2071,29 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let vn = av.version_num;
             // Uncommitted workunits: a pinned one needs this number; one that
             // is not needs a version still sent to everyone.
-            let free = if v.pinned_only {
-                format!("w.app_version_num = {vn}")
+            // A version kept only for committed workunits takes no uncommitted
+            // one (`admitted` below).
+            let free = if v.commit_only {
+                None
+            } else if v.pinned_only {
+                Some(format!("w.app_version_num = {vn}"))
             } else {
-                format!("w.app_version_num IN (0, {vn})")
+                Some(format!("w.app_version_num IN (0, {vn})"))
             };
-            let mut clause = if hav {
-                format!(
+            let mut clause = match (hav, free) {
+                (true, Some(free)) => format!(
                     "((w.app_version_id = {} AND w.app_version_num IN (0, {vn})) \
                      OR (w.app_version_id = 0 AND {free}))",
                     av.id
-                )
-            } else {
-                free
+                ),
+                (true, None) => format!(
+                    "(w.app_version_id = {} AND w.app_version_num IN (0, {vn}))",
+                    av.id
+                ),
+                (false, Some(free)) => free,
+                // Not reached: only an app with homogeneous app version keeps
+                // such a version.
+                (false, None) => "0 = 1".to_string(),
             };
             if let Some(spec) = ctx.plan_classes.find(&av.plan_class) {
                 for (column, bound, upper) in [
@@ -2550,16 +2575,22 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                         && match v.av {
                             Some(av) => {
                                 // Homogeneous app version: a committed workunit
-                                // goes only with its version. Otherwise a
-                                // workunit pinned to a version number goes with
-                                // that number, whether or not the version is
-                                // still sent to everyone, and an unpinned one
-                                // with a version that is (`get_app_version` in
+                                // goes only with its version, even one stock
+                                // no longer loads
+                                // (`check_homogeneous_app_version`).
+                                // Otherwise a workunit pinned to a version
+                                // number goes with that number, if the
+                                // scheduler loads it, whether or not the
+                                // version is still sent to everyone, and an
+                                // unpinned one with a version that is
+                                // (`get_app_version` in
                                 // `sched/sched_version.cpp`).
                                 (if hom.hav && c.wu.app_version_id != 0 {
                                     c.wu.app_version_id == av.id
+                                } else if c.wu.app_version_num != 0 {
+                                    !v.commit_only
                                 } else {
-                                    c.wu.app_version_num != 0 || !v.pinned_only
+                                    !v.pinned_only
                                 }) && (c.wu.app_version_num == 0
                                     || av.version_num == c.wu.app_version_num)
                                     && ctx.plan_classes.admits_workunit(
@@ -3211,6 +3242,7 @@ mod tests {
             gpu: pt != 0,
             score: flops,
             pinned_only: false,
+            commit_only: false,
         }
     }
 

@@ -500,8 +500,13 @@ class is held, so a job pinned to an older one is not sent. With it, every versi
 only to jobs pinned to them (or, with homogeneous app version, committed to them), while jobs that
 are not pinned get the latest (`Catalog::superseded` and `keeps_version` in
 `crates/cb-core/src/scheduler.rs`). `cboinc app-put --min-version N` sets it. A version
-deprecated by hand is not loaded at all, as upstream (an app with homogeneous app version also
-loads those, for the workunits committed to them).
+deprecated by hand is not loaded at all, as upstream. An app with homogeneous app version also
+keeps the versions stock does not load (deprecated by hand, below `min_version`, or superseded
+when there is no `min_version`), but only for the workunits already committed to them
+(`check_homogeneous_app_version` looks the version up in the database whatever its state): a new
+workunit, pinned to the number of such a version or not, is never sent with it (`commit_only` in
+`crates/cb-core/src/scheduler.rs`, in both `admitted` and `version_gate`), as in stock, where
+`get_app_version` only scans what `scan_tables` loaded.
 
 **Client versions.**
 
@@ -2057,7 +2062,13 @@ who each read it, change a tag and write it back undo each other. `cboinc config
 the stored config on the server, change that one top-level element of `<config>` in place (the
 rest of the text is not touched, including the `<daemons>` list and comments), and write it back
 only if the document is still the one read; if another write got in between, the change is made
-again to the new document, up to five times, and then refused with a conflict. The result must
+again to the new document, up to five times, and then refused with a conflict. A value for an
+option the loader reads must be one the loader reads: `Config::check_option` runs the loader's own
+reader (`OPTIONS` in `crates/cb-core/src/config.rs`, the table `Config::parse` itself goes
+through, with each option's `XmlParser` method) on the element, so `maintenance_delay` 1800s,
+which the loader would skip and replace with the default, is refused, as is a homogeneous
+redundancy type the loader rejects. A tag that is not in the table is stored as it is, as the
+loader skips it. The result must
 pass the same checks as a whole-config write, so an edit that would leave the config unparseable,
 without a master URL, or with a bad sender address is refused and nothing is stored. A tag stated
 twice is changed in its last occurrence, which is the one the loader uses (each reading replaces the one
@@ -2080,12 +2091,17 @@ validator needs a URL, so a call that states one of the two holds the other to t
 check read, and reads and checks again if it changed. `add_app_version` checks in the same
 batch that every file still has the MD5 its signature was checked against, and writes nothing
 if one was staged again meanwhile. The release of HR commitments and the config edit are single
-guarded statements.
+guarded statements. Releasing a whole class reads `workunit` by `hr_class`, which has no index
+(as upstream's `reset_hrclass.php`): one scan of the table for an operator's call; by name it
+uses the unique index on `name`.
 
 An app version takes up to 1000 files (`MAX_VERSION_FILES` in `crates/cb-core/src/admin.rs`; it
-was 40) and a description of at most 1 MiB, under D1's limit of a row. The lookups and the
-`no_delete` updates run 90 names to a statement in one batch, so a version of 1000 files is 12
-statements each way.
+was 40) and a description of at most 1 MiB, under D1's limit of a row. The statements send the
+file names as one JSON value (200 to a statement, so one bound parameter whatever the count) and
+join `job_file` on its primary key through `json_each`: a version of 1000 files is 7 reads and one
+batch of 11 statements (the insert, 5 `no_delete` updates and 5 MD5 checks), 18 in all, and 5 more
+if a check fails, against about 50 queries to a request on the free plan. None scans `job_file`
+(`tests/admin_gaps.rs` runs `EXPLAIN QUERY PLAN` on each).
 
 ## Cost model
 

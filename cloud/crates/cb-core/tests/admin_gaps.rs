@@ -9,6 +9,7 @@ use cb_core::admin::{
     add_app_version, put_app, reset_homogeneous, NewApp, NewAppVersion, ResetTarget, ResetWhat,
     VersionFile, MAX_VERSION_FILES,
 };
+use cb_core::config::OptionKind;
 use cb_core::model::{App, Workunit};
 use cb_core::project::{
     change_config_tag, edit_config_tag, get_setting, put_setting, SETTING_CONFIG,
@@ -1110,4 +1111,194 @@ fn a_file_replaced_while_a_version_is_registered_stops_it() {
     };
     db.apply("UPDATE job_file SET no_delete = 0").ok();
     assert!(add(&db, &version).is_ok());
+}
+
+/// Counts the statements sent through it.
+struct Counting<'a> {
+    inner: &'a SqliteDb,
+    statements: std::cell::Cell<usize>,
+    sql: RefCell<Vec<String>>,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for Counting<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        self.statements.set(self.statements.get() + stmts.len());
+        self.sql
+            .borrow_mut()
+            .extend(stmts.iter().map(|s| s.sql.clone()));
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn a_thousand_file_version_fits_the_free_plans_statement_budget_without_scans() {
+    let db = world();
+    block_on(db.batch(vec![
+        stmt!("INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (1, 0, 'p', 'p')"),
+        stmt!("INSERT INTO app (id, create_time, name, user_friendly_name, validator) VALUES (1, 0, 'app', 'app', 'trivial')"),
+    ]))
+    .unwrap();
+    let version = NewAppVersion {
+        app: "app".into(),
+        platform: "p".into(),
+        version_num: 102,
+        files: files(&db, MAX_VERSION_FILES),
+        ..Default::default()
+    };
+    let counting = Counting {
+        inner: &db,
+        statements: Default::default(),
+        sql: Default::default(),
+    };
+    let config = Config::parse(CONFIG).unwrap();
+    block_on(add_app_version(&counting, &config, None, 20, &version)).unwrap();
+    assert_eq!(counting.statements.get(), 18);
+    // Every statement that touches `job_file` finds its rows by primary key.
+    let mut seen = std::collections::HashSet::new();
+    for sql in counting.sql.borrow().iter() {
+        if !sql.contains("job_file") || !seen.insert(sql.clone()) {
+            continue;
+        }
+        let plan = block_on(db.run(Stmt::new(format!(
+            "EXPLAIN QUERY PLAN {}",
+            sql.replace('?', "'[]'")
+        ))))
+        .unwrap();
+        let text: Vec<String> = plan
+            .rows
+            .iter()
+            .map(|r| {
+                r.get("detail")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !text
+                .iter()
+                .any(|d| d.contains("SCAN job_file") || d.contains("SCAN f")),
+            "{sql}\n{text:?}"
+        );
+    }
+}
+
+// ---- A value the loader would skip is refused --------------------------------
+
+/// A value that reads for the kind, and a second that reads differently.
+fn samples(tag: &str, kind: OptionKind) -> (&'static str, &'static str) {
+    match (tag, kind) {
+        ("homogeneous_redundancy", _) => ("1", "2"),
+        ("enable_delete_account", _) => ("1", "2"),
+        (_, OptionKind::Str) => ("value one", "value two"),
+        (_, OptionKind::Bool) => ("1", "0"),
+        (_, OptionKind::Double) => ("2.5", "3.5"),
+        _ => ("7", "8"),
+    }
+}
+
+/// None of these is a number or a flag in any reading, so the loader skips
+/// them for every option that is not text.
+#[test]
+fn every_option_the_loader_reads_refuses_text_it_would_skip() {
+    let base = "<config>\n    <master_url>https://p.example/</master_url>\n</config>\n";
+    let mut n = 0;
+    for (tag, kind) in Config::option_kinds() {
+        n += 1;
+        if kind == OptionKind::Str {
+            continue;
+        }
+        for bad in ["1800s", "abc", "1 2", "0x", "1.5.2", "--3"] {
+            // The loader skips it: the config is as if the tag were absent.
+            let xml = format!("<config><{tag}>{bad}</{tag}></config>");
+            assert_eq!(
+                Config::parse(&xml).unwrap(),
+                Config::parse("<config></config>").unwrap(),
+                "the loader reads {tag}={bad:?}"
+            );
+            // So `config-set` must not take it.
+            assert!(
+                matches!(
+                    edit_config_tag(base, tag, Some(bad)),
+                    Err(CoreError::Invalid(_))
+                ),
+                "{tag}={bad:?} was accepted"
+            );
+        }
+    }
+    assert!(n > 50, "{n} options");
+}
+
+#[test]
+fn text_the_loader_skips_is_refused_by_config_set() {
+    let db = world();
+    for (tag, bad) in [
+        ("maintenance_delay", "1800s"),
+        ("email_max_per_day", "many"),
+        ("max_wus_to_send", "10x"),
+        ("min_core_client_upgrade_deadline", "tomorrow"),
+        ("dont_send_jobs", "yes please"),
+        ("homogeneous_redundancy", "9"),
+    ] {
+        let e = block_on(change_config_tag(&db, tag, Some(bad), 20)).unwrap_err();
+        assert!(matches!(e, CoreError::Invalid(_)), "{tag}: {e}");
+    }
+    assert_eq!(
+        block_on(get_setting(&db, SETTING_CONFIG)).unwrap().unwrap(),
+        CONFIG
+    );
+    // The same options take what the loader reads.
+    block_on(change_config_tag(
+        &db,
+        "maintenance_delay",
+        Some("1800"),
+        20,
+    ))
+    .unwrap();
+    assert_eq!(
+        Config::parse(&block_on(get_setting(&db, SETTING_CONFIG)).unwrap().unwrap())
+            .unwrap()
+            .maintenance_delay,
+        1800.0
+    );
+    // A tag the loader does not read is stored as it is.
+    block_on(change_config_tag(
+        &db,
+        "some_stock_option",
+        Some("anything"),
+        21,
+    ))
+    .unwrap();
+}
+
+/// For every option, what a set stores shows in the parsed config: set one
+/// sample, then the other, and the two configs differ.
+#[test]
+fn a_set_is_visible_in_the_parsed_config_for_every_option() {
+    let base = "<config>\n    <master_url>https://p.example/</master_url>\n</config>\n";
+    let mut checked = 0;
+    for (tag, kind) in Config::option_kinds() {
+        // The stock layout options only make sense together (the loader
+        // refuses a prefix without a short name); `tests/stock_layout.rs`
+        // covers them.
+        if tag.starts_with("stock_") {
+            continue;
+        }
+        let (a, b) = samples(tag, kind);
+        let (xa, _) = edit_config_tag(base, tag, Some(a)).unwrap();
+        let (xb, _) = edit_config_tag(base, tag, Some(b)).unwrap();
+        Config::check_option(tag, a).unwrap();
+        Config::check_option(tag, b).unwrap();
+        let (ca, cb) = (Config::parse(&xa).unwrap(), Config::parse(&xb).unwrap());
+        // Aliases that write the same field in the same direction would
+        // not differ; none of the options do.
+        assert_ne!(ca, cb, "{tag}: {a} and {b} read the same");
+        // And a set after a set on one document: the last value shows.
+        let (xc, prev) = edit_config_tag(&xa, tag, Some(b)).unwrap();
+        assert_eq!(prev.as_deref(), Some(a), "{tag}");
+        assert_eq!(Config::parse(&xc).unwrap(), cb, "{tag}");
+        checked += 1;
+    }
+    assert!(checked > 45);
 }

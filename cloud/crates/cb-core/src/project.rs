@@ -251,6 +251,10 @@ pub fn edit_config_tag(
                 "config tag: the value is too long or has a NUL".into(),
             ));
         }
+        // An option the loader reads must be given a value it reads: the
+        // loader skips `1800s` for a number and uses the default, so the
+        // edit would report a change that did not happen.
+        Config::check_option(tag, v)?;
     }
     let doc = scan_config(xml)?;
     let same: Vec<&ConfigElement> = doc.elements.iter().filter(|e| e.name == tag).collect();

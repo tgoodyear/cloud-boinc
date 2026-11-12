@@ -1193,3 +1193,69 @@ fn workunits_the_host_already_has_a_result_of_do_not_fill_the_window() {
     // The ones it holds a result of are left for other hosts.
     assert_eq!(w.unsent_of("a"), 250);
 }
+
+// ---- Versions kept only for committed workunits -------------------------------
+
+/// An app with homogeneous app version and versions 100 and 101, for one of
+/// three reasons version 100 is not one stock loads: it is superseded and
+/// there is no `min_version`, it is below `min_version`, or it is deprecated
+/// by hand while `min_version` would keep it. A new workunit pinned to 100 is
+/// not sent (stock never loads it); one already committed to it still is
+/// (`check_homogeneous_app_version` looks the version up anyway).
+fn kept_for_commitments_only(app_extra: &str, old_extra: &str) {
+    let w = World::new("", "");
+    w.app(1, "h", &format!("homogeneous_app_version = 1{app_extra}"));
+    w.version_with(11, 1, "h", 100, 1, "", old_extra);
+    w.version(12, 1, "h", 101, 1, "");
+    w.pinned("h", "new_old", 100);
+    w.pinned("h", "committed_old", 100);
+    w.sql("UPDATE workunit SET app_version_id = 11 WHERE name = 'committed_old'");
+    w.pinned("h", "new_new", 101);
+    w.unpinned("h", "free");
+    let host = w.computer("a");
+    let out = w.rpc(&host, 2000);
+    assert_eq!(
+        w.sent_versions(&out),
+        vec![
+            ("committed_old".into(), 100),
+            ("free".into(), 101),
+            ("new_new".into(), 101)
+        ],
+        "{app_extra} {old_extra}"
+    );
+    assert_eq!(w.wu("new_old").app_version_id, 0);
+    assert_eq!(w.unsent_of("h"), 1);
+    // Told what it is, not that nothing is there.
+    let again = w.rpc(&host, 2100);
+    assert_eq!(again.n_sent, 0);
+    assert!(has_message(&again, "No tasks sent"));
+}
+
+#[test]
+fn a_new_job_pinned_to_a_superseded_version_is_not_sent_without_min_version() {
+    kept_for_commitments_only("", "");
+}
+
+#[test]
+fn a_new_job_pinned_to_a_version_below_min_version_is_not_sent() {
+    kept_for_commitments_only(", min_version = 101", "");
+}
+
+#[test]
+fn a_new_job_pinned_to_a_deprecated_version_is_not_sent() {
+    kept_for_commitments_only(", min_version = 100", "deprecated = 1");
+}
+
+#[test]
+fn a_pinned_job_goes_to_a_superseded_version_that_min_version_keeps() {
+    // The control: with `min_version` 100, version 100 is loaded and marked
+    // deprecated in memory, which a pinned job accepts.
+    let w = World::new("", "");
+    w.app(1, "h", "homogeneous_app_version = 1, min_version = 100");
+    w.version(11, 1, "h", 100, 1, "");
+    w.version(12, 1, "h", 101, 1, "");
+    w.pinned("h", "old", 100);
+    let host = w.computer("a");
+    let out = w.rpc(&host, 2000);
+    assert_eq!(w.sent_versions(&out), vec![("old".into(), 100)]);
+}

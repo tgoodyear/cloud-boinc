@@ -15,9 +15,14 @@ use crate::{Config, CoreError, CoreResult};
 
 /// Most names in one `IN (...)` list; D1 allows 100 bound parameters.
 const MAX_IN_LIST: usize = 90;
-/// Most files in one app version. Each statement takes 90 names, and a
-/// request may run about 50 statements on D1's free plan, so this leaves the
-/// batches of `add_app_version` well within that.
+/// Files to a statement of `add_app_version`, which sends them as one JSON
+/// value; at most 200 names of 255 bytes and their MD5s, under 60 KB.
+const JSON_CHUNK: usize = 200;
+/// Longest file name of an app version.
+const MAX_FILE_NAME: usize = 255;
+/// Most files in one app version. A statement covers 200 files, and a
+/// request may run about 50 statements on D1's free plan; 1000 files take 18
+/// (see `add_app_version`).
 pub const MAX_VERSION_FILES: usize = 1000;
 /// Longest description of an app version. D1 limits a row to 2 MB; the
 /// scheduler keeps every version's description in memory and sends it in
@@ -388,20 +393,23 @@ pub async fn add_app_version(
         stmt!("SELECT * FROM platform WHERE name = ?", v.platform.as_str()),
     ];
     for f in &v.files {
-        if !is_valid_filename(&f.name) || f.name.contains('/') || f.name.is_empty() {
+        if !is_valid_filename(&f.name)
+            || f.name.contains('/')
+            || f.name.is_empty()
+            || f.name.len() > MAX_FILE_NAME
+        {
             return invalid(format!("app version: bad file name {:?}", f.name));
         }
     }
-    // D1 binds at most 100 values to a statement.
-    for chunk in v.files.chunks(MAX_IN_LIST) {
-        let mut files = Stmt::new(format!(
-            "SELECT name, nbytes, md5 FROM job_file WHERE name IN ({})",
-            vec!["?"; chunk.len()].join(", ")
+    // The names go to each statement as one JSON array, so a statement binds
+    // one value however many files it covers (D1 allows 100), and joins
+    // `job_file` on its primary key, `name`.
+    let names: Vec<&str> = v.files.iter().map(|f| f.name.as_str()).collect();
+    for chunk in names.chunks(JSON_CHUNK) {
+        lookups.push(stmt!(
+            "SELECT f.name, f.nbytes, f.md5 FROM json_each(?) j JOIN job_file f ON f.name = j.value",
+            serde_json::to_string(chunk).unwrap_or_default()
         ));
-        for f in chunk {
-            files = files.bind(f.name.as_str());
-        }
-        lookups.push(files);
     }
     let mut out = db.batch(lookups).await?.into_iter();
     let app: App = out
@@ -517,60 +525,71 @@ pub async fn add_app_version(
         v.beta
     )];
     // App files outlive the jobs that use them.
-    for chunk in v.files.chunks(MAX_IN_LIST) {
-        let mut keep = Stmt::new(format!(
-            "UPDATE job_file SET no_delete = 1 WHERE name IN ({})",
-            vec!["?"; chunk.len()].join(", ")
+    for chunk in names.chunks(JSON_CHUNK) {
+        writes.push(stmt!(
+            "UPDATE job_file SET no_delete = 1 WHERE name IN (SELECT value FROM json_each(?))",
+            serde_json::to_string(chunk).unwrap_or_default()
         ));
-        for f in chunk {
-            keep = keep.bind(f.name.as_str());
-        }
-        writes.push(keep);
     }
     // The signatures were checked against the MD5s read above. A file staged
     // again with other contents (`replace=1`) since would leave a version that
     // describes the old one, so the batch checks every file still has the MD5
     // that was read, and fails, writing nothing, if one does not. The check
     // raises an error when the count is off: `abs` of the smallest integer
-    // overflows in SQLite.
-    let keys: Vec<String> = v
-        .files
-        .iter()
-        .filter_map(|f| {
-            staged
-                .get(f.name.as_str())
-                .map(|s| format!("{}:{}", f.name, s.md5))
-        })
-        .collect();
-    let mut distinct = keys.clone();
-    distinct.sort();
-    distinct.dedup();
-    for chunk in distinct.chunks(MAX_IN_LIST) {
-        let mut guard = Stmt::new(format!(
-            "SELECT CASE WHEN (SELECT count(*) FROM job_file WHERE name || ':' || md5 IN ({})) = ? \
+    // overflows in SQLite. Each check is a join of a JSON object of
+    // name to MD5 with `job_file` on its primary key.
+    //
+    // Statements for a version of 1000 files (200 to a statement): 5 reads
+    // of the files and 2 of the app and platform, then one batch of 1 insert,
+    // 5 updates and 5 checks, 18 in all, and 5 more if a check fails. D1's
+    // free plan allows about 50 queries to a request.
+    let pairs: Vec<(&str, &str)> = {
+        let mut p: Vec<(&str, &str)> = v
+            .files
+            .iter()
+            .filter_map(|f| {
+                staged
+                    .get(f.name.as_str())
+                    .map(|s| (f.name.as_str(), s.md5.as_str()))
+            })
+            .collect();
+        p.sort_unstable();
+        p.dedup();
+        p
+    };
+    let check_of = |chunk: &[(&str, &str)]| -> String {
+        let map: serde_json::Map<String, serde_json::Value> = chunk
+            .iter()
+            .map(|(n, m)| (n.to_string(), serde_json::Value::from(*m)))
+            .collect();
+        serde_json::Value::Object(map).to_string()
+    };
+    for chunk in pairs.chunks(JSON_CHUNK) {
+        writes.push(stmt!(
+            "SELECT CASE WHEN (SELECT count(*) FROM json_each(?) j JOIN job_file f \
+             ON f.name = j.key AND f.md5 = j.value) = ? \
              THEN 1 ELSE abs(-9223372036854775808) END AS ok",
-            vec!["?"; chunk.len()].join(", ")
+            check_of(chunk),
+            chunk.len() as i64
         ));
-        for k in chunk {
-            guard = guard.bind(k.as_str());
-        }
-        writes.push(guard.bind(chunk.len() as i64));
     }
     let done = match db.batch(writes).await {
         Ok(d) => d,
         Err(e) => {
             // Was it the check? Look at the files again.
+            let again: Vec<Stmt> = pairs
+                .chunks(JSON_CHUNK)
+                .map(|chunk| {
+                    stmt!(
+                        "SELECT count(*) AS n FROM json_each(?) j JOIN job_file f \
+                         ON f.name = j.key AND f.md5 = j.value",
+                        check_of(chunk)
+                    )
+                })
+                .collect();
             let mut changed = false;
-            for chunk in distinct.chunks(MAX_IN_LIST) {
-                let mut q = Stmt::new(format!(
-                    "SELECT count(*) AS n FROM job_file WHERE name || ':' || md5 IN ({})",
-                    vec!["?"; chunk.len()].join(", ")
-                ));
-                for k in chunk {
-                    q = q.bind(k.as_str());
-                }
-                let n = db.run(q).await?.scalar_i64().unwrap_or(0);
-                changed |= n != chunk.len() as i64;
+            for (chunk, rows) in pairs.chunks(JSON_CHUNK).zip(db.batch(again).await?) {
+                changed |= rows.scalar_i64().unwrap_or(0) != chunk.len() as i64;
             }
             return Err(if changed {
                 CoreError::Conflict(
