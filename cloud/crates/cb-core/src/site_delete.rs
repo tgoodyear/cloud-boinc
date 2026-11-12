@@ -511,6 +511,10 @@ pub async fn delete_account_steps(
 /// batch of five.
 const MAX_STEP_STATEMENTS: usize = 13;
 
+/// Statements [`delete_account_steps`] needs to make progress on a queued
+/// deletion: the queue read and one step.
+pub const DELETION_PROGRESS_STATEMENTS: usize = 1 + MAX_STEP_STATEMENTS;
+
 /// The condition every statement of a step ends with: this deletion is still
 /// the one the pass read (the queue row exists with the same `gen`) and its
 /// account is still the blocked one that carries it. Two bound values: the

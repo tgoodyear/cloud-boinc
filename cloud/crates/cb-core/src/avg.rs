@@ -86,6 +86,29 @@ pub fn update_average(
     *avg_time = now;
 }
 
+/// An average as of `now`: the stored value halved for each `CREDIT_HALF_LIFE`
+/// since it was last updated. The stored one is only brought up to date when
+/// the account or computer earns credit, so a list shows this instead.
+pub fn decayed(avg: f64, avg_time: f64, now: f64) -> f64 {
+    if avg_time <= 0.0 || now <= avg_time {
+        return avg;
+    }
+    avg * (-(now - avg_time) * std::f64::consts::LN_2 / CREDIT_HALF_LIFE).exp()
+}
+
+/// The sort key of an average, comparable across rows: `ln(avg) + t * ln 2 /
+/// half life`. The decayed value at any time `now` is `exp(key - now * ln 2 /
+/// half life)`, so ordering by the key is ordering by the average as it stands
+/// at any common time. Rows with no average get a key below every real one.
+pub const NO_KEY: f64 = -1e9;
+pub fn recent_key(avg: f64, avg_time: f64) -> f64 {
+    if avg > 0.0 && avg.is_finite() && avg_time > 0.0 {
+        avg.ln() + avg_time * std::f64::consts::LN_2 / CREDIT_HALF_LIFE
+    } else {
+        NO_KEY
+    }
+}
+
 /// Average in which each value is weighted by the sum of the others, which
 /// reduces the weight of large outliers (`low_average` in `sched/credit.cpp`).
 pub fn low_average(v: &[f64]) -> f64 {
@@ -125,6 +148,31 @@ mod tests {
         assert_eq!(low_average(&[5.0]), 5.0);
         assert!((low_average(&[1.0, 1.0]) - 1.0).abs() < 1e-12);
         assert!(low_average(&[1.0, 1.0, 100.0]) < 34.0);
+    }
+
+    #[test]
+    fn decay_halves_each_week() {
+        assert_eq!(decayed(8.0, 0.0, 1e9), 8.0);
+        assert_eq!(decayed(8.0, 100.0, 50.0), 8.0);
+        assert!((decayed(8.0, 0.0 + 1.0, 1.0 + CREDIT_HALF_LIFE) - 4.0).abs() < 1e-9);
+        assert!((decayed(8.0, 1.0, 1.0 + 2.0 * CREDIT_HALF_LIFE) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_key_orders_as_the_decayed_averages_do() {
+        let now = 2e9;
+        let week = CREDIT_HALF_LIFE;
+        // Idle for ten weeks at 100 against active at 10 now.
+        let idle = (100.0, now - 10.0 * week);
+        let active = (10.0, now);
+        assert!(decayed(idle.0, idle.1, now) < decayed(active.0, active.1, now));
+        assert!(recent_key(idle.0, idle.1) < recent_key(active.0, active.1));
+        // And the other way round three weeks in.
+        let idle = (100.0, now - 3.0 * week);
+        assert!(decayed(idle.0, idle.1, now) > decayed(active.0, active.1, now));
+        assert!(recent_key(idle.0, idle.1) > recent_key(active.0, active.1));
+        assert_eq!(recent_key(0.0, now), NO_KEY);
+        assert_eq!(recent_key(5.0, 0.0), NO_KEY);
     }
 
     #[test]

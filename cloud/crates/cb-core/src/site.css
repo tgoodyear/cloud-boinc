@@ -83,3 +83,32 @@ summary{cursor:pointer;min-height:44px;padding:.6rem 0;font-weight:600}
 .notice{color:var(--fg);background:var(--note-bg);border-color:var(--accent)}
 @media(min-width:40rem){.top{position:sticky;top:0;z-index:5}.top nav{flex:1;margin:0;padding:0}}
 @media(max-width:40rem){form table,form tbody,form tr,form th,form td{display:block}form tr{margin-bottom:.75rem}h1{font-size:1.5rem}.kv{grid-template-columns:1fr;gap:0}.kv dd{margin-bottom:.75rem}}
+.charts{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(min(22rem,100%),1fr))}
+.charts>.card{margin:0}
+.chart{display:block;width:100%;max-width:36rem;height:auto}
+.chart text{font:12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;fill:var(--muted)}
+.ch-grid{stroke:var(--line);stroke-width:1}
+.ch-axis{stroke:var(--ctl);stroke-width:1}
+.ch-bar.ch-s0{fill:var(--accent)}
+.ch-bar.ch-s1{fill:var(--warn)}
+.ch-partial{opacity:.45}
+.ch-line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.ch-line.ch-s0{stroke:var(--accent)}
+.ch-line.ch-s1{stroke:var(--warn)}
+.ch-dot.ch-s0{fill:var(--accent)}
+.ch-dot.ch-s1{fill:var(--warn)}
+.ch-area.ch-s0{fill:var(--accent);opacity:.18}
+.legend{display:flex;flex-wrap:wrap;gap:.25rem 1rem;list-style:none;padding:0;margin:.5rem 0}
+.legend li{margin:0;font-size:.875rem;color:var(--muted)}
+.legend .legend-key{width:1.5rem;height:.8rem;vertical-align:middle;margin-right:.35rem}
+
+table.stack td.num,table.stack th.num{text-align:right}
+@media(max-width:40rem){
+table.stack thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+table.stack,table.stack tbody,table.stack tr,table.stack td{display:block}
+table.stack tr{padding:.5rem .75rem;border-bottom:1px solid var(--line)}
+table.stack tr:last-child{border-bottom:0}
+table.stack td{display:flex;justify-content:space-between;gap:1rem;padding:.15rem 0;border:0;text-align:right;background:none}
+table.stack td::before{content:attr(data-label);color:var(--muted);text-align:left;flex:none}
+table.stack td.who{font-weight:600}
+}

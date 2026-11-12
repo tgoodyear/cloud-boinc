@@ -21,6 +21,16 @@ fn err(e: rusqlite::Error) -> DbError {
 impl SqliteDb {
     pub fn open_in_memory() -> DbResult<Self> {
         let conn = Connection::open_in_memory().map_err(err)?;
+        // D1's SQLite has the math functions; this build of SQLite does not.
+        // `ln` is what `migrations/0008_dashboards.sql` uses.
+        conn.create_scalar_function(
+            "ln",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(ctx.get::<f64>(0)?.ln()),
+        )
+        .map_err(err)?;
         Ok(SqliteDb {
             conn: RefCell::new(conn),
             written: Cell::new(0),
@@ -44,6 +54,7 @@ impl SqliteDb {
         db.apply(include_str!("../../../migrations/0005_upload_epoch.sql"))?;
         db.apply(include_str!("../../../migrations/0006_homogeneous.sql"))?;
         db.apply(include_str!("../../../migrations/0007_site_ops.sql"))?;
+        db.apply(include_str!("../../../migrations/0008_dashboards.sql"))?;
         Ok(db)
     }
 

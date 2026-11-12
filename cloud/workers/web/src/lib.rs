@@ -6,19 +6,22 @@
 
 use std::collections::HashMap;
 
+use cb_core::feed::parse_feed;
 use cb_core::mail::Mailer;
 use cb_core::site::{
     auth_from_cookie, robots_txt, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS,
 };
+use cb_core::site_boards::{public_cache_key, CACHE_SECS, PUBLIC_PATHS};
+use cb_core::site_work::{work, FeedState};
 use cb_core::stock::{route_web, url_origin, WebRoute};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, html_cache_control, lookup_account,
-    master_page, project_config, server_status, server_status_page, server_status_xml, NewAccount,
-    FAVICON_SVG, MAX_FORM_BYTES,
+    master_page_with, project_config, server_status, server_status_page, server_status_xml,
+    NewAccount, FAVICON_SVG, MAX_FORM_BYTES,
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
-    db, mailer, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
+    db, fetch_feed, mailer, now, project, random_u32, read_body, secret_bytes, text, xml, xml_utf8,
     SECRET_PASSWD_PEPPER,
 };
 use worker::{
@@ -72,6 +75,94 @@ fn site_response(page: SitePage, robots_tag: &str) -> Result<Response> {
         .with_status(page.status)
         .with_headers(headers)
         .fixed(page.body.into_bytes()))
+}
+
+/// A dashboard page: the same for every visitor, so a shared cache may keep it
+/// for [`CACHE_SECS`]. `server_timing` says what the database work cost.
+fn public_response(page: SitePage, server_timing: Option<String>) -> Result<Response> {
+    let mut builder = Response::builder()
+        .with_status(page.status)
+        .with_header("Content-Type", page.content_type)?
+        .with_header(
+            "Cache-Control",
+            &html_cache_control(&format!("public, max-age={CACHE_SECS}")),
+        )?;
+    for (name, value) in SITE_HEADERS {
+        builder = builder.with_header(name, value)?;
+    }
+    if let Some(t) = server_timing {
+        builder = builder.with_header("Server-Timing", &t)?;
+    }
+    Ok(builder.fixed(page.body.into_bytes()))
+}
+
+/// The project panels of `work.php`: fetched, checked, or a state that says why
+/// there are none. Nothing here fails the page.
+async fn dashboard_feed(config: &cb_core::Config) -> FeedState {
+    if config.dashboard_feed_url.is_empty() {
+        return FeedState::NotConfigured;
+    }
+    let body = match fetch_feed(&config.dashboard_feed_url).await {
+        Ok(b) => b,
+        Err(e) => {
+            console_error!("dashboard feed: {e}");
+            return FeedState::Unavailable;
+        }
+    };
+    match parse_feed(&body, now()) {
+        Ok(feed) => FeedState::Ready(feed),
+        Err(e) => {
+            console_error!("dashboard feed: {e}");
+            FeedState::Unavailable
+        }
+    }
+}
+
+/// The edge cache key of a dashboard request, from its canonical form.
+fn public_key(req: &Request, path: &str) -> Result<Option<String>> {
+    if !PUBLIC_PATHS.contains(&path) || !matches!(req.method(), Method::Get | Method::Head) {
+        return Ok(None);
+    }
+    let url = req.url()?;
+    let q: HashMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let Some(key) = public_cache_key(path, &q) else {
+        return Ok(None);
+    };
+    let mut canonical = url.clone();
+    let (p, qs) = match key.split_once('?') {
+        Some((p, qs)) => (p, Some(qs)),
+        None => (key.as_str(), None),
+    };
+    canonical.set_path(p);
+    canonical.set_query(qs);
+    canonical.set_fragment(None);
+    Ok(Some(canonical.to_string()))
+}
+
+/// The edge cache's copy of a dashboard page, with the headers a client gets.
+async fn cached_public(key: &str) -> Result<Option<Response>> {
+    let Some(hit) = Cache::default().get(key, false).await? else {
+        return Ok(None);
+    };
+    // As for the master page: the zone may rewrite Cache-Control on a stored
+    // response, so the headers are set again.
+    let headers = Headers::new();
+    if let Some(kind) = hit.headers().get("Content-Type")? {
+        headers.set("Content-Type", &kind)?;
+    }
+    headers.set(
+        "Cache-Control",
+        &html_cache_control(&format!("public, max-age={CACHE_SECS}")),
+    )?;
+    for (name, value) in SITE_HEADERS {
+        headers.set(name, value)?;
+    }
+    Ok(Some(
+        Response::from_body(hit.body().clone())?.with_headers(headers),
+    ))
 }
 
 /// Pages that are the same for every client and need no database read when
@@ -129,7 +220,7 @@ async fn cached(key: &str) -> Result<Option<Response>> {
 }
 
 #[event(fetch)]
-async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
+async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
     if !matches!(req.method(), Method::Get | Method::Head | Method::Post) {
         return text(405, "method not allowed\n");
     }
@@ -147,6 +238,13 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         .transpose()?;
     if let Some(key) = &cache_key {
         if let Some(hit) = cached(key).await? {
+            return Ok(hit);
+        }
+    }
+    // Dashboard pages too, under a key made from their validated parameters.
+    let mut public_key = public_key(&req, &raw_path)?;
+    if let Some(key) = &public_key {
+        if let Some(hit) = cached_public(key).await? {
             return Ok(hit);
         }
     }
@@ -181,6 +279,14 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         }
         cache_key = Some(key);
     }
+    if prefixed && public_key.is_none() {
+        public_key = self::public_key(&req, &path)?;
+        if let Some(key) = &public_key {
+            if let Some(hit) = cached_public(key).await? {
+                return Ok(hit);
+            }
+        }
+    }
     // Where redirects and the login cookie point: the directory the request
     // came in under.
     let base = match (stock, url_origin(&project.config.master_url)) {
@@ -192,11 +298,23 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             let mut response = if path == "/get_project_config.php" {
                 cacheable_xml(project_config(&project))?
             } else {
-                html(master_page(&project))?
+                // The figures are one row of the rollup; a page without them
+                // is still a good page.
+                let summary = if path == "/get_project_config.php" {
+                    None
+                } else {
+                    cb_core::stats::load_overview(&db)
+                        .await
+                        .unwrap_or_else(|e| {
+                            console_error!("home summary: {e}");
+                            None
+                        })
+                };
+                html(master_page_with(&project, summary.as_ref(), now()))?
             };
             if let Some(key) = cache_key {
                 let copy = response.cloned()?;
-                ctx.wait_until(async move {
+                exec.wait_until(async move {
                     if let Err(e) = Cache::default().put(key.as_str(), copy).await {
                         console_error!("cache: {e}");
                     }
@@ -292,6 +410,10 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             }
         }
         p if SITE_PATHS.contains(&p) => {
+            let public = PUBLIC_PATHS.contains(&p);
+            if public && !matches!(req.method(), Method::Get | Method::Head) {
+                return text(405, "method not allowed\n");
+            }
             let post = req.method() == Method::Post;
             let cookie = req
                 .headers()
@@ -314,7 +436,31 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 random: &random,
                 mailer: mail.as_ref().map(|m| m as &dyn Mailer),
             };
-            match site_page(&ctx, p, &q).await {
+            let page = if p == "/work.php" {
+                let feed = dashboard_feed(&project.config).await;
+                work(&ctx, &q, &feed).await.map(Some)
+            } else {
+                site_page(&ctx, p, &q).await
+            };
+            match page {
+                Ok(Some(page)) if public => {
+                    let ok = page.status == 200;
+                    let timing = format!(
+                        "db;desc=\"{} trips, {} rows read\"",
+                        db.round_trips(),
+                        db.rows_read()
+                    );
+                    let mut response = public_response(page, Some(timing))?;
+                    if let (true, Some(key)) = (ok, public_key) {
+                        let copy = response.cloned()?;
+                        exec.wait_until(async move {
+                            if let Err(e) = Cache::default().put(key.as_str(), copy).await {
+                                console_error!("cache: {e}");
+                            }
+                        });
+                    }
+                    Ok(response)
+                }
                 Ok(Some(page)) => site_response(page, &project.config.robots_tag),
                 Ok(None) => text(404, "not found\n"),
                 Err(e) => {

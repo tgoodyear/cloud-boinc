@@ -1270,7 +1270,7 @@ year when "stay logged in" is ticked, and for the browser session otherwise. A p
 taken from a POST only. Logging out is a POST with the form token, as described under the account pages below. Private fields follow upstream: the account page, the IP address,
 domain name, disk and activity fractions of a computer, and an account's task list are shown
 to the account holder only. Another account's computers are listed only when it has
-`show_hosts` set, and then without names. A computer's task list, a task (with its stderr) and
+`show_hosts` set, or when `host_owner_public` is on (the default, see Dashboards), and then without names. A computer's task list, a task (with its stderr) and
 a workunit are public, as upstream. Every value from a client or a user is HTML-escaped. The
 pages are served with `Cache-Control: private, no-store`.
 
@@ -1289,7 +1289,7 @@ the same reason.
 ### Site pages: shell and building blocks
 
 Every HTML page comes out of `page` in `cloud/crates/cb-core/src/web.rs`: the viewport meta, the
-stylesheet inline (`cloud/crates/cb-core/src/site.css`, under 7 KB), the header, then the body in
+stylesheet inline (`cloud/crates/cb-core/src/site.css`, under 9 KB), the header, then the body in
 `<main>`. The stylesheet is inline and not a route because the pages are built in one function, the
 site's `Content-Security-Policy` sets only `frame-ancestors`, and a route would be one more path to
 keep in step with the URL layout. There are no images, web fonts, scripts or external requests.
@@ -1325,6 +1325,206 @@ lifetime for clients that ask for that path.
 Plain elements need no class: headings, paragraphs, lists, `code`, `pre`, `details`, and forms
 with labels above the fields. A submit button is the primary button; add `class="secondary"` or
 `class="danger"` for the others. New pages use the CSS variables and no inline `style` attributes.
+
+### Dashboards
+
+Four public pages show what the project is doing. They are in
+`cloud/crates/cb-core/src/site_boards.rs` (leaderboards) and `site_work.rs` (jobs and activity), and
+are routed through `site_page` with the rest of the site. They are the same for every visitor, so
+the web Worker answers them with `Cache-Control: public, max-age=60` and keeps each in the edge
+cache for the same time, under a key made from the path and the parameters the page reads
+(`public_cache_key`), so other query strings do not each get an entry. Only `GET` and `HEAD`
+are served. Nothing on them depends on the visitor, and no request can make the database do work
+that is not bounded by the limits below.
+
+| Page | Shows | Reads |
+| --- | --- | --- |
+| `top_users.php` | Rank, name, total credit, recent average credit, jobs completed (tasks that passed validation), country when the project shows it. Sorted by `sort=total_credit` (default), `expavg_credit` or `valid_results`; `page=` of 50 rows, at most 40 pages. Accounts with no credit and blocked accounts are left out | the first rows of one partial index |
+| `top_hosts.php` | The same for computers, with CPU, operating system and GPU summary (from `host.serialnum`). The owner is named and linked for every computer (see `host_owner_public` below); with that option off, only when the account has `show_hosts` on, and "Anonymous" otherwise | the first rows of one partial index, and each owner by ID |
+| `work.php` | Per application and in total: tasks waiting to send, in progress, workunits awaiting validation and awaiting assimilation, tasks completed and failed in the last 24 hours and 7 days; a week of three-hour periods as three SVG charts (queue, completed, active volunteers and computers) with a table of the same numbers; the project's own panels | the `overview` snapshot and 56 rows of `stats_bucket` |
+| `activity.php` | Volunteers holding tasks, with tasks per application, number of computers, last contact; computers are listed under their volunteers, subject to `host_owner_public`; and for each application its largest holders | the `inflight` snapshot and the accounts on the page by ID |
+
+Upstream's `top_users.php` and `top_hosts.php` (`html/user/`) list every account and computer with
+`offset` paging and team and search options. These list only accounts and computers with credit,
+cap the depth, and have no team boards, since the site has no teams. `work.php` and `activity.php`
+have no upstream counterpart; `server_status.php` is the nearest.
+
+**Who owns a computer.** Upstream shows a computer's owner only when the account has `show_hosts`
+on, and lists another account's computers only then (`html/user/show_host_detail.php`,
+`hosts_user.php`, `top_hosts.php`). The config option `<host_owner_public>` (default 1) sets this
+project to show the owner of every computer, whatever the owner chose: the leaderboard and the
+activity page name and link the owner, `show_host_detail.php` names the owner, `show_user.php`
+links to the account's computers, and `hosts_user.php` lists them. With the option set to 0 the
+upstream rule applies everywhere. The default differs from upstream. A project moving over from a stock server whose
+users chose `show_hosts` 0 sets the option to 0. While the option is on, the preference form does not offer
+the "show my computers" switch (it would change nothing) and says so; the stored value is kept and
+is used again if the option is turned off. The option changes who is named and nothing else: a
+computer's domain name, addresses, and an account's email address and keys are shown to the owner
+only, as upstream, and a computer is identified publicly by its ID and its CPU, operating system
+and GPU.
+
+**Leaderboard indexes.** `migrations/0008_dashboards.sql` adds three partial indexes each to `user`
+and `host`: `total_credit DESC`, `recent_key DESC` and `valid_results DESC`, all
+`WHERE total_credit > 0`, and the three on `user` also `AND blocked = 0`, because the page leaves
+blocked accounts out and a run of them would otherwise be read past before the first row. A page
+runs one statement of `ORDER BY <column> DESC, id LIMIT 51 OFFSET n`
+whose `WHERE` repeats the index condition, so it reads at most 51 index entries and their rows
+plus, for computers, 51 owner rows; the deepest page allowed (40) reads about 2,000 index entries to
+skip to its offset, and has no "Next" link. The tests run `EXPLAIN QUERY PLAN` on every statement of
+these pages and fail on a full scan of a large table, on a missing index and on a sort outside the
+index. The price is writes: a task that earns credit changes `total_credit`, `recent_key` and
+`valid_results` of an account and of a computer, which updates three index entries for each, six
+more index writes per valid task than before. At the design's 25 rows per job that is a quarter
+more; on the Paid plan it is negligible, on the Free plan it lowers the jobs a day that fit in
+100,000 writes. A project that cannot spend them can drop the `valid_results` indexes and the sort
+that uses them.
+
+**Recent average.** The stored `expavg_credit` is brought up to date only when its owner earns credit
+(upstream leaves the decay to the `update_stats` daemon), so ordering by it would rank an idle
+account above an active one. The pages order by `recent_key = ln(expavg_credit) + expavg_time * ln 2
+/ half life` (`recent_key` in `avg.rs`), which the pipeline writes in the statement that writes
+`expavg_credit`. An average that halves every half life is multiplied by the same factor at every
+time, so the keys of two rows compare as their averages do at any common time, and the order is
+right across pages without decaying each row in the query. The pages show the average decayed to
+now (`decayed` in `avg.rs`). The migration fills the key with `ln`, which D1's SQLite has; the
+native test database registers the same function.
+
+`valid_results` is added to in the statement that grants the credit (`host_statements` in
+`cloud/crates/cb-core/src/pipeline.rs`), so it counts each valid result once, with the credit, under
+the commit guard. The migration counts the valid tasks still in the table for accounts and
+computers that have credit; tasks purged earlier are not counted.
+
+**The rollup.** A project can hold hundreds of thousands of `result` rows, and no page counts them.
+The pipeline Worker's five-minute cron (the one that runs the purge) calls `rollup_pass`
+(`cloud/crates/cb-core/src/stats.rs`) after the purge, and it writes two small tables:
+
+- `stats_bucket`: a row per three-hour period (UTC) for the project (`appid` 0), each of the first
+  18 applications by id and the rest together (`appid` -1): tasks returned with a success outcome,
+  valid, invalid, failed (any other outcome), timed out, and, in the project row, the queue length
+  at the last count (with a flag when the count stopped at its cap, kept after the period closes)
+  and the accounts and computers that returned a task.
+- `stats_snapshot`: three documents. `overview` has, per application and in total, tasks waiting to
+  send, in progress, workunits awaiting validation and assimilation, the counts of the last day and
+  week summed from `stats_bucket`, and the number of volunteers and computers holding tasks.
+  `inflight` has tasks in progress by computer and application. `rollup_run` is the time of the
+  last pass.
+
+A pass recounts the open period; each closed period once within ten minutes of its end, and
+then hourly for as long as tasks returned in it still wait for validation (`pending`), because a
+validation moves a task from one count to another; and up to six periods that have no row (a new
+deployment's week is filled in a few passes). A period that starts before the purge horizon is
+never counted or recounted, since what is left of it is only part of what happened: it stays unknown,
+or keeps the count it had. The counts come from the partial index `res_received` (tasks by time
+received): about two reads per task returned in the period (one scan, grouped by application,
+outcome, validation state, account and computer, from which the accounts and computers are
+counted). The recount writes absolute numbers, so a pass that runs twice, or fails partway, leaves
+the same rows, and an application that had a row for the period and has no task in it now is
+written as zero (its timeouts and queue length are left alone).
+
+The queue length is one statement: `res_unsent` read in application order up to 100,000 tasks in
+all. Past that the count stops inside one application's queue; that application and every later
+one are lower bounds (`unsent_from` in the overview), and the page shows them as "40,000+" (an
+application it never reached as "0+"). Tasks in progress are counted from `res_host_inprog`, which
+now holds the application as well as the computer (`(hostid, appid) WHERE server_state = 4`), so
+those counts read the index alone, and the accounts and computers holding tasks are counted
+separately over all of them, so they stay exact when the list of groups the activity page keeps
+(4,000) is cut off; the tasks in progress that page shows are then marked as at least. Waiting
+workunits use `wu_need_validate` and `wu_assim`. The sums of the last day and week cover only the
+periods that have been counted; the overview says how many of the 8 and 56, and the pages mark the
+sums "+" and say so while the week is being filled in. The targets are always 8 and 56: a window
+part of which was purged (or never existed, on a new deployment with a short `purge_days`) stays
+marked as partial.
+
+**Statement budget.** A Worker invocation may make 50 queries on the Free plan, and the cron does
+three jobs in it, split in one place (`run_cron` and the three budget functions in
+`cloud/crates/cb-core/src/cron.rs`): the purge, #21's account deletions and the rollup. What is left
+after the settings load is divided before anything starts. The deletions are reserved what one step
+needs to make progress (14: the queue read and a step of up to 13), the rollup its minimum (18) and
+there is a margin of 2, so on a cold isolate with a four-statement settings load the purge may use
+12: one full pass, which sends seven statements (the candidates, the read of the rows, the four
+deletes of the commit; an empty pass sends one), and what it does not finish waits for the next run.
+The deletions then take what the purge left, at most 22 and never so much that the rollup has less
+than its minimum, and the rollup takes the rest. The statements are counted where they are sent
+(`Counting`), not assumed. `tests/cron.rs` runs a purge backlog of 600 workunits, a queued deletion
+of an account with 12,000 tasks and 450 computers, and the rollup, through a counting database for
+as many runs as it takes, with the settings load at 4 and 6, and checks that each run sends at most 50
+in all and that all three make progress in every run.
+
+| Share | Cold isolate (settings load 4) | After a full purge pass | Without a purge |
+| --- | --- | --- | --- |
+| Settings load | 4 | 4 | 4 |
+| Purge | up to 12 (one pass of 7) | 7 | 0 or 1 |
+| Account deletions | 14 to 22 | 19 | 22 |
+| Rollup | 18 or more | 18 or more | 18 to 24 |
+
+Every part of a pass has a count that does not depend
+on the data, so the bound is enforced by construction and not by trimming:
+
+| Step | Statements |
+| --- | --- |
+| Round trip 1: last run, tracked applications, counted periods | 3 |
+| Round trip 2: one scan per period counted, and the queue, tasks in progress per application, the largest in-progress groups, who holds tasks, workunits awaiting validation and assimilation | 1 per period + 6 |
+| Round trip 3: the rows of each period (at most 20 rows, ten to a statement), the queue gauge (one row), the retention delete, the sums | 2 per period + 3 |
+| Round trip 4: the three snapshots | 3 |
+
+That is `FIXED + 3 * periods` (`statements_for` in `stats.rs`): 15 plus 3 a period, at least 18
+(`MIN_BUDGET`) for the open period alone, and a pass counts `(budget - 15) / 3` periods at most,
+the open one first, and leaves the rest for the next pass (`postponed` in its report); with less
+than `MIN_BUDGET` it does nothing. The count does not grow with the applications because the first
+18 applications by id (`TRACKED_APPS`; deprecated or not, so that deprecating one does not move the
+grouping of periods already counted) have rows of their own, and the tasks of all the
+others are counted together in a row with `appid` -1, shown as "Other applications"; the queue gauge
+is one row for the project. The tests build 400 applications with returns in the open period and
+tasks waiting, at the least budget, and check that exactly the budget is sent, that every budget from
+18 to 60 is respected, and that no statement binds more than 100 values. Dev: 19 to 20 statements in
+steady state.
+
+The requests are bounded the same way (statements a page makes after the settings load, which is
+two and cached for 30 seconds in each isolate):
+
+| Request | Statements |
+| --- | --- |
+| `top_users.php`, `top_hosts.php` | 1 |
+| `work.php` | 2 (overview and history in one round trip) |
+| `activity.php` | 1 for the snapshot, then at most 3 for accounts: 80 accounts to a statement, and the page shows at most 50 volunteers and the ten largest holders of each of the 12 applications with most tasks, so 170 accounts |
+| the home page's card | 1 |
+
+`activity.php` chooses what it will show before it looks anything up, and shows only an account that
+was looked up and is not blocked: a holder whose account was not fetched is left out, not shown as
+nobody. When more applications hold tasks than it lists, it says how many. A test drives 400
+applications with ten holders each, a blocked holder, and holders with no account row, and counts the
+statements.
+
+A row in `stats_bucket` with `computed_at` 0 (made by a timeout before its period was counted) is
+not a counted period: the pages show the period as unknown and the sums leave it out until a pass
+counts it.
+
+Timed-out tasks are the one figure the pass cannot count, since a task that misses its deadline is
+never returned and has no `received_time`. The transition that writes it off counts it in the batch
+that commits the write-off (`timeout_statements`), under the same commit guard, so it is counted
+once. Timeouts are therefore counted from when this was installed.
+
+Counting from the cron and not on each event keeps the scheduler's hot path, and the write budget
+per job, unchanged, makes the figures a pass counts repairable by the next one, and makes the cost of a page
+independent of traffic and of the table size. The cost is that figures are up to five minutes old
+(the pages say how old), and the daily and weekly figures are in whole three-hour periods (the last
+8 and 56). A period with no row, or a queue length that was never counted, is unknown: the charts
+leave a gap and the table says "unknown", never 0.
+
+Rows read, for a project with 20 accounts, 20 computers and three applications: a leaderboard page
+is about 100 rows (51 index entries and 51 rows, plus up to 51 owners for computers); `work.php` about
+60 and `activity.php` about 2 plus the accounts on the page; the pass reads two rows for each task
+returned in the periods it recounts (a few thousand a day), plus the unsent and in-progress
+counts, which are the length of the queues they count. All of this only happens on a cache miss,
+once a minute per page at most.
+
+**Project panels.** `<dashboard_feed_url>` in the config names an `https` JSON document the
+project publishes; `work.php` shows its sections as cards. The web Worker fetches it on a cache
+miss of the page (so about once a minute), with a 3-second timeout, no redirects and a 64 KB
+limit, and `parse_feed` (`cloud/crates/cb-core/src/feed.rs`) checks it strictly. The page
+cache is what holds it, so there is no second cache. A feed that is missing, slow, too large or
+invalid never fails the page: the panels are replaced by a note. The schema is in
+[dashboard-feed.md](dashboard-feed.md).
 
 ### Account and preference pages
 

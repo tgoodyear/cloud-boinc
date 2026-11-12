@@ -17,10 +17,12 @@ use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
 
 const PEPPER: &[u8] = b"pepper for tests";
-const CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<download_url>https://p.example/download</download_url>\n<upload_url>https://p.example/upload/file_upload_handler</upload_url>\n<user_country>1</user_country>\n</config>\n";
+/// The default: every computer is shown with its owner.
+const PUBLIC_CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<download_url>https://p.example/download</download_url>\n<upload_url>https://p.example/upload/file_upload_handler</upload_url>\n<user_country>1</user_country>\n</config>\n";
+const CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<download_url>https://p.example/download</download_url>\n<upload_url>https://p.example/upload/file_upload_handler</upload_url>\n<user_country>1</user_country>\n<host_owner_public>0</host_owner_public>\n</config>\n";
 const NOW: i64 = 2_000_000_000;
 /// The same project with a sender address, so that the site sends email.
-const MAIL_CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<download_url>https://p.example/download</download_url>\n<upload_url>https://p.example/upload/file_upload_handler</upload_url>\n<user_country>1</user_country>\n<account_creation>1</account_creation>\n<email_from>boinc@p.example</email_from>\n<email_from_name>Test Project</email_from_name>\n</config>\n";
+const MAIL_CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<download_url>https://p.example/download</download_url>\n<upload_url>https://p.example/upload/file_upload_handler</upload_url>\n<user_country>1</user_country>\n<account_creation>1</account_creation>\n<host_owner_public>0</host_owner_public>\n<email_from>boinc@p.example</email_from>\n<email_from_name>Test Project</email_from_name>\n</config>\n";
 
 /// A transport that keeps what it is given.
 #[derive(Default)]
@@ -167,6 +169,13 @@ impl World {
 
     fn sql(&self, sql: &str) {
         block_on(self.db.run(stmt!(sql))).unwrap();
+    }
+
+    fn sql_scalar(&self, sql: &str) -> i64 {
+        block_on(self.db.run(stmt!(sql)))
+            .unwrap()
+            .scalar_i64()
+            .unwrap()
     }
 
     fn host(&self, userid: i64, domain: &str, rpc_time: i64) -> i64 {
@@ -897,6 +906,53 @@ fn home_shows_the_account_to_its_holder_only() {
         !body.contains("get_passwd.php"),
         "no mail, no recovery link"
     );
+}
+
+#[test]
+fn every_computer_is_shown_with_its_owner_by_default() {
+    let w = World::with_config(PUBLIC_CONFIG);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    // Ada has not chosen to show her computers.
+    assert_eq!(
+        w.sql_scalar(&format!(
+            "SELECT show_hosts FROM user WHERE id = {}",
+            ada.id
+        )),
+        0
+    );
+    let h1 = w.host(ada.id, "ada-desk.lan", NOW - 100);
+    let id = ada.id.to_string();
+    let hid = h1.to_string();
+    // Her public page links to her computers, and others may list them.
+    let user = w.get("/show_user.php", None, &[("userid", &id)]);
+    assert!(user.body.contains(&format!("hosts_user.php?userid={id}")));
+    let list = w.get("/hosts_user.php", Some(&bob.auth), &[("userid", &id)]);
+    assert!(list.body.contains("Computers belonging to Ada"));
+    assert!(list
+        .body
+        .contains(&format!("show_host_detail.php?hostid={h1}")));
+    // One computer names its owner, and still not itself.
+    for viewer in [Some(bob.auth.as_str()), None] {
+        let d = w.get("/show_host_detail.php", viewer, &[("hostid", &hid)]);
+        assert!(d
+            .body
+            .contains(&format!("show_user.php?userid={id}\">Ada</a>")));
+        assert!(!d.body.contains("Anonymous"));
+        assert!(!d.body.contains("ada-desk.lan"));
+        assert!(!d.body.contains("192.0.2.7"));
+    }
+    // The preferences do not offer a switch that does nothing, and saving
+    // them leaves the stored choice alone.
+    let prefs = w.get("/prefs_edit.php", Some(&ada.auth), &[("subset", "project")]);
+    assert!(!prefs.body.contains("name=\"show_hosts\" value=\"1\"><"));
+    assert!(!prefs.body.contains("type=\"checkbox\" id=\"show_hosts\""));
+    assert!(prefs.body.contains("shows every computer with its owner"));
+    // With the stock rule the same page has the switch.
+    let stock = World::new();
+    let eve = stock.account("eve@example.com", "secret", "Eve");
+    let prefs = stock.get("/prefs_edit.php", Some(&eve.auth), &[("subset", "project")]);
+    assert!(prefs.body.contains("type=\"checkbox\" id=\"show_hosts\""));
 }
 
 #[test]
@@ -2043,9 +2099,10 @@ fn unnamed_controls(html: &str) -> Vec<String> {
 
 #[test]
 fn form_controls_have_names() {
-    let w = World::with_config(
-        &OPEN_CONFIG.replace("<user_country>1", "<user_url>1</user_url>\n<user_country>1"),
-    );
+    let w = World::with_config(&OPEN_CONFIG.replace(
+        "<user_country>1",
+        "<user_url>1</user_url>\n<host_owner_public>0</host_owner_public>\n<user_country>1",
+    ));
     let ada = w.account("ada@example.com", "secret", "Ada");
     let auth = Some(ada.auth.as_str());
     let mut pages = vec![
@@ -4972,6 +5029,12 @@ fn a_project_name_with_markup_is_shown_as_text() {
     assert!(home.contains("<title>A &lt;b&gt;&amp;amp; Co</title>"));
     assert!(home.contains("<h1>A &lt;b&gt;&amp;amp; Co</h1>"));
     assert!(!home.contains("<b>"));
+    // The public page of an account has the name in a table label.
+    let user = w
+        .get("/show_user.php", None, &[("userid", &ada.id.to_string())])
+        .body;
+    assert!(user.contains("A &lt;b&gt;&amp;amp; Co member since"));
+    assert!(!user.contains("<b>"));
 }
 
 /// The outlined and danger buttons have to out-rank the primary

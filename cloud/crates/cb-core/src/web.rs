@@ -887,6 +887,10 @@ fn favicon_href() -> String {
 pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
     let body = body
         .replace("<table>", "<div class=\"scroll\"><table>")
+        .replace(
+            "<table class=\"stack\">",
+            "<div class=\"scroll\"><table class=\"stack\">",
+        )
         .replace("</table>", "</table></div>");
     let (header, main) = match body.strip_prefix("<header class=\"top\">") {
         Some(rest) => {
@@ -909,10 +913,58 @@ pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
     )
 }
 
+/// The "Right now" card of the home page: what the project is doing, from the
+/// overview snapshot, with links to the pages behind each figure.
+fn summary_card(o: &crate::stats::Overview, now: i64) -> String {
+    let n = |v: i64| crate::site::number_format(v as f64, 0);
+    let total = o.apps.iter().find(|a| a.id == 0);
+    let mut items = Vec::new();
+    if let Some(t) = total {
+        let plus = |v: i64, exact: bool| if exact { n(v) } else { format!("{}+", n(v)) };
+        let waiting = plus(t.unsent, !t.unsent_capped);
+        items.push(site_ui::stat("Waiting to send", &waiting, ""));
+        items.push(site_ui::stat("In progress", &n(t.in_progress), ""));
+        items.push(site_ui::stat(
+            "Completed, 24 hours",
+            &plus(t.ok_24h, o.day_complete()),
+            "",
+        ));
+    }
+    items.push(site_ui::stat("Volunteers working", &n(o.working_users), ""));
+    items.push(site_ui::stat("Computers working", &n(o.working_hosts), ""));
+    // How old the counts are, so that a pipeline that stopped is not "right now".
+    let age = (now - o.at).max(0);
+    let badge = if age <= 20 * 60 {
+        site_ui::badge(
+            &format!("counted {}", crate::feed::age_text(age)),
+            site_ui::Tone::Good,
+        )
+    } else {
+        site_ui::badge(
+            &format!("stale, counted {}", crate::feed::age_text(age)),
+            site_ui::Tone::Warning,
+        )
+    };
+    let body = format!("<p>{badge}</p>\n{}", site_ui::stats(&items));
+    site_ui::card("Right now", &body)
+}
+
 /// The master URL page. The client finds the scheduler through the
 /// `<link rel="boinc_scheduler">` element, and older clients through the
 /// `<scheduler>` element in a comment (`SCHEDULER_OP::parse_master_file`).
 pub fn master_page(project: &Project) -> String {
+    master_page_with(project, None, 0)
+}
+
+/// [`master_page`] with the headline figures of the rollup (see
+/// `cb_core::stats`) in a card under the join box. The page is cached for
+/// every visitor, so the figures are the project's and nothing on it depends
+/// on who is looking.
+pub fn master_page_with(
+    project: &Project,
+    summary: Option<&crate::stats::Overview>,
+    now: i64,
+) -> String {
     let c = &project.config;
     let sched = scheduler_url(c);
     let head = format!(
@@ -950,9 +1002,9 @@ pub fn master_page(project: &Project) -> String {
         html_escape(&c.long_name)
     );
     body.push_str(&site_ui::card_accent("Join this project", &join));
-    // Summary cards of the dashboard pages go here: `site_ui::stats` or a
-    // `site_ui::grid` of `site_ui::card`s, built from data the page already
-    // has, so that this page stays cheap and cacheable.
+    if let Some(o) = summary {
+        body.push_str(&summary_card(o, now));
+    }
     body.push_str(&site_ui::card("Explore", &site_ui::link_list(&links)));
     let mut apps = Vec::new();
     for av in &project.catalog.app_versions {

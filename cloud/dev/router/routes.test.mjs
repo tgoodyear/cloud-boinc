@@ -29,6 +29,10 @@ for (const short of SHORTS) {
       [`/${short}/`]: "WEB",
       [`/${short}/home.php`]: "WEB",
       [`/${short}/get_project_config.php`]: "WEB",
+      [`/${short}/work.php`]: "WEB",
+      [`/${short}/activity.php`]: "WEB",
+      [`/${short}/top_users.php`]: "WEB",
+      [`/${short}/top_hosts.php`]: "WEB",
       // The native paths keep their Workers.
       "/sched": "SCHEDULER",
       "/upload/file_upload_handler": "FILES",
@@ -51,6 +55,7 @@ for (const short of SHORTS) {
       [`/${short}?x=1`]: "WEB",
       [`/${short}/?x=1`]: "WEB",
       [`/${short}/home.php?x=1`]: "WEB",
+      [`/${short}/top_users.php?sort=valid_results&page=2`]: "WEB",
       "/sched?x=1": "SCHEDULER",
       "/upload/file_upload_handler?x=1": "FILES",
       "/download/wu_1_0?x=1": "FILES",

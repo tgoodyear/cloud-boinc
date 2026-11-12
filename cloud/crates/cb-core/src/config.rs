@@ -117,6 +117,13 @@ pub struct Config {
     pub max_upload_nbytes: f64,
     /// Days to keep finished workunits before they are purged; 0 keeps them.
     pub purge_days: f64,
+    /// An `https` URL of a JSON document the project publishes for the panels
+    /// on `work.php` (see `cloud/docs/dashboard-feed.md`). Empty: no panels.
+    pub dashboard_feed_url: String,
+    /// Whether every computer is listed under its owner's name, whatever the
+    /// owner chose with `show_hosts`. On by default, unlike upstream, where
+    /// `show_hosts` decides (`<host_owner_public>0</host_owner_public>` brings that back).
+    pub host_owner_public: bool,
     /// Upstream's `uldl_dir_fanout`: the number of hash directories of a
     /// stock server's download hierarchy, 0 for none. Used only with
     /// [`Config::stock`], which is where it takes effect.
@@ -185,6 +192,8 @@ impl Default for Config {
             max_granted_credit: 200.0 * 1000.0 * 365.0,
             max_upload_nbytes: 100e6,
             purge_days: 0.0,
+            dashboard_feed_url: String::new(),
+            host_owner_public: true,
             uldl_dir_fanout: 0,
             stock: None,
         }
@@ -480,6 +489,23 @@ static OPTIONS: &[ConfigOption] = &[
     option!("max_granted_credit", Double, c.max_granted_credit),
     option!("max_upload_nbytes", Double, c.max_upload_nbytes),
     option!("purge_days", Double, c.purge_days),
+    ConfigOption {
+        name: "dashboard_feed_url",
+        kind: OptionKind::Str,
+        set: |p, v| {
+            // The panels' feed is fetched from the project's own Worker, so
+            // an address that is not `https` is refused where it is set.
+            let url = v.str();
+            if !url.is_empty() && !crate::feed::valid_https_url(&url) {
+                return Err(CoreError::Invalid(
+                    "config: <dashboard_feed_url> must be an https URL".into(),
+                ));
+            }
+            p.c.dashboard_feed_url = url;
+            Ok(())
+        },
+    },
+    option!("host_owner_public", Bool, c.host_owner_public),
     option!("uldl_dir_fanout", Int, c.uldl_dir_fanout),
     option!("stock_short_name", Str, spec.short_name),
     option!("stock_cgi_prefix", Str, spec.cgi_prefix),

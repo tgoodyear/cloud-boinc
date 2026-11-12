@@ -88,6 +88,8 @@ pub struct User {
     pub previous_email_addr: String,
     /// When the address was last changed through the site with email on.
     pub email_addr_change_time: i64,
+    /// Tasks that passed validation, for the leaderboards.
+    pub valid_results: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

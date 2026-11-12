@@ -1191,6 +1191,8 @@ fn samples(tag: &str, kind: OptionKind) -> (&'static str, &'static str) {
     match (tag, kind) {
         ("homogeneous_redundancy", _) => ("1", "2"),
         ("enable_delete_account", _) => ("1", "2"),
+        // An https address: the loader refuses any other.
+        ("dashboard_feed_url", _) => ("https://example.org/a.json", "https://example.org/b.json"),
         (_, OptionKind::Str) => ("value one", "value two"),
         (_, OptionKind::Bool) => ("1", "0"),
         (_, OptionKind::Double) => ("2.5", "3.5"),
