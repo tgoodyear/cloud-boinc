@@ -1742,7 +1742,7 @@ A person may belong to one team. The pages and the RPC follow upstream's `html/u
 `top_teams.php`, `html/inc/team.inc` and `html/inc/team_types.inc`; the logic is in
 `cloud/crates/cb-core/src/teams.rs` (what a team may hold, the statements, the search) and
 `site_teams.rs` (the pages and `team_lookup.php`), and the web Worker only routes to them. The
-differences from upstream are D18 to D20 in [compatibility.md](compatibility.md).
+differences from upstream are D26 to D28 in [compatibility.md](compatibility.md).
 
 **Data.** `migrations/0009_teams.sql` adds `team` with the columns of `db/schema.sql` that the pages
 and RPCs read: `id`, `create_time`, `userid` (the founder, 0 when that account was deleted), `name`,
@@ -1856,7 +1856,9 @@ user's team (`team.total_credit`, `expavg_credit`, `expavg_time`), each with `up
 transition's batch now joins `team` on `user.teamid`, which costs no statement and finds nothing for an
 account with no team, and each team credited gets one `UPDATE team SET total_credit = total_credit + ?,
 expavg_credit = ?, expavg_time = ?, recent_key = ?` in the batch that writes the host and user, guarded by the
-workunit's commit token like the others. Two accounts of one team in one transition make one update. A grant
+workunit's commit token like the others. Two accounts of one team in one transition make one update. The whole transition of a quorum-1 job
+that earns credit sends 11 statements for an account with no team (reads and writes, in the test's fixture) and 12 for one with a team, in the same
+round trips. A grant
 costs the statements it did, and for an account with a team one more, which writes the team row and its
 two index entries (`team_total_credit`, `team_recent_key`); for an account with no team (`teamid` 0, or a
 team that is gone) it costs nothing more. A test counts both
