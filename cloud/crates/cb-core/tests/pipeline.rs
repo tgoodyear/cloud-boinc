@@ -159,9 +159,13 @@ impl World {
     }
 
     fn transition(&self, wu: i64, now: i64) -> cb_core::pipeline::TransitionReport {
+        self.transition_on(&self.db, wu, now)
+    }
+
+    fn transition_on(&self, db: &dyn Db, wu: i64, now: i64) -> cb_core::pipeline::TransitionReport {
         let random = || self.rand();
         let ctx = Ctx {
-            db: &self.db,
+            db,
             files: &self.files,
             webhook: &NoWebhook,
             config: &self.config,
@@ -1200,4 +1204,215 @@ fn a_transition_that_read_the_tasks_of_a_deleted_account_does_not_commit_over_th
     // And the account is gone.
     assert_eq!(w.scalar("SELECT count(*) FROM user WHERE id = 1"), 0.0);
     assert_eq!(w.scalar("SELECT count(*) FROM user_deletion"), 0.0);
+}
+
+/// One quorum-1 job from dispatch to validation on host 1 (user 1), and what
+/// the transition cost: statements sent and rows written.
+fn credit_one_job(w: &World, name: &str) -> (u64, u64) {
+    let wu = w.submit(name, 1000, 1, 1);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("out"), 0);
+    let (statements, written) = (w.db.statements(), w.db.rows_written());
+    let rep = w.transition(wu, 1200);
+    assert_eq!(rep.results_valid, 1);
+    (
+        w.db.statements() - statements,
+        w.db.rows_written() - written,
+    )
+}
+
+/// Upstream's `grant_credit` (`sched/credit.cpp`) updates the user's team with
+/// the user: the same grant, the same decay. Here that is one more statement in
+/// the transition's batch for an account with a team, and none for one without.
+#[test]
+fn a_grant_goes_to_the_accounts_team_in_one_more_statement() {
+    let without = World::new("trivial");
+    let (base_statements, base_written) = credit_one_job(&without, "j1");
+
+    let with = World::new("trivial");
+    with.db
+        .apply(
+            "INSERT INTO team (id, create_time, userid, name, name_lc, expavg_time, total_credit) \
+             VALUES (7, 1, 1, 'T', 't', 500, 3);\
+             UPDATE user SET teamid = 7 WHERE id = 1;",
+        )
+        .unwrap();
+    assert_eq!(with.scalar("SELECT nusers FROM team WHERE id = 7"), 1.0);
+    let (statements, written) = credit_one_job(&with, "j1");
+    assert_eq!(statements, base_statements + 1);
+    // The team's row and its two index entries (`total_credit`, `recent_key`).
+    assert!(written > base_written && written <= base_written + 3);
+
+    let credit = 2e9 * 100.0 * 200.0 / 86400e9;
+    let user_total = with.scalar("SELECT total_credit FROM user WHERE id = 1");
+    assert!((user_total - credit).abs() < 1e-9);
+    assert!(
+        (with.scalar("SELECT total_credit FROM team WHERE id = 7") - (3.0 + credit)).abs() < 1e-9
+    );
+    // The same average as the user's, brought up to date from the same time
+    // (the team's first sample is at its own `expavg_time`).
+    assert!(with.scalar("SELECT expavg_credit FROM team WHERE id = 7") > 0.0);
+    assert_eq!(
+        with.scalar("SELECT expavg_time FROM team WHERE id = 7"),
+        1200.0
+    );
+    assert!(with.scalar("SELECT recent_key FROM team WHERE id = 7") > -1e8);
+    // Nothing else is touched.
+    assert_eq!(with.scalar("SELECT nusers FROM team WHERE id = 7"), 1.0);
+}
+
+/// An account whose team row is gone is credited as one with no team.
+#[test]
+fn a_missing_team_costs_nothing() {
+    let without = World::new("trivial");
+    let (base_statements, _) = credit_one_job(&without, "j1");
+    let w = World::new("trivial");
+    w.db.apply("UPDATE user SET teamid = 99 WHERE id = 1;")
+        .unwrap();
+    let (statements, _) = credit_one_job(&w, "j1");
+    assert_eq!(statements, base_statements);
+}
+
+/// `team_grant_statement` is `update_average` and `recent_key`, in SQL, for the
+/// first sample, a sample in the same second, ordinary ones and a long idle time.
+#[test]
+fn the_teams_average_in_sql_is_update_average() {
+    use cb_core::avg::{recent_key, update_average, CREDIT_HALF_LIFE};
+    let db = SqliteDb::with_schema().unwrap();
+    // (now, work start, credit); team 1 starts with no average, team 2 with one.
+    let samples = [
+        (1000.0, 900.0, 5.0),
+        (1000.0, 900.0, 5.0),
+        (1100.0, 1000.0, 3.0),
+        (1100.0 + 86400.0 * 3.0, 90000.0, 7.5),
+        (1100.0 + 86400.0 * 3.0 + 1.0, 90000.0, 0.25),
+        (2.0e8, 1.0e8, 100.0),
+        (2.0e8 + 5.0, 1.0e8, 0.0),
+    ];
+    let starts = [(0.0, 0.0), (4.0, 500.0)];
+    for (i, (avg0, time0)) in starts.iter().enumerate() {
+        let id = i as i64 + 1;
+        block_on(db.run(stmt!(
+            "INSERT INTO team (id, create_time, userid, name, name_lc, expavg_credit, expavg_time) \
+             VALUES (?, 1, 1, ?, ?, ?, ?)",
+            id,
+            format!("t{id}"),
+            format!("t{id}"),
+            *avg0,
+            *time0
+        )))
+        .unwrap();
+        let (mut avg, mut time, mut total) = (*avg0, *time0, 0.0);
+        for (now, sent, credit) in samples {
+            update_average(now, sent, credit, CREDIT_HALF_LIFE, &mut avg, &mut time);
+            total += credit;
+            block_on(db.run(cb_core::teams::team_grant_statement(id, now, sent, credit))).unwrap();
+            let row = block_on(db.run(stmt!(
+                "SELECT total_credit, expavg_credit, expavg_time, recent_key FROM team WHERE id = ?",
+                id
+            )))
+            .unwrap()
+            .rows
+            .remove(0);
+            let f = |k: &str| row[k].as_f64().unwrap();
+            let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1.0);
+            assert!(close(f("total_credit"), total), "{id} {now}");
+            assert!(
+                close(f("expavg_credit"), avg),
+                "{id} {now}: {} vs {avg}",
+                f("expavg_credit")
+            );
+            assert_eq!(f("expavg_time"), time, "{id} {now}");
+            assert!(close(f("recent_key"), recent_key(avg, time)), "{id} {now}");
+        }
+    }
+}
+
+/// A transition for a member of a team and another for a member of the same
+/// team that commits between the first one's read and its write: the team keeps
+/// both samples of its average. (An average computed from the row the first one
+/// read would write the first sample over the second.)
+struct Race<'a> {
+    inner: &'a SqliteDb,
+    world: &'a World,
+    wu: i64,
+    fired: Cell<bool>,
+}
+
+#[async_trait(?Send)]
+impl Db for Race<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if !self.fired.get()
+            && stmts
+                .iter()
+                .any(|s| s.sql.starts_with("UPDATE team SET total_credit"))
+        {
+            self.fired.set(true);
+            self.world.transition(self.wu, 1200);
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn concurrent_transitions_for_one_team_lose_no_average_sample() {
+    use cb_core::avg::{update_average, CREDIT_HALF_LIFE};
+    let w = World::new("trivial");
+    w.db.apply(
+        "INSERT INTO user (id, create_time, email_addr, name, authenticator) VALUES (2, 0, 'v@example.com', 'v', 'auth2');\
+         INSERT INTO host (id, create_time, userid) VALUES (4, 0, 2);\
+         INSERT INTO host_app_version (host_id, app_version_id, max_jobs_per_day) VALUES (4, 7, 10);\
+         INSERT INTO team (id, create_time, userid, name, name_lc, expavg_time, expavg_credit) VALUES (7, 1, 1, 'T', 't', 500, 2);\
+         UPDATE user SET teamid = 7;",
+    )
+    .unwrap();
+    let wu_a = w.submit("a", 1000, 1, 1);
+    let wu_b = w.submit("b", 1000, 1, 1);
+    let (ra, rb) = (w.results(wu_a).remove(0), w.results(wu_b).remove(0));
+    w.dispatch(&ra, 1, 1100);
+    w.dispatch(&rb, 4, 1100);
+    w.db.apply("UPDATE result SET userid = 2 WHERE hostid = 4;")
+        .unwrap();
+    w.report(&ra, 1200, Some("out"), 0);
+    w.report(&rb, 1200, Some("out"), 0);
+
+    let race = Race {
+        inner: &w.db,
+        world: &w,
+        wu: wu_b,
+        fired: Cell::new(false),
+    };
+    let rep = w.transition_on(&race, wu_a, 1200);
+    assert!(race.fired.get());
+    assert_eq!(rep.results_valid, 1);
+    let credit = 2e9 * 100.0 * 200.0 / 86400e9;
+    // Both members' credit is in the team, and its average has both samples.
+    assert!((w.scalar("SELECT total_credit FROM team WHERE id = 7") - 2.0 * credit).abs() < 1e-9);
+    let (mut avg, mut time) = (2.0, 500.0);
+    update_average(
+        1200.0,
+        1100.0,
+        credit,
+        CREDIT_HALF_LIFE,
+        &mut avg,
+        &mut time,
+    );
+    update_average(
+        1200.0,
+        1100.0,
+        credit,
+        CREDIT_HALF_LIFE,
+        &mut avg,
+        &mut time,
+    );
+    let stored = w.scalar("SELECT expavg_credit FROM team WHERE id = 7");
+    assert!(
+        (stored - avg).abs() < 1e-9 * avg.max(1.0),
+        "{stored} vs {avg}"
+    );
+    assert_eq!(
+        w.scalar("SELECT expavg_time FROM team WHERE id = 7"),
+        1200.0
+    );
 }

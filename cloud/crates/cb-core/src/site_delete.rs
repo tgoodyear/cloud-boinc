@@ -412,6 +412,20 @@ pub async fn start_deletion(
                 user.id,
                 x
             ),
+            // Teams the account founded have no founder, as `user_erase_team_owner`
+            // in `html/inc/team.inc` leaves a team (it does this for the team the
+            // account is a member of; this covers every team it founded). The
+            // member count moves by the trigger on `user.teamid`.
+            stmt!(
+                "UPDATE team SET userid = 0 WHERE userid = ? AND EXISTS \
+                 (SELECT 1 FROM user_deletion WHERE userid = ? AND gen = ?) \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND authenticator = ?)",
+                user.id,
+                user.id,
+                x,
+                user.id,
+                x
+            ),
         ])
         .await?;
     Ok(out.first().is_some_and(|r| !r.rows.is_empty()))

@@ -36,9 +36,10 @@ pub const CACHE_SECS: u32 = 60;
 /// The dashboard pages. They are the same for every visitor and are served
 /// with `Cache-Control: public`; the Worker also keeps them in the edge cache
 /// under [`public_cache_key`].
-pub const PUBLIC_PATHS: [&str; 4] = [
+pub const PUBLIC_PATHS: [&str; 5] = [
     "/top_users.php",
     "/top_hosts.php",
+    "/top_teams.php",
     "/work.php",
     "/activity.php",
 ];
@@ -107,6 +108,7 @@ pub fn public_cache_key(path: &str, q: &Params) -> Option<String> {
             Sort::parse(str_param(q, "sort")).key(),
             page_param(q)
         )),
+        "/top_teams.php" => Some(crate::site_teams::top_teams_cache_key(q)),
         "/work.php" | "/activity.php" => Some(path.to_string()),
         _ => None,
     }

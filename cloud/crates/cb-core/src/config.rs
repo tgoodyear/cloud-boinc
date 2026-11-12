@@ -124,6 +124,16 @@ pub struct Config {
     /// owner chose with `show_hosts`. On by default, unlike upstream, where
     /// `show_hosts` decides (`<host_owner_public>0</host_owner_public>` brings that back).
     pub host_owner_public: bool,
+    /// `disable_teams` (upstream's `DISABLE_TEAMS` in `project.inc`): no team
+    /// pages, no team in the navigation, and the team RPCs answer an error.
+    /// Off by default.
+    pub disable_teams: bool,
+    /// `disable_team_creation`: the team creation page refuses
+    /// (`html/user/team_create_action.php`).
+    pub disable_team_creation: bool,
+    /// `team_create_need_credit` (upstream's `TEAM_CREATE_NEED_CREDIT` in
+    /// `project.inc`): an account with no credit may not create a team.
+    pub team_create_need_credit: bool,
     /// Upstream's `uldl_dir_fanout`: the number of hash directories of a
     /// stock server's download hierarchy, 0 for none. Used only with
     /// [`Config::stock`], which is where it takes effect.
@@ -194,6 +204,9 @@ impl Default for Config {
             purge_days: 0.0,
             dashboard_feed_url: String::new(),
             host_owner_public: true,
+            disable_teams: false,
+            disable_team_creation: false,
+            team_create_need_credit: false,
             uldl_dir_fanout: 0,
             stock: None,
         }
@@ -506,6 +519,9 @@ static OPTIONS: &[ConfigOption] = &[
         },
     },
     option!("host_owner_public", Bool, c.host_owner_public),
+    option!("disable_teams", Bool, c.disable_teams),
+    option!("disable_team_creation", Bool, c.disable_team_creation),
+    option!("team_create_need_credit", Bool, c.team_create_need_credit),
     option!("uldl_dir_fanout", Int, c.uldl_dir_fanout),
     option!("stock_short_name", Str, spec.short_name),
     option!("stock_cgi_prefix", Str, spec.cgi_prefix),

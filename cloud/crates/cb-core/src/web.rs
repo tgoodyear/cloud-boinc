@@ -371,14 +371,40 @@ pub fn php_urlencode(s: &str) -> String {
 
 /// `am_get_info.php`: an account manager reads the account a key belongs
 /// to. Only the account key itself is accepted, not the weak key, as
-/// upstream (`BoincUser::lookup_auth`). One statement.
+/// upstream (`BoincUser::lookup_auth`). One statement; the account's team
+/// comes with it (a join on `teamid`, which finds nothing for an account with
+/// no team), for `<teamfounder/>`.
 ///
-/// Profiles and teams are not offered, so `has_profile` and `teamid` are 0
-/// and there is no `<teamfounder/>`; `postal_code` is left out as upstream
-/// does by default.
+/// Profiles are not offered, so `has_profile` is 0; `postal_code` is left out
+/// as upstream does by default.
 pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
-    let Some(user) = crate::site::user_by_auth(db, account_key.trim()).await? else {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        #[serde(flatten)]
+        user: User,
+        team_founder: Option<i64>,
+    }
+    let key = account_key.trim();
+    let row: Option<Row> = if crate::site::plausible_account_key(key) {
+        db.run(stmt!(
+            "SELECT u.*, t.userid AS team_founder FROM user u \
+             LEFT JOIN team t ON t.id = u.teamid WHERE u.authenticator = ? AND u.blocked = 0",
+            key
+        ))
+        .await?
+        .first()?
+    } else {
+        None
+    };
+    let Some(Row { user, team_founder }) = row else {
         return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
+    };
+    // `if ($team->userid == $user->id) <teamfounder/>`, after the venue and the
+    // postal code.
+    let founder = if user.teamid > 0 && team_founder == Some(user.id) {
+        "<teamfounder/>\n"
+    } else {
+        ""
     };
     Ok(format!(
         "{XML_HEADER_UTF8}<am_get_info_reply>\n    <success/>\n    <id>{}</id>\n<name>{}</name>\n\
@@ -386,7 +412,7 @@ pub async fn am_get_info(db: &dyn Db, account_key: &str) -> CoreResult<String> {
          <has_profile>0</has_profile>\n<create_time>{}</create_time>\n\
          <global_prefs>\n{}\n</global_prefs>\n<project_prefs>\n{}\n</project_prefs>\n\
          <url>{}</url>\n<send_email>{}</send_email>\n<show_hosts>{}</show_hosts>\n\
-         <teamid>{}</teamid>\n<venue>{}</venue>\n</am_get_info_reply>\n",
+         <teamid>{}</teamid>\n<venue>{}</venue>\n{founder}</am_get_info_reply>\n",
         user.id,
         php_urlencode(&user.name),
         php_urlencode(&user.country),
@@ -420,8 +446,11 @@ pub const MAX_FORM_BYTES: usize = 2 * 3 * crate::prefs::MAX_PREFS_BYTES + 64 * 1
 /// `send_email` and `show_hosts` when given and not empty; `email_addr` when
 /// it differs from the current address; `password_hash` (the client's
 /// `md5(password + email)`) when given. Values are checked before anything is
-/// written, and a refused value changes nothing. `teamid` is accepted and
-/// ignored, since there are no teams; the consent fields are ignored, since
+/// written, and a refused value changes nothing. `teamid` joins the team (when
+/// it takes new members; any other ID changes nothing, as upstream) or, for 0,
+/// quits the current one, in the same `UPDATE` as the other fields (see
+/// `teams::join_statement` for the rules); it is ignored when the project has
+/// `disable_teams` set. The consent fields are ignored, since
 /// there is no consent table. As upstream, a new email address without a new
 /// `password_hash` leaves the stored hash, which was made with the old
 /// address, so the password stops working until it is set again.
@@ -447,9 +476,14 @@ pub async fn am_set_info(
         return Ok(write_error(err::ERR_DB_NOT_FOUND, None));
     };
     let mut update = Stmt::new("");
-    let mut sets: Vec<&str> = Vec::new();
-    let mut set = |col: &'static str, v: cb_db::Value| {
-        sets.push(col);
+    let mut sets: Vec<String> = Vec::new();
+    // A column name, or a whole assignment (it has spaces) with one `?`.
+    let mut set = |col: &str, v: cb_db::Value| {
+        sets.push(if col.contains(' ') {
+            col.to_string()
+        } else {
+            format!("{col} = ?")
+        });
         update.params.push(v);
     };
 
@@ -534,6 +568,24 @@ pub async fn am_set_info(
             set(col, i32::from(v != "0").into());
         }
     }
+    // `teamid`: 0 quits, a team's ID joins it if it takes new members (the
+    // subquery finds nothing for another ID, and the account keeps its team).
+    // Upstream does this before the other changes, with `user_quit_team` and
+    // `user_join_team`; here it is one assignment of the same `UPDATE`, and the
+    // trigger of `migrations/0009_teams.sql` moves the member counts. A value
+    // that is not a number changes nothing.
+    if !config.disable_teams {
+        if let Ok(team_id) = get("teamid").trim().parse::<i64>() {
+            if team_id == 0 {
+                set("teamid", 0.into());
+            } else if team_id > 0 {
+                set(
+                    "teamid = coalesce((SELECT id FROM team WHERE id = ? AND joinable = 1), teamid)",
+                    team_id.into(),
+                );
+            }
+        }
+    }
     let venue = get("venue");
     if !venue.is_empty() {
         if !is_valid_venue(venue) {
@@ -585,7 +637,6 @@ pub async fn am_set_info(
         pepper_passwd_hash(pepper, &password_hash)
     };
     if !sets.is_empty() {
-        let assignments: Vec<String> = sets.iter().map(|c| format!("{c} = ?")).collect();
         let target = if new_email {
             email.as_str()
         } else {
@@ -597,7 +648,7 @@ pub async fn am_set_info(
         let credentials = !password_hash.is_empty() || !email.is_empty();
         // The account key too, every time: a request that authenticated before
         // `reset_account_key.php` replaced it must not write afterwards.
-        let mut guard = String::from(" AND authenticator = ?");
+        let mut guard = String::from(" AND authenticator = ? AND blocked = 0");
         let mut observed: Vec<&str> = vec![user.authenticator.as_str()];
         if credentials {
             guard.push_str(" AND email_addr = ? AND passwd_hash = ?");
@@ -612,7 +663,7 @@ pub async fn am_set_info(
              (SELECT 1 FROM user WHERE email_addr = ? AND id != ?) AND NOT EXISTS \
              (SELECT 1 FROM user WHERE previous_email_addr = ? AND previous_email_addr != '' \
              AND email_addr_change_time > ? AND id != ?) RETURNING id",
-            assignments.join(", ")
+            sets.join(", ")
         );
         update = update.bind(user.id);
         for v in observed {
@@ -993,7 +1044,7 @@ pub fn master_page_with(
     join.push_str(&site_ui::actions(&buttons));
     let links: Vec<(&str, String)> = site_ui::NAV
         .iter()
-        .filter(|i| !i.account)
+        .filter(|i| !i.account && site_ui::shown(project, i))
         .map(|i| (i.label, i.path.to_string()))
         .collect();
     let mut body = format!(
