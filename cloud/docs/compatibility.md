@@ -312,9 +312,9 @@ Apple-silicon Mac was run.
 In the container the clients ran in, `binfmt_misc` was not mounted. `mount -t binfmt_misc`
 worked inside it, and the `qemu-aarch64` and `qemu-arm` handlers were registered there with the
 fix-binary flag from the binaries in the `qemu-user` package, extracted with `dpkg-deb -x`
-without installing it. The clients ran as root in `podman` containers with the host's network, so
-they report the build machine's memory, disk and kernel release (the kernel release is scrubbed in
-the fixtures), and the ARM clients report qemu's processor and features.
+without installing it. The clients ran as root in `podman` containers on the network of the machine
+that ran them, so they report that machine's memory, disk and kernel release (the kernel release is
+scrubbed in the fixtures), and the ARM clients report qemu's processor and features.
 
 #### Application
 
@@ -411,8 +411,9 @@ read by the stock parser: `HOST::parse` and `SCHEDULER_REQUEST::parse` (`dont_us
    client ("each client instance needs its own host record"), is run only when the name, address,
    OS name and CPU model are all present, and also compares the memory. Test:
    `clients_that_share_a_computer_get_a_host_each_only_when_they_say_so`. Items 5 and 6 are fixed in
-   the code; the dev deployment was not updated, so there the i686 and arm64 clients share one host row,
-   and the two starts of the macOS client share another.
+   the code. They were not yet in the dev deployment during the run, which is why the i686 and
+   arm64 clients shared one host row and the two starts of the macOS client shared another; the fix
+   was deployed after the run.
 7. Not a difference. The macOS client looks for `detect_rosetta_cpu` in its data directory and
    adds `x86_64-apple-darwin` to its platforms only when that program runs and exits with status 0
    (`launch_child_process_to_detect_emulated_cpu` in `client/cs_platforms.cpp`). A new data
@@ -599,6 +600,7 @@ echo, the user, host and credit fields, and the `<gui_urls>` and `<rss_feeds>` l
 | D15 | Which unsent results a host is offered | The feeder's cache of `shmem_work_items` results, filled without regard to a host; a cache full of work one host cannot take hides the rest from it | The candidate query carries the host's conditions (version number, pinned and committed versions, plan-class windows, replica rule), and a full window is followed by the next, up to four | A host behind a backlog of work it cannot run still gets what it can. The message logic is D10's and is unchanged. |
 | D16 | `apps.php` | `html/user/apps.php` lists applications with their creation date and recent average GFLOPS, each linking to `apps.php?app_id=` (versions of one application, with GFLOPS) and `apps.php?avid=` (one version's statistics). `apps.php?xml=1` writes the current versions of every application, with names and plan classes as they are stored, under `encoding="ISO-8859-1"`. A login is required when the project sets `REQUIRE_LOGIN`. | One page lists each application with its current versions (platform, version, plan class, creation date). `app_id`, `avid` and the GFLOPS column are not built. `?xml=1` has the same elements and indentation; text is XML-escaped, and the declaration says UTF-8. No login is asked for. Empty plan classes show as `---` on the page. | Stock writes names into the XML unescaped, so a name with `<` or `&` gives a document that does not parse, and a non-ASCII name is written as UTF-8 bytes under a Latin-1 declaration. A tool that reads the XML sees the same values for names without those characters. The page reads the catalog the Worker loads with the settings, so a new version shows within 30 seconds. See "Applications page and unknown paths" in [architecture.md](architecture.md). |
 | D17 | The computer page, `show_host_detail.php`: the rows for coprocessors, virtualization, Docker and BOINC version | `html/inc/host.inc` reads the JSON in `host.misc` (`gpu_desc`, `vbox_desc`, `docker_desc`, `boinc_version`): each GPU as count, model, memory, driver (for an Apple GPU, the Metal support value) and OpenCL level, VirtualBox with its acceleration flags, "Docker" or "Podman" with the version, the WSL distribution and "Config: don't use Docker" or WSL when the client's config says so, the client version and brand | The rows are read from the summary string in `host.serialnum`: each GPU as `[count] type (memory)`, the VirtualBox and Docker versions alone, the client version alone | The scheduler writes both columns on every request (`host.misc` as D14 says). An Apple-silicon Mac with an M1 shows "[1] apple_gpu (12124MB)" and Docker "6.1.4", where stock shows the model, memory, driver and OpenCL level, and "Podman version 6.1.4" with "Config: don't use Docker" below it. The other rows are the same. Not fixed. |
+| D18 | The random noise `version_select_random_factor` adds to a version's speed when the scheduler picks among versions of an app (default 1) | `get_app_version` in `sched/sched_version.cpp`: the speed is multiplied by `r = 1 + factor * N / n`, `N` a normal sample and `n` the number of samples in the host's `host_app_version` row for the version (at least 1), and `r` is kept at 0.1 or more | `handle_request` in `cloud/crates/cb-core/src/scheduler.rs` multiplies the speed by `1 + 0.1 * factor * N`, with no `n` and no floor | The noise here has the same spread, a tenth of the factor, for every host. In stock the spread is the factor divided by `n`: ten times larger than here for a host with no samples, equal at ten samples, smaller after that. With two versions of nearly equal speed the choice is therefore random more often here for a host that has run them a good deal, and less often for a new host. A project that sets the option to 0 sees no difference. Not fixed: stock's other use of `n` in the same function (the speed of a version the host has run is blended with the plan class's estimate by `n`, and a version that fails on the host is penalized) has no counterpart here either, so matching the noise alone would not make the choice the same. |
 
 ### Differences found, and what was done
 

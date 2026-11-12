@@ -956,6 +956,335 @@ fn a_host_with_the_clients_cpid_that_is_another_computer_is_not_reused() {
     assert!(more > 0 && more != a.hostid && more != arm);
 }
 
+// ---- Which host a request is ------------------------------------------------
+//
+// `authenticate_user` in `sched/handle_request.cpp`. The label `didnt_find_host` is where a
+// host ID of another account and a stale `rpc_seqno` go: it skips `find_host_by_cpid`, runs
+// `find_host_by_other` (not for a client that is one of several), and then makes a host. A
+// request with no host ID, or one that names no host, goes through `find_host_by_cpid` first
+// (`lookup_user_and_make_new_host`). Whichever host is found or made is stored with
+// `rpc_seqno` 0 and named in the reply.
+
+const IP_A: &str = "<ip_addr>198.51.100.7</ip_addr>\n";
+const MULTIPLE: &str = "<allow_multiple_clients>1</allow_multiple_clients>\n";
+
+/// A computer `a` of the account that has sent an address.
+fn computer_with_address(w: &World) -> Req {
+    let mut a = w.computer("a");
+    a.host_extra = IP_A.into();
+    a.work_secs = 0.0;
+    a.seqno = 6;
+    assert_eq!(w.rpc(&a, 1500).host_id, a.hostid);
+    a
+}
+
+/// Another computer of the account with the same kind of hardware, without an address.
+fn twin(w: &World, cpid: &str) -> Req {
+    let mut b = w.computer(cpid);
+    b.work_secs = 0.0;
+    b
+}
+
+/// A copy of `a`'s state file on another computer: `a`'s host ID with a sequence number below
+/// the one stored for it (which is set to 6 here).
+fn stale(w: &World, a: &Req) -> Req {
+    w.sql(&format!(
+        "UPDATE host SET rpc_seqno = 6 WHERE id = {}",
+        a.hostid
+    ));
+    let mut c = a.clone();
+    c.seqno = 2;
+    c
+}
+
+/// The request with the host CPID element changed and nothing else (the domain name of a test
+/// client is its CPID string, so changing `cpid` changes that too).
+fn with_host_cpid(req: &Req, cpid: &str) -> String {
+    req.xml().replace(
+        &format!("<host_cpid>{}</host_cpid>", req.cpid),
+        &format!("<host_cpid>{cpid}</host_cpid>"),
+    )
+}
+
+#[test]
+fn a_seqno_below_the_stored_one_makes_a_new_host_even_when_the_cpid_matches_another() {
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    let b = twin(&w, "b");
+    // The copy has the CPID of the account's other host `b` and no address, so only
+    // `find_host_by_cpid` could match it, and stock does not run that here.
+    let mut copy = stale(&w, &a);
+    copy.cpid = "b".into();
+    copy.host_extra = String::new();
+    let out = w.rpc(&copy, 2000);
+    assert!(out.host_id > 0 && out.host_id != a.hostid && out.host_id != b.hostid);
+    assert_eq!(out.reply.hostid, out.host_id as u64);
+    let made = w.host(out.host_id);
+    assert_eq!(made.userid, 1);
+    assert_eq!(made.rpc_seqno, 0);
+    // The host the copy named is untouched.
+    assert_eq!(w.host(a.hostid).rpc_seqno, 6);
+    // The client takes the new ID and starts from 0: the next requests are that host.
+    let mut next = copy.clone();
+    next.hostid = out.host_id;
+    next.seqno = 0;
+    let again = w.rpc(&next, 2100);
+    assert_eq!(again.host_id, out.host_id);
+    assert_eq!(again.reply.hostid, 0);
+    next.seqno = 1;
+    assert_eq!(w.rpc(&next, 2200).host_id, out.host_id);
+}
+
+#[test]
+fn a_seqno_below_the_stored_one_finds_a_host_by_name_address_os_and_model() {
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    // The copy runs on a computer that looks like `a` (`find_host_by_other`): that host is
+    // used, whatever CPID the copy has, and the reply names it so that the client takes it.
+    let copy = stale(&w, &a);
+    let out = w.rpc_xml(&with_host_cpid(&copy, "other"), 2000);
+    assert_eq!(out.host_id, a.hostid);
+    assert_eq!(out.reply.hostid, a.hostid as u64);
+    assert_eq!(w.host(a.hostid).rpc_seqno, 0);
+    // The same state file on a client that says it is one of several gets a host of its own.
+    let mut shared = stale(&w, &a);
+    shared.top_extra = MULTIPLE.into();
+    let second = w.rpc(&shared, 2100).host_id;
+    assert!(second > 0 && second != a.hostid);
+    // One without an address, or on another model, does not look like `a`.
+    let mut no_ip = stale(&w, &a);
+    no_ip.host_extra = String::new();
+    let third = w.rpc(&no_ip, 2200).host_id;
+    assert!(third != a.hostid && third != second);
+    let mut other_model = stale(&w, &a);
+    other_model.model = "ARMv8 Processor".into();
+    let fourth = w.rpc(&other_model, 2300).host_id;
+    assert!(fourth != a.hostid && fourth != second && fourth != third);
+}
+
+#[test]
+fn a_host_found_by_name_address_os_and_model_loses_its_jobs_unless_the_client_lists_some() {
+    let w = World::new("", "");
+    w.app(1, "a", "");
+    w.version(11, 1, "a", 100, 1, "");
+    w.job("a", "j1", 1000, JobSpec::default());
+    w.job("a", "j2", 1000, JobSpec::default());
+    let mut a = w.computer("a");
+    a.host_extra = IP_A.into();
+    a.seqno = 6;
+    let first = w.rpc(&a, 1500);
+    assert_eq!(first.n_sent, 2, "{:?}", first.reply.messages);
+    // A copy of the state file that lists a job it holds: the jobs stay.
+    let mut copy = stale(&w, &a);
+    copy.work_secs = 0.0;
+    copy.top_extra =
+        "<other_results>\n<other_result>\n<name>j1_0</name>\n</other_result>\n</other_results>\n"
+            .into();
+    // (A CPID that no host has, so that only `find_host_by_other` can match.)
+    assert_eq!(
+        w.rpc_xml(&with_host_cpid(&copy, "new"), 2000).host_id,
+        a.hostid
+    );
+    for name in ["j1_0", "j2_0"] {
+        assert_eq!(
+            w.result_named(name).server_state,
+            RESULT_SERVER_STATE_IN_PROGRESS
+        );
+    }
+    // One that lists none: the jobs are written off, as `mark_results_over` does.
+    let mut copy = stale(&w, &a);
+    copy.work_secs = 0.0;
+    assert_eq!(
+        w.rpc_xml(&with_host_cpid(&copy, "newer"), 2100).host_id,
+        a.hostid
+    );
+    for name in ["j1_0", "j2_0"] {
+        let r = w.result_named(name);
+        assert_eq!(r.server_state, RESULT_SERVER_STATE_OVER, "{name}");
+        assert_eq!(r.outcome, RESULT_OUTCOME_CLIENT_DETACHED, "{name}");
+    }
+}
+
+/// A computer of another account, known to the project.
+const THEIRS: i64 = 500;
+
+fn host_of_another_account(w: &World) {
+    w.sql("INSERT INTO user (id, create_time, email_addr, name, authenticator, cross_project_id) VALUES (2, 0, 'v@example.com', 'v', 'auth2', 'cpid2')");
+    w.sql("INSERT INTO host (id, create_time, userid, rpc_seqno, host_cpid, domain_name, last_ip_addr, os_name, p_model, m_nbytes) VALUES (500, 0, 2, 0, 'x', 'a', '198.51.100.7', 'Linux', 'Intel(R) Xeon(R) CPU E5-2680 v4', 8e9)");
+}
+
+#[test]
+fn a_host_id_of_another_account_makes_a_new_host_even_when_the_cpid_matches_one_of_the_account() {
+    let w = World::new("", "");
+    host_of_another_account(&w);
+    let a = twin(&w, "a");
+    // The account's own host `a` has the request's CPID and no address is sent, so only
+    // `find_host_by_cpid` could match it: stock goes to `didnt_find_host` and skips it.
+    let mut req = a.clone();
+    req.hostid = THEIRS;
+    req.seqno = 7;
+    let out = w.rpc(&req, 2000);
+    assert!(out.host_id > 0 && out.host_id != THEIRS && out.host_id != a.hostid);
+    assert_eq!(out.reply.hostid, out.host_id as u64);
+    let made = w.host(out.host_id);
+    assert_eq!(made.userid, 1);
+    assert_eq!(made.rpc_seqno, 0);
+    // The other account's host is not touched.
+    let other = w.host(THEIRS);
+    assert_eq!(other.userid, 2);
+    assert_eq!(other.rpc_time, 0);
+}
+
+#[test]
+fn a_host_id_of_another_account_finds_a_host_by_name_address_os_and_model() {
+    let w = World::new("", "");
+    host_of_another_account(&w);
+    let a = computer_with_address(&w);
+    let mut req = a.clone();
+    req.hostid = THEIRS;
+    req.seqno = 7;
+    let out = w.rpc_xml(&with_host_cpid(&req, "other"), 2000);
+    // The account's own host, not the other's, though both look like the request.
+    assert_eq!(out.host_id, a.hostid);
+    assert_eq!(out.reply.hostid, a.hostid as u64);
+    assert_eq!(w.host(THEIRS).rpc_time, 0);
+}
+
+#[test]
+fn a_weak_authenticator_is_not_taken_for_a_host_of_another_account() {
+    let w = World::new("", "");
+    host_of_another_account(&w);
+    let weak = cb_crypto::account::weak_auth(1, "auth1", "");
+    let mut req = w.computer("a");
+    req.work_secs = 0.0;
+    let own = req.hostid;
+    let with_weak = |r: &Req| {
+        r.xml()
+            .replace("<authenticator>auth1<", &format!("<authenticator>{weak}<"))
+    };
+    req.hostid = THEIRS;
+    let out = w.rpc_xml(&with_weak(&req), 2000);
+    assert_eq!(out.host_id, 0);
+    assert!(has_message(&out, "Invalid or missing account key"));
+    // With a host ID of its own account the weak authenticator is accepted.
+    req.hostid = own;
+    assert_eq!(w.rpc_xml(&with_weak(&req), 2100).host_id, own);
+}
+
+#[test]
+fn an_unknown_host_id_is_a_request_with_none_and_the_client_is_told() {
+    // The CPID is looked up first, as for no host ID.
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    let b = twin(&w, "b");
+    let mut with_cpid_of_b = a.clone();
+    with_cpid_of_b.hostid = 9999;
+    with_cpid_of_b.seqno = 0;
+    let out = w.rpc_xml(&with_host_cpid(&with_cpid_of_b, "b"), 2000);
+    assert_eq!(out.host_id, b.hostid);
+    assert_eq!(out.reply.hostid, b.hostid as u64);
+    let note = out
+        .reply
+        .messages
+        .iter()
+        .find(|m| m.message == "Can't find host record")
+        .expect("the message of `authenticate_user`");
+    assert_eq!(note.priority, "low");
+    // Then the other lookup: a CPID nobody has, on the computer of `a`.
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    let mut moved = a.clone();
+    moved.hostid = 9999;
+    moved.seqno = 0;
+    assert_eq!(
+        w.rpc_xml(&with_host_cpid(&moved, "other"), 2000).host_id,
+        a.hostid
+    );
+    // Neither: a new host.
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    let mut stranger = a.clone();
+    stranger.host_extra = String::new();
+    stranger.cpid = "q".into();
+    stranger.hostid = 9999;
+    stranger.seqno = 0;
+    let out = w.rpc(&stranger, 2000);
+    assert!(out.host_id > 0 && out.host_id != a.hostid && out.host_id != 9999);
+    assert!(has_message(&out, "Can't find host record"));
+}
+
+#[test]
+fn no_host_id_looks_up_the_cpid_and_then_the_other_host() {
+    let none = |w: &World, a: &Req, cpid: &str, ip: bool| -> SchedOutcome {
+        let mut r = a.clone();
+        r.hostid = 0;
+        r.seqno = 0;
+        r.host_extra = if ip { IP_A.into() } else { String::new() };
+        w.rpc_xml(&with_host_cpid(&r, cpid), 2000)
+    };
+    // The CPID of `b`, with the address and name of `a`: the CPID is looked up first.
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    let b = twin(&w, "b");
+    let out = none(&w, &a, "b", true);
+    assert_eq!(out.host_id, b.hostid);
+    assert!(!has_message(&out, "Can't find host record"));
+    // A CPID nobody has, with the name, address, OS, model and memory of `a`.
+    let w = World::new("", "");
+    let a = computer_with_address(&w);
+    let _b = twin(&w, "b");
+    assert_eq!(none(&w, &a, "other", true).host_id, a.hostid);
+    // Neither matches.
+    let c = none(&w, &a, "c", false).host_id;
+    assert!(c > 0 && c != a.hostid);
+}
+
+#[test]
+fn a_merged_host_is_followed_to_the_host_it_became() {
+    let w = World::new("", "");
+    let a = twin(&w, "a");
+    // Hosts merged on the web keep the row with no user and the new host's ID in `rpc_seqno`.
+    w.sql(&format!("INSERT INTO host (id, create_time, userid, rpc_seqno) VALUES (600, 0, 0, {}), (601, 0, 0, 600)", a.hostid));
+    let mut req = a.clone();
+    req.hostid = 601;
+    req.seqno = 9;
+    let out = w.rpc(&req, 2000);
+    assert_eq!(out.host_id, a.hostid);
+    // The client is told its new ID.
+    assert_eq!(out.reply.hostid, a.hostid as u64);
+    assert!(!has_message(&out, "Can't find host record"));
+}
+
+#[test]
+fn a_chain_of_merged_hosts_that_is_too_long_or_broken_is_an_unknown_host_id() {
+    let w = World::new("", "");
+    let a = twin(&w, "a");
+    // 700 -> 701 -> ... -> 710 -> `a`.
+    for i in 0..=10 {
+        let next = if i == 10 { a.hostid } else { 701 + i };
+        w.sql(&format!(
+            "INSERT INTO host (id, create_time, userid, rpc_seqno) VALUES ({}, 0, 0, {next})",
+            700 + i
+        ));
+    }
+    let mut req = a.clone();
+    req.seqno = 0;
+    // Eleven links: `authenticate_user` stops after ten, and the CPID lookup finds `a`.
+    req.hostid = 700;
+    let out = w.rpc(&req, 2000);
+    assert!(has_message(&out, "Can't find host record"));
+    assert_eq!(out.host_id, a.hostid);
+    // Ten links are followed.
+    req.hostid = 701;
+    let out = w.rpc(&req, 2100);
+    assert!(!has_message(&out, "Can't find host record"));
+    assert_eq!(out.host_id, a.hostid);
+    // A link to nothing.
+    w.sql("INSERT INTO host (id, create_time, userid, rpc_seqno) VALUES (800, 0, 0, 12345)");
+    req.hostid = 800;
+    assert!(has_message(&w.rpc(&req, 2200), "Can't find host record"));
+}
+
 // ---- Alternate platforms ---------------------------------------------------
 
 const I686: &str = "i686-pc-linux-gnu";
