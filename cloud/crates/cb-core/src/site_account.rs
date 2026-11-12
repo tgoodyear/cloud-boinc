@@ -898,7 +898,11 @@ pub async fn prefs(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         row2(
             &mut b,
             "Computers shown on this site",
-            yes_no(user.show_hosts),
+            if project.config.host_owner_public {
+                "yes, every computer is shown with its owner's name"
+            } else {
+                yes_no(user.show_hosts)
+            },
         );
         row2(
             &mut b,
@@ -1017,15 +1021,29 @@ fn prefs_form_page(
                 checked(flag("send_email", user.send_email))
             ),
         );
-        label_row(
-            &mut b,
-            "show_hosts",
-            "Should this project show your computers on its web site?",
-            &format!(
-                "<input type=\"checkbox\" id=\"show_hosts\" name=\"show_hosts\" value=\"1\"{}>",
-                checked(flag("show_hosts", user.show_hosts))
-            ),
-        );
+        if project.config.host_owner_public {
+            // The choice has no effect here, so it is not offered; the stored
+            // value is sent back unchanged.
+            b.push_str(&format!(
+                "<tr><th scope=\"row\">Your computers</th><td>This project shows every computer with its \
+                 owner's name, so there is nothing to choose.{}</td></tr>\n",
+                if user.show_hosts != 0 {
+                    "<input type=\"hidden\" name=\"show_hosts\" value=\"1\">"
+                } else {
+                    ""
+                }
+            ));
+        } else {
+            label_row(
+                &mut b,
+                "show_hosts",
+                "Should this project show your computers on its web site?",
+                &format!(
+                    "<input type=\"checkbox\" id=\"show_hosts\" name=\"show_hosts\" value=\"1\"{}>",
+                    checked(flag("show_hosts", user.show_hosts))
+                ),
+            );
+        }
         let venue_now = sent.map_or(user.venue.as_str(), |q| str_param(q, "default_venue"));
         let mut select = String::from("<select id=\"default_venue\" name=\"default_venue\">");
         for v in ["", "home", "school", "work"] {

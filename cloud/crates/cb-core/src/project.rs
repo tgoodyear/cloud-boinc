@@ -80,6 +80,13 @@ pub async fn put_setting(db: &dyn Db, name: &str, value: &str, now: i64) -> Core
                     "config: <master_url> must be an http or https URL".into(),
                 ));
             }
+            if !c.dashboard_feed_url.is_empty()
+                && !crate::feed::valid_https_url(&c.dashboard_feed_url)
+            {
+                return Err(CoreError::Invalid(
+                    "config: <dashboard_feed_url> must be an https URL".into(),
+                ));
+            }
             if !c.email_from.is_empty() && !crate::web::is_strict_email(&c.email_from) {
                 return Err(CoreError::Invalid(
                     "config: <email_from> must be one email address".into(),

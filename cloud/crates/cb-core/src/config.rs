@@ -76,6 +76,13 @@ pub struct Config {
     pub max_upload_nbytes: f64,
     /// Days to keep finished workunits before they are purged; 0 keeps them.
     pub purge_days: f64,
+    /// An `https` URL of a JSON document the project publishes for the panels
+    /// on `work.php` (see `cloud/docs/dashboard-feed.md`). Empty: no panels.
+    pub dashboard_feed_url: String,
+    /// Whether every computer is listed under its owner's name, whatever the
+    /// owner chose with `show_hosts`. On by default, unlike upstream, where
+    /// `show_hosts` decides (`<host_owner_public>0</host_owner_public>` brings that back).
+    pub host_owner_public: bool,
 }
 
 impl Default for Config {
@@ -128,6 +135,8 @@ impl Default for Config {
             max_granted_credit: 200.0 * 1000.0 * 365.0,
             max_upload_nbytes: 100e6,
             purge_days: 0.0,
+            dashboard_feed_url: String::new(),
+            host_owner_public: true,
         }
     }
 }
@@ -228,6 +237,8 @@ impl Config {
             take!(xp.parse_double("max_granted_credit") => c.max_granted_credit);
             take!(xp.parse_double("max_upload_nbytes") => c.max_upload_nbytes);
             take!(xp.parse_double("purge_days") => c.purge_days);
+            take!(xp.parse_str("dashboard_feed_url") => c.dashboard_feed_url);
+            take!(xp.parse_bool("host_owner_public") => c.host_owner_public);
             // There are many upstream tags cloud-boinc has no use for.
             xp.skip_unexpected();
         }

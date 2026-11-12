@@ -24,8 +24,10 @@ use crate::mail::{Mail, Mailer};
 use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
 use crate::site_account;
+use crate::site_boards;
 use crate::site_email;
 use crate::site_ui::{self, site_header};
+use crate::site_work;
 use crate::web::{account_creation_refusal, html_escape, page, show_user_xml, weak_account_key};
 use crate::CoreResult;
 
@@ -149,7 +151,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 27] = [
+pub const SITE_PATHS: [&str; 31] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -177,6 +179,10 @@ pub const SITE_PATHS: [&str; 27] = [
     "/validate_email_addr.php",
     "/recover_email.php",
     "/reset_account_key.php",
+    "/top_users.php",
+    "/top_hosts.php",
+    "/work.php",
+    "/activity.php",
 ];
 
 /// Headers every site page is sent with: no framing by another site (the
@@ -221,6 +227,13 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/validate_email_addr.php" => site_email::validate_email_addr(ctx, q).await?,
         "/recover_email.php" => site_email::recover_email(ctx, q).await?,
         "/reset_account_key.php" => site_account::reset_account_key(ctx, q).await?,
+        "/top_users.php" => site_boards::top_users(ctx, q).await?,
+        "/top_hosts.php" => site_boards::top_hosts(ctx, q).await?,
+        "/work.php" => {
+            let feed = site_work::FeedState::without_fetch(&ctx.project.config);
+            site_work::work(ctx, q, &feed).await?
+        }
+        "/activity.php" => site_work::activity(ctx, q).await?,
         _ => return Ok(None),
     }))
 }
@@ -229,7 +242,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
 // Formatting, after `html/inc/util_basic.inc` and `util.inc`.
 
 /// `(year, month, day)` of a day count since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -765,7 +778,7 @@ pub async fn show_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         "Recent average credit",
         &number_format(user.expavg_credit, 2),
     );
-    if user.show_hosts != 0 {
+    if user.show_hosts != 0 || project.config.host_owner_public {
         row2(
             &mut b,
             "Computers",
@@ -811,7 +824,7 @@ fn boinc_version(serialnum: &str) -> String {
 }
 
 /// `gpu_desc`, from the host summary. Escaped.
-fn gpu_desc(serialnum: &str) -> String {
+pub(crate) fn gpu_desc(serialnum: &str) -> String {
     let gpus: Vec<String> = summary_parts(serialnum)
         .into_iter()
         .filter(|p| p.len() == 3 && !matches!(p[0], "BOINC" | "vbox" | "docker"))
@@ -890,7 +903,7 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             let Some(other) = other else {
                 return Ok(error_page(project, 404, "No such user"));
             };
-            if other.show_hosts == 0 {
+            if other.show_hosts == 0 && !project.config.host_owner_public {
                 return Ok(SitePage::html(
                     200,
                     layout(
@@ -1107,7 +1120,7 @@ pub async fn show_host_detail(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
         );
         row2(&mut b, "Location", &html_escape(&h.venue));
     } else {
-        let shown = holder.filter(|u| u.show_hosts != 0);
+        let shown = holder.filter(|u| u.show_hosts != 0 || project.config.host_owner_public);
         row2(
             &mut b,
             "User",

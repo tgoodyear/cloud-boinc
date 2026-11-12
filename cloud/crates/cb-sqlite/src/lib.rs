@@ -41,6 +41,7 @@ impl SqliteDb {
         db.apply(include_str!("../../../migrations/0004_email.sql"))?;
         db.apply(include_str!("../../../migrations/0005_upload_epoch.sql"))?;
         db.apply(include_str!("../../../migrations/0006_homogeneous.sql"))?;
+        db.apply(include_str!("../../../migrations/0008_dashboards.sql"))?;
         Ok(db)
     }
 

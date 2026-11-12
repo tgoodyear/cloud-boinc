@@ -1147,6 +1147,9 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
 
     let mut host_credit: BTreeMap<i64, f64> = BTreeMap::new();
     let mut user_credit: BTreeMap<i64, f64> = BTreeMap::new();
+    // Valid tasks, for the leaderboards' "jobs completed".
+    let mut host_valid: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut user_valid: BTreeMap<i64, i64> = BTreeMap::new();
     for e in &st.events {
         match e {
             HostEvent::Timeout {
@@ -1207,6 +1210,7 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
                         &mut h.expavg_time,
                     );
                     *host_credit.entry(*host_id).or_default() += credit;
+                    *host_valid.entry(*host_id).or_default() += 1;
                 }
                 if let Some(u) = users.get_mut(user_id) {
                     update_average(
@@ -1218,6 +1222,7 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
                         &mut u.expavg_time,
                     );
                     *user_credit.entry(*user_id).or_default() += credit;
+                    *user_valid.entry(*user_id).or_default() += 1;
                 }
                 if let Some(h) = havs.get_mut(&(*host_id, *gavid)) {
                     h.row.max_jobs_per_day += 1;
@@ -1244,11 +1249,12 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         out.push(guarded(
             stmt!(
                 "UPDATE host SET total_credit = total_credit + ?, expavg_credit = ?, expavg_time = ?, \
-                 avg_turnaround = ? WHERE id = ?",
+                 avg_turnaround = ?, valid_results = valid_results + ? WHERE id = ?",
                 *credit,
                 h.expavg_credit,
                 h.expavg_time,
                 h.avg_turnaround,
+                host_valid.get(id).copied().unwrap_or(0),
                 *id
             ),
             wu_id,
@@ -1259,10 +1265,12 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         let u = &users[id];
         out.push(guarded(
             stmt!(
-                "UPDATE user SET total_credit = total_credit + ?, expavg_credit = ?, expavg_time = ? WHERE id = ?",
+                "UPDATE user SET total_credit = total_credit + ?, expavg_credit = ?, expavg_time = ?, \
+                 valid_results = valid_results + ? WHERE id = ?",
                 *credit,
                 u.expavg_credit,
                 u.expavg_time,
+                user_valid.get(id).copied().unwrap_or(0),
                 *id
             ),
             wu_id,
@@ -1298,6 +1306,23 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
             s = s.bind(p);
         }
         out.push(guarded(s.bind(*host_id).bind(*gavid), wu_id, token));
+    }
+    // Tasks written off at their deadline are never returned, so the rollup of
+    // the jobs overview cannot find them; they are counted here, in the batch
+    // that writes them off.
+    let timed_out = st
+        .events
+        .iter()
+        .filter(|e| matches!(e, HostEvent::Timeout { .. }))
+        .count();
+    if timed_out > 0 {
+        out.extend(crate::stats::timeout_statements(
+            ctx.now,
+            st.wu.appid,
+            timed_out as i64,
+            wu_id,
+            token,
+        ));
     }
     Ok(out)
 }

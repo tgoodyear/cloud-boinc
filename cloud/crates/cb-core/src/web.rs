@@ -860,10 +860,40 @@ pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
     )
 }
 
+/// The "Right now" card of the home page: what the project is doing, from the
+/// overview snapshot, with links to the pages behind each figure.
+fn summary_card(o: &crate::stats::Overview) -> String {
+    let n = |v: i64| crate::site::number_format(v as f64, 0);
+    let total = o.apps.iter().find(|a| a.id == 0);
+    let mut items = Vec::new();
+    if let Some(t) = total {
+        let waiting = if t.unsent_capped {
+            format!("{}+", n(crate::stats::UNSENT_COUNT_CAP))
+        } else {
+            n(t.unsent)
+        };
+        items.push(site_ui::stat("Waiting to send", &waiting, ""));
+        items.push(site_ui::stat("In progress", &n(t.in_progress), ""));
+        items.push(site_ui::stat("Completed, 24 hours", &n(t.ok_24h), ""));
+    }
+    items.push(site_ui::stat("Volunteers working", &n(o.working_users), ""));
+    items.push(site_ui::stat("Computers working", &n(o.working_hosts), ""));
+    let body = site_ui::stats(&items);
+    site_ui::card("Right now", &body)
+}
+
 /// The master URL page. The client finds the scheduler through the
 /// `<link rel="boinc_scheduler">` element, and older clients through the
 /// `<scheduler>` element in a comment (`SCHEDULER_OP::parse_master_file`).
 pub fn master_page(project: &Project) -> String {
+    master_page_with(project, None)
+}
+
+/// [`master_page`] with the headline figures of the rollup (see
+/// `cb_core::stats`) in a card under the join box. The page is cached for
+/// every visitor, so the figures are the project's and nothing on it depends
+/// on who is looking.
+pub fn master_page_with(project: &Project, summary: Option<&crate::stats::Overview>) -> String {
     let c = &project.config;
     let sched = scheduler_url(c);
     let head = format!(
@@ -901,9 +931,9 @@ pub fn master_page(project: &Project) -> String {
         html_escape(&c.long_name)
     );
     body.push_str(&site_ui::card_accent("Join this project", &join));
-    // Summary cards of the dashboard pages go here: `site_ui::stats` or a
-    // `site_ui::grid` of `site_ui::card`s, built from data the page already
-    // has, so that this page stays cheap and cacheable.
+    if let Some(o) = summary {
+        body.push_str(&summary_card(o));
+    }
     body.push_str(&site_ui::card("Explore", &site_ui::link_list(&links)));
     let mut apps = Vec::new();
     for av in &project.catalog.app_versions {

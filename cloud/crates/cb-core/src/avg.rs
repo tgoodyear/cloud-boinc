@@ -86,6 +86,16 @@ pub fn update_average(
     *avg_time = now;
 }
 
+/// An average as of `now`: the stored value halved for each `CREDIT_HALF_LIFE`
+/// since it was last updated. The stored one is only brought up to date when
+/// the account or computer earns credit, so a list shows this instead.
+pub fn decayed(avg: f64, avg_time: f64, now: f64) -> f64 {
+    if avg_time <= 0.0 || now <= avg_time {
+        return avg;
+    }
+    avg * (-(now - avg_time) * std::f64::consts::LN_2 / CREDIT_HALF_LIFE).exp()
+}
+
 /// Average in which each value is weighted by the sum of the others, which
 /// reduces the weight of large outliers (`low_average` in `sched/credit.cpp`).
 pub fn low_average(v: &[f64]) -> f64 {
@@ -125,6 +135,14 @@ mod tests {
         assert_eq!(low_average(&[5.0]), 5.0);
         assert!((low_average(&[1.0, 1.0]) - 1.0).abs() < 1e-12);
         assert!(low_average(&[1.0, 1.0, 100.0]) < 34.0);
+    }
+
+    #[test]
+    fn decay_halves_each_week() {
+        assert_eq!(decayed(8.0, 0.0, 1e9), 8.0);
+        assert_eq!(decayed(8.0, 100.0, 50.0), 8.0);
+        assert!((decayed(8.0, 0.0 + 1.0, 1.0 + CREDIT_HALF_LIFE) - 4.0).abs() < 1e-9);
+        assert!((decayed(8.0, 1.0, 1.0 + 2.0 * CREDIT_HALF_LIFE) - 2.0).abs() < 1e-9);
     }
 
     #[test]

@@ -7,8 +7,10 @@
 
 pub mod admin;
 pub mod avg;
+pub mod charts;
 pub mod config;
 pub mod countries;
+pub mod feed;
 pub mod hr;
 pub mod mail;
 pub mod model;
@@ -20,8 +22,11 @@ pub mod purge;
 pub mod scheduler;
 pub mod site;
 pub mod site_account;
+pub mod site_boards;
 pub mod site_email;
 pub mod site_ui;
+pub mod site_work;
+pub mod stats;
 pub mod template;
 pub mod upload;
 pub mod web;

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
 use cb_core::purge::{purge_pass, MAX_PURGE_BATCH};
+use cb_core::stats::rollup_pass;
 use cb_core::CoreResult;
 use cb_worker::{db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Files, BUCKET};
 use worker::{
@@ -141,11 +142,45 @@ async fn purge(env: Env) -> Result<()> {
     Ok(())
 }
 
+/// The counts behind the jobs overview and the charts (`cb_core::stats`).
+/// Runs in the purge trigger's invocation, every five minutes, after the
+/// purge, so that its queries do not come out of the sweep's allowance.
+async fn rollup(env: Env) -> Result<()> {
+    let db = db(&env)?;
+    let project = project(&db).await.map_err(cb_worker::core_err)?;
+    let now = now();
+    // Purged workunits take their tasks with them, so a period that ended
+    // before the purge horizon cannot be counted from what is left.
+    let not_before = if project.config.purge_days > 0.0 {
+        now - (project.config.purge_days * 86_400.0) as i64
+    } else {
+        0
+    };
+    let report = rollup_pass(&db, now, not_before)
+        .await
+        .map_err(cb_worker::core_err)?;
+    if report.ran {
+        console_log!(
+            "rollup: {} periods, {} apps, stmts={} trips={} read={} written={}",
+            report.recounted.len(),
+            report.apps,
+            db.statements(),
+            db.round_trips(),
+            db.rows_read(),
+            cb_db::Db::rows_written(&db),
+        );
+    }
+    Ok(())
+}
+
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if event.cron() == PURGE_CRON {
-        if let Err(e) = purge(env).await {
+        if let Err(e) = purge(env.clone()).await {
             console_error!("purge: {e}");
+        }
+        if let Err(e) = rollup(env).await {
+            console_error!("rollup: {e}");
         }
     } else if let Err(e) = sweep(env).await {
         console_error!("sweep: {e}");

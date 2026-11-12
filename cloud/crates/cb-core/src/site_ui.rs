@@ -23,11 +23,33 @@ pub struct NavItem {
 /// entries that are not `account` ones, then a link to the account page;
 /// the home page lists the same entries as links. Adding a page to the menu
 /// is adding a line here.
-pub const NAV: &[NavItem] = &[NavItem {
-    label: "Server status",
-    path: "server_status.php",
-    account: false,
-}];
+pub const NAV: &[NavItem] = &[
+    NavItem {
+        label: "Jobs",
+        path: "work.php",
+        account: false,
+    },
+    NavItem {
+        label: "Activity",
+        path: "activity.php",
+        account: false,
+    },
+    NavItem {
+        label: "Top users",
+        path: "top_users.php",
+        account: false,
+    },
+    NavItem {
+        label: "Top computers",
+        path: "top_hosts.php",
+        account: false,
+    },
+    NavItem {
+        label: "Server status",
+        path: "server_status.php",
+        account: false,
+    },
+];
 
 /// The header of every page: the project name as the home link and the
 /// navigation. It scrolls sideways on a narrow screen instead of wrapping.

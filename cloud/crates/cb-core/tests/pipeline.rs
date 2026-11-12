@@ -283,6 +283,10 @@ fn quorum_one_job_runs_to_deletion() {
     assert!((r.granted_credit - credit).abs() < 1e-9);
     assert!((w.scalar("SELECT total_credit FROM host WHERE id = 1") - credit).abs() < 1e-9);
     assert!((w.scalar("SELECT total_credit FROM user WHERE id = 1") - credit).abs() < 1e-9);
+    // The leaderboards' "jobs completed".
+    assert_eq!(w.scalar("SELECT valid_results FROM host WHERE id = 1"), 1.0);
+    assert_eq!(w.scalar("SELECT valid_results FROM user WHERE id = 1"), 1.0);
+    assert_eq!(w.scalar("SELECT valid_results FROM host WHERE id = 2"), 0.0);
     assert_eq!(
         w.scalar("SELECT avg_turnaround FROM host WHERE id = 1"),
         100.0
@@ -418,6 +422,21 @@ fn timeout_creates_a_replacement_and_penalises_the_host() {
     );
     assert_eq!(
         w.scalar("SELECT turnaround_n FROM host_app_version WHERE host_id = 1"),
+        1.0
+    );
+    // The timeout is counted for the application and for the project, in the
+    // period it happened in; a repeated transition does not count it again.
+    assert_eq!(
+        w.scalar("SELECT timed_out FROM stats_bucket WHERE appid = 1 AND bucket = 0"),
+        1.0
+    );
+    assert_eq!(
+        w.scalar("SELECT timed_out FROM stats_bucket WHERE appid = 0 AND bucket = 0"),
+        1.0
+    );
+    w.transition(wu, 4800);
+    assert_eq!(
+        w.scalar("SELECT sum(timed_out) FROM stats_bucket WHERE appid = 1"),
         1.0
     );
 }

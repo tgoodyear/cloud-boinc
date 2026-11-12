@@ -142,6 +142,24 @@ adds (see step 4 under Email).
 resent task's earlier attempt from its current one; apply it before the scheduler and files
 Workers that use it are deployed.
 
+## Dashboards
+
+`migrations/0008_dashboards.sql` must be applied before the pipeline or web Worker of this build
+is deployed: the pipeline writes `valid_results` and the rollup tables, and the web pages read
+them. It adds a column to `user` and `host` and counts the valid tasks still in the table into
+it (one pass over the tasks of accounts and computers that have credit), builds six leaderboard
+indexes, replaces `res_host_inprog` with one that also holds the application, builds `res_received`
+and `wu_need_validate` unless the per-application server status migration already did, and creates
+`stats_bucket` and `stats_snapshot`. Building `res_received` writes one index row for each task
+ever received that is still in the table, once. The scheduler, files and admin Workers do not name
+the new columns and work before and after.
+
+The pipeline Worker's existing five-minute cron fills in the history: the first pass counts the
+open three-hour period and six more, and each later pass adds six, so the week of charts is
+complete after about ten passes. `work.php` says the counts are not available until the first
+pass has run. To show the project's own figures on `work.php`, set `<dashboard_feed_url>` in the
+config (see [dashboard-feed.md](dashboard-feed.md)).
+
 ## Email
 
 The site's password recovery, address verification and address-change notices
