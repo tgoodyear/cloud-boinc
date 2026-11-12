@@ -318,10 +318,11 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
     if ncouldnt_send > 0 {
         wu.error_mask |= WU_ERROR_COULDNT_SEND_RESULT;
     }
-    // Results with errors and none that succeeded, is in progress or may
-    // still come back: release the workunit's homogeneous redundancy class
-    // and app version, so that other platforms and versions can have a go
-    // (`handle_wu` in `sched/transitioner.cpp`).
+    // A workunit that has results with errors and nothing else to wait for
+    // (no result succeeded, none is in progress, none timed out and may still
+    // come back) gives up its homogeneous redundancy class and app version, so
+    // that other platforms and versions can have a go (`handle_wu` in
+    // `sched/transitioner.cpp`).
     if nerrors > 0 && !(nsuccess > 0 || ninprogress > 0 || nno_reply > 0) && !config.hr_class_static
     {
         wu.hr_class = 0;

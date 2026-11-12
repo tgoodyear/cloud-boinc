@@ -950,6 +950,36 @@ fn withdraw_all_versions(w: &World, how: &str) {
 }
 
 #[test]
+fn the_catalog_keeps_withdrawn_versions_only_of_live_hav_apps() {
+    let w = World::new();
+    // App 5 is deprecated and uses HAV, app 6 is live and does not; each has a
+    // deprecated version, as app 4 (live, HAV) gets below.
+    w.sql(
+        "INSERT INTO app (id, create_time, name, user_friendly_name, validator, deprecated, homogeneous_app_version) \
+         VALUES (5, 0, 'dead', 'D', 'trivial', 1, 1), (6, 0, 'plain2', 'P', 'trivial', 0, 0)",
+    );
+    w.sql(
+        "INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc, plan_class, deprecated) \
+         VALUES (50, 0, 5, 100, 1, '', '', 1), (51, 0, 5, 101, 1, '', '', 0), (60, 0, 6, 100, 1, '', '', 1)",
+    );
+    w.sql(&format!(
+        "UPDATE app_version SET deprecated = 1 WHERE id = {V_MT}"
+    ));
+    let catalog = block_on(Catalog::load(&w.db)).unwrap();
+    let ids = |v: &[cb_core::model::AppVersion]| {
+        let mut ids: Vec<i64> = v.iter().map(|v| v.id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    // Withdrawn: the live HAV app's version only, not those of a deprecated
+    // app or of an app that does not use HAV.
+    assert_eq!(ids(&catalog.retired_versions), vec![V_MT]);
+    // Not withdrawn: as before, including a version of a deprecated app,
+    // which has no app to be sent with.
+    assert_eq!(ids(&catalog.app_versions), vec![7, 8, 9, V_PLAIN, 51]);
+}
+
+#[test]
 fn a_host_with_only_withdrawn_versions_is_still_sent_committed_work() {
     for how in ["deprecated", "below the minimum"] {
         let w = World::new();

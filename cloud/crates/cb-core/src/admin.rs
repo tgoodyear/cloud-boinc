@@ -192,7 +192,9 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
     };
     // NULL keeps the stored value of an existing app, and is 0 for a new one.
     let hr_type = a.homogeneous_redundancy.map_or(Value::Null, Value::from);
-    let hav = a.homogeneous_app_version.map_or(Value::Null, Value::from);
+    let hav = a
+        .homogeneous_app_version
+        .map_or(Value::Null, |b| Value::from(i32::from(b)));
     let rows = db
         .run(stmt!(
             "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, target_nresults, \

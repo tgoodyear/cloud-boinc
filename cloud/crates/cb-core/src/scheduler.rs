@@ -123,8 +123,8 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Everything not deprecated, and the deprecated versions of apps that
-    /// use homogeneous app version.
+    /// Every version not deprecated, and the deprecated versions of apps that
+    /// are not deprecated and use homogeneous app version.
     pub async fn load(db: &dyn Db) -> CoreResult<Catalog> {
         let mut out = db
             .batch(vec![
@@ -132,7 +132,8 @@ impl Catalog {
                 Stmt::new("SELECT * FROM app WHERE deprecated = 0 ORDER BY id"),
                 Stmt::new(
                     "SELECT * FROM app_version WHERE deprecated = 0 OR appid IN \
-                     (SELECT id FROM app WHERE homogeneous_app_version != 0) ORDER BY id",
+                     (SELECT id FROM app WHERE deprecated = 0 AND homogeneous_app_version != 0) \
+                     ORDER BY id",
                 ),
             ])
             .await?
