@@ -1199,6 +1199,14 @@ arguments are escaped by the helper; arguments that are HTML are named `value`, 
 | `empty`, `notice`, `error_note` | An empty list, a message, an error (`class="empty"`, `"notice"`, `"error"`) |
 | `button_link`, `actions`, `link_list` | A link that looks like a button (primary or `secondary`), a wrapping row of buttons, touch-sized link rows |
 
+Every HTML response carries `no-transform` in `Cache-Control` (`html_cache_control` in
+`cloud/crates/cb-core/src/web.rs`, applied in `cloud/workers/web/src/lib.rs`), next to the lifetime
+the page already had. The directive tells a CDN or proxy in front not to rewrite the body, so
+that the master URL page, which clients parse for the scheduler link, and the site pages, which
+hold forms, reach the browser as built. XML replies are not HTML and are unchanged. Pages carry
+a small SVG icon as a data URL, and `/favicon.ico` answers the same SVG with a day's cache
+lifetime for clients that ask for that path.
+
 Plain elements need no class: headings, paragraphs, lists, `code`, `pre`, `details`, and forms
 with labels above the fields. A submit button is the primary button; add `class="secondary"` or
 `class="danger"` for the others. New pages use the CSS variables and no inline `style` attributes.
