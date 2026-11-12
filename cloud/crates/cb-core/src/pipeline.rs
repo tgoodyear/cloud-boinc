@@ -1053,8 +1053,8 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> Checked {
                     let answer = reply
                         .as_ref()
                         .and_then(|rep| rep.results.iter().find(|x| x.id == id));
-                    if let Some(c) = answer
-                        .and_then(|x| webhook_credit(x.credit, ctx.config.max_granted_credit))
+                    if let Some(c) =
+                        answer.and_then(|x| webhook_credit(x.credit, ctx.config.max_granted_credit))
                     {
                         credits.insert(i, c);
                     }

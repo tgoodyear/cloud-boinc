@@ -1566,15 +1566,26 @@ fn an_acknowledged_workunit_can_be_listed_and_reopened_until_deletion_starts() {
     assert_eq!(done.workunits.len(), 1);
     assert_eq!(done.workunits[0].id, wu);
     assert_eq!(
-        done.workunits[0].canonical_result.as_ref().unwrap().files.len(),
+        done.workunits[0]
+            .canonical_result
+            .as_ref()
+            .unwrap()
+            .files
+            .len(),
         1
     );
     // `since` filters on the last change; the ready list does not take it.
-    assert_eq!(ready(&w, AssimilateList::Done, 0, 1300, 10).workunits.len(), 1);
+    assert_eq!(
+        ready(&w, AssimilateList::Done, 0, 1300, 10).workunits.len(),
+        1
+    );
     assert!(ready(&w, AssimilateList::Done, 0, 1301, 10)
         .workunits
         .is_empty());
-    assert_eq!(ready(&w, AssimilateList::Ready, 0, 99999, 10).workunits[0].id, other);
+    assert_eq!(
+        ready(&w, AssimilateList::Ready, 0, 99999, 10).workunits[0].id,
+        other
+    );
 
     let rev = w.wu(wu).rev;
     assert_eq!(
@@ -1639,16 +1650,17 @@ fn a_reopened_workunit_is_not_taken_by_the_purge() {
     let mut config = w.config.clone();
     config.purge_days = 1.0;
     let plan = block_on(plan_purge(&w.db, &config, 1400 + 10 * 86400, 10)).unwrap();
-    assert!(plan.is_none(), "a workunit whose files are kept is not purged");
+    assert!(
+        plan.is_none(),
+        "a workunit whose files are kept is not purged"
+    );
 }
 
 fn webhook_world() -> World {
     let w = World::new("webhook");
-    block_on(
-        w.db.run(stmt!(
-            "UPDATE app SET validator_url = 'https://v.example/check' WHERE id = 1"
-        )),
-    )
+    block_on(w.db.run(stmt!(
+        "UPDATE app SET validator_url = 'https://v.example/check' WHERE id = 1"
+    )))
     .unwrap();
     w
 }
@@ -1722,7 +1734,11 @@ fn webhook_check_set_request_and_credit_override() {
         .collect();
     assert_eq!(
         shape,
-        [("a".to_string(), 0), ("c".to_string(), 2), ("-".to_string(), 3)]
+        [
+            ("a".to_string(), 0),
+            ("c".to_string(), 2),
+            ("-".to_string(), 3)
+        ]
     );
     assert_eq!(files[0]["md5"], "m");
     assert_eq!(files[0]["nbytes"], 1);
