@@ -214,6 +214,7 @@ and the requests they sent were kept as fixtures (`cloud/tests/client-corpus/`, 
 that says how to capture and scrub a new one; the test is
 `cloud/crates/cb-core/tests/client_corpus.rs`). Every client ran in a new data directory, on its
 own GUI RPC port, as a new computer of one test account, on x86-64 Linux (Debian 13), CPU only.
+The same steps were then run for clients of other platforms; see "Other platforms" below.
 
 | Client | Binary | Attached | Work fetched | Jobs validated | Output uploaded | Re-attach in the same data directory |
 |--------|--------|----------|--------------|----------------|-----------------|--------------------------------------|
@@ -292,13 +293,160 @@ The preferences the server reads from `<working_global_preferences>` are the eig
 first to send `<docker_version>` and `<docker_type>` on this host (Podman is installed on that computer);
 the parser reads both.
 
+### Other platforms
+
+The steps above were run again with stock clients of five more kinds, and with the i386 package a
+second way, against the same dev deployment and the same test account, each in a new data directory
+and on its own GUI RPC port. Only what could be run from one x86-64 Linux machine and one
+Apple-silicon Mac was run.
+
+| Client | Platform it names | How it was obtained and run | Jobs validated | Re-attach, same host ID |
+|--------|-------------------|-----------------------------|----------------|-------------------------|
+| 8.0.4 | `i686-pc-linux-gnu` | Debian 13 package `boinc-client` 8.0.4+dfsg-1 for i386, installed with `apt` in an i386 container (`debian:trixie-slim`) and started under `setarch i686`, which makes `uname -m` say i686 | 5 of 5 | yes |
+| 8.0.4 | `aarch64-unknown-linux-gnu` | The same package for arm64, in an arm64 container, run under qemu-user 10.0 | 5 of 5 | yes |
+| 8.0.4 | `arm-unknown-linux-gnueabihf` | The same package for armhf, in a linux/arm/v7 container, under qemu-user | 5 of 6 (item 8) | yes |
+| 8.2.11 | `arm64-apple-darwin` | The macOS client from the BOINC Mac installer, on an Apple-silicon Mac, as a second client instance in a new data directory: `--allow_multiple_clients`, its own GUI RPC port, `-insecure`, one CPU (`max_ncpus_pct` in `global_prefs_override.xml`) | 5 of 5 | yes |
+| 8.2.15 | `windows_x86_64` | The Windows client binary under Wine, not a Windows host: `boinc.exe` of the official 8.2.15 Windows x86-64 installer, taken out of it with 7z without running it, and run by Wine 10.0 (Debian 13) in an amd64 container | 5 of 6 (item 8) | yes |
+| 8.0.4 | `x86_64-pc-linux-gnu`, alternate `i686-pc-linux-gnu` | The i386 package run as it is, on a 64-bit kernel. The project had an app version for `i686-pc-linux-gnu` only | 1 of 1 | not run |
+
+In the container the clients ran in, `binfmt_misc` was not mounted. `mount -t binfmt_misc`
+worked inside it, and the `qemu-aarch64` and `qemu-arm` handlers were registered there with the
+fix-binary flag from the binaries in the `qemu-user` package, extracted with `dpkg-deb -x`
+without installing it. The clients ran as root in `podman` containers with the host's network, so
+they report the build machine's memory, disk and kernel release (the kernel release is scrubbed in
+the fixtures), and the ARM clients report qemu's processor and features.
+
+#### Application
+
+A new app, `upperx`, with one version for each platform, so that the hosts of
+the existing apps are not offered anything new. The Linux versions are `cloud/tests/app` built
+static for `i686-unknown-linux-musl`, `aarch64-unknown-linux-musl` and
+`armv7-unknown-linux-musleabihf`. The macOS and Windows versions are `cloud/tests/app/c/upper.c`,
+which does the same, built with the Xcode command line tools (`arm64-apple-darwin`) and with
+mingw-w64 (`x86_64-pc-windows-gnu`). Each was signed and registered with `cboinc version-add`. The
+Windows file is stored as `upperx_1.00_windows_x86_64`, with no `.exe`, which is how `version-add`
+names a main program; Wine ran it. Whether a Windows host runs a main program with no extension
+was not checked.
+
+#### Steps and result
+
+The steps listed above for the 64-bit Linux clients, on every client but
+the last: attach, fetch work,
+download the application and the input file (the client accepted the signature and the MD5 sum),
+run, upload, report, validation and credit, a restart in the middle of a task, a detach and attach
+again, and `boinccmd`'s `--get_project_config` and (not on macOS) `--lookup_account` with a wrong
+password. Every job that was sent and not lost ended valid and canonical. No client logged a parse
+warning, an unrecognized element, a signature complaint, a backoff or an error that the server
+caused. The replies to the first request of the i686, arm64 and armhf clients were equal but for the
+platform in the file names and the `<platform>` elements, and the host ID.
+
+#### What the requests carry
+
+Compared with the 64-bit Linux requests (the set of element paths,
+over the files of the corpus), these differ and nothing else does:
+
+- the macOS client sends `<coprocs>` with a `<coproc_apple_gpu>` (the M1's GPU, with its OpenCL
+  properties), `<product_name>` in `<host_info>`, `<dont_use_docker/>` at the top (the data
+  directory's `cc_config.xml` set `<dont_use_docker>`), and `<final_peak_working_set_size>` in each
+  reported result. It has `<docker_version>` and `<docker_type>` 2 (Podman) in `<host_info>`, and no
+  `<wsl_available>` (8.2 clients do not send it). `p_vendor` is `Apple`, `os_name` is `Darwin` and
+  `os_version` is the kernel's, `27.0.0`;
+- the Windows client sends `<alt_platform>` with `windows_intelx86`, an empty `<wsl>` in
+  `<host_info>`, `os_name` "Microsoft Windows 10" and an `os_version` of the form "Ultimate N x64
+  Edition, (10.00.19043.00)" (Wine's answer). It has no `<docker_version>`, `<docker_type>` or
+  `<final_peak_disk_usage>`, and a task's `<stderr_out>` has no `<stderr_txt>` when the
+  application wrote nothing;
+- the arm64 and armhf clients send the same elements as 8.0.4 on x86-64, with `p_vendor` `ARM` and
+  a `p_model` such as "ARMv8 Processor rev 0 (v8l) [Impl 0x00 Arch 8 Variant 0x0 Part 0x051 Rev
+  0]", which are qemu's, `p_features` from the `/proc/cpuinfo` that qemu writes (for armhf `swp
+  half thumb fast_mult vfp edsp neon ...`), and `<m_cache>` -1;
+- the i686 client's reported results have no `<final_peak_disk_usage>`. Run on a 64-bit kernel
+  with no `setarch`, it names `x86_64-pc-linux-gnu` first and sends `<alt_platform>` with
+  `i686-pc-linux-gnu`.
+
+`unread_elements_are_the_documented_ones` finds no element that the 64-bit Linux clients do not
+already send and the parser ignores: every new element is read by `cb-proto` (the `<wsl>`
+container, with nothing in it, is listed with the other containers in the test). Each is also
+read by the stock parser: `HOST::parse` and `SCHEDULER_REQUEST::parse` (`dont_use_docker`, `dont_use_wsl`) in
+`sched/sched_types.cpp`, and `COPROCS::parse` and `COPROC_APPLE::parse` in `lib/coproc.cpp`. No element is read by the stock parser and ignored here.
+
+#### Differences found
+
+
+1. Not a difference. This is client behaviour that decides which platform is named. A 32-bit client on a
+   64-bit kernel names `x86_64-pc-linux-gnu` as its platform and lists `i686-pc-linux-gnu` after
+   it: `detect_platforms` in `client/cs_platforms.cpp` runs `uname -m` and finds a 64-bit kernel.
+   It reports only `i686-pc-linux-gnu` on a 32-bit kernel, which the i686 run imitates with
+   `setarch i686`. A project with versions for both platforms is served by the platform order of
+   the request (items 2 to 4).
+2. Fixed. Of two versions of an app with the same projected speed, one for the client's primary
+   platform and one for an alternate, this server took the one added first. `get_app_version` in
+   `sched/sched_version.cpp` scans the platforms in the request's order and replaces its choice
+   only by a faster version, so the primary platform's wins. `Version::rank` in
+   `crates/cb-core/src/scheduler.rs` orders equal versions by platform; the tests are
+   `of_two_equal_versions_the_primary_platform_wins` and
+   `a_client_gets_a_version_for_an_alternate_platform_when_its_primary_has_none`. The second shows
+   what the live run did: the i386 package on a 64-bit kernel was sent the i686 version, as the
+   project had no other, ran it, and was credited.
+3. Fixed. `prefer_primary_platform` in the project's config was read and never used. The scan in
+   `get_app_version` stops at the first platform that has a feasible version when it is set.
+   Test: `prefer_primary_platform_stops_at_the_first_platform_with_a_version`.
+4. Fixed. A job with a memory bound above what a 32-bit app can address (3 GiB for a Linux
+   client, 2 GiB for Windows, 4 GiB for macOS and Solaris, 2 GiB otherwise) was sent with a version for any platform of the
+   host. `get_app_version` skips platforms with no `64` in their name for such a job
+   (`job_needs_64b`, `max_32b_address_space`, `is_64b_platform`); this server did that only on the
+   anonymous platform. Test: `a_job_too_big_for_a_32_bit_app_goes_only_with_a_64_bit_version`.
+5. Fixed. A request with a host CPID that is the account's, and a host ID of 0, was given the host
+   with that CPID even when it was another computer. `find_host_by_cpid` is followed in
+   `handle_request` by `obviously_different` (processor count, vendor and model, OS name and
+   version), and a host that differs is not used. The CPID of a client is the MD5 of its MAC
+   address and its data directory path, so the first arm64 attempt, which ran in a container with
+   the host's network and the same data directory path as the i686 client, had the same CPID and
+   was given the i686 client's computer. Test: `a_host_with_the_clients_cpid_that_is_another_computer_is_not_reused`.
+6. Fixed. A request with a new CPID was matched to a host of the same name, address, OS and CPU
+   model even when the client said `<allow_multiple_clients>1</allow_multiple_clients>`; the
+   second arm64 attempt, which had a new CPID and the name and model of the host the first one
+   had left behind, got that host again, and so did a second start of the macOS client in a new
+   data directory. `find_host_by_other` in `sched/handle_request.cpp` is not run for such a
+   client ("each client instance needs its own host record"), is run only when the name, address,
+   OS name and CPU model are all present, and also compares the memory. Test:
+   `clients_that_share_a_computer_get_a_host_each_only_when_they_say_so`. Items 5 and 6 are fixed in
+   the code; the dev deployment was not updated, so there the i686 and arm64 clients share one host row,
+   and the two starts of the macOS client share another.
+7. Not a difference. The macOS client looks for `detect_rosetta_cpu` in its data directory and
+   adds `x86_64-apple-darwin` to its platforms only when that program runs and exits with status 0
+   (`launch_child_process_to_detect_emulated_cpu` in `client/cs_platforms.cpp`). A new data
+   directory has none, so the client logged "Emulated CPU detection failed: process exited with
+   status 2: No such file or directory" and named `arm64-apple-darwin` alone; no macOS alternate
+   platform was served. The alternate-platform replay in the test uses the 32-bit Linux client.
+8. Not a difference. The armhf and Windows runs each lost one job: the server sent the job
+   created just before the detach, in the same second as the client's "Resetting project"
+   message, and the client dropped the reply. The job stayed in progress on the old attach, as the
+   stock server would leave it (it marks a host's tasks over after an attach only when the client
+   did not say `<allow_multiple_clients>` and lists no other results). Another job after the re-attach completed the steps.
+9. Not a difference. The macOS client runs `podman machine init` and `podman machine start` while
+   it starts, even with `<dont_use_docker>` set, and says "Docker: version 6.1.4 (podman)" and
+   "Config: don't use Docker"; the request carries both `<dont_use_docker/>` and the Podman
+   version. A plan class with `<docker/>` is not offered to it ("Client config does not allow
+   using Docker", `check_docker`), as in `PLAN_CLASS_SPEC::check`.
+10. D17, not fixed. The computer page (`show_host_detail.php`) describes the host from
+    the summary string in `host.serialnum`, where stock's `html/inc/host.inc` reads the JSON in
+    `host.misc` (`gpu_desc`, `docker_desc`, `vbox_desc`, `boinc_version`). The macOS host shows
+    "[1] apple_gpu (12124MB)" for the GPU and "6.1.4" for Docker, where stock shows the
+    count, model, memory, driver (for an Apple GPU, the Metal support value) and OpenCL level of the GPU, and "Podman version 6.1.4" with a second line "Config: don't use Docker", as the client sent `<dont_use_docker/>`. The CPU
+    type, core count, operating system, memory, cache and speeds are shown as the clients sent
+    them (an arm64 host shows "ARM", then qemu's model; a Windows host "Microsoft Windows 10",
+    then the version string).
+
 ### What this does not cover
 
-- Windows, macOS and Android clients. They need an application version for their platform in the
-  project, or the anonymous platform, and a computer to run on; none was run. They differ in
-  `platform_name`, in `host_info` (for example the `<wsl>` elements the parser reads for
-  Windows) and in the application files they fetch; this is from the parser, not from a capture.
-- 32-bit and aarch64 Linux clients, and GPU hosts with plan classes.
+- Android clients, 32-bit Windows and macOS clients, 32-bit ARM and arm64 clients on real hardware,
+  and a real Windows host: the Windows client ran under Wine, the ARM clients under qemu-user,
+  and the macOS client on one Apple-silicon Mac without the `detect_rosetta_cpu` helper. GPU hosts
+  other than the Apple GPU of the macOS client, which was sent no GPU work, and plan classes.
+- Windows hosts with WSL distributions, and macOS or Linux hosts with Docker: the `<wsl>` and
+  `<docker_*>` elements of such requests are read by the parser, from its own tests, and were not
+  captured.
 - Client behaviour over time: the runs lasted a few minutes each, so backoff after repeated
   failures, daily transfer limits, and client updates were not exercised. The dev project has
   `min_sendwork_interval` 0, so no reply carried a `<request_delay>`.
@@ -450,6 +598,7 @@ echo, the user, host and credit fields, and the `<gui_urls>` and `<rss_feeds>` l
 | D14 | `host.misc` | `host_info_json` in `sched/sched_host.cpp`: strings as they come, cut only by the 64 KiB column | The same layout and key order, strings JSON-escaped and cut at 200 bytes, the whole value held to 8 KiB by dropping the GPU list | A quote in a GPU name gives stock an invalid document; here it parses. Tools that read the JSON see the same keys. |
 | D15 | Which unsent results a host is offered | The feeder's cache of `shmem_work_items` results, filled without regard to a host; a cache full of work one host cannot take hides the rest from it | The candidate query carries the host's conditions (version number, pinned and committed versions, plan-class windows, replica rule), and a full window is followed by the next, up to four | A host behind a backlog of work it cannot run still gets what it can. The message logic is D10's and is unchanged. |
 | D16 | `apps.php` | `html/user/apps.php` lists applications with their creation date and recent average GFLOPS, each linking to `apps.php?app_id=` (versions of one application, with GFLOPS) and `apps.php?avid=` (one version's statistics). `apps.php?xml=1` writes the current versions of every application, with names and plan classes as they are stored, under `encoding="ISO-8859-1"`. A login is required when the project sets `REQUIRE_LOGIN`. | One page lists each application with its current versions (platform, version, plan class, creation date). `app_id`, `avid` and the GFLOPS column are not built. `?xml=1` has the same elements and indentation; text is XML-escaped, and the declaration says UTF-8. No login is asked for. Empty plan classes show as `---` on the page. | Stock writes names into the XML unescaped, so a name with `<` or `&` gives a document that does not parse, and a non-ASCII name is written as UTF-8 bytes under a Latin-1 declaration. A tool that reads the XML sees the same values for names without those characters. The page reads the catalog the Worker loads with the settings, so a new version shows within 30 seconds. See "Applications page and unknown paths" in [architecture.md](architecture.md). |
+| D17 | The computer page, `show_host_detail.php`: the rows for coprocessors, virtualization, Docker and BOINC version | `html/inc/host.inc` reads the JSON in `host.misc` (`gpu_desc`, `vbox_desc`, `docker_desc`, `boinc_version`): each GPU as count, model, memory, driver (for an Apple GPU, the Metal support value) and OpenCL level, VirtualBox with its acceleration flags, "Docker" or "Podman" with the version, the WSL distribution and "Config: don't use Docker" or WSL when the client's config says so, the client version and brand | The rows are read from the summary string in `host.serialnum`: each GPU as `[count] type (memory)`, the VirtualBox and Docker versions alone, the client version alone | The scheduler writes both columns on every request (`host.misc` as D14 says). An Apple-silicon Mac with an M1 shows "[1] apple_gpu (12124MB)" and Docker "6.1.4", where stock shows the model, memory, driver and OpenCL level, and "Podman version 6.1.4" with "Config: don't use Docker" below it. The other rows are the same. Not fixed. |
 
 ### Differences found, and what was done
 

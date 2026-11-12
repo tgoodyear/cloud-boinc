@@ -328,6 +328,10 @@ struct Version<'a> {
     version_num: i32,
     plan_class: &'a str,
     platform: &'a str,
+    /// Where the version's platform is in the client's list: 0 for the primary
+    /// platform, 1 for the first alternate, and so on. `get_app_version` scans the
+    /// platforms in that order. Always 0 for a version of the client's own.
+    rank: usize,
     /// For an anonymous-platform version, how far the client's estimate of
     /// its speed is from ours (`CLIENT_APP_VERSION::rsc_fpops_scale`).
     fpops_scale: f64,
@@ -838,6 +842,37 @@ fn core_version(v: i32) -> i32 {
     }
 }
 
+/// Whether a stored host is obviously not the computer a request describes
+/// (`obviously_different` in `sched/handle_request.cpp`).
+fn obviously_different(h: &Host, hi: &cb_proto::sched_request::HostInfo) -> bool {
+    h.p_ncpus != hi.p_ncpus
+        || h.p_vendor != hi.p_vendor
+        || h.p_model != hi.p_model
+        || h.os_name != hi.os_name
+        || h.os_version != hi.os_version
+}
+
+/// `is_64b_platform` in `sched/sched_types.h`.
+fn is_64b_platform(name: &str) -> bool {
+    name.contains("64")
+}
+
+/// The largest memory bound a job can have and still run in a 32-bit app, by the client's
+/// primary platform (`max_32b_address_space` in `sched/sched_version.cpp`, which looks at
+/// `g_request->platform`).
+fn max_32b_address_space(primary_platform: &str) -> f64 {
+    if primary_platform.contains("windows") {
+        2.0 * GIGA
+    } else if primary_platform.contains("linux") {
+        3.0 * GIGA
+    } else if primary_platform.contains("darwin") || primary_platform.contains("solaris") {
+        4.0 * GIGA
+    } else {
+        // The anonymous platform, which upstream takes to be Windows, and any other.
+        2.0 * GIGA
+    }
+}
+
 /// What an app version would use on this host, with the platform it runs
 /// as; or, when the host cannot run it, what to tell the volunteer.
 fn usage_for<'a>(
@@ -847,11 +882,12 @@ fn usage_for<'a>(
     plan_classes: &PlanClassSpecs,
     plan_host: &PlanHost<'_>,
     hav: Option<&HostAppVersion>,
-) -> Result<(HostUsage, &'a str), Option<&'static str>> {
-    let platform = platforms
+) -> Result<(HostUsage, &'a str, usize), Option<&'static str>> {
+    let rank = platforms
         .iter()
-        .find(|p| p.id == av.platformid)
+        .position(|p| p.id == av.platformid)
         .ok_or(None)?;
+    let platform = platforms[rank];
     // The volunteer is not told that the client is too old for a particular
     // version, as upstream does not say it (`get_app_version`).
     if req.core_client_version < core_version(av.min_core_version) {
@@ -876,7 +912,7 @@ fn usage_for<'a>(
     if !(hu.projected_flops.is_finite() && hu.projected_flops > 0.0) {
         hu.projected_flops = 1e9;
     }
-    Ok((hu, platform.name.as_str()))
+    Ok((hu, platform.name.as_str(), rank))
 }
 
 /// What a version from the client's `app_info.xml` uses on this host
@@ -998,8 +1034,7 @@ fn pick_anonymous(
         if v.appid != app.id || !v.anonymous() {
             continue;
         }
-        // `is_64b_platform` in `sched/sched_types.h`
-        if need_64b && !v.platform.contains("64") {
+        if need_64b && !is_64b_platform(v.platform) {
             continue;
         }
         let row = &rows[&v.gavid];
@@ -1172,15 +1207,26 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             ));
         }
         let n_cpid = lookups.len();
-        if !req.host_info.domain_name.is_empty() {
+        // `find_host_by_other` in `sched/handle_request.cpp`: only when the client has all four
+        // of the name, address, OS and CPU model, and not when it says it is one of several
+        // clients on a computer ("each client instance needs its own host record"), whose
+        // host CPIDs differ by design.
+        let hi = &req.host_info;
+        if req.allow_multiple_clients != 1
+            && !hi.domain_name.is_empty()
+            && !hi.last_ip_addr.is_empty()
+            && !hi.os_name.is_empty()
+            && !hi.p_model.is_empty()
+        {
             lookups.push(stmt!(
                 "SELECT * FROM host WHERE userid = ? AND domain_name = ? AND last_ip_addr = ? \
-                 AND os_name = ? AND p_model = ? ORDER BY id DESC LIMIT 1",
+                 AND os_name = ? AND p_model = ? AND m_nbytes = ? ORDER BY id DESC LIMIT 1",
                 user.id,
-                req.host_info.domain_name.as_str(),
-                req.host_info.last_ip_addr.as_str(),
-                req.host_info.os_name.as_str(),
-                req.host_info.p_model.as_str()
+                hi.domain_name.as_str(),
+                hi.last_ip_addr.as_str(),
+                hi.os_name.as_str(),
+                hi.p_model.as_str(),
+                hi.m_nbytes
             ));
         }
         if !lookups.is_empty() {
@@ -1190,6 +1236,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 }
                 host = r.first()?;
                 if host.is_some() && i < n_cpid {
+                    // A host with the same CPID that is obviously another computer is not
+                    // this one (`obviously_different` in `sched/handle_request.cpp`); the
+                    // CPID is made from the MAC address and the data directory, which a
+                    // cloned machine or a virtual machine image shares.
+                    if host
+                        .as_ref()
+                        .is_some_and(|h| obviously_different(h, &req.host_info))
+                    {
+                        host = None;
+                        continue;
+                    }
                     // The client lost track of its jobs unless it lists
                     // them, or says other clients share the host.
                     results_detached =
@@ -1732,6 +1789,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 version_num: cav.version_num,
                 plan_class: &cav.plan_class,
                 platform: &cav.platform,
+                rank: 0,
                 fpops_scale,
                 hu: HostUsage {
                     projected_flops,
@@ -1768,7 +1826,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 continue;
             }
             let hav = havs.get(&av.id);
-            let (hu, platform) =
+            let (hu, platform, rank) =
                 match usage_for(av, &host_platforms, &req, ctx.plan_classes, &plan_host, hav) {
                     Ok(x) => x,
                     Err(message) => {
@@ -1798,6 +1856,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 version_num: av.version_num,
                 plan_class: &av.plan_class,
                 platform,
+                rank,
                 fpops_scale: 1.0,
                 hu,
                 gpu,
@@ -1807,10 +1866,14 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             });
         }
     }
+    // The fastest first; of two equal ones the version of the platform the client lists
+    // first (`get_app_version` scans the platforms in order and replaces its choice only
+    // by a version that is faster), then the earlier in the catalog (the sort is stable).
     versions.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.rank.cmp(&b.rank))
     });
 
     let mut too_recent = false;
@@ -2316,7 +2379,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     havs.get(&av.id),
                 )
                 .ok()
-                .map(|(hu, platform)| Sending {
+                .map(|(hu, platform, _)| Sending {
                     av_id: av.id,
                     result_av_id: av.id,
                     gavid: av.id,
@@ -2570,6 +2633,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                         continue;
                     }
                 }
+                // A job that needs more address space than a 32-bit app has goes only with
+                // a version for a platform whose name has "64" in it, and the platform
+                // that sets the limit is the client's primary one: the first test in the
+                // scan of `get_app_version`, which a workunit committed to a version
+                // (`check_homogeneous_app_version`) does not reach.
+                let committed = hom.hav && c.wu.app_version_id != 0;
+                let need_64b = c.wu.rsc_memory_bound > max_32b_address_space(&req.platform_name);
                 let admitted = |v: &Version<'_>| {
                     v.appid == c.wu.appid
                         && match v.av {
@@ -2585,14 +2655,15 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                                 // unpinned one with a version that is
                                 // (`get_app_version` in
                                 // `sched/sched_version.cpp`).
-                                (if hom.hav && c.wu.app_version_id != 0 {
+                                (if committed {
                                     c.wu.app_version_id == av.id
                                 } else if c.wu.app_version_num != 0 {
                                     !v.commit_only
                                 } else {
                                     !v.pinned_only
-                                }) && (c.wu.app_version_num == 0
-                                    || av.version_num == c.wu.app_version_num)
+                                }) && (committed || !need_64b || is_64b_platform(v.platform))
+                                    && (c.wu.app_version_num == 0
+                                        || av.version_num == c.wu.app_version_num)
                                     && ctx.plan_classes.admits_workunit(
                                         &av.plan_class,
                                         c.wu.id,
@@ -2703,8 +2774,36 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                             (i, pt, est_secs(&c.wu, &versions[i].hu, pt))
                         });
                 } else {
+                    // `prefer_primary_platform`: the scan of `get_app_version` stops at the
+                    // first platform with a version that passes the checks up to the
+                    // limits, so a later platform's version is used only when none of the
+                    // earlier ones does. Within that platform the search below goes on to
+                    // the next version when the job does not fit one, as it does without
+                    // the option.
+                    let min_rank = if config.prefer_primary_platform {
+                        versions
+                            .iter()
+                            .filter(|v| {
+                                let pt = proc_index(v.hu.proc_type);
+                                let (count, limit) = if v.gpu {
+                                    (n_gpu, gpu_limit)
+                                } else {
+                                    (n_cpu, cpu_limit)
+                                };
+                                let row = &rows[&v.gavid];
+                                admitted(v)
+                                    && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0)
+                                    && row.n_today < row.quota
+                                    && !(limit > 0 && count >= limit)
+                                    && !(total_limit > 0 && n_cpu + n_gpu >= total_limit)
+                            })
+                            .map(|v| v.rank)
+                            .min()
+                    } else {
+                        None
+                    };
                     for (i, v) in versions.iter().enumerate() {
-                        if !admitted(v) {
+                        if !admitted(v) || min_rank.is_some_and(|r| v.rank != r) {
                             continue;
                         }
                         let pt = proc_index(v.hu.proc_type);
@@ -3251,6 +3350,7 @@ mod tests {
             version_num,
             plan_class: "",
             platform,
+            rank: 0,
             fpops_scale: 1.0,
             hu: HostUsage {
                 proc_type: pt,

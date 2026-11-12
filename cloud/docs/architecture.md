@@ -209,8 +209,18 @@ deadline, so neither sends a message.
 2. Batch 1 (read): user by authenticator or weak authenticator, host by ID, config version.
    If the config version changed, reload apps, app versions, platforms, plan classes and
    project settings; otherwise use the copy cached in the isolate.
-3. Authenticate, find or create the host (same rules as `handle_request.cpp`: host ID and
-   `rpc_seqno` checks, CPID match to detect a copied or reset client).
+3. Authenticate, find or create the host (same rules as `handle_request.cpp`). A request whose
+   host ID is one of the account's hosts, with an `rpc_seqno` not below the stored one, gets that
+   host. When no host ID is sent, or it is not the account's, or the `rpc_seqno` is too low, the
+   account's newest host with the request's host CPID is used, unless it is obviously another
+   computer (`obviously_different`: processor count, vendor and model, OS name
+   and version): a CPID is made from the MAC address and the data directory, so two computers
+   cloned from one image share it. Failing that, and unless the client says it is one of several
+   on its computer (`<allow_multiple_clients>`), the newest host with the same name, address, OS
+   name, processor model and memory is used, as `find_host_by_other` does when the request has
+   all of the first four. Otherwise a new host is made. Stock skips the CPID lookup when the host
+   ID is the account's but the `rpc_seqno` is too low (a copied state file) and goes straight to
+   the second search; here the CPID lookup runs for that request too.
 4. Batch 2 (read): reported results by name, this host's in-progress results, its
    `host_app_version` rows.
 5. Find the app versions the host can run: platform match and the host-dependent part of
@@ -238,8 +248,9 @@ deadline, so neither sends a message.
    committed to or pinned to another app version, the client still
    wants work for the version's resource (seconds or idle instances not yet filled by this
    reply, as `need_this_resource` in `sched/sched_version.cpp`), and the version's daily
-   quota and in-progress limits are not used up. Take the fastest version that remains; drop
-   the candidate if none does. A CPU-only request therefore gets the CPU version of an app
+   quota and in-progress limits are not used up. Take the fastest version that remains (of
+   two with the same speed, the one for the platform the client lists first; see "Platforms of a
+   client"); drop the candidate if none does. A CPU-only request therefore gets the CPU version of an app
    that also has a faster GPU version, and so does a request whose GPU share is already
    filled. Then check feasibility with that version (memory, disk, deadline against the
    host's estimated speed and availability) and the replica rule from batch 4 and within
@@ -547,6 +558,34 @@ string, is still written, as `host_summary_regex` reads it.
 carried a fixed 600 seconds before. A request that is too large is answered the same way with
 the default delay. Upstream's other use of the option, the reply while `stop_sched` exists, has
 no counterpart: nothing here stops the scheduler from answering.
+
+### Platforms of a client
+
+A request names a primary platform in `<platform_name>` and may list others in `<alt_platform>`:
+a 64-bit Linux client with 32-bit libraries lists `i686-pc-linux-gnu`, a 32-bit client on a
+64-bit kernel names `x86_64-pc-linux-gnu` first and `i686-pc-linux-gnu` second, an Apple-silicon
+Mac lists `x86_64-apple-darwin` when the helper that detects Rosetta runs, and a Windows client
+lists `windows_intelx86` as an alternate (a 64-bit x86 Windows client). The host's platforms are the ones the project has, primary first, as
+`process_request` in `sched/handle_request.cpp` builds them; the alternates of an anonymous-platform
+client are ignored. A version for any of them can be sent, and `handle_request` in
+`crates/cb-core/src/scheduler.rs` chooses among them as `get_app_version` in
+`sched/sched_version.cpp` does:
+
+- of versions with the same projected speed the one for the earlier platform in the client's list
+  wins (stock scans the platforms in order and replaces its choice only by a faster version), and
+  after that the one added first. The option `version_select_random_factor` defaults to 1, which
+  adds random noise to each speed (here 0.1 times the factor times a normal sample; stock divides
+  the factor by the host's job count for the version instead), so the platform order decides only
+  for a project that sets it to 0.
+- with `prefer_primary_platform`, the scan stops at the first platform that has a version
+  that passes every check before the speed comparison (plan class, preferences, daily quota, jobs
+  in progress, resource wanted, client version), so another platform's version is used only when
+  none of the earlier platform's is.
+- a job whose `rsc_memory_bound` is more than a 32-bit app can address is sent only with a
+  version for a platform with `64` in its name (`is_64b_platform`). The limit is set by the
+  client's primary platform: 3 GiB for Linux, 2 GiB for Windows, 4 GiB for macOS and Solaris, 2 GiB
+  otherwise (`max_32b_address_space`). The rule is not applied to a job already committed to an
+  app version (homogeneous app version): stock returns for that case before it makes the check.
 
 ### Plan classes and admission gates
 
