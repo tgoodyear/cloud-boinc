@@ -52,7 +52,7 @@ flowchart LR
 
   subgraph Cloudflare
     sched[scheduler Worker<br>/sched]
-    files[files Worker<br>/download /upload]
+    files[files Worker<br>/download /upload<br>stock layout paths if set]
     web[web Worker<br>/ and web RPCs]
     admin[admin Worker<br>/admin/v1]
     pipe[pipeline Worker<br>queue consumer + cron]
@@ -979,6 +979,96 @@ Limits:
   uploads work but restart from byte 0. A size query sent right after a drop can report less
   than the Worker goes on to store.
 
+### Stock URL layout
+
+A project that moves from a stock server keeps its master URL, and every attached client holds
+URLs from that server's layout: the scheduler URL in its project state, and the download and
+upload URLs inside the `<file_info>` elements of work it has already been sent. A task stays in
+client state until it is reported, so those URLs have to keep answering for at least the longest
+`delay_bound` after the move. The stock layout is an option, off by default, that makes the
+Workers answer on those paths as well as on their own. It is set with `stock_*` tags in the
+`config` setting (`StockSpec` and `StockLayout` in `crates/cb-core/src/stock.rs`; the tags are
+read by `Config::parse`).
+
+A server made with `tools/make_project` under the short name `<short>` has these paths
+(`tools/make_project`, `py/Boinc/setup_project.py`):
+
+| What | Path | Setting |
+| --- | --- | --- |
+| Scheduler | `/<short>_cgi/cgi` | `stock_cgi_prefix` |
+| Upload handler | `/<short>_cgi/file_upload_handler` | `stock_upload_prefix`, the directory; the cgi prefix when not given |
+| Downloads | `/<short>/download/<dir>/<name>` | `stock_download_prefix`, and `uldl_dir_fanout` for `<dir>` |
+| User pages and web RPCs | `/<short>/<page>.php` | `stock_page_prefix` |
+
+`stock_short_name` only fills in the defaults above; every prefix can be named, because a project
+may have set `download_url`, `upload_url` or the CGI URL to other paths in its `config.xml`
+(for example a download directory beside the pages, not under them). Without a short name all
+of cgi, download and, optionally, pages must be given. `uldl_dir_fanout` is upstream's tag, so a
+copied `config.xml` can bring it as it is. An empty or `/` page prefix means the pages are
+served at the root only. Prefixes are validated when the setting is stored (`put_setting` parses
+it): a path of letters, digits, `.`, `_`, `-` and `~`, no `..`, and not starting with a path
+the native layout uses (`admin`, `download`, `sched`, `upload`).
+
+Decisions:
+
+- **Where the setting lives.** In the stored project config, next to the other options, not in
+  Worker vars. The scheduler and web Workers already read the config, and the files Worker reads
+  it through `cb_worker::config`, one statement for the `config` row, cached in the isolate for
+  30 seconds like the project settings. All three see one value, and changing it is a
+  `config-put`, not a redeploy of every Worker, where vars could differ between Workers. The
+  files Worker tries the native paths first (`route_files(path, None)`), so the default
+  deployment pays no database read for a download or an upload.
+- **Downloads map to the stored object.** `<download prefix>/<dir>/<name>` serves `download/<name>`
+  from the bucket, with range requests and `HEAD` as before. `<dir>` is verified against the
+  hash: `filename_dir` computes what `filename_hash` in `sched/sched_util_basic.cpp` does (the
+  lowercase hex of hex digits 1 to 7 of the MD5 of the name, modulo the fanout), and a wrong,
+  missing or extra directory is a 404, as on a stock server where the file is not at that path.
+  Verifying also means one object has one URL, so a client cannot make many cache keys for it.
+  With `uldl_dir_fanout` 0 the URL is `<prefix>/<name>`.
+- **Upload handler.** The stock path takes every request kind the native one does (size query,
+  upload, resume); the Worker's code does not look at the path after routing. The upload
+  certificate holds the file name and size limit and no URL, so it is unaffected.
+- **Scheduler.** `route_scheduler` accepts `/sched*` and, with the layout, exactly
+  `<cgi prefix>/cgi`. A scheduler request body does not depend on the URL.
+- **What new replies advertise.** With a stock layout set, `stock_advertise` defaults to on: the
+  master page's `boinc_scheduler` link is the stock scheduler URL, and the `<url>` of new app
+  version files, workunit inputs and result outputs are the stock download and upload URLs (with
+  the hash directory), unless `download_url` or `upload_url` is set explicitly. A client reads the master page
+  again only after ten consecutive scheduler failures (`SCHEDULER_OP::project_rpc_backoff` and
+  `MASTER_FETCH_PERIOD` in `client/scheduler_op.cpp`) and then replaces its scheduler URLs with
+  the page's (`update_urls`). Advertising the stock URL means that refresh keeps the URL the
+  client already had, and new work looks like the old. `<stock_advertise>0</stock_advertise>`
+  advertises the native URLs (`<master_url>sched`, `/download/`, `/upload/`) while the stock
+  paths keep answering; the way to move a project to the native layout once the old work is
+  gone. If the native download URL happens to be the stock one (master URL `/<short>/` and
+  `download_url` left at its default), it is the stock one and gets the hash directory,
+  because that is the only path under it that is served.
+- **Stored XML.** `app_version.xml_doc`, `workunit.xml_doc` and `result.xml_doc_in` imported from
+  a stock server carry the stock URLs, and serving the stock paths is what keeps them working;
+  nothing is rewritten. The places that read a file URL were checked: the file deletion step
+  deletes a workunit's download only when its `<url>` is one of this project's download
+  directories (`Config::is_own_download_url`: the configured one, the native one and the stock
+  one, with scheme and host case ignored), so a file with a stock URL is deleted with its
+  workunit and one on another host is not; `no_delete` is read from the `<file_info>`
+  whatever its URL; `output_files` takes an output as uploadable when its URL contains
+  `file_upload_handler`, which the stock handler URL does; upload certificates carry no URL.
+- **Pages.** `route_web` takes `<page prefix>/<page>` to the same handlers as `/<page>`; both
+  answer, so a master URL of the host root or of `/<short>/` works. `/<short>` without the slash
+  is redirected to `/<short>/` (301), as a web server does for a directory. The pages' links are
+  relative (`home.php`), so they stay under the prefix a visitor came in on. Redirects and the
+  login cookie follow the request: `SiteCtx::base` is the master URL for a request at the root,
+  and the prefix on the master URL's host for a request under it, so a sign-in under
+  `/<short>/` redirects there and the cookie's `Path` is `/<short>/`; at the root it is the
+  master URL's path as before. Text that leaves the site (email links, the weak-key instructions)
+  keeps naming the master URL, which is what clients attach to. The static pages (master
+  page, `get_project_config.php`) are cached per URL.
+
+Differences from the stock server: `/<short>_ops/` (the PHP operations pages, replaced by the
+admin API), `/<short>/stats`, `/<short>/user_profile` and any other script under the CGI
+directory (`get_file`, `sched_ping`, ...) are not served. The `.md5` files a stock download
+directory holds are not. Routes are per path pattern, so a deployment adds them for the
+layout; see `docs/deploy.md`.
+
 ## Keys and secrets
 
 BOINC uses two RSA key pairs in its own key file format, and signs the MD5 of the data with
@@ -1623,4 +1713,6 @@ server.
 
 - Whether the queue is worth keeping once the sweep interval and scheduler-triggered
   transitions are measured.
-- Importing an existing project's MySQL database, and cutting a live master URL over.
+- Importing an existing project's MySQL database, and cutting a live master URL over. The URL
+  layout of a stock project is served as an option (see "Stock URL layout"); the import is not
+  written.

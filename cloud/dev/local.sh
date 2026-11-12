@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs the five Workers behind a router on one local port, with a local D1
 # database, bucket and queue kept under the state directory.
-#   dev/local.sh --state <dir> [--port <n>] [--skip-build]
+#   dev/local.sh --state <dir> [--port <n>] [--skip-build] [--stock-short-name <name>]
 # The first run creates throwaway keys, an admin token and a password pepper
 # in <dir> and writes them to each Worker's .dev.vars. Needs cargo,
 # worker-build and Node.js. The scheduled sweep is not run by wrangler dev;
@@ -11,12 +11,14 @@ cd "$(dirname "$0")/.."
 state=""
 port=8787
 build=1
+stock=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --state) state="$2"; shift 2 ;;
         --port) port="$2"; shift 2 ;;
         --skip-build) build=0; shift ;;
-        *) echo "usage: dev/local.sh --state <dir> [--port <n>] [--skip-build]" >&2; exit 2 ;;
+        --stock-short-name) stock="$2"; shift 2 ;;
+        *) echo "usage: dev/local.sh --state <dir> [--port <n>] [--skip-build] [--stock-short-name <name>]" >&2; exit 2 ;;
     esac
 done
 [ -n "$state" ] || { echo "dev/local.sh: --state is required" >&2; exit 2; }
@@ -48,7 +50,10 @@ umask 022
 [ "$build" = 0 ] || dev/build.sh
 (cd workers/scheduler && npx wrangler d1 migrations apply cloud-boinc-dev --local \
     --persist-to "$state/wrangler")
+# The router sends the stock layout's paths to the Workers when asked to; the
+# config's stock_short_name setting is what makes the Workers answer them.
 exec npx wrangler dev \
+    ${stock:+--var "STOCK_SHORT_NAME:$stock"} \
     -c dev/router/wrangler.toml \
     -c workers/scheduler/wrangler.toml \
     -c workers/files/wrangler.toml \

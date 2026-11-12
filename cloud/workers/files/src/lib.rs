@@ -1,9 +1,11 @@
 //! File transfer: `GET /download/<name>` from the bucket and `POST /upload/file_upload_handler`,
-//! the `file_upload_handler` protocol, with resume (`cb_core::upload`). This Worker holds no
-//! private key.
+//! the `file_upload_handler` protocol, with resume (`cb_core::upload`). With a stock layout in
+//! the config (`cb_core::stock`) the same two answer on the stock server's paths. This Worker
+//! holds no private key.
 
 mod store;
 
+use cb_core::stock::{route_files, FilesRoute};
 use cb_core::upload::{self, is_flat_name, PIECE_BYTES};
 use cb_core::FileKind;
 use cb_proto::upload::{
@@ -11,16 +13,12 @@ use cb_proto::upload::{
     reply_success, UploadError, UploadRequest, MAX_HEADER_BYTES,
 };
 use cb_proto::ProtoError;
-use cb_worker::{db, object_key, project, text, xml, BUCKET};
+use cb_worker::{config, db, object_key, project, text, xml, BUCKET};
 use store::{Body, R2Uploads};
 use worker::{
     console_error, console_log, event, Bucket, Context, Env, Headers, Method, Object, Range,
     Request, Response, Result,
 };
-
-/// A client treats a `<url>` in a `<file_info>` as an upload URL only when it
-/// contains `file_upload_handler`, so the path keeps the stock handler's name.
-const UPLOAD_PATH: &str = "/upload/file_upload_handler";
 
 /// One `bytes=` range of a `Range` header, as first and last byte.
 /// `None`: no usable range, serve the whole object. `Err`: not satisfiable.
@@ -226,10 +224,22 @@ async fn upload(req: Request, env: Env) -> Result<Response> {
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let path = req.path();
+    // The native paths need no setting. Any other path is checked against the
+    // stock layout of the config, which an isolate keeps for a few seconds.
+    let route = match route_files(&path, None) {
+        FilesRoute::NotFound => match config(&db(&env)?).await {
+            Ok(c) => route_files(&path, c.stock.as_ref()),
+            Err(e) => {
+                console_error!("settings: {e}");
+                return text(503, "The project is temporarily unavailable.\n");
+            }
+        },
+        route => route,
+    };
     match req.method() {
-        Method::Get | Method::Head => match path.strip_prefix("/download/") {
-            Some(name) => download(&req, &env.bucket(BUCKET)?, name).await,
-            None => text(404, "not found\n"),
+        Method::Get | Method::Head => match route {
+            FilesRoute::Download(name) => download(&req, &env.bucket(BUCKET)?, name).await,
+            _ => text(404, "not found\n"),
         },
         // The upload runs under `wait_until`: if the client drops the
         // connection while the body streams in, the runtime cancels the
@@ -238,7 +248,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response> {
         // `request_body_buffering` is `none` for the upload path; by default
         // the edge holds the whole body first, so a dropped request never
         // reaches the Worker.
-        Method::Post if path == UPLOAD_PATH => {
+        Method::Post if route == FilesRoute::Upload => {
             let (tx, rx) = futures_channel::oneshot::channel();
             ctx.wait_until(async move {
                 let _ = tx.send(upload(req, env).await);

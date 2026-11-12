@@ -18,6 +18,18 @@ zone_name = "usnewsmap.com"
 pattern = "boinc-dev.usnewsmap.com/upload*"
 zone_name = "usnewsmap.com"
 
+# Stock server URL layout (docs/deploy.md, "Stock layout routes"): uncomment, and
+# replace `example` with the project's short name, to answer the stock upload handler
+# and download paths. The download path is under the pages' path, so it must be a
+# route of its own: the more specific pattern wins over the web Worker's `/*`.
+# [[routes]]
+# pattern = "boinc-dev.usnewsmap.com/example_cgi/file_upload_handler*"
+# zone_name = "usnewsmap.com"
+#
+# [[routes]]
+# pattern = "boinc-dev.usnewsmap.com/example/download/*"
+# zone_name = "usnewsmap.com"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "cloud-boinc-dev"

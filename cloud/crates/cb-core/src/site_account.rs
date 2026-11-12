@@ -138,13 +138,13 @@ fn passwd_input(name: &str, label: &str, autocomplete: &str) -> String {
 pub async fn logout(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(SitePage::redirect(project.config.master_url.clone()));
+        return Ok(SitePage::redirect(ctx.base.to_string()));
     };
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
     }
-    let mut out = SitePage::redirect(project.config.master_url.clone());
-    out.set_cookie = Some(logout_cookie(project));
+    let mut out = SitePage::redirect(ctx.base.to_string());
+    out.set_cookie = Some(logout_cookie(ctx.base));
     Ok(out)
 }
 
@@ -281,8 +281,8 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
         }
     }
     let next = local_url(str_param(q, "next_url")).unwrap_or("home.php");
-    let mut out = SitePage::redirect(format!("{}{next}", project.config.master_url));
-    out.set_cookie = Some(login_cookie(project, &authenticator, true));
+    let mut out = SitePage::redirect(format!("{}{next}", ctx.base));
+    out.set_cookie = Some(login_cookie(ctx.base, &authenticator, true));
     Ok(out)
 }
 
@@ -293,7 +293,7 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
 pub async fn edit_user_info_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "edit_user_info_form.php"));
+        return Ok(to_login(ctx.base, "edit_user_info_form.php"));
     };
     let mut b = format!(
         "<form method=\"post\" action=\"edit_user_info_action.php\">\n{}<table>\n",
@@ -342,7 +342,7 @@ pub async fn edit_user_info_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
 pub async fn edit_user_info_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "edit_user_info_form.php"));
+        return Ok(to_login(ctx.base, "edit_user_info_form.php"));
     };
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
@@ -394,10 +394,7 @@ pub async fn edit_user_info_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
             "The account changed meanwhile; please try again.",
         ));
     }
-    Ok(SitePage::redirect(format!(
-        "{}home.php",
-        project.config.master_url
-    )))
+    Ok(SitePage::redirect(format!("{}home.php", ctx.base)))
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +418,7 @@ fn proves_account(pepper: &[u8], user: &User, given: &str) -> bool {
 pub async fn edit_passwd_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "edit_passwd_form.php"));
+        return Ok(to_login(ctx.base, "edit_passwd_form.php"));
     };
     let mut b = format!(
         "<form method=\"post\" action=\"edit_passwd_action.php\">\n{}",
@@ -453,7 +450,7 @@ pub async fn edit_passwd_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
 pub async fn edit_passwd_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "edit_passwd_form.php"));
+        return Ok(to_login(ctx.base, "edit_passwd_form.php"));
     };
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
@@ -533,7 +530,7 @@ pub async fn edit_passwd_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
 pub async fn edit_email_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "edit_email_form.php"));
+        return Ok(to_login(ctx.base, "edit_email_form.php"));
     };
     let mut b = format!(
         "<form method=\"post\" action=\"edit_email_action.php\">\n{}\
@@ -587,7 +584,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
     let project = ctx.project;
     let mail = ctx.mail();
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "edit_email_form.php"));
+        return Ok(to_login(ctx.base, "edit_email_form.php"));
     };
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
@@ -773,7 +770,7 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
 pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "reset_account_key.php"));
+        return Ok(to_login(ctx.base, "reset_account_key.php"));
     };
     if !ctx.post {
         return Ok(page(
@@ -829,7 +826,7 @@ pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
     );
     // The server does not know how long the cookie it replaces was meant to
     // last (it only gets the value), so this one ends with the browser.
-    out.set_cookie = Some(login_cookie(project, &new_key, false));
+    out.set_cookie = Some(login_cookie(ctx.base, &new_key, false));
     Ok(out)
 }
 
@@ -863,7 +860,7 @@ pub async fn prefs(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     };
     let Some(user) = viewer(ctx).await? else {
         return Ok(to_login(
-            project,
+            ctx.base,
             &format!("prefs.php?subset={}", subset.name()),
         ));
     };
@@ -1064,7 +1061,7 @@ pub async fn prefs_edit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     };
     let Some(user) = viewer(ctx).await? else {
         return Ok(to_login(
-            project,
+            ctx.base,
             &format!("prefs.php?subset={}", subset.name()),
         ));
     };
@@ -1163,7 +1160,7 @@ pub async fn prefs_edit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     }
     Ok(SitePage::redirect(format!(
         "{}prefs.php?subset={}&updated=1",
-        project.config.master_url,
+        ctx.base,
         subset.name()
     )))
 }
@@ -1177,7 +1174,7 @@ pub async fn prefs_remove(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
     };
     let Some(user) = viewer(ctx).await? else {
         return Ok(to_login(
-            project,
+            ctx.base,
             &format!("prefs.php?subset={}", subset.name()),
         ));
     };
@@ -1227,7 +1224,7 @@ pub async fn prefs_remove(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
     }
     Ok(SitePage::redirect(format!(
         "{}prefs.php?subset={}",
-        project.config.master_url,
+        ctx.base,
         subset.name()
     )))
 }

@@ -117,6 +117,12 @@ impl SitePage {
 pub struct SiteCtx<'a> {
     pub db: &'a dyn Db,
     pub project: &'a Project,
+    /// The URL, with a trailing slash, of the directory the request was
+    /// served from. Redirects go there and the login cookie applies to its
+    /// path. It is the master URL, or the stock page prefix on the master
+    /// URL's host for a request that came in under that prefix, so a visitor
+    /// stays under the URL they used. Links inside pages are relative.
+    pub base: &'a str,
     /// The value of the `auth` cookie, if the request carried one.
     pub auth: Option<&'a str>,
     /// Whether the request is a POST; passwords are taken from a POST only.
@@ -426,9 +432,9 @@ pub fn auth_from_cookie(header: &str) -> Option<String> {
     })
 }
 
-/// The path of the master URL, where the cookie applies (`send_cookie`).
-fn cookie_path(project: &Project) -> String {
-    let url = &project.config.master_url;
+/// The path of the base URL, where the cookie applies (`send_cookie`).
+fn cookie_path(base: &str) -> String {
+    let url = base;
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     match rest.find('/') {
         Some(i) => rest[i..].to_string(),
@@ -437,7 +443,7 @@ fn cookie_path(project: &Project) -> String {
 }
 
 /// `Set-Cookie` value that logs a browser in.
-pub fn login_cookie(project: &Project, authenticator: &str, permanent: bool) -> String {
+pub fn login_cookie(base: &str, authenticator: &str, permanent: bool) -> String {
     let lifetime = if permanent {
         format!("; Max-Age={PERMANENT_COOKIE_SECS}")
     } else {
@@ -445,15 +451,15 @@ pub fn login_cookie(project: &Project, authenticator: &str, permanent: bool) -> 
     };
     format!(
         "{AUTH_COOKIE}={authenticator}; Path={}; HttpOnly; Secure; SameSite=Lax{lifetime}",
-        cookie_path(project)
+        cookie_path(base)
     )
 }
 
 /// `Set-Cookie` value that logs a browser out.
-pub fn logout_cookie(project: &Project) -> String {
+pub fn logout_cookie(base: &str) -> String {
     format!(
         "{AUTH_COOKIE}=; Path={}; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
-        cookie_path(project)
+        cookie_path(base)
     )
 }
 
@@ -554,12 +560,12 @@ pub async fn login_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
     let Some(user) = user else {
         return Ok(error_page(project, 403, "Login failed."));
     };
-    let mut out = SitePage::redirect(format!("{}{next}", project.config.master_url));
-    out.set_cookie = Some(login_cookie(project, &user.authenticator, permanent));
+    let mut out = SitePage::redirect(format!("{}{next}", ctx.base));
+    out.set_cookie = Some(login_cookie(ctx.base, &user.authenticator, permanent));
     Ok(out)
 }
 
-pub(crate) fn to_login(project: &Project, next: &str) -> SitePage {
+pub(crate) fn to_login(base: &str, next: &str) -> SitePage {
     let next: String = next
         .bytes()
         .map(|b| match b {
@@ -569,10 +575,7 @@ pub(crate) fn to_login(project: &Project, next: &str) -> SitePage {
             _ => (b as char).to_string(),
         })
         .collect();
-    SitePage::redirect(format!(
-        "{}login_form.php?next_url={next}",
-        project.config.master_url
-    ))
+    SitePage::redirect(format!("{}login_form.php?next_url={next}", base))
 }
 
 pub(crate) async fn viewer(ctx: &SiteCtx<'_>) -> CoreResult<Option<User>> {
@@ -589,7 +592,7 @@ pub(crate) async fn viewer(ctx: &SiteCtx<'_>) -> CoreResult<Option<User>> {
 pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "home.php"));
+        return Ok(to_login(ctx.base, "home.php"));
     };
     let weak = weak_account_key(&user);
     let account_file = account_file_name(&project.config.master_url);
@@ -874,7 +877,7 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             (other, false)
         }
         (None, Some(me)) => (me, true),
-        (None, None) => return Ok(to_login(project, "hosts_user.php")),
+        (None, None) => return Ok(to_login(ctx.base, "hosts_user.php")),
     };
 
     let (column, desc) = match sort {
@@ -1557,7 +1560,7 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         )
     } else if let Some(u) = userid {
         let Some(auth) = ctx.auth.filter(|a| plausible_account_key(a)) else {
-            return Ok(to_login(project, &format!("results.php?userid={u}")));
+            return Ok(to_login(ctx.base, &format!("results.php?userid={u}")));
         };
         (
             user_by_auth_stmt(auth),
@@ -1649,7 +1652,7 @@ pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
                 clause = format!("userid={u}");
             }
             Some(_) => return Ok(error_page(project, 403, "No access")),
-            None => return Ok(to_login(project, &format!("results.php?userid={u}"))),
+            None => return Ok(to_login(ctx.base, &format!("results.php?userid={u}"))),
         }
     }
 

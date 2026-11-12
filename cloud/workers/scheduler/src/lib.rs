@@ -1,8 +1,9 @@
 //! `POST /sched`: the scheduler RPC.
 
 use cb_core::scheduler::{handle_request, SchedCtx};
+use cb_core::stock::route_scheduler;
 use cb_proto::sched_reply::write_project_down;
-use cb_worker::{db, enqueue, now, project, random_u32, read_body, text, xml};
+use cb_worker::{config, db, enqueue, now, project, random_u32, read_body, text, xml};
 use worker::{console_error, console_log, event, Context, Env, Method, Request, Response, Result};
 
 /// A scheduler request with a full host description and a few hundred
@@ -16,6 +17,22 @@ fn down(message: &str) -> Result<Response> {
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let path = req.path();
+    if !route_scheduler(&path, None) {
+        // Not the native path: the stock scheduler path answers only when
+        // the config names a stock layout.
+        let db = db(&env)?;
+        let stock = match config(&db).await {
+            Ok(c) => c.stock.clone(),
+            Err(e) => {
+                console_error!("settings: {e}");
+                return text(503, "The project is temporarily unavailable.\n");
+            }
+        };
+        if !route_scheduler(&path, stock.as_ref()) {
+            return text(404, "not found\n");
+        }
+    }
     if req.method() != Method::Post {
         return text(
             200,

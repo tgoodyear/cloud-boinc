@@ -5,6 +5,7 @@
 use cb_proto::xml::XmlParser;
 
 use crate::hr::HR_NTYPES;
+use crate::stock::{comparable_url, url_origin, url_path, FileUrls, StockLayout, StockSpec};
 use crate::{CoreError, CoreResult};
 
 /// Upper bound on the CPU count used to scale per-host limits.
@@ -76,6 +77,13 @@ pub struct Config {
     pub max_upload_nbytes: f64,
     /// Days to keep finished workunits before they are purged; 0 keeps them.
     pub purge_days: f64,
+    /// Upstream's `uldl_dir_fanout`: the number of hash directories of a
+    /// stock server's download hierarchy, 0 for none. Used only with
+    /// [`Config::stock`], which is where it takes effect.
+    pub uldl_dir_fanout: i32,
+    /// The URL layout of a stock server, served in addition to the native
+    /// one. Set by the `stock_*` tags; see [`crate::stock`].
+    pub stock: Option<StockLayout>,
 }
 
 impl Default for Config {
@@ -128,6 +136,8 @@ impl Default for Config {
             max_granted_credit: 200.0 * 1000.0 * 365.0,
             max_upload_nbytes: 100e6,
             purge_days: 0.0,
+            uldl_dir_fanout: 0,
+            stock: None,
         }
     }
 }
@@ -147,6 +157,7 @@ impl Config {
         let mut c = Config::default();
         let mut xp = XmlParser::new(xml);
         let mut in_config = false;
+        let mut spec = StockSpec::default();
         while xp.get_tag() {
             if !xp.is_tag() {
                 continue;
@@ -158,6 +169,7 @@ impl Config {
                 continue;
             }
             if xp.match_tag("/config") {
+                c.stock = spec.resolve(c.uldl_dir_fanout)?;
                 c.finish();
                 return Ok(c);
             }
@@ -228,6 +240,19 @@ impl Config {
             take!(xp.parse_double("max_granted_credit") => c.max_granted_credit);
             take!(xp.parse_double("max_upload_nbytes") => c.max_upload_nbytes);
             take!(xp.parse_double("purge_days") => c.purge_days);
+            take!(xp.parse_int("uldl_dir_fanout") => c.uldl_dir_fanout);
+            take!(xp.parse_str("stock_short_name") => spec.short_name);
+            take!(xp.parse_str("stock_cgi_prefix") => spec.cgi_prefix);
+            take!(xp.parse_str("stock_upload_prefix") => spec.upload_prefix);
+            take!(xp.parse_str("stock_download_prefix") => spec.download_prefix);
+            if let Some(v) = xp.parse_str("stock_page_prefix") {
+                spec.page_prefix = Some(v);
+                continue;
+            }
+            if let Some(v) = xp.parse_bool("stock_advertise") {
+                spec.advertise = Some(v);
+                continue;
+            }
             // There are many upstream tags cloud-boinc has no use for.
             xp.skip_unexpected();
         }
@@ -251,15 +276,82 @@ impl Config {
             // the trailing slash.
             self.master_url.push('/');
             let base = self.master_url.clone();
+            let stock = self.stock_urls();
+            let advertise = self.stock.as_ref().is_some_and(|s| s.advertise);
             if self.download_url.is_empty() {
-                self.download_url = format!("{base}download");
+                self.download_url = match &stock {
+                    Some((download, _)) if advertise => download.clone(),
+                    _ => format!("{base}download"),
+                };
             }
             if self.upload_url.is_empty() {
                 // A client takes a `<url>` for an upload URL only when it
                 // contains `file_upload_handler`.
-                self.upload_url = format!("{base}upload/file_upload_handler");
+                self.upload_url = match &stock {
+                    Some((_, upload)) if advertise => upload.clone(),
+                    _ => format!("{base}upload/file_upload_handler"),
+                };
             }
         }
+    }
+
+    /// The stock download and upload URLs, on the master URL's host.
+    fn stock_urls(&self) -> Option<(String, String)> {
+        let stock = self.stock.as_ref()?;
+        let origin = url_origin(&self.master_url)?;
+        Some((stock.download_url(origin), stock.upload_url(origin)))
+    }
+
+    /// Where clients send scheduler requests: the master page's
+    /// `boinc_scheduler` link. With a stock layout whose URLs are advertised
+    /// it is the stock scheduler URL, which a client attached to a stock
+    /// server already holds; a client reads the master page again only after
+    /// repeated scheduler failures (`SCHEDULER_OP::project_rpc_backoff` in
+    /// `client/scheduler_op.cpp`) and then replaces its scheduler URLs with
+    /// the page's.
+    pub fn scheduler_url(&self) -> String {
+        if let (Some(stock), Some(origin)) = (
+            self.stock.as_ref().filter(|s| s.advertise),
+            url_origin(&self.master_url),
+        ) {
+            return stock.scheduler_url(origin);
+        }
+        format!("{}sched", self.master_url)
+    }
+
+    /// The URL of a download file is `<base>/<name>`, with a hash directory
+    /// between them when the base is the stock download URL of a layout with
+    /// fanout.
+    pub fn download_urls(&self) -> FileUrls {
+        let fanout = self
+            .stock
+            .as_ref()
+            .filter(|s| url_path(&self.download_url) == s.download_prefix)
+            .map_or(0, |s| s.fanout);
+        FileUrls {
+            base: self.download_url.clone(),
+            fanout,
+        }
+    }
+
+    /// Whether a file's `<url>` in stored XML points at a download directory
+    /// of this project: the configured one, the native one, or the stock one.
+    /// Work imported from a stock server carries the stock URL whatever
+    /// `download_url` is. The scheme does not matter, so a project that moved
+    /// from `http` to `https` still owns its work.
+    pub fn is_own_download_url(&self, url: &str) -> bool {
+        let url = comparable_url(url);
+        let mut bases = vec![self.download_url.clone()];
+        if !self.master_url.is_empty() {
+            bases.push(format!("{}download", self.master_url));
+        }
+        if let Some((download, _)) = self.stock_urls() {
+            bases.push(download);
+        }
+        bases.iter().filter(|b| !b.is_empty()).any(|b| {
+            url.strip_prefix(&comparable_url(b))
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 }
 
@@ -289,6 +381,145 @@ mod tests {
         assert_eq!(c.delete_delay, 7200.0);
         assert_eq!(c.min_core_client_version, 70900);
         assert_eq!(c.max_wus_to_send, 10);
+    }
+
+    fn stock(extra: &str) -> Config {
+        Config::parse(&format!(
+            "<config><master_url>https://example.org/testproj</master_url>{extra}</config>"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn no_stock_tag_leaves_the_native_layout() {
+        let c = stock("<uldl_dir_fanout>1024</uldl_dir_fanout>");
+        assert_eq!(c.stock, None);
+        assert_eq!(c.scheduler_url(), "https://example.org/testproj/sched");
+        assert_eq!(c.download_url, "https://example.org/testproj/download");
+        assert_eq!(
+            c.upload_url,
+            "https://example.org/testproj/upload/file_upload_handler"
+        );
+        assert_eq!(c.download_urls().fanout, 0);
+    }
+
+    #[test]
+    fn stock_layout_advertises_stock_urls_by_default() {
+        let c = Config::parse(
+            "<config><master_url>https://example.org/</master_url>\
+             <stock_short_name>testproj</stock_short_name>\
+             <uldl_dir_fanout>1024</uldl_dir_fanout></config>",
+        )
+        .unwrap();
+        let s = c.stock.as_ref().unwrap();
+        assert_eq!(s.fanout, 1024);
+        assert_eq!(c.scheduler_url(), "https://example.org/testproj_cgi/cgi");
+        assert_eq!(c.download_url, "https://example.org/testproj/download");
+        assert_eq!(
+            c.upload_url,
+            "https://example.org/testproj_cgi/file_upload_handler"
+        );
+        assert_eq!(
+            c.download_urls().download("wu_1_0"),
+            "https://example.org/testproj/download/319/wu_1_0"
+        );
+    }
+
+    #[test]
+    fn stock_layout_without_advertising_keeps_the_native_urls() {
+        let c = Config::parse(
+            "<config><master_url>https://example.org/</master_url>\
+             <stock_short_name>testproj</stock_short_name>\
+             <stock_advertise>0</stock_advertise><uldl_dir_fanout>1024</uldl_dir_fanout></config>",
+        )
+        .unwrap();
+        assert!(c.stock.is_some());
+        assert_eq!(c.scheduler_url(), "https://example.org/sched");
+        assert_eq!(c.download_url, "https://example.org/download");
+        assert_eq!(
+            c.upload_url,
+            "https://example.org/upload/file_upload_handler"
+        );
+        // The native download URL has no hash directory, whatever the fanout.
+        assert_eq!(
+            c.download_urls().download("wu_1_0"),
+            "https://example.org/download/wu_1_0"
+        );
+        // The stock URLs still count as this project's.
+        assert!(c.is_own_download_url("https://example.org/testproj/download/319/wu_1_0"));
+    }
+
+    /// A master URL under the short name makes the native download URL the
+    /// stock one. The hash directory goes in then, because that is the only
+    /// path under it that the files Worker serves.
+    #[test]
+    fn a_native_download_url_on_the_stock_path_gets_the_directory() {
+        let c = stock(
+            "<stock_short_name>testproj</stock_short_name><stock_advertise>0</stock_advertise>\
+             <uldl_dir_fanout>1024</uldl_dir_fanout>",
+        );
+        assert_eq!(c.download_url, "https://example.org/testproj/download");
+        assert_eq!(
+            c.download_urls().download("wu_1_0"),
+            "https://example.org/testproj/download/319/wu_1_0"
+        );
+    }
+
+    #[test]
+    fn explicit_urls_win_over_the_stock_ones() {
+        let c = stock(
+            "<stock_short_name>testproj</stock_short_name>\
+             <download_url>https://dl.example.org/files</download_url>\
+             <upload_url>https://up.example.org/x/file_upload_handler</upload_url>",
+        );
+        assert_eq!(c.download_url, "https://dl.example.org/files");
+        assert_eq!(c.upload_url, "https://up.example.org/x/file_upload_handler");
+        assert_eq!(c.download_urls().fanout, 0);
+        // The scheduler link is still the stock one: it is the URL clients hold.
+        assert_eq!(c.scheduler_url(), "https://example.org/testproj_cgi/cgi");
+        assert!(c.is_own_download_url("https://dl.example.org/files/a"));
+        assert!(c.is_own_download_url("https://example.org/testproj/download/0/a"));
+        assert!(!c.is_own_download_url("https://elsewhere.example/testproj/download/0/a"));
+    }
+
+    #[test]
+    fn own_download_urls() {
+        let c = Config::parse(
+            "<config><master_url>https://example.org/</master_url>\
+             <stock_short_name>testproj</stock_short_name></config>",
+        )
+        .unwrap();
+        for own in [
+            "https://example.org/testproj/download/a",
+            "http://EXAMPLE.org/testproj/download/a",
+            "https://example.org/download/a",
+            "https://example.org/testproj/download/ab/a",
+        ] {
+            assert!(c.is_own_download_url(own), "{own}");
+        }
+        for foreign in [
+            "https://example.org/testproj/downloads/a",
+            "https://example.org/testproj/download",
+            "https://example.org/other/download/a",
+            "https://mirror.example/testproj/download/a",
+            "",
+        ] {
+            assert!(!c.is_own_download_url(foreign), "{foreign}");
+        }
+    }
+
+    #[test]
+    fn bad_stock_settings_make_the_config_unparseable() {
+        for extra in [
+            "<stock_short_name>a b</stock_short_name>",
+            "<stock_short_name>x</stock_short_name><stock_cgi_prefix>x</stock_cgi_prefix>",
+            "<stock_cgi_prefix>/x_cgi</stock_cgi_prefix>",
+            "<stock_short_name>x</stock_short_name><uldl_dir_fanout>-1</uldl_dir_fanout>",
+        ] {
+            let xml =
+                format!("<config><master_url>https://e.example/</master_url>{extra}</config>");
+            assert!(Config::parse(&xml).is_err(), "{extra}");
+        }
     }
 
     #[test]

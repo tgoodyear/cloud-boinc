@@ -17,6 +17,12 @@ mode = "smart"
 pattern = "boinc-dev.usnewsmap.com/*"
 zone_name = "usnewsmap.com"
 
+# Stock server URL layout: the pages under `/example/` are covered by the route above.
+# A deployment whose route is narrower than `/*` adds this one, with its short name:
+# [[routes]]
+# pattern = "boinc-dev.usnewsmap.com/example/*"
+# zone_name = "usnewsmap.com"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "cloud-boinc-dev"

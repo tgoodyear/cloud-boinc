@@ -98,6 +98,52 @@ The configs declare the routes, the queue consumer and the pipeline's two cron t
 sweep every minute, the purge every five) for `wrangler deploy` to create. The dev deployment's resources and Workers were created through
 the Cloudflare API, so the `wrangler` commands on this page have not been run as written.
 
+## Stock layout routes
+
+A project taking over a stock server's master URL turns on the stock URL layout (see "Stock URL
+layout" in [architecture.md](architecture.md)) with tags in the `config` setting, for a project
+made with `make_project` under the short name `example`:
+
+```
+<stock_short_name>example</stock_short_name>
+<uldl_dir_fanout>1024</uldl_dir_fanout>
+```
+
+`uldl_dir_fanout` is the value of the stock server's `config.xml`. Other paths are set with
+`stock_cgi_prefix`, `stock_upload_prefix`, `stock_download_prefix` and `stock_page_prefix`, each
+a path such as `/example_cgi`. The setting only decides what the Workers answer; the routes decide
+what reaches them, so each Worker needs the routes for its stock paths, in addition to the native
+ones. For the default layout:
+
+| Worker | Route pattern |
+| --- | --- |
+| `scheduler` | `<host>/example_cgi/cgi*` |
+| `files` | `<host>/example_cgi/file_upload_handler*` |
+| `files` | `<host>/example/download/*` |
+| `web` | `<host>/*`, which is already there; `<host>/example/*` if the route is narrower |
+
+Cloudflare picks the most specific matching pattern for a request. That matters in two places.
+The scheduler and the upload handler share the `example_cgi/` directory but are different
+Workers, so each pattern names its script and ends in `*` (so a request with a query string
+matches); a pattern for `example_cgi/*` would send both to one Worker. And the download
+directory of the default layout is under the pages' path, so `example/download/*` has to be a
+route of its own, or the web Worker's `/*` takes it and answers 404. The pattern with the
+longer literal part, `example/download/*`, wins over `/*`. If the stock project set its own
+download or upload directory, the patterns follow the prefixes in the setting. The pieces in
+`wrangler.toml` are commented out in each Worker's file for a deployment to uncomment and
+adapt.
+
+If the Configuration Rule for upload buffering (above) is used, give it the stock handler's path
+as well:
+
+```
+expression: (http.host eq "<hostname>" and (starts_with(http.request.uri.path, "/upload/") or starts_with(http.request.uri.path, "/example_cgi/file_upload_handler")))
+```
+
+The `*` in a route pattern matches any characters, so `example_cgi/cgi*` also reaches the
+scheduler Worker for `example_cgi/cgi-bin/...`; the Worker answers 404 for any path that is not
+exactly the scheduler's.
+
 ## Secrets
 
 | Secret | Workers | Value |

@@ -1,12 +1,14 @@
 //! The master URL page, the web RPCs of clients and account managers, the
 //! server status and the site pages. PHP file names stay in the URLs because
-//! clients have them built in. Everything past routing is in
-//! `cb_core::web` and `cb_core::site`.
+//! clients have them built in. With a stock layout in the config
+//! (`cb_core::stock`) the pages also answer under its page prefix. Everything
+//! past routing is in `cb_core::web` and `cb_core::site`.
 
 use std::collections::HashMap;
 
 use cb_core::mail::Mailer;
 use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS};
+use cb_core::stock::{route_web, url_origin, WebRoute};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
     project_config, server_status, server_status_page, server_status_xml, NewAccount,
@@ -87,27 +89,39 @@ async fn params(req: &mut Request) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// The edge cache's copy of a static page, with the headers a client gets.
+async fn cached(key: &str) -> Result<Option<Response>> {
+    let Some(hit) = Cache::default().get(key, false).await? else {
+        return Ok(None);
+    };
+    // The zone's browser cache setting rewrites Cache-Control on a stored
+    // response; clients get the lifetime the page was built with.
+    let headers = Headers::new();
+    if let Some(kind) = hit.headers().get("Content-Type")? {
+        headers.set("Content-Type", &kind)?;
+    }
+    headers.set(
+        "Cache-Control",
+        &format!("public, max-age={PAGE_CACHE_SECS}"),
+    )?;
+    Ok(Some(
+        Response::from_body(hit.body().clone())?.with_headers(headers),
+    ))
+}
+
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     if !matches!(req.method(), Method::Get | Method::Head | Method::Post) {
         return text(405, "method not allowed\n");
     }
-    let path = req.path();
-    let cache_key = is_static_page(&req, &path).then(|| req.url().map(|u| u.to_string()));
-    let cache_key = cache_key.transpose()?;
+    let raw_path = req.path();
+    // Pages at the root need no database read when the cache has them.
+    let mut cache_key = is_static_page(&req, &raw_path)
+        .then(|| req.url().map(|u| u.to_string()))
+        .transpose()?;
     if let Some(key) = &cache_key {
-        if let Some(hit) = Cache::default().get(key.as_str(), false).await? {
-            // The zone's browser cache setting rewrites Cache-Control on a
-            // stored response; clients get the lifetime the page was built with.
-            let headers = Headers::new();
-            if let Some(kind) = hit.headers().get("Content-Type")? {
-                headers.set("Content-Type", &kind)?;
-            }
-            headers.set(
-                "Cache-Control",
-                &format!("public, max-age={PAGE_CACHE_SECS}"),
-            )?;
-            return Ok(Response::from_body(hit.body().clone())?.with_headers(headers));
+        if let Some(hit) = cached(key).await? {
+            return Ok(hit);
         }
     }
     let db = db(&env)?;
@@ -117,6 +131,35 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             console_error!("settings: {e}");
             return text(503, "The project is temporarily unavailable.\n");
         }
+    };
+    // Pages answer at the root and, with a stock layout, under its page
+    // prefix. The handlers below name pages as they are at the root.
+    let stock = project.config.stock.as_ref();
+    let (path, prefixed) = match route_web(&raw_path, stock) {
+        WebRoute::Page { path, prefixed } => (path.to_string(), prefixed),
+        WebRoute::Redirect(mut to) => {
+            if let Some(q) = req.url()?.query() {
+                to.push('?');
+                to.push_str(q);
+            }
+            return Ok(Response::builder()
+                .with_status(301)
+                .with_header("Location", &to)?
+                .empty());
+        }
+    };
+    if prefixed && cache_key.is_none() && is_static_page(&req, &path) {
+        let key = req.url()?.to_string();
+        if let Some(hit) = cached(&key).await? {
+            return Ok(hit);
+        }
+        cache_key = Some(key);
+    }
+    // Where redirects and the login cookie point: the directory the request
+    // came in under.
+    let base = match (stock, url_origin(&project.config.master_url)) {
+        (Some(stock), Some(origin)) if prefixed => stock.page_base(origin),
+        _ => project.config.master_url.clone(),
     };
     match path.as_str() {
         "/" | "/index.php" | "/get_project_config.php" => {
@@ -230,6 +273,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             let ctx = SiteCtx {
                 db: &db,
                 project: &project,
+                base: &base,
                 auth: cookie.as_deref(),
                 post,
                 pepper: pepper.as_deref(),
