@@ -29,7 +29,7 @@ In scope, because the reference deployment uses it:
 
 | Area | Features |
 | --- | --- |
-| Scheduler | account keys and weak keys, host records, result reporting, work requests for CPU and GPU, plan classes (container, NVIDIA, AMD, Intel, Apple GPU, multi-thread), client-version floors, batch and workunit-ID gates, per-app weights, assigned (targeted) jobs, `one_result_per_host_per_wu`, in-progress and daily limits, lost-result resend, request back-off |
+| Scheduler | account keys and weak keys, host records, result reporting, work requests for CPU and GPU, plan classes (container, NVIDIA, AMD, Intel, Apple GPU, multi-thread), client-version floors, batch and workunit-ID gates, per-app weights, assigned (targeted) jobs, homogeneous redundancy and homogeneous app version, `one_result_per_host_per_wu`, in-progress and daily limits, lost-result resend, request back-off |
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
 | Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits, checksums and resume |
 | Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
@@ -37,8 +37,7 @@ In scope, because the reference deployment uses it:
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
 
 Out of scope for now: forums, teams, profiles, locality scheduling,
-homogeneous redundancy, adaptive replication, trickle messages, BUDA, the XML stats export,
-and the full PFC credit model (see "Credit").
+trickle messages, BUDA, the XML stats export, and the full PFC credit model (see "Credit").
 
 ## Service map
 
@@ -220,7 +219,9 @@ deadline, so neither sends a message.
    projected speed. Nothing is chosen yet, because the batch and workunit-ID gates of a plan
    class depend on the job.
 6. Batch 3 (read): candidate unsent results for the apps that have a usable version, joined
-   to their workunits, ordered by priority then age, interleaved across apps by weight; plus,
+   to their workunits, ordered by priority then age, interleaved across apps by weight (for an app
+   with homogeneous redundancy or homogeneous app version, only workunits not committed to another
+   class or version; see "Homogeneous redundancy and homogeneous app version"); plus,
    with `enable_assignment`, assigned jobs for this host or user (see "Assigned jobs").
 7. If an assigned job can be sent, the reply carries assigned jobs and no other new work,
    and steps 8 and 9 are skipped.
@@ -230,7 +231,8 @@ deadline, so neither sends a message.
    one (`sched/sched_check.cpp`, `slow_check`), so the in-progress list from batch 2 is not
    enough.
 9. Filter candidates in memory. For each candidate, narrow the kept versions to the ones
-   that can still be sent: the batch and workunit-ID gates admit the job, the client still
+   that can still be sent: the batch and workunit-ID gates admit the job, the workunit is not
+   committed to another app version, the client still
    wants work for the version's resource (seconds or idle instances not yet filled by this
    reply, as `need_this_resource` in `sched/sched_version.cpp`), and the version's daily
    quota and in-progress limits are not used up. Take the fastest version that remains; drop
@@ -242,7 +244,9 @@ deadline, so neither sends a message.
 10. Batch 5 (write, one transaction): update the host; apply result reports; claim each chosen
     result; lower `transition_time` on the workunits of claimed results and set it to now on
     the workunits of reported ones. The claim statements enforce the limits again (see
-    "Limits under concurrent requests").
+    "Limits under concurrent requests"), and, for an app with homogeneous redundancy or
+    homogeneous app version, that the workunit is not committed to another class or version; the
+    update that follows a claim commits it.
 11. Send the workunit IDs of reported results to the queue, build the `<scheduler_reply>`
     from the claims that succeeded, return it.
 
@@ -331,6 +335,114 @@ host again, and a replacement for a user-assigned job goes to another of the use
 Because a host never gets a second instance, `build_workunit` in `crates/cb-core/src/work.rs`
 refuses a host-assigned job with `target_nresults` above 1.
 Assignment rows stay until the purge removes them with their workunit.
+
+### Homogeneous redundancy and homogeneous app version
+
+Two app settings keep the results of one workunit comparable. Both are off by default.
+
+- **Homogeneous redundancy (HR)** sends every result of a workunit to hosts of one class. The
+  class comes from the host's OS name, CPU vendor and CPU model as the request reports them,
+  computed by `hr_class` in `crates/cb-core/src/hr.rs`, a port of `sched/hr.cpp`: `os + cpu`,
+  with OS 256 Linux, 384 Windows, 512 Darwin, 640 FreeBSD, 768 Android and 128 for any other
+  OS, and a CPU number that differs by type. Type 1 ("fine") tells CPU families apart (Xeon,
+  Core, Pentium variants, AMD Athlon, Opteron and so on). Type 2 ("coarse") has Intel, ARM,
+  PowerPC (`Macintosh`) and none, and counts AMD as Intel, as upstream does. A host a type
+  cannot place (`hr_unknown_class`) is sent nothing by an app of that type: for type 1 an OS
+  or CPU the table has no number for, for type 2 anything but Windows, Linux, and Darwin on an
+  Intel, AMD or PowerPC CPU. The type of an app is its own `homogeneous_redundancy` if nonzero,
+  else the project's `<homogeneous_redundancy>` (`app_hr_type` in `sched/sched_hr.h`).
+- **Homogeneous app version (HAV)** sends every result of a workunit with one app version. The
+  first send decides it. An anonymous-platform client is never sent a job of such an app, which
+  `get_app_version` in `sched/sched_version.cpp` does too: its own versions are not known to
+  the project, so they cannot be matched.
+
+The commitment is `workunit.hr_class` (migration `0004_homogeneous.sql`) and
+`workunit.app_version_id`, 0 while the workunit is uncommitted.
+
+**Choosing.** The query that reads the candidates for an app adds `AND w.hr_class IN (0, :class)`
+for an app that uses HR and `AND w.app_version_id IN (0, :versions)` for one that uses HAV,
+where the versions are those this host can run (as integers of the cached catalog, not bound
+parameters). A queue whose first rows are committed to other classes therefore cannot hide
+the ones this host can take, as it would if the window of `fetch` rows were cut first and
+filtered after. The in-memory loop then repeats the check against the row it read, picks the
+version for a committed workunit (only its own, which can be a deprecated version, or one
+superseded by a newer version of the same platform and plan class, as
+`check_homogeneous_app_version` allows) or, for an uncommitted one, the fastest version still
+sent, and applies the memory, disk, deadline, quota and in-progress checks to it as for any
+job. A host the type cannot place is left out of the app's queue altogether, and when every app
+uses HR and none can place the host, the request sends nothing and the reply carries
+"Your computer type is not supported by this project". Assigned jobs skip the unknown-class
+test, as `send_assigned_job` does, and are held to the class and version by the claim.
+
+**Committing.** The claim of a result adds one condition to the claim statement:
+
+```sql
+AND EXISTS (SELECT 1 FROM workunit WHERE id = ? AND hr_class IN (0, :class)
+            AND app_version_id IN (0, :version))
+```
+
+and the workunit update already guarded by "this claim succeeded" gains
+`hr_class = :class, app_version_id = :version`. They run in the request's one write batch, one
+transaction, so a host of another class or version whose claim comes later sees the commitment
+and fails its claim, and a host that read the workunit uncommitted but writes after another host
+committed it gets no result of it, never a result of a workunit committed to something else.
+Because the commitment is written only together with a claim that held, a workunit is never
+committed without a result having been sent, unlike upstream's `update_wu_on_send`, which
+commits before it updates the result and can leave a commitment behind when that update fails
+(upstream's feeder undoes such commitments in `purge_stale`; nothing here needs to). A lost
+claim sends less work and the client asks again.
+
+**Releasing.** The transition (`transitioner_pass` in `crates/cb-core/src/pipeline.rs`) sets
+both fields back to 0 when a workunit has results with errors and none successful, in
+progress or timed out and possibly still to come, as `handle_wu` in `sched/transitioner.cpp`
+does. `<hr_class_static/>` in the config turns that off. The write of the fields is part of the
+transition's update guarded by `rev`, and every claim bumps `rev`, so a transition computed
+from a read that a claim has overtaken is retried and cannot undo the claim's commitment.
+
+**Lost results.** A resend runs the same tests as upstream's `wu_is_infeasible_fast`: if the
+host's class is not the workunit's, or the type no longer places it, the result is let go
+("Didn't resend lost task ... (expired)"); a client on the anonymous platform is not resent a
+result of an app with HAV. A resend does not commit: a workunit with a result in progress is
+never released by the transition, so the commitment is still there.
+
+**Cost per request.** No statement is added to a request that sends work. The candidate
+statement for an app has one more condition; the claim and the workunit update gain a few bound
+parameters (the claim stays well under D1's 100). For an app that uses HAV the catalog also
+carries the deprecated versions of such apps, in the statement that already reads versions. One
+round trip is added only to a request that sends nothing: when an HR app's candidate query came
+back empty, a probe, `SELECT 1 ... LIMIT 1`, asks whether unsent work of the app is committed to
+another class, to give upstream's message "Tasks are committed to other platforms"
+(`hr_reject_temp`). It stops at the first such row, or on an empty queue.
+
+**Differences from upstream.**
+
+- The feeder's `hr_info` balancing (`sched/hr_info.cpp`, the job cache's per-class slots and
+  `hr_info.txt`) is not ported: there is no job cache, each request reads candidates for its own
+  class, so nothing needs balancing. The statistics pages (`html/ops/hrclass_summary.php`,
+  `reset_hrclass.php`) are not ported; `cboinc job --name` shows a workunit's `hr_class` and
+  `app_version_id`.
+- `already_sent_to_different_hr_class` sets `hr_reject_temp` for the last job it looked at;
+  the message here is given when any job was passed over for its class, or the probe above
+  finds work committed elsewhere.
+- Upstream's `send_work` returns before it writes "Your computer type is not supported by this
+  project" (`hr_reject_perm`), so the message never reaches a client. Here it is sent.
+- A committed job is still held to the host's daily limit, limit on jobs in progress and
+  per-version limits, as the claim enforces them; upstream's `check_homogeneous_app_version`
+  does not look at them.
+- A beta version is not sent to a user who does not allow beta work, even as the committed
+  version of a workunit; upstream's `check_homogeneous_app_version` does not look at beta.
+- A resend does not commit the workunit (see above). Upstream's `add_result_to_reply` does, and
+  fails the resend if the workunit is committed to something else.
+- `homogeneous_redundancy` outside 0 to 2 in the config is refused when the config is saved;
+  upstream's feeder exits at start. Setting both a project type and a different app type is
+  allowed and the app's wins; upstream's feeder refuses to start with both.
+- There is no `--hr_class` for job submission, so a job cannot start out committed.
+- Validation does not look at a version or class: upstream's validator does not either.
+
+An app is set with `PUT /admin/v1/apps` or `cboinc app-put --name NAME --homogeneous-redundancy 0|1|2
+--homogeneous-app-version true|false`. Unlike the other settings of an app, which a put replaces,
+these two stay as they are when the request leaves them out, so a put that changes a URL
+does not end a project's HR. `deploy.md` has the steps to switch it on for a running project.
 
 ### Plan classes and admission gates
 
@@ -459,9 +571,11 @@ Differences from upstream:
   wants work for it, which needs no room, since the result is counted already; only otherwise does
   it move to the fastest other version, and then only to a kind of resource (CPU or GPU) whose
   limit has room, counting the results already moved in the request.
-- A workunit committed to a project app version (`workunit.app_version_id` other than 0) is not
-  sent to an anonymous client. Upstream does this for apps with homogeneous app version, which is
-  not built here, so nothing sets that field today.
+- An app with homogeneous app version (`app.homogeneous_app_version`) is never sent to an
+  anonymous client, committed workunit or not, and a result of one is not resent to it: the
+  client's versions cannot be matched with a version of the project, as `get_app_version` in
+  `sched/sched_version.cpp` has it. A client that has a version of such an app is not told that
+  its `app_info.xml` lacks one. See "Homogeneous redundancy and homogeneous app version".
 - A missing `host_app_version` row is created when the job is sent. Upstream's `hav_lookup` also
   creates one when a result is validated or times out; here those steps leave a missing row alone.
 - The project preferences that switch a resource off do not apply to the client's own versions,
@@ -1318,7 +1432,7 @@ trip on D1.
 | Resource | Operations |
 | --- | --- |
 | `status`, `catalog` | project counts; platforms, apps and app versions |
-| `platforms`, `apps` | create, update |
+| `platforms`, `apps` | create, update; an app's homogeneous redundancy type and homogeneous app version switch are set here |
 | `app-versions` | upload signed files and register, deprecate, restore |
 | `config` | project settings, plan classes, public keys |
 | `files` | stage inputs (upload, or register an object already in the bucket); a stored name keeps its contents unless the caller asks to replace them |
@@ -1479,9 +1593,8 @@ certificates are checked.
 
 Not implemented yet:
 
-- In the scheduler: assigned jobs for teams and broadcast (`multi`) assignments, homogeneous
-  redundancy and homogeneous app version, locality scheduling, size classes, and the client
-  workload simulation behind upstream's deadline check.
+- In the scheduler: assigned jobs for teams and broadcast (`multi`) assignments, locality
+  scheduling, size classes, and the client workload simulation behind upstream's deadline check.
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.

@@ -31,6 +31,11 @@ pub struct App {
     pub validator: String,
     pub validator_url: String,
     pub assimilate_url: String,
+    /// The homogeneous redundancy type: 0 for none, 1 fine, 2 coarse. When
+    /// 0, the project's `<homogeneous_redundancy>` applies.
+    pub homogeneous_redundancy: i32,
+    /// Nonzero: a workunit's results all go out with one app version.
+    pub homogeneous_app_version: i32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -232,6 +237,9 @@ pub struct Workunit {
     pub app_version_num: i32,
     pub n_sent: i32,
     pub rev: i64,
+    /// The homogeneous redundancy class the workunit is committed to; 0 when
+    /// it is not committed.
+    pub hr_class: i32,
 }
 
 /// A row of `result`. Named `JobResult` to keep `Result` free.

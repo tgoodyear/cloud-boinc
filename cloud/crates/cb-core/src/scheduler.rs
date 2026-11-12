@@ -22,10 +22,18 @@
 //! `host_app_version` row keyed by `anon_gavid`. See "Anonymous platform" in
 //! `docs/architecture.md`.
 //!
+//! Homogeneous redundancy (HR) and homogeneous app version (HAV) are done as
+//! in `sched/sched_send.cpp`, `sched/sched_check.cpp` and
+//! `sched/sched_version.cpp`: the candidate query leaves out workunits
+//! committed to another class or version, and the claim of a result commits
+//! the workunit to the host's class and version in the same transaction, with
+//! a guard that the workunit is still uncommitted or committed to the same.
+//! See "Homogeneous redundancy and homogeneous app version" in
+//! `docs/architecture.md` and `crates/cb-core/src/hr.rs`.
+//!
 //! Not done here: assigned jobs for teams and broadcast (`multi`)
-//! assignments, homogeneous redundancy and homogeneous app version, locality
-//! scheduling, and the client workload simulation behind upstream's deadline
-//! check.
+//! assignments, locality scheduling, and the client workload simulation
+//! behind upstream's deadline check.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,6 +49,7 @@ use cb_proto::web_rpc::err::EXIT_ABORTED_BY_PROJECT;
 use cb_proto::xml::{extract_venue, line};
 use serde::Deserialize;
 
+use crate::hr::{app_hr_type, hr_class, hr_unknown_class, HrHost};
 use crate::model::{
     anon_gavid, anon_platform_id, anon_proc_type, anon_uses_gpu, generalized_app_version_id, App,
     AppVersion, Host, HostAppVersion, Platform, User, Workunit,
@@ -107,23 +116,40 @@ pub struct Catalog {
     pub platforms: Vec<Platform>,
     pub apps: Vec<App>,
     pub app_versions: Vec<AppVersion>,
+    /// Deprecated versions of apps that use homogeneous app version. A
+    /// workunit committed to one is still sent with it, as upstream does
+    /// (`check_homogeneous_app_version` in `sched/sched_version.cpp`).
+    pub retired_versions: Vec<AppVersion>,
 }
 
 impl Catalog {
-    /// Everything not deprecated.
+    /// Everything not deprecated, and the deprecated versions of apps that
+    /// use homogeneous app version.
     pub async fn load(db: &dyn Db) -> CoreResult<Catalog> {
         let mut out = db
             .batch(vec![
                 Stmt::new("SELECT * FROM platform WHERE deprecated = 0 ORDER BY id"),
                 Stmt::new("SELECT * FROM app WHERE deprecated = 0 ORDER BY id"),
-                Stmt::new("SELECT * FROM app_version WHERE deprecated = 0 ORDER BY id"),
+                Stmt::new(
+                    "SELECT * FROM app_version WHERE deprecated = 0 OR appid IN \
+                     (SELECT id FROM app WHERE homogeneous_app_version != 0) ORDER BY id",
+                ),
             ])
             .await?
             .into_iter();
+        let platforms = out.next().unwrap_or_default().decode()?;
+        let apps = out.next().unwrap_or_default().decode()?;
+        let (retired_versions, app_versions) = out
+            .next()
+            .unwrap_or_default()
+            .decode::<AppVersion>()?
+            .into_iter()
+            .partition(|v| v.deprecated != 0);
         Ok(Catalog {
-            platforms: out.next().unwrap_or_default().decode()?,
-            apps: out.next().unwrap_or_default().decode()?,
-            app_versions: out.next().unwrap_or_default().decode()?,
+            platforms,
+            apps,
+            app_versions,
+            retired_versions,
         })
     }
 
@@ -132,7 +158,10 @@ impl Catalog {
     }
 
     fn app_version(&self, id: i64) -> Option<&AppVersion> {
-        self.app_versions.iter().find(|v| v.id == id)
+        self.app_versions
+            .iter()
+            .chain(self.retired_versions.iter())
+            .find(|v| v.id == id)
     }
 
     /// Whether a newer version exists for the same app, platform and plan
@@ -207,6 +236,8 @@ struct Skipped {
     memory: bool,
     disk: bool,
     speed: bool,
+    /// A workunit was passed over for being committed to another HR class.
+    hr_class: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,6 +331,10 @@ struct Version<'a> {
     gpu: bool,
     /// Sort key: projected speed with the selection noise applied.
     score: f64,
+    /// A version the host is sent only workunits committed to it: a
+    /// deprecated or superseded version, or one below the app's minimum, of
+    /// an app that uses homogeneous app version.
+    pinned_only: bool,
 }
 
 /// What a request keeps for one `host_app_version` row. Several versions of
@@ -334,6 +369,102 @@ impl Version<'_> {
             fpops_scale: self.fpops_scale,
             hu: self.hu.clone(),
         }
+    }
+}
+
+/// What homogeneous redundancy and homogeneous app version ask of one app
+/// for the host of this request.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Homogeneous {
+    /// The app's HR type (`app_hr_type`); 0 for none.
+    hr_type: i32,
+    /// The host's class under that type. Set whenever `hr_type` is, even for
+    /// a host the type cannot place, as upstream's `hr_class` is.
+    host_class: i32,
+    /// The type cannot place the host (`hr_unknown_class`): it gets no
+    /// unsent work of the app.
+    unknown: bool,
+    /// The app uses homogeneous app version.
+    hav: bool,
+}
+
+impl Homogeneous {
+    fn of(app: &App, config: &Config, host: &HrHost<'_>) -> Homogeneous {
+        let hr_type = app_hr_type(app, config);
+        Homogeneous {
+            hr_type,
+            host_class: if hr_type != 0 {
+                hr_class(host, hr_type)
+            } else {
+                0
+            },
+            unknown: hr_type != 0 && hr_unknown_class(host, hr_type),
+            hav: app.homogeneous_app_version != 0,
+        }
+    }
+
+    /// `already_sent_to_different_hr_class` in `sched/sched_hr.cpp`: whether
+    /// the workunit is committed to a class other than the host's.
+    fn other_class(&self, wu: &Workunit) -> bool {
+        self.hr_type != 0 && wu.hr_class != 0 && wu.hr_class != self.host_class
+    }
+
+    /// What a claim of a result of the workunit commits it to, with the
+    /// version the result is sent with (`update_wu_on_send` in
+    /// `sched/sched_send.cpp`).
+    fn commit(&self, version: &Version<'_>) -> Commit {
+        Commit {
+            hr_class: (self.hr_type != 0).then_some(self.host_class),
+            app_version_id: version.av.filter(|_| self.hav).map(|a| a.id),
+        }
+    }
+}
+
+/// What sending a result commits its workunit to. A part is `None` when the
+/// app does not use that feature.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Commit {
+    hr_class: Option<i32>,
+    app_version_id: Option<i64>,
+}
+
+impl Commit {
+    /// The claim's condition: the workunit is not committed, or is committed
+    /// to the same class and version. Evaluated when the claim runs, so two
+    /// hosts of different classes cannot both be sent a result of a workunit
+    /// that neither was committed to when they chose it.
+    fn guard(&self, wu_id: i64) -> Option<(String, Vec<cb_db::Value>)> {
+        if self.hr_class.is_none() && self.app_version_id.is_none() {
+            return None;
+        }
+        let mut sql = String::from(" AND EXISTS (SELECT 1 FROM workunit WHERE id = ?");
+        let mut params: Vec<cb_db::Value> = vec![wu_id.into()];
+        if let Some(c) = self.hr_class {
+            sql.push_str(" AND hr_class IN (0, ?)");
+            params.push(c.into());
+        }
+        if let Some(v) = self.app_version_id {
+            sql.push_str(" AND app_version_id IN (0, ?)");
+            params.push(v.into());
+        }
+        sql.push(')');
+        Some((sql, params))
+    }
+
+    /// The assignments the workunit update that follows a claim adds, as
+    /// `, hr_class = ?` style text to append to a `SET` list.
+    fn set(&self) -> (String, Vec<cb_db::Value>) {
+        let mut sql = String::new();
+        let mut params: Vec<cb_db::Value> = Vec::new();
+        if let Some(c) = self.hr_class {
+            sql.push_str(", hr_class = ?");
+            params.push(c.into());
+        }
+        if let Some(v) = self.app_version_id {
+            sql.push_str(", app_version_id = ?");
+            params.push(v.into());
+        }
+        (sql, params)
     }
 }
 
@@ -404,6 +535,9 @@ struct Claim<'a> {
     /// No result of the workunit may already have this `(column, value)`:
     /// the replica rule, or one instance per host of an assigned job.
     one_per: Option<(&'static str, i64)>,
+    /// What the workunit is committed to by this send; the claim fails if it
+    /// is committed to anything else.
+    commit: Commit,
 }
 
 impl Claim<'_> {
@@ -464,6 +598,10 @@ impl Claim<'_> {
             ));
             params.push(self.wu_id.into());
             params.push(who.into());
+        }
+        if let Some((guard, p)) = self.commit.guard(self.wu_id) {
+            sql.push_str(&guard);
+            params.extend(p);
         }
         sql.push_str(" RETURNING id");
         Stmt { sql, params }
@@ -1326,6 +1464,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let gpu_version_ids: Vec<i64> = catalog
         .app_versions
         .iter()
+        .chain(catalog.retired_versions.iter())
         .filter(|v| {
             ctx.plan_classes
                 .find(&v.plan_class)
@@ -1346,6 +1485,26 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         random: unit(ctx.random),
     };
     let mut plan_messages: Vec<&'static str> = Vec::new();
+
+    // Homogeneous redundancy and app version, per app, for this host. The
+    // class comes from the host's description in this request, as upstream's
+    // `g_request->host` does.
+    let hr_host = HrHost {
+        os_name: &req.host_info.os_name,
+        p_vendor: &req.host_info.p_vendor,
+        p_model: &req.host_info.p_model,
+    };
+    let homog: HashMap<i64, Homogeneous> = catalog
+        .apps
+        .iter()
+        .map(|a| (a.id, Homogeneous::of(a, config, &hr_host)))
+        .collect();
+    // `hr_unknown_platform`: every app uses HR and none can place the host.
+    let hr_blocked = !catalog.apps.is_empty()
+        && catalog
+            .apps
+            .iter()
+            .all(|a| homog[&a.id].hr_type != 0 && homog[&a.id].unknown);
 
     // The daily limit of a (host, app version): the host's row, scaled by the
     // processors the version uses (`scaled_max_jobs_per_day`).
@@ -1436,14 +1595,19 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 },
                 gpu,
                 score: projected_flops,
+                pinned_only: false,
             });
         }
     } else {
-        for av in &catalog.app_versions {
+        for av in catalog.app_versions.iter().chain(&catalog.retired_versions) {
             let Some(app) = catalog.app(av.appid) else {
                 continue;
             };
-            if catalog.superseded(av) || av.version_num < app.min_version {
+            // A version that is no longer sent to anyone can still be the
+            // one a homogeneous-app-version workunit is committed to.
+            let pinned_only =
+                av.deprecated != 0 || catalog.superseded(av) || av.version_num < app.min_version;
+            if pinned_only && app.homogeneous_app_version == 0 {
                 continue;
             }
             if !prefs.app_ids.is_empty() && !prefs.app_ids.contains(&app.id) {
@@ -1457,7 +1621,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 match usage_for(av, &host_platforms, &req, ctx.plan_classes, &plan_host, hav) {
                     Ok(x) => x,
                     Err(message) => {
-                        if let Some(m) = message {
+                        if let Some(m) = message.filter(|_| !pinned_only) {
                             if !plan_messages.contains(&m) {
                                 plan_messages.push(m);
                             }
@@ -1487,6 +1651,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 hu,
                 gpu,
                 score,
+                pinned_only,
             });
         }
     }
@@ -1513,9 +1678,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let has_versions = if anonymous {
         (0..NPROC).any(|pt| client_has[pt] && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0))
     } else {
-        !versions.is_empty()
+        versions.iter().any(|v| !v.pinned_only)
     };
     let send = work_requested
+        && !hr_blocked
         && key_ok
         && !config.dont_send_jobs
         && !req.dont_send_work
@@ -1628,14 +1794,27 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let per_rpc = i64::from(config.max_wus_to_send.max(1))
         * (i64::from(ncpus) + i64::from(config.gpu_multiplier.max(0)) * i64::from(ngpus));
     let max_send = usize::try_from(per_rpc).unwrap_or(1).clamp(1, MAX_SEND);
+    // Apps this host has a version of, and of those the apps whose unsent
+    // results it may be sent: not an app that uses homogeneous redundancy
+    // and cannot place the host, and, on the anonymous platform, not an app
+    // that uses homogeneous app version (`get_app_version`).
+    let mut usable_apps: Vec<i64> = Vec::new();
     let mut app_ids: Vec<i64> = Vec::new();
     if send {
         for v in &versions {
-            if !app_ids.contains(&v.appid) {
-                app_ids.push(v.appid);
+            if !usable_apps.contains(&v.appid) {
+                usable_apps.push(v.appid);
             }
         }
-        app_ids.sort_unstable();
+        usable_apps.sort_unstable();
+        app_ids = usable_apps
+            .iter()
+            .copied()
+            .filter(|id| {
+                let h = homog[id];
+                !h.unknown && !(anonymous && h.hav)
+            })
+            .collect();
     }
     // On the anonymous platform, the apps the client has no version of that
     // may have work: the client is told its `app_info.xml` lacks one
@@ -1647,7 +1826,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             .apps
             .iter()
             .filter(|a| {
-                !app_ids.contains(&a.id)
+                !usable_apps.contains(&a.id)
+                    && !homog[&a.id].hav
                     && (prefs.app_ids.is_empty() || prefs.app_ids.contains(&a.id))
                     && (a.beta == 0 || prefs.allow_beta_work)
             })
@@ -1670,14 +1850,49 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // an app, and a pinned version, this host has a usable version of: the
     // limit counts jobs that can be sent, so ones the host cannot run do
     // not hold back later ones. The IDs are integers of the catalog.
-    let want_assigned = send && config.enable_assignment && !app_ids.is_empty();
+    //
+    // Upstream's `send_assigned_job` does not ask whether HR can place the
+    // host, so an app that cannot is not left out; a workunit committed to
+    // another class, or, for an app with homogeneous app version, to a
+    // version the host has no use of, fails the claim and is left out here.
+    // The client's own versions are not for an app with homogeneous app
+    // version.
+    let assigned_list: Vec<i64> = usable_apps
+        .iter()
+        .copied()
+        .filter(|id| !(anonymous && homog[id].hav))
+        .collect();
+    let want_assigned = send && config.enable_assignment && !assigned_list.is_empty();
     let id_list = |ids: &mut dyn Iterator<Item = i64>| {
         ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     };
-    let assigned_apps = id_list(&mut app_ids.iter().copied());
-    // Versions a workunit may be pinned to; the client's own are none.
+    let assigned_apps = id_list(&mut assigned_list.iter().copied());
+    // Versions a workunit of an app with homogeneous app version may be
+    // committed to; the client's own are none.
     let assigned_versions =
         id_list(&mut std::iter::once(0).chain(versions.iter().filter_map(|v| v.av.map(|a| a.id))));
+    let hav_apps = id_list(
+        &mut catalog
+            .apps
+            .iter()
+            .filter(|a| a.homogeneous_app_version != 0)
+            .map(|a| a.id),
+    );
+    let assigned_version_gate = if hav_apps.is_empty() {
+        String::new()
+    } else {
+        format!(" AND (w.app_version_id IN ({assigned_versions}) OR w.appid NOT IN ({hav_apps}))")
+    };
+    let assigned_class_gate: String = assigned_list
+        .iter()
+        .filter(|id| homog[id].hr_type != 0)
+        .map(|id| {
+            format!(
+                " AND NOT (w.appid = {id} AND w.hr_class NOT IN (0, {}))",
+                homog[id].host_class
+            )
+        })
+        .collect();
     if want_assigned {
         reads.push(stmt!(
             format!(
@@ -1688,8 +1903,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                  WHERE a.multi = 0 AND ((a.target_type = ? AND a.target_id = ?) \
                  OR (a.target_type = ? AND a.target_id = ?)) \
                  AND w.error_mask = 0 AND w.canonical_resultid = 0 \
-                 AND w.appid IN ({assigned_apps}) \
-                 AND w.app_version_id IN ({assigned_versions}) \
+                 AND w.appid IN ({assigned_apps}){assigned_version_gate}{assigned_class_gate} \
                  AND NOT EXISTS (SELECT 1 FROM result r2 WHERE r2.workunitid = a.workunitid \
                  AND r2.hostid = ?) \
                  ORDER BY a.id LIMIT ?"
@@ -1704,14 +1918,33 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     }
     let fetch = (3 * max_send + 20).min(100);
     for id in &app_ids {
-        reads.push(stmt!(
-            format!(
-                "SELECT {CANDIDATE_COLS} FROM result r JOIN workunit w ON w.id = r.workunitid \
-                 WHERE r.server_state = 2 AND r.appid = ? ORDER BY r.priority DESC, r.id LIMIT ?"
-            ),
-            *id,
-            fetch
-        ));
+        // Workunits committed to another class or version are left out in the
+        // query, so that a window of them at the head of the queue cannot hide
+        // the ones this host can be sent. The version IDs are integers of the
+        // catalog.
+        let h = homog[id];
+        let mut sql = format!(
+            "SELECT {CANDIDATE_COLS} FROM result r JOIN workunit w ON w.id = r.workunitid \
+             WHERE r.server_state = 2 AND r.appid = ?"
+        );
+        let mut params: Vec<cb_db::Value> = vec![(*id).into()];
+        if h.hr_type != 0 {
+            sql.push_str(" AND w.hr_class IN (0, ?)");
+            params.push(h.host_class.into());
+        }
+        if h.hav {
+            let ids = id_list(
+                &mut versions
+                    .iter()
+                    .filter(|v| v.appid == *id)
+                    .filter_map(|v| v.av.map(|a| a.id)),
+            );
+            let ids = if ids.is_empty() { "0".into() } else { ids };
+            sql.push_str(&format!(" AND w.app_version_id IN (0, {ids})"));
+        }
+        sql.push_str(" ORDER BY r.priority DESC, r.id LIMIT ?");
+        params.push(fetch.into());
+        reads.push(Stmt { sql, params });
     }
     let probe_ids: HashSet<i64> = probe_apps.iter().map(|a| a.id).collect();
     if !probe_apps.is_empty() {
@@ -1749,6 +1982,15 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
     }
 
+    // HR apps with no candidate for this host: if the request ends up with
+    // nothing, one probe says whether that is because their unsent work is
+    // committed to other classes.
+    let hr_empty: Vec<(i64, i32)> = queues
+        .iter()
+        .filter(|(id, q)| q.is_empty() && homog[id].hr_type != 0)
+        .map(|(id, _)| (*id, homog[id].host_class))
+        .collect();
+
     let mut outgoing: Vec<Outgoing> = Vec::new();
     // Jobs in progress on CPU and on GPU, and their limits. A lost result
     // recorded again for the other kind of resource moves from one count to
@@ -1781,31 +2023,36 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             // still has a usable version for it; only otherwise does it move,
             // and then to a kind of resource that has room under its limit
             // on jobs in progress.
-            catalog.app(c.wu.appid).and_then(|app| {
-                let wanted = |pt: usize| need_secs[pt] > 0.0 || need_inst[pt] > 0.0;
-                let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
-                let recorded = anon_proc_type(ip.app_version_id).map(proc_index);
-                let same = recorded.and_then(|r| {
-                    pick_anonymous(&versions, &rows, app, need_64b, &|pt| pt == r && wanted(pt))
-                        .chosen
-                });
-                let room = |pt: usize| {
-                    let gpu = pt != 0;
-                    let (count, limit) = if gpu {
-                        (n_gpu, gpu_limit)
-                    } else {
-                        (n_cpu, cpu_limit)
+            // An app with homogeneous app version is never sent to the
+            // client's own versions, a resend included.
+            catalog
+                .app(c.wu.appid)
+                .filter(|app| app.homogeneous_app_version == 0)
+                .and_then(|app| {
+                    let wanted = |pt: usize| need_secs[pt] > 0.0 || need_inst[pt] > 0.0;
+                    let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
+                    let recorded = anon_proc_type(ip.app_version_id).map(proc_index);
+                    let same = recorded.and_then(|r| {
+                        pick_anonymous(&versions, &rows, app, need_64b, &|pt| pt == r && wanted(pt))
+                            .chosen
+                    });
+                    let room = |pt: usize| {
+                        let gpu = pt != 0;
+                        let (count, limit) = if gpu {
+                            (n_gpu, gpu_limit)
+                        } else {
+                            (n_cpu, cpu_limit)
+                        };
+                        gpu == was_gpu || limit <= 0 || count < limit
                     };
-                    gpu == was_gpu || limit <= 0 || count < limit
-                };
-                same.or_else(|| {
-                    pick_anonymous(&versions, &rows, app, need_64b, &|pt| {
-                        wanted(pt) && room(pt)
+                    same.or_else(|| {
+                        pick_anonymous(&versions, &rows, app, need_64b, &|pt| {
+                            wanted(pt) && room(pt)
+                        })
+                        .chosen
                     })
-                    .chosen
+                    .map(|i| versions[i].sending())
                 })
-                .map(|i| versions[i].sending())
-            })
         } else {
             catalog.app_version(ip.app_version_id).and_then(|av| {
                 usage_for(
@@ -1830,7 +2077,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 })
             })
         };
-        let wanted = c.wu.error_mask == 0
+        // `wu_is_infeasible_fast` runs for a resend too: HR must still place
+        // the host in the class the workunit is committed to.
+        let placed = homog
+            .get(&c.wu.appid)
+            .is_none_or(|h| h.hr_type == 0 || (!h.unknown && !h.other_class(&c.wu)));
+        let wanted = placed
+            && c.wu.error_mask == 0
             && c.wu.canonical_resultid == 0
             && c.wu.assimilate_state == ASSIMILATE_INIT;
         let Some(version) = usable.filter(|_| wanted) else {
@@ -2063,20 +2316,41 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let Some(app) = catalog.app(c.wu.appid) else {
                 continue;
             };
+            let hom = homog[&app.id];
+            // Homogeneous redundancy (`wu_is_infeasible_fast`): a host the
+            // type cannot place gets no unsent work, and none of a workunit
+            // committed to another class. Assigned jobs skip the first, as
+            // `send_assigned_job` does, and are held to the second by the
+            // claim.
+            if hom.hr_type != 0 {
+                if hom.unknown && !assigned {
+                    continue;
+                }
+                if hom.other_class(&c.wu) {
+                    skipped.hr_class = true;
+                    continue;
+                }
+            }
             let admitted = |v: &Version<'_>| {
                 v.appid == c.wu.appid
                     && match v.av {
                         Some(av) => {
-                            (c.wu.app_version_id == 0 || c.wu.app_version_id == av.id)
-                                && ctx.plan_classes.admits_workunit(
-                                    &av.plan_class,
-                                    c.wu.id,
-                                    c.wu.batch,
-                                )
+                            // Homogeneous app version: a committed workunit
+                            // goes only with its version, an uncommitted one
+                            // with any that is still sent.
+                            (if hom.hav && c.wu.app_version_id != 0 {
+                                c.wu.app_version_id == av.id
+                            } else {
+                                !v.pinned_only
+                            }) && ctx.plan_classes.admits_workunit(
+                                &av.plan_class,
+                                c.wu.id,
+                                c.wu.batch,
+                            )
                         }
-                        // A job committed to one of the project's versions
-                        // is not for the client's own.
-                        None => c.wu.app_version_id == 0,
+                        // The client's own versions are never used for an
+                        // app with homogeneous app version.
+                        None => !hom.hav,
                     }
             };
             let mut chosen: Option<(usize, usize, f64)> = None;
@@ -2106,7 +2380,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     (need_secs[pt] > 0.0 || need_inst[pt] > 0.0) && (assigned || !at_limit(pt))
                 };
                 let need_64b = c.wu.rsc_memory_bound > 2.0 * GIGA;
-                let pick = if c.wu.app_version_id == 0 {
+                let pick = if !hom.hav {
                     pick_anonymous(&versions, &rows, app, need_64b, &needed)
                 } else {
                     AnonPick {
@@ -2290,6 +2564,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 } else {
                     replica_rule.then_some(replica_who)
                 },
+                commit: hom.commit(v),
             };
             let claim_at = writes.len();
             writes.push(claim.stmt());
@@ -2313,32 +2588,44 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             // extra results could go nowhere but its own host or user.
             let trusted = row.consecutive_valid >= CONS_VALID_UNREPLICATED
                 && unit(ctx.random) > 1.0 / f64::from(row.consecutive_valid);
+            // The same statement commits the workunit to the host's class and
+            // to the version (`update_wu_on_send`): the claim above held only
+            // if the workunit was uncommitted or committed to the same.
+            let (commit_set, commit_params) = claim.commit.set();
+            let tail: [cb_db::Value; 4] = [
+                c.wu.id.into(),
+                c.result_id.into(),
+                host.id.into(),
+                now.into(),
+            ];
             if !assigned && app.target_nresults > 1 && c.wu.target_nresults == 1 && !trusted {
-                writes.push(stmt!(
-                    format!(
+                let mut params: Vec<cb_db::Value> = vec![
+                    app.target_nresults.into(),
+                    app.target_nresults.into(),
+                    now.into(),
+                ];
+                params.extend(commit_params);
+                params.extend(tail);
+                writes.push(Stmt {
+                    sql: format!(
                         "UPDATE workunit SET target_nresults = ?, min_quorum = ?, \
-                         transition_time = ?, rev = rev + 1 WHERE id = ? AND {CLAIMED}"
+                         transition_time = ?, rev = rev + 1{commit_set} \
+                         WHERE id = ? AND {CLAIMED}"
                     ),
-                    app.target_nresults,
-                    app.target_nresults,
-                    now,
-                    c.wu.id,
-                    c.result_id,
-                    host.id,
-                    now
-                ));
+                    params,
+                });
             } else {
-                writes.push(stmt!(
-                    format!(
+                let mut params: Vec<cb_db::Value> =
+                    vec![(deadline + i64::from(config.report_grace_period)).into()];
+                params.extend(commit_params);
+                params.extend(tail);
+                writes.push(Stmt {
+                    sql: format!(
                         "UPDATE workunit SET transition_time = min(transition_time, ?), \
-                         rev = rev + 1 WHERE id = ? AND {CLAIMED}"
+                         rev = rev + 1{commit_set} WHERE id = ? AND {CLAIMED}"
                     ),
-                    deadline + i64::from(config.report_grace_period),
-                    c.wu.id,
-                    c.result_id,
-                    host.id,
-                    now
-                ));
+                    params,
+                });
             }
             outgoing.push(Outgoing {
                 result_name: c.result_name,
@@ -2436,10 +2723,49 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // results made now rather than at the next sweep.
     transition.extend(bumped);
 
+    if hr_blocked
+        && work_requested
+        && key_ok
+        && !too_recent
+        && !config.dont_send_jobs
+        && !req.dont_send_work
+    {
+        // Upstream's `send_work` returns before it writes this message
+        // (`hr_reject_perm`), so its client is told nothing.
+        out.reply.messages.push(UserMessage::new(
+            "Your computer type is not supported by this project",
+            "notice",
+        ));
+    }
     if work_requested && out.n_sent == 0 && key_ok && !too_recent {
         out.reply
             .messages
             .push(UserMessage::new("No tasks sent", "low"));
+        // `hr_reject_temp`. The query leaves out workunits committed to other
+        // classes, so for an HR app with nothing to offer this host, one
+        // probe asks whether that is what it found.
+        let mut committed_elsewhere = skipped.hr_class;
+        if !committed_elsewhere && !hr_empty.is_empty() {
+            let probes = hr_empty
+                .iter()
+                .map(|(id, class)| {
+                    stmt!(
+                        "SELECT 1 AS workunitid FROM result r \
+                         JOIN workunit w ON w.id = r.workunitid \
+                         WHERE r.server_state = 2 AND r.appid = ? \
+                         AND w.hr_class NOT IN (0, ?) LIMIT 1",
+                        *id,
+                        *class
+                    )
+                })
+                .collect();
+            committed_elsewhere = ctx
+                .db
+                .batch(probes)
+                .await?
+                .iter()
+                .any(|r| !r.rows.is_empty());
+        }
         let mut why: Vec<String> = Vec::new();
         if config.dont_send_jobs {
             why.push("Project is not sending tasks".into());
@@ -2450,7 +2776,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if plan_messages.is_empty() && !anonymous {
                 why.push("No app version is available for this computer".into());
             }
-        } else if send && n_candidates == 0 && apps_with_work.is_empty() {
+        } else if send && n_candidates == 0 && apps_with_work.is_empty() && !committed_elsewhere {
             // Not when the search never ran: a client on the anonymous
             // platform with no version for a resource it asks work for is
             // told only "No tasks sent", as upstream's `work_needed` stops
@@ -2472,6 +2798,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
         if skipped.speed {
             why.push("Tasks won't finish in time on this computer".into());
+        }
+        if committed_elsewhere {
+            why.push("Tasks are committed to other platforms".into());
         }
         for w in why {
             out.reply.messages.push(UserMessage::new(w, "low"));
@@ -2551,6 +2880,7 @@ mod tests {
             },
             gpu: pt != 0,
             score: flops,
+            pinned_only: false,
         }
     }
 

@@ -2,11 +2,12 @@
 //! and the ops pages. Every function is one admin API operation.
 
 use cb_crypto::{verify_md5, PublicKey};
-use cb_db::{query, query_one, stmt, Db, Stmt};
+use cb_db::{query, query_one, stmt, Db, Stmt, Value};
 use cb_proto::upload::is_valid_filename;
 use cb_proto::xml::xml_escape;
 use serde::{Deserialize, Serialize};
 
+use crate::hr::HR_NTYPES;
 use crate::model::{App, AppVersion, JobResult, Platform, Workunit};
 use crate::{Config, CoreError, CoreResult};
 
@@ -135,6 +136,13 @@ pub struct NewApp {
     pub validator: String,
     pub validator_url: String,
     pub assimilate_url: String,
+    /// Homogeneous redundancy type: 0 for none, 1 fine, 2 coarse. Left as it
+    /// is when absent, unlike the other settings, which a put replaces: a put
+    /// that only changes a URL must not end a project's HR.
+    pub homogeneous_redundancy: Option<i32>,
+    /// Send all results of a workunit with one app version. Left as it is
+    /// when absent.
+    pub homogeneous_app_version: Option<bool>,
 }
 
 impl Default for NewApp {
@@ -152,6 +160,8 @@ impl Default for NewApp {
             validator: "trivial".into(),
             validator_url: String::new(),
             assimilate_url: String::new(),
+            homogeneous_redundancy: None,
+            homogeneous_app_version: None,
         }
     }
 }
@@ -170,22 +180,33 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
     if !a.assimilate_url.is_empty() && !a.assimilate_url.starts_with("https://") {
         return invalid("app: assimilate_url must be https");
     }
+    if let Some(t) = a.homogeneous_redundancy {
+        if !(0..HR_NTYPES).contains(&t) {
+            return invalid("app: homogeneous_redundancy must be 0 (none), 1 (fine) or 2 (coarse)");
+        }
+    }
     let friendly = if a.user_friendly_name.is_empty() {
         &a.name
     } else {
         &a.user_friendly_name
     };
+    // NULL keeps the stored value of an existing app, and is 0 for a new one.
+    let hr_type = a.homogeneous_redundancy.map_or(Value::Null, Value::from);
+    let hav = a.homogeneous_app_version.map_or(Value::Null, Value::from);
     let rows = db
         .run(stmt!(
             "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, target_nresults, \
              non_cpu_intensive, fraction_done_exact, min_version, deprecated, validator, validator_url, \
-             assimilate_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             assimilate_url, homogeneous_redundancy, homogeneous_app_version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, 0), coalesce(?, 0)) \
              ON CONFLICT (name) DO UPDATE SET user_friendly_name = excluded.user_friendly_name, \
              weight = excluded.weight, beta = excluded.beta, target_nresults = excluded.target_nresults, \
              non_cpu_intensive = excluded.non_cpu_intensive, \
              fraction_done_exact = excluded.fraction_done_exact, min_version = excluded.min_version, \
              deprecated = excluded.deprecated, validator = excluded.validator, \
-             validator_url = excluded.validator_url, assimilate_url = excluded.assimilate_url \
+             validator_url = excluded.validator_url, assimilate_url = excluded.assimilate_url, \
+             homogeneous_redundancy = coalesce(?, app.homogeneous_redundancy), \
+             homogeneous_app_version = coalesce(?, app.homogeneous_app_version) \
              RETURNING id",
             now,
             a.name.as_str(),
@@ -199,7 +220,11 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
             a.deprecated,
             a.validator.as_str(),
             a.validator_url.as_str(),
-            a.assimilate_url.as_str()
+            a.assimilate_url.as_str(),
+            hr_type.clone(),
+            hav.clone(),
+            hr_type,
+            hav
         ))
         .await?;
     Ok(rows.scalar_i64().unwrap_or(0))
@@ -459,6 +484,10 @@ pub struct JobStatus {
     pub canonical_resultid: i64,
     pub canonical_credit: f64,
     pub transition_time: i64,
+    /// The homogeneous redundancy class the workunit is committed to; 0 if none.
+    pub hr_class: i32,
+    /// The app version it is committed to (homogeneous app version); 0 if none.
+    pub app_version_id: i64,
     pub results: Vec<ResultStatus>,
 }
 
@@ -508,6 +537,8 @@ pub async fn job_status(db: &dyn Db, name: &str) -> CoreResult<Option<JobStatus>
         canonical_resultid: wu.canonical_resultid,
         canonical_credit: wu.canonical_credit,
         transition_time: wu.transition_time,
+        hr_class: wu.hr_class,
+        app_version_id: wu.app_version_id,
         results: results
             .into_iter()
             .map(|r| ResultStatus {
