@@ -355,7 +355,7 @@ Two app settings keep the results of one workunit comparable. Both are off by de
   first send decides it. An anonymous-platform client is never sent a job of such an app, as in
   `get_app_version` in `sched/sched_version.cpp`.
 
-The commitment is `workunit.hr_class` (migration `0005_homogeneous.sql`) and
+The commitment is `workunit.hr_class` (migration `0006_homogeneous.sql`) and
 `workunit.app_version_id`, 0 while the workunit is uncommitted.
 
 **Choosing.** The query that reads the candidates for an app adds `AND w.hr_class IN (0, :class)`
