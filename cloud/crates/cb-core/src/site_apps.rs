@@ -8,7 +8,8 @@
 //! platform, plan class and beta flag with a higher version number. The page
 //! runs no statement of its own. The web Worker has already loaded the
 //! catalog (platforms, applications and versions, see
-//! `crate::scheduler::Catalog`, kept for a few seconds in each isolate) with
+//! `crate::scheduler::Catalog`, kept for 30 seconds in each isolate, `PROJECT_TTL_MS` in
+//! `cb-worker`) with
 //! the settings, and the catalog holds exactly the rows this page lists, so
 //! the cost is the same for one application and for a hundred.
 //!
