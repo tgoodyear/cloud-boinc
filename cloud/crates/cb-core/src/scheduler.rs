@@ -1995,7 +1995,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
          d_boinc_used_total = ?, d_boinc_used_project = ?, d_boinc_max = ?, n_bwup = ?, \
          n_bwdown = ?, host_cpid = ?, external_ip_addr = ?, product_name = ?, p_ngpus = ?, \
          p_gpu_fpops = ?, misc = ? WHERE id = ?",
-        if named_host {
+        // Whenever the reply names the host the client starts from 0 again, so
+        // that is what is stored. Stock stores the request's value for a merged
+        // host's destination (D20 in compatibility.md).
+        if out.reply.hostid == 0 {
             i64::from(req.rpc_seqno)
         } else {
             0

@@ -1253,6 +1253,35 @@ fn a_merged_host_is_followed_to_the_host_it_became() {
     // The client is told its new ID.
     assert_eq!(out.reply.hostid, a.hostid as u64);
     assert!(!has_message(&out, "Can't find host record"));
+    // The client takes the ID and starts from 0 (`handle_scheduler_reply`), so 0 is what is
+    // stored. Stock stores the request's 9 and treats the next request as a copied state file
+    // (D20 in compatibility.md).
+    assert_eq!(w.host(a.hostid).rpc_seqno, 0);
+    // The next requests are the destination, also from a client that says it is one of several
+    // and one that sends no address, which no lookup could match.
+    let rows = |w: &World| -> i64 {
+        block_on(query_one::<Count>(
+            &w.db,
+            stmt!("SELECT count(*) AS n FROM host WHERE userid = 1"),
+        ))
+        .unwrap()
+        .unwrap()
+        .n
+    };
+    let before = rows(&w);
+    let mut next = a.clone();
+    next.seqno = 1;
+    next.host_extra = String::new();
+    let again = w.rpc(&next, 2100);
+    assert_eq!(again.host_id, a.hostid);
+    assert_eq!(again.reply.hostid, 0);
+    next.seqno = 2;
+    next.top_extra = MULTIPLE.into();
+    let again = w.rpc(&next, 2200);
+    assert_eq!(again.host_id, a.hostid);
+    assert_eq!(again.reply.hostid, 0);
+    assert_eq!(rows(&w), before);
+    assert_eq!(w.host(a.hostid).rpc_seqno, 2);
 }
 
 #[test]

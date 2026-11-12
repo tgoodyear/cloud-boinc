@@ -240,7 +240,12 @@ deadline, so neither sends a message.
    - A host that was found by a lookup or made is stored with `rpc_seqno` 0 and named in the reply
      (`got_host`), so the client takes the ID and starts its sequence from 0 again; a host named by
      the request keeps the request's `rpc_seqno`. The reply names the host even when a lookup finds
-     the one the request already named.
+     the one the request already named. The same holds for the destination of a merged host: the
+     reply names it, so `rpc_seqno` 0 is stored. Stock stores the request's value there
+     (`g_reply->host.rpc_seqno = g_request->rpc_seqno` in `handle_request`, after the zombie loop
+     of `authenticate_user`), and the client starts from 0 when the reply carries a host ID
+     (`handle_scheduler_reply` in `client/cs_scheduler.cpp`), so stock treats the client's next
+     request as a copied state file (D20 in [compatibility.md](compatibility.md)).
    - A weak authenticator is accepted only with a host ID of its own account; with another
      account's it finds no key and the request is refused, as in stock.
    - Stock's `stdin_reqs` exception to the `rpc_seqno` test belongs to a scheduler run from a file
