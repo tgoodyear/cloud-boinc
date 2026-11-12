@@ -1192,7 +1192,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // A host merged into another through the web is a "zombie": no user, and
     // the ID of the host it became in `rpc_seqno`. `authenticate_user` follows
     // the links, ten at most; a chain that breaks is a host ID that does not
-    // exist.
+    // exist. The extra reads happen only for a merged host (`userid` 0), so an
+    // ordinary request makes none.
     let mut hops = 0;
     while let Some(z) = host_row.as_ref().filter(|h| h.userid == 0) {
         hops += 1;
@@ -1242,14 +1243,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     } else {
         host_cpid(&req.host_info.host_cpid, &user.email_addr)
     };
-    let no_such_host = host_row.is_none();
+    // True when the request's host ID did not resolve to a row (none sent, no such host, or a
+    // broken merge chain). It is false for another account's host and for a stale `rpc_seqno`:
+    // those rows exist, so `authenticate_user` skips the CPID lookup for them.
+    let host_row_missing = host_row.is_none();
     let mut host = host_row
         .filter(|h| h.userid == user.id && i64::from(req.rpc_seqno) >= h.rpc_seqno && h.id > 0);
     let named_host = host.is_some();
     let mut results_detached = false;
     if host.is_none() {
         let mut lookups = Vec::new();
-        if no_such_host && !request_cpid.is_empty() {
+        if host_row_missing && !request_cpid.is_empty() {
             lookups.push(stmt!(
                 "SELECT * FROM host WHERE userid = ? AND host_cpid = ? ORDER BY id DESC LIMIT 1",
                 user.id,
