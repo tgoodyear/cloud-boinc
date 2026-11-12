@@ -73,8 +73,8 @@ select[id^=pref_]{display:inline-block;width:auto;margin:.25rem 0}
 input[type=checkbox]{width:1.35rem;height:1.35rem;margin:.6rem .5rem .6rem 0;vertical-align:middle;accent-color:var(--accent)}
 input[type=submit],button,.button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:.5rem 1.25rem;font:inherit;font-weight:600;color:var(--on-accent);background:var(--accent);border:1px solid var(--accent);border-radius:.5rem;cursor:pointer;text-decoration:none}
 input[type=submit]:hover,button:hover,.button:hover{filter:brightness(1.1)}
-.secondary,form[action="logout.php"] input[type=submit]{color:var(--accent);background:none}
-.danger{color:var(--err);background:none;border-color:var(--err)}
+.button.secondary,input[type=submit].secondary,button.secondary,form[action="logout.php"] input[type=submit]{color:var(--accent);background:none}
+.button.danger,input[type=submit].danger,button.danger{color:var(--err);background:none;border-color:var(--err)}
 .actions{display:flex;flex-wrap:wrap;gap:.75rem;margin:1rem 0}
 details{margin:.75rem 0}
 summary{cursor:pointer;min-height:44px;padding:.6rem 0;font-weight:600}

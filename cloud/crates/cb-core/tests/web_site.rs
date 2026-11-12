@@ -4626,3 +4626,23 @@ fn a_project_name_with_markup_is_shown_as_text() {
     assert!(home.contains("<h1>A &lt;b&gt;&amp;amp; Co</h1>"));
     assert!(!home.contains("<b>"));
 }
+
+/// The outlined and danger buttons have to out-rank the primary
+/// `input[type=submit]` rule, which has an element and an attribute: a bare
+/// `.secondary` loses to it. A browser check of computed styles is in the PR.
+#[test]
+fn secondary_and_danger_buttons_out_rank_the_primary_rule() {
+    let css = cb_core::web::SITE_CSS;
+    for selector in [
+        "input[type=submit].secondary",
+        "input[type=submit].danger",
+        ".button.secondary",
+        ".button.danger",
+    ] {
+        assert!(css.contains(selector), "{selector}");
+    }
+    let verify = World::with_mail();
+    let ada = verify.account("ada@example.com", "secret", "Ada");
+    let body = verify.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("class=\"secondary\" value=\"Send verification email\""));
+}
