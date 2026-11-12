@@ -5,13 +5,11 @@ use cb_crypto::account::{
     pepper_passwd_hash, random_hex_string, user_cpid, verify_peppered_passwd_hash, weak_auth,
 };
 use cb_db::{query_one, stmt, Db, Stmt};
-use cb_proto::consts::*;
 use cb_proto::web_rpc::{
     err, write_create_account, write_error, write_lookup_account, write_lookup_account_exists,
     AccountError, ConfigPlatform, ProjectConfig, XML_HEADER, XML_HEADER_UTF8,
 };
 use cb_proto::xml::{xml_escape, xml_escape_text};
-use serde::Serialize;
 
 use crate::model::{Host, User};
 use crate::project::{scheduler_url, Project};
@@ -158,11 +156,30 @@ pub fn is_valid_venue(venue: &str) -> bool {
             .any(|c| c.is_control() || c == '<' || c == '>' || c == '&' || c == '"')
 }
 
-/// Why an account may not be made here, if it may not. Shared by
-/// `create_account.php` and the site's sign-up form, as upstream's
-/// `disable_account_creation` applies to both.
+/// Why `create_account.php` refuses, if it does. As upstream's
+/// `html/user/create_account.php`: `disable_account_creation` (here also an
+/// unstated option, see [`Config::account_creation`]) says the project takes
+/// no new accounts; `disable_account_creation_rpc` says to use the web site,
+/// or, with the web site closed too, that the project takes none.
 pub fn account_creation_refusal(config: &Config) -> Option<AccountError> {
-    (!config.account_creation).then_some(AccountError::CreationDisabled)
+    if !config.account_creation {
+        Some(AccountError::CreationDisabled)
+    } else if config.disable_account_creation_rpc {
+        Some(if config.disable_web_account_creation {
+            AccountError::CreationDisabled
+        } else {
+            AccountError::CreationOnWebSite
+        })
+    } else {
+        None
+    }
+}
+
+/// Whether the site's sign-up page is closed: all account creation is, or
+/// `no_web_account_creation` says so (`create_account_form.php`,
+/// `validate_post_make_user`).
+pub fn web_account_creation_closed(config: &Config) -> bool {
+    !config.account_creation || config.disable_web_account_creation
 }
 
 async fn user_by_email(db: &dyn Db, email: &str) -> CoreResult<Option<User>> {
@@ -214,6 +231,22 @@ pub struct NewAccount<'a> {
     /// One of [`crate::countries::COUNTRIES`], or empty.
     pub country: &'a str,
     pub postal_code: &'a str,
+    /// `show_hosts` of the new account: the callers pass
+    /// [`Config::default_show_hosts`] (upstream's `default_show_hosts`).
+    pub show_hosts: bool,
+}
+
+/// An SQL expression for the ID of a new row of `table` (`user` or `host`): the
+/// largest ID the table has or has had (`id_floor`, kept by triggers on delete)
+/// plus one, so that an ID is never given out twice. It is meant for the
+/// `SELECT` of one `INSERT`, which runs as one statement, so two inserts cannot
+/// get the same ID. Every insert into those two tables uses it: `make_user`
+/// here and the scheduler's computer insert in `scheduler.rs`.
+pub fn next_id_sql(table: &str) -> String {
+    format!(
+        "(SELECT max(coalesce((SELECT max(id) FROM {table}), 0), \
+         coalesce((SELECT last_id FROM id_floor WHERE name = '{table}'), 0)) + 1)"
+    )
 }
 
 /// Inserts a user. `Ok(Err(..))` is a refusal with the upstream error.
@@ -265,13 +298,18 @@ pub async fn make_user(
     };
     // Not an address another account changed away from within the week: that
     // account's undo link has to find it free.
+    let sql = format!(
+        "INSERT INTO user (id, create_time, email_addr, name, authenticator, cross_project_id, \
+         passwd_hash, expavg_time, country, postal_code, show_hosts) \
+         SELECT {}, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+         WHERE NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
+         AND previous_email_addr != '' AND email_addr_change_time > ?) \
+         ON CONFLICT (email_addr) DO NOTHING RETURNING id",
+        next_id_sql("user")
+    );
     let inserted = db
         .run(stmt!(
-            "INSERT INTO user (create_time, email_addr, name, authenticator, cross_project_id, \
-             passwd_hash, expavg_time, country, postal_code) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? \
-             WHERE NOT EXISTS (SELECT 1 FROM user WHERE previous_email_addr = ? \
-             AND previous_email_addr != '' AND email_addr_change_time > ?) \
-             ON CONFLICT (email_addr) DO NOTHING RETURNING id",
+            sql,
             now,
             email.as_str(),
             name.as_str(),
@@ -281,6 +319,7 @@ pub async fn make_user(
             now,
             account.country,
             account.postal_code,
+            account.show_hosts,
             email.as_str(),
             now - EMAIL_CHANGE_WAIT_SECS
         ))
@@ -306,7 +345,11 @@ pub async fn create_account(
     if account.passwd_hash.is_empty() {
         return Ok(AccountError::BadPasswdHashLength.reply());
     }
-    Ok(match make_user(db, pepper, now, random, account).await? {
+    let account = NewAccount {
+        show_hosts: config.default_show_hosts,
+        ..account.clone()
+    };
+    Ok(match make_user(db, pepper, now, random, &account).await? {
         Ok(authenticator) => write_create_account(&authenticator),
         Err(e) => e.reply(),
     })
@@ -445,6 +488,12 @@ pub async fn am_set_info(
         }
         if global_prefs.len() > crate::prefs::MAX_PREFS_BYTES {
             return Ok(write_error(err::ERR_BUFFER_OVERFLOW, None));
+        }
+        if let Some(why) = crate::prefs::mod_time_error(&global_prefs, now) {
+            return Ok(write_error(
+                err::ERR_XML_PARSE,
+                Some(&format!("Invalid global preferences: {why}")),
+            ));
         }
         set("global_prefs", global_prefs.into());
     }
@@ -877,7 +926,7 @@ pub fn master_page(project: &Project) -> String {
         html_escape(&c.master_url)
     );
     let mut buttons = Vec::new();
-    if account_creation_refusal(c).is_none() {
+    if !web_account_creation_closed(c) {
         buttons.push(site_ui::button_link(
             "Create an account",
             "create_account_form.php",
@@ -939,161 +988,142 @@ pub fn master_page(project: &Project) -> String {
     page(&c.long_name, &head, &body)
 }
 
-/// Job counts by state, plus account and computer counts from a snapshot at
-/// most `STATUS_COUNTS_TTL` seconds old.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct ServerStatus {
-    pub results_ready_to_send: i64,
-    pub results_in_progress: i64,
-    pub workunits_waiting_for_assimilation: i64,
-    pub transitions_due: i64,
-    pub users: i64,
-    pub hosts: i64,
-    /// Accounts and computers with `expavg_credit` over 1, as upstream
-    /// counts "recent credit".
-    pub users_with_recent_credit: i64,
-    pub hosts_with_recent_credit: i64,
+use crate::status::pipeline_running;
+pub use crate::status::{server_status, ServerStatus, STATUS_COUNTS_TTL};
+
+fn item_xml(out: &mut String, name: &str, value: impl std::fmt::Display) {
+    out.push_str(&format!("   <{name}>{value}</{name}>\n"));
 }
 
-/// `config` row holding the account and computer counts. `Project::load`
-/// ignores names it does not know, so the row is safe beside the settings.
-const STATUS_COUNTS_SETTING: &str = "status_counts";
-
-/// Seconds a stored count snapshot is reused. The counts scan the whole
-/// `user` and `host` tables, so a public poll must not run them each time.
-pub const STATUS_COUNTS_TTL: i64 = 600;
-
-#[derive(Serialize, serde::Deserialize)]
-struct StatusCounts {
-    at: i64,
-    users: i64,
-    users_recent: i64,
-    hosts: i64,
-    hosts_recent: i64,
+/// Upstream's `item_xml` writes a missing or zero value as 0.
+fn hours_xml(x: f64) -> String {
+    if x == 0.0 {
+        "0".into()
+    } else {
+        format!("{x}")
+    }
 }
 
-#[derive(serde::Deserialize)]
-struct CountsRow {
-    value: String,
-}
-
-async fn refresh_status_counts(db: &dyn Db, now: i64) -> CoreResult<StatusCounts> {
-    let out = db
-        .batch(vec![
-            Stmt::new(
-                "SELECT count(*) AS n, coalesce(sum(expavg_credit > 1), 0) AS recent FROM user",
-            ),
-            Stmt::new(
-                "SELECT count(*) AS n, coalesce(sum(expavg_credit > 1), 0) AS recent FROM host",
-            ),
-        ])
-        .await?;
-    let get = |i: usize, col: &str| {
-        out.get(i)
-            .and_then(|r| r.rows.first())
-            .and_then(|row| row.get(col))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-    };
-    let counts = StatusCounts {
-        at: now,
-        users: get(0, "n"),
-        users_recent: get(0, "recent"),
-        hosts: get(1, "n"),
-        hosts_recent: get(1, "recent"),
-    };
-    let json = serde_json::to_string(&counts).map_err(|e| CoreError::Invalid(e.to_string()))?;
-    db.run(stmt!(
-        "INSERT INTO config (name, value, mod_time) VALUES (?, ?, ?) \
-         ON CONFLICT (name) DO UPDATE SET value = excluded.value, mod_time = excluded.mod_time",
-        STATUS_COUNTS_SETTING,
-        json,
-        now
-    ))
-    .await?;
-    Ok(counts)
-}
-
-pub async fn server_status(db: &dyn Db, now: i64) -> CoreResult<ServerStatus> {
-    let out = db
-        .batch(vec![
-            stmt!(
-                "SELECT count(*) AS n FROM result WHERE server_state = ?",
-                RESULT_SERVER_STATE_UNSENT
-            ),
-            stmt!(
-                "SELECT count(*) AS n FROM result WHERE server_state = ? AND hostid > 0",
-                RESULT_SERVER_STATE_IN_PROGRESS
-            ),
-            stmt!(
-                "SELECT count(*) AS n FROM workunit WHERE assimilate_state = ?",
-                ASSIMILATE_READY
-            ),
-            stmt!(
-                "SELECT count(*) AS n FROM workunit WHERE transition_time < ? AND transition_time < 2147483647",
-                now
-            ),
-            stmt!(
-                "SELECT value FROM config WHERE name = ?",
-                STATUS_COUNTS_SETTING
-            ),
-        ])
-        .await?;
-    let n = |i: usize| out.get(i).and_then(|r| r.scalar_i64()).unwrap_or(0);
-    let cached = match out.get(4).cloned() {
-        Some(rows) => rows
-            .first::<CountsRow>()?
-            .and_then(|r| serde_json::from_str::<StatusCounts>(&r.value).ok()),
-        None => None,
-    };
-    let counts = match cached {
-        Some(c) if c.at <= now && now - c.at < STATUS_COUNTS_TTL => c,
-        _ => refresh_status_counts(db, now).await?,
-    };
-    Ok(ServerStatus {
-        results_ready_to_send: n(0),
-        results_in_progress: n(1),
-        workunits_waiting_for_assimilation: n(2),
-        transitions_due: n(3),
-        users: counts.users,
-        hosts: counts.hosts,
-        users_with_recent_credit: counts.users_recent,
-        hosts_with_recent_credit: counts.hosts_recent,
-    })
-}
-
-/// `server_status.php?xml=1`, in the element names of the upstream page.
+/// `server_status.php?xml=1`, in the element names of the upstream page
+/// (`show_status_xml`), with `update_time` and `software_version` besides.
+/// The `<daemon_status>` has the scheduler, which is the Worker answering, and
+/// the pipeline, which is "running" while its cron's last sweep is recent
+/// (see [`crate::status::record_sweep`]) or none was recorded yet. The
+/// numbers are the snapshot of `cached_time`.
 pub fn server_status_xml(project: &Project, s: &ServerStatus, now: i64) -> String {
-    format!(
+    let mut o = format!(
         "{XML_HEADER}<server_status>\n<update_time>{now}</update_time>\n<software_version>cloud-boinc {}</software_version>\n\
          <daemon_status>\n<daemon><host>cloudflare</host><command>scheduler</command><status>{}</status></daemon>\n\
-         <daemon><host>cloudflare</host><command>pipeline</command><status>running</status></daemon>\n</daemon_status>\n\
-         <database_file_states>\n<results_ready_to_send>{}</results_ready_to_send>\n\
-         <results_in_progress>{}</results_in_progress>\n\
-         <workunits_waiting_for_assimilation>{}</workunits_waiting_for_assimilation>\n\
-         <transitioner_backlog_hours>{}</transitioner_backlog_hours>\n\
-         <users_with_recent_credit>{}</users_with_recent_credit>\n<hosts_with_recent_credit>{}</hosts_with_recent_credit>\n\
-         </database_file_states>\n</server_status>\n",
+         <daemon><host>cloudflare</host><command>pipeline</command><status>{}</status></daemon>\n</daemon_status>\n\
+         <database_file_states>\n",
         env!("CARGO_PKG_VERSION"),
-        if project.config.ended { "disabled" } else { "running" },
-        s.results_ready_to_send,
-        s.results_in_progress,
+        if project.config.ended {
+            "disabled"
+        } else {
+            "running"
+        },
+        if pipeline_running(s.last_sweep, now) {
+            "running"
+        } else {
+            "not running"
+        },
+    );
+    item_xml(&mut o, "results_ready_to_send", s.results_ready_to_send);
+    item_xml(&mut o, "results_in_progress", s.results_in_progress);
+    item_xml(
+        &mut o,
+        "workunits_waiting_for_validation",
+        s.workunits_waiting_for_validation,
+    );
+    item_xml(
+        &mut o,
+        "workunits_waiting_for_assimilation",
         s.workunits_waiting_for_assimilation,
-        if s.transitions_due > 0 { "0.02" } else { "0" },
+    );
+    item_xml(
+        &mut o,
+        "workunits_waiting_for_deletion",
+        s.workunits_waiting_for_deletion,
+    );
+    item_xml(
+        &mut o,
+        "results_waiting_for_deletion",
+        s.results_waiting_for_deletion,
+    );
+    item_xml(
+        &mut o,
+        "transitioner_backlog_hours",
+        hours_xml(s.transitioner_backlog_hours),
+    );
+    item_xml(
+        &mut o,
+        "users_with_recent_credit",
         s.users_with_recent_credit,
+    );
+    item_xml(&mut o, "users_with_credit", s.users_with_credit);
+    item_xml(
+        &mut o,
+        "users_registered_in_past_24_hours",
+        s.users_past_24_hours,
+    );
+    item_xml(
+        &mut o,
+        "hosts_with_recent_credit",
         s.hosts_with_recent_credit,
-    )
+    );
+    item_xml(&mut o, "hosts_with_credit", s.hosts_with_credit);
+    item_xml(
+        &mut o,
+        "hosts_registered_in_past_24_hours",
+        s.hosts_past_24_hours,
+    );
+    item_xml(&mut o, "current_floating_point_speed", hours_xml(s.flops));
+    o.push_str("<tasks_by_app>\n");
+    // Upstream lists the applications that are not deprecated.
+    for a in s.apps.iter().filter(|a| !a.deprecated) {
+        o.push_str("<app>\n");
+        item_xml(&mut o, "id", a.id);
+        item_xml(&mut o, "name", xml_escape_text(&a.name));
+        item_xml(&mut o, "unsent", a.unsent);
+        item_xml(&mut o, "in_progress", a.in_progress);
+        if let (Some(avg), Some(min), Some(max)) = (a.avg_hours, a.min_hours, a.max_hours) {
+            item_xml(&mut o, "avg_runtime", hours_xml(avg));
+            item_xml(&mut o, "min_runtime", hours_xml(min));
+            item_xml(&mut o, "max_runtime", hours_xml(max));
+            item_xml(&mut o, "users", a.users_24h);
+        }
+        o.push_str("</app>\n");
+    }
+    o.push_str("</tasks_by_app>\n</database_file_states>\n</server_status>\n");
+    o
 }
 
+/// `time_diff2` of upstream for the runtimes in the table.
+fn duration_hours(hours: f64) -> String {
+    let secs = hours * 3600.0;
+    if secs >= 86400.0 {
+        format!("{:.2} days", secs / 86400.0)
+    } else if secs >= 3600.0 {
+        format!("{:.2} hours", secs / 3600.0)
+    } else if secs >= 60.0 {
+        format!("{:.2} min", secs / 60.0)
+    } else {
+        format!("{secs:.2} sec")
+    }
+}
+
+/// `server_status.php` as a page: the counts and the table of tasks by
+/// application (`show_status_html`).
 pub fn server_status_page(project: &Project, s: &ServerStatus) -> String {
-    let group = |rows: &[(&str, i64)]| {
+    let group = |rows: &[(&str, String)]| {
         site_ui::stats(
             &rows
                 .iter()
-                .map(|(label, n)| site_ui::stat(label, &n.to_string(), ""))
+                .map(|(label, n)| site_ui::stat(label, n, ""))
                 .collect::<Vec<_>>(),
         )
     };
+    let n = |x: i64| x.to_string();
     let mut body = format!(
         "{}<h1>{} server status</h1>\n",
         site_header(project),
@@ -1101,21 +1131,96 @@ pub fn server_status_page(project: &Project, s: &ServerStatus) -> String {
     );
     body.push_str("<h2>Tasks</h2>\n");
     body.push_str(&group(&[
-        ("Tasks ready to send", s.results_ready_to_send),
-        ("Tasks in progress", s.results_in_progress),
+        ("Tasks ready to send", n(s.results_ready_to_send)),
+        ("Tasks in progress", n(s.results_in_progress)),
+        (
+            "Workunits waiting for validation",
+            n(s.workunits_waiting_for_validation),
+        ),
         (
             "Workunits waiting for assimilation",
-            s.workunits_waiting_for_assimilation,
+            n(s.workunits_waiting_for_assimilation),
         ),
-        ("Transitions due", s.transitions_due),
+        (
+            "Workunits waiting for file deletion",
+            n(s.workunits_waiting_for_deletion),
+        ),
+        (
+            "Tasks waiting for file deletion",
+            n(s.results_waiting_for_deletion),
+        ),
+        ("Transitions due", n(s.transitions_due)),
+        (
+            "Transitioner backlog (hours)",
+            format!("{:.2}", s.transitioner_backlog_hours),
+        ),
     ]));
     body.push_str("<h2>Accounts and computers</h2>\n");
     body.push_str(&group(&[
-        ("Accounts", s.users),
-        ("Accounts with recent credit", s.users_with_recent_credit),
-        ("Computers", s.hosts),
-        ("Computers with recent credit", s.hosts_with_recent_credit),
+        ("Accounts", n(s.users)),
+        ("Accounts with credit", n(s.users_with_credit)),
+        ("Accounts with recent credit", n(s.users_with_recent_credit)),
+        (
+            "Accounts registered in past 24 hours",
+            n(s.users_past_24_hours),
+        ),
+        ("Computers", n(s.hosts)),
+        ("Computers with credit", n(s.hosts_with_credit)),
+        (
+            "Computers with recent credit",
+            n(s.hosts_with_recent_credit),
+        ),
+        (
+            "Computers registered in past 24 hours",
+            n(s.hosts_past_24_hours),
+        ),
+        ("Current GigaFLOPS", format!("{:.2}", s.flops)),
     ]));
+    let apps: Vec<Vec<String>> = s
+        .apps
+        .iter()
+        .filter(|a| !a.deprecated)
+        .map(|a| {
+            let (runtime, users) = match (a.avg_hours, a.min_hours, a.max_hours) {
+                (Some(avg), Some(min), Some(max)) if max > 0.0 => (
+                    format!(
+                        "{} ({} - {})",
+                        duration_hours(avg),
+                        duration_hours(min),
+                        duration_hours(max)
+                    ),
+                    a.users_24h.to_string(),
+                ),
+                _ => ("---".into(), "---".into()),
+            };
+            vec![
+                html_escape(&a.user_friendly_name),
+                a.unsent.to_string(),
+                a.in_progress.to_string(),
+                runtime,
+                users,
+            ]
+        })
+        .collect();
+    let table = if apps.is_empty() {
+        site_ui::empty("No applications are available yet.")
+    } else {
+        site_ui::data_table(
+            &[
+                site_ui::Col::text("Application"),
+                site_ui::Col::num("Unsent"),
+                site_ui::Col::num("In progress"),
+                site_ui::Col::text("Runtime of recent tasks: average, min, max"),
+                site_ui::Col::num("Users in last 24 hours"),
+            ],
+            &apps,
+        )
+    };
+    body.push_str(&site_ui::card("Tasks by application", &table));
+    body.push_str(&format!(
+        "<p>Task data as of {}.</p>\n",
+        crate::site::time_str(s.cached_time)
+    ));
     page("Server status", "", &body)
 }
 

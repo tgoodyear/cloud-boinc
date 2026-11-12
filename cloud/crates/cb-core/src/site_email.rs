@@ -41,7 +41,7 @@ const TOKEN_CLEANUP_ROWS: i64 = 20;
 /// may be issued to the same account, and whether a new one replaces the
 /// older ones that are still unused.
 pub(crate) struct TokenKind {
-    code: &'static str,
+    pub(crate) code: &'static str,
     lifetime: i64,
     interval: i64,
     supersede: bool,
@@ -72,6 +72,15 @@ pub(crate) const CHANGE: TokenKind = TokenKind {
     supersede: true,
 };
 
+/// The link that confirms a request to delete the account, as upstream's
+/// `TOKEN_TYPE_DELETE_ACCOUNT` (a day). Used up by the deletion itself.
+pub(crate) const DELETE: TokenKind = TokenKind {
+    code: "D",
+    lifetime: LINK_SECS,
+    interval: MAIL_INTERVAL_SECS,
+    supersede: false,
+};
+
 fn new_token(random: &dyn Fn() -> u32) -> String {
     format!(
         "{}{}",
@@ -81,7 +90,7 @@ fn new_token(random: &dyn Fn() -> u32) -> String {
 }
 
 /// Whether `s` has the form of a token this module issues.
-fn is_token(s: &str) -> bool {
+pub(crate) fn is_token(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -233,7 +242,7 @@ pub(crate) enum Budget {
 /// a refused message is not counted, does not reach the transport, and is
 /// logged with the reason and `userid`. Every message the site sends goes
 /// through here. A message that fails still counts.
-async fn deliver(
+pub(crate) async fn deliver(
     ctx: &SiteCtx<'_>,
     mail: &Mail<'_>,
     userid: i64,
@@ -583,6 +592,55 @@ pub(crate) async fn send_verification(
         Delivery::Undeliverable(_) => Ok(Sent::Undeliverable),
         // The limit stays used, and so does the link if the message did get
         // there after all.
+        Delivery::NotSent => Ok(Sent::Failed),
+    }
+}
+
+/// Mails the account the link that confirms the deletion of the account
+/// (`send_confirm_delete_email` in `html/inc/email.inc`), unless it had one
+/// within [`MAIL_INTERVAL_SECS`].
+pub(crate) async fn send_delete_confirmation(
+    ctx: &SiteCtx<'_>,
+    mail: &Mail<'_>,
+    user: &User,
+) -> CoreResult<Sent> {
+    if mail.refuse(user.id, &user.email_addr).is_some() {
+        return Ok(Sent::Undeliverable);
+    }
+    if !is_strict_email(&user.email_addr) {
+        return Ok(Sent::Failed);
+    }
+    let Some(token) = issue_token(ctx, user, &DELETE, "").await? else {
+        return Ok(Sent::Recent);
+    };
+    let n = name(ctx);
+    let master = &ctx.project.config.master_url;
+    let body = format!(
+        "This email was sent in response to a request on the {n} web site.\n\n\
+         You have requested to delete your account at {n}. To confirm, use the following \
+         link. It leads to a page where you enter your password to finish deleting the \
+         account.\n\n\
+         {master}delete_account_confirm.php?id={}&token={token}\n\n\
+         This link is valid for 1 day.\n\n\
+         If you did not ask for this, ignore this message: nothing is deleted without the \
+         link and the password.\n\n\
+         For further information and assistance with {n}, visit\n{master}\n",
+        user.id
+    );
+    let subject = format!("Confirm your request to delete your account at {n}");
+    match deliver(
+        ctx,
+        mail,
+        user.id,
+        &user.email_addr,
+        &subject,
+        &body,
+        Budget::Counted,
+    )
+    .await?
+    {
+        Delivery::Sent => Ok(Sent::Delivered),
+        Delivery::Undeliverable(_) => Ok(Sent::Undeliverable),
         Delivery::NotSent => Ok(Sent::Failed),
     }
 }
