@@ -242,11 +242,13 @@ async fn deliver(
     body: &str,
     budget: Budget,
 ) -> CoreResult<Delivery> {
-    if !is_strict_email(to) {
-        return Ok(Delivery::NotSent);
-    }
+    // The guard comes before the syntax check, so that an address it
+    // classifies (`a@localhost`) is always logged and reported as one.
     if let Some(reason) = mail.refuse(userid, to) {
         return Ok(Delivery::Undeliverable(reason));
+    }
+    if !is_strict_email(to) {
+        return Ok(Delivery::NotSent);
     }
     let cap = ctx.project.config.email_max_per_day;
     let day = ctx.now.div_euclid(86400);
@@ -384,7 +386,7 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
     // An address the site would not mail (an account made under the looser
     // rule) gets no token either: it would use the account's slot for nothing.
     if let Some(user) = user
-        .filter(|u| is_strict_email(&u.email_addr) && mail.refuse(u.id, &u.email_addr).is_none())
+        .filter(|u| mail.refuse(u.id, &u.email_addr).is_none() && is_strict_email(&u.email_addr))
     {
         if let Some(token) = issue_token(ctx, &user, &LOGIN, "").await? {
             let n = name(ctx);
@@ -550,11 +552,11 @@ pub(crate) async fn send_verification(
     user: &User,
     budget: Budget,
 ) -> CoreResult<Sent> {
-    if !is_strict_email(&user.email_addr) {
-        return Ok(Sent::Failed);
-    }
     if mail.refuse(user.id, &user.email_addr).is_some() {
         return Ok(Sent::Undeliverable);
+    }
+    if !is_strict_email(&user.email_addr) {
+        return Ok(Sent::Failed);
     }
     let Some(token) = issue_token(ctx, user, &VERIFY, &user.email_addr).await? else {
         return Ok(Sent::Recent);
@@ -744,7 +746,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
             project,
             400,
             &format!(
-                "{CANNOT_RECEIVE} Change the address of your account on the account page, then                  ask for the message again."
+                "{CANNOT_RECEIVE} Change the address of your account on the account page, then ask for the message again."
             ),
         ),
     })

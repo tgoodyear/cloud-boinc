@@ -127,8 +127,11 @@ pub fn undeliverable(addr: &str) -> Option<Undeliverable> {
 /// (sign-up, address change). A site that sends no email has nothing to
 /// bounce, so it refuses nothing.
 pub(crate) fn cannot_receive(ctx: &SiteCtx<'_>, addr: &str) -> bool {
-    ctx.mail()
-        .is_some_and(|mail| mail.undeliverable(addr).is_some())
+    // An empty field is a missing address, which the form's own check names.
+    !addr.is_empty()
+        && ctx
+            .mail()
+            .is_some_and(|mail| mail.undeliverable(addr).is_some())
 }
 
 /// Whether fake mailers in tests keep the reserved names (`@example.org` is

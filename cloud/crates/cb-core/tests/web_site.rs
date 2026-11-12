@@ -4153,6 +4153,95 @@ fn a_reserved_address_is_not_mailed_or_counted() {
         .all(|(_, r)| !r.contains('@')));
 }
 
+/// Addresses the loose syntax test lets an old account hold but the guard
+/// classifies; an operator cannot make them now, so the tests set them
+/// directly.
+const OLD_FORMS: [&str; 3] = ["a@localhost", "a@example.com.", "a@[192.0.2.1]"];
+
+impl World {
+    /// An account that was made with `old@gmail.com` and now has `addr`, with
+    /// no password (its account key proves it).
+    fn account_with_old_address(&self, addr: &str) -> Account {
+        let a = self.account("old@gmail.com", "secret", "Old");
+        self.sql(&format!(
+            "UPDATE user SET email_addr = '{addr}', passwd_hash = '' WHERE id = {}",
+            a.id
+        ));
+        a
+    }
+}
+
+#[test]
+fn verification_names_an_old_address_the_guard_classifies() {
+    for addr in OLD_FORMS {
+        let w = World::with_guard();
+        let a = w.account_with_old_address(addr);
+        let page = w.ask_verification(&a);
+        assert_eq!(page.status, 400, "{addr}: {}", page.body);
+        assert!(page.body.contains(CANNOT_RECEIVE), "{addr}: {}", page.body);
+        assert_eq!(w.mail.calls.get(), 0);
+        assert_eq!(w.mail_days(), 0);
+        assert_eq!(w.token_rows("V"), 0);
+        assert_eq!(w.mail.refused.borrow().len(), 1, "{addr}: logged");
+        assert!(w.mail.refused.borrow()[0].1 != "unknown");
+    }
+}
+
+#[test]
+fn recovery_stays_neutral_for_an_old_address_the_guard_classifies() {
+    let w = World::with_guard();
+    for addr in OLD_FORMS {
+        w.account_with_old_address(addr);
+        w.sql("DELETE FROM user WHERE email_addr = 'old@gmail.com'");
+        let known = w.request_login_link(addr);
+        let unknown = w.request_login_link(&addr.replace("a@", "nobody@"));
+        let generic = |p: &SitePage, a: &str| (p.status, p.body.replace(a, "ADDR"));
+        assert_eq!(
+            generic(&known, addr),
+            generic(&unknown, &addr.replace("a@", "nobody@")),
+            "{addr}"
+        );
+        w.sql("DELETE FROM user WHERE id > 0");
+    }
+    assert_eq!(w.mail.calls.get(), 0);
+    assert_eq!(w.token_rows("L"), 0);
+}
+
+#[test]
+fn an_address_change_logs_a_refused_old_address_the_guard_classifies() {
+    for addr in OLD_FORMS {
+        let w = World::with_guard();
+        let a = w.account_with_old_address(addr);
+        let page = w.change_email(&a.auth, "new@sub.gmail.com", &a.auth);
+        assert_eq!(w.user(a.id).email_addr, "new@sub.gmail.com", "{addr}");
+        assert!(
+            page.body.contains("unable to send"),
+            "{addr}: {}",
+            page.body
+        );
+        assert_eq!(w.mails().len(), 1, "only the new address is mailed");
+        assert_eq!(w.mail.refused.borrow().len(), 1, "{addr}: logged");
+    }
+}
+
+#[test]
+fn the_forms_name_these_forms_as_unable_to_receive_mail() {
+    let w = World::with_guard();
+    let ada = w.account("ada@gmail.com", "secret", "Ada");
+    for to in OLD_FORMS {
+        let page = w.change_email(&ada.auth, to, "secret");
+        assert_eq!(page.status, 400, "{to}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{to}: {}", page.body);
+        let page = w.sign_up("n", to);
+        assert_eq!(page.status, 400, "{to}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{to}: {}", page.body);
+    }
+    // An empty field is still just invalid.
+    let page = w.sign_up("n", "");
+    assert_eq!(page.status, 400);
+    assert!(!page.body.contains(CANNOT_RECEIVE));
+}
+
 #[test]
 fn a_refused_send_is_logged_with_the_reason_and_the_account_only() {
     let w = World::with_guard();

@@ -213,15 +213,15 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
         return Ok(error_page(project, 400, e));
     }
     let email = str_param(q, "new_email_addr").to_lowercase();
+    if cannot_receive(ctx, &email) {
+        return Ok(error_page(project, 400, CANNOT_RECEIVE));
+    }
     if !is_strict_email(&email) {
         return Ok(error_page(
             project,
             400,
             "Invalid email address: please enter a valid address of the form name@xxx.yyy",
         ));
-    }
-    if cannot_receive(ctx, &email) {
-        return Ok(error_page(project, 400, CANNOT_RECEIVE));
     }
     let passwd = q.get("passwd").map(String::as_str).unwrap_or_default();
     if let Some(e) = passwd_error(passwd) {
@@ -601,15 +601,15 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         ));
     };
     let email = str_param(q, "email_addr").to_lowercase();
+    if cannot_receive(ctx, &email) {
+        return Ok(error_page(project, 400, CANNOT_RECEIVE));
+    }
     if !is_strict_email(&email) {
         return Ok(error_page(
             project,
             400,
             "The new email address is invalid.",
         ));
-    }
-    if cannot_receive(ctx, &email) {
-        return Ok(error_page(project, 400, CANNOT_RECEIVE));
     }
     if email == user.email_addr {
         return Ok(error_page(
