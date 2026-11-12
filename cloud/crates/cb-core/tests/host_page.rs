@@ -374,16 +374,43 @@ fn hostile_strings_in_misc_are_escaped() {
         assert!(!page.contains("<img src=x"), "{page}");
         assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
-    // A distribution that is not BOINC's is named by whoever set the computer up: the
-    // account sees the name, a visitor does not.
-    assert!(row(&own, "Docker").contains("WSL distro: &lt;script&gt;"));
-    assert!(row(&public, "Docker").contains("WSL distro: other ver 3"));
-    let distro_line = row(&public, "Docker")
-        .split("<br>")
-        .nth(1)
-        .unwrap()
-        .to_string();
-    assert!(!distro_line.contains("alert"), "{distro_line}");
+}
+
+/// A WSL distribution name is shown to every visitor, as `docker_desc` in `html/inc/host.inc`
+/// does, with the markup characters escaped.
+#[test]
+fn a_wsl_distro_name_is_shown_to_everyone_and_escaped() {
+    let request = fixture("8.0.4/01-first-contact.request.xml");
+    let w = World::new(&request);
+    let host = w.rpc(&request);
+    let name = "<b>x</b> & \"q\" 'y'";
+    let misc = serde_json::json!({
+        "client_version": "8.2.15",
+        "docker": {"version": "28.0.4", "type": 1, "wsl_distro": name, "boinc_buda_runner_version": 9},
+    })
+    .to_string();
+    w.set(host, &misc, "");
+    let (own, public) = w.detail(host);
+    for page in [&own, &public] {
+        assert_eq!(
+            row(page, "Docker"),
+            "Docker version 28.0.4<br>WSL distro: &lt;b&gt;x&lt;/b&gt; &amp; &quot;q&quot; &#39;y&#39; ver 9"
+        );
+        assert!(!page.contains("<b>x</b>"));
+    }
+    // A name with no runner version, and a plain one.
+    w.set(
+        host,
+        r#"{"docker":{"version":"1","type":1,"wsl_distro":"alice-laptop"}}"#,
+        "",
+    );
+    let (own, public) = w.detail(host);
+    for page in [&own, &public] {
+        assert_eq!(
+            row(page, "Docker"),
+            "Docker version 1<br>WSL distro: alice-laptop"
+        );
+    }
 }
 
 /// BOINC's own WSL distribution is public, with its runner version, as the rest of the row is.

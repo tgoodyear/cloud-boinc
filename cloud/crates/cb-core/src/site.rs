@@ -1298,7 +1298,7 @@ pub async fn show_host_detail(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
     let misc = HostMisc::read(&h.misc, &h.serialnum);
     row2(&mut b, "Coprocessors", &misc.gpu_desc());
     row2(&mut b, "Virtualization", &misc.vbox_desc());
-    row2(&mut b, "Docker", &misc.docker_desc(private));
+    row2(&mut b, "Docker", &misc.docker_desc());
     row2(
         &mut b,
         "Operating System",

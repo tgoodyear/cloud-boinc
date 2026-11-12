@@ -22,8 +22,6 @@ use serde_json::Value;
 
 use crate::web::html_escape;
 
-/// `BOINC_WSL_DISTRO_NAME` in `lib/wslinfo.h`: the distribution BOINC installs.
-const BOINC_WSL_DISTRO_NAME: &str = "boinc-buda-runner";
 const KILO: f64 = 1024.0;
 const MEGA: f64 = KILO * KILO;
 const GIGA: f64 = MEGA * KILO;
@@ -369,11 +367,7 @@ impl HostMisc {
 
     /// `docker_desc`: Docker or Podman with its version, the WSL distribution
     /// it runs in, and the client's own settings. Escaped.
-    ///
-    /// A WSL distribution other than BOINC's is named by whoever set the
-    /// computer up, so its name is shown only when `show_names` is set (the
-    /// computer's own account), as the computer's name is.
-    pub fn docker_desc(&self, show_names: bool) -> String {
+    pub fn docker_desc(&self) -> String {
         let Some(d) = &self.docker else {
             return "---".into();
         };
@@ -384,11 +378,7 @@ impl HostMisc {
         };
         let mut x = format!("{kind} version {}", html_escape(&d.version));
         if let Some(w) = &d.distro {
-            let name = if show_names || w.name == BOINC_WSL_DISTRO_NAME {
-                html_escape(&w.name)
-            } else {
-                "other".into()
-            };
+            let name = html_escape(&w.name);
             if w.runner_version == 0 {
                 x.push_str(&format!("<br>WSL distro: {name}"));
             } else {
@@ -442,7 +432,7 @@ mod tests {
             "Virtualbox 7.1.6<br>HW acceleration: yes<br>Enabled: no"
         );
         assert_eq!(
-            m.docker_desc(false),
+            m.docker_desc(),
             "Docker version 27.0.3<br>WSL distro: boinc-buda-runner ver 9<br>Config: don't use Docker"
         );
     }
@@ -460,7 +450,7 @@ mod tests {
             m.vbox_desc(),
             "Virtualbox 7.1.6<br>HW acceleration: yes<br>Enabled: yes"
         );
-        assert_eq!(m.docker_desc(false), "Podman version 27.0.3");
+        assert_eq!(m.docker_desc(), "Podman version 27.0.3");
     }
 
     #[test]
@@ -470,7 +460,7 @@ mod tests {
         assert_eq!(m.boinc_version(), "8.0.4");
         assert_eq!(m.gpu_desc(), "2 CUDA; 8.00 GB RAM");
         assert_eq!(m.vbox_desc(), "Virtualbox 7.0&lt;b&gt;");
-        assert_eq!(m.docker_desc(false), "Docker or Podman version 24");
+        assert_eq!(m.docker_desc(), "Docker or Podman version 24");
         assert_eq!(HostMisc::read("", "").gpu_desc(), "---");
         assert_eq!(HostMisc::read("", "").boinc_version(), "---");
     }
@@ -497,7 +487,7 @@ mod tests {
         let m = HostMisc::read(odd, s);
         assert_eq!(m.boinc_version(), "8");
         assert_eq!(m.gpu_desc(), "---");
-        assert_eq!(m.docker_desc(true), "---");
+        assert_eq!(m.docker_desc(), "---");
         let odd = r#"{"gpus":[1,null,{"model":["x"],"count":"3abc","ram_mb":"0","opencl_version":"abc"}]}"#;
         assert_eq!(HostMisc::read(odd, s).gpu_desc(), "3 ");
     }
@@ -517,8 +507,8 @@ mod tests {
             m.boinc_version(),
             m.gpu_desc(),
             m.vbox_desc(),
-            m.docker_desc(true),
-            m.docker_desc(false),
+            m.docker_desc(),
+            m.docker_desc(),
         ] {
             assert!(!s.contains("<img"), "{s}");
             assert!(!s.contains('"') && !s.contains('\''), "{s}");
@@ -530,29 +520,31 @@ mod tests {
             m.boinc_version(),
             m.gpu_desc(),
             m.vbox_desc(),
-            m.docker_desc(true),
+            m.docker_desc(),
         ] {
             assert!(!s.contains("<img"), "{s}");
         }
     }
 
     #[test]
-    fn another_wsl_distro_is_named_only_for_the_account() {
+    fn a_wsl_distro_name_is_shown_as_stock_does_and_escaped() {
         let misc = r#"{"docker":{"version":"1","type":1,"wsl_distro":"alice-laptop"}}"#;
-        let m = HostMisc::read(misc, "");
         assert_eq!(
-            m.docker_desc(false),
-            "Docker version 1<br>WSL distro: other"
-        );
-        assert_eq!(
-            m.docker_desc(true),
+            HostMisc::read(misc, "").docker_desc(),
             "Docker version 1<br>WSL distro: alice-laptop"
         );
         // Science United's nested form.
         let misc = r#"{"docker":{"version":"1","type":1,"wsl_distro":{"wsl_distro":"boinc-buda-runner","boinc_buda_runner_version":3}}}"#;
         assert_eq!(
-            HostMisc::read(misc, "").docker_desc(false),
+            HostMisc::read(misc, "").docker_desc(),
             "Docker version 1<br>WSL distro: boinc-buda-runner ver 3"
+        );
+        let misc =
+            serde_json::json!({"docker": {"version": "1", "type": 1, "wsl_distro": "<b>&\"'x"}})
+                .to_string();
+        assert_eq!(
+            HostMisc::read(&misc, "").docker_desc(),
+            "Docker version 1<br>WSL distro: &lt;b&gt;&amp;&quot;&#39;x"
         );
     }
 
