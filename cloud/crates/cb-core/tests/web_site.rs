@@ -27,11 +27,28 @@ const MAIL_CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<maste
 struct Capture {
     sent: RefCell<Vec<MailMessage>>,
     fail: Cell<bool>,
+    /// Times the transport was called, whether or not it succeeded.
+    calls: Cell<u32>,
+    /// Whether the real reserved-name list applies. Off by default: the
+    /// fixtures keep their `@example.org` addresses (see
+    /// `Mailer::allows_reserved_recipients`).
+    guarded: Cell<bool>,
+    /// What the log was told about refused messages: account id and reason.
+    refused: RefCell<Vec<(i64, String)>>,
 }
 
 #[async_trait(?Send)]
 impl Mailer for Capture {
+    fn log_refused(&self, userid: i64, reason: &str) {
+        self.refused.borrow_mut().push((userid, reason.to_string()));
+    }
+
+    fn allows_reserved_recipients(&self) -> bool {
+        !self.guarded.get()
+    }
+
     async fn send(&self, message: &MailMessage) -> Result<(), MailError> {
+        self.calls.set(self.calls.get() + 1);
         if self.fail.get() {
             return Err(MailError::Send("refused".into()));
         }
@@ -4058,6 +4075,322 @@ fn an_address_the_site_would_not_mail_gets_no_token_and_no_cap() {
         0
     );
     assert!(w.mails().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Addresses that cannot receive mail (`cb_core::mail_guard`).
+
+impl World {
+    /// A mail-sending project where the real list of reserved names applies.
+    fn with_guard() -> World {
+        let w = World::with_mail();
+        w.mail.guarded.set(true);
+        w
+    }
+
+    fn mail_days(&self) -> i64 {
+        self.count("SELECT count(*) AS n FROM mail_day WHERE day > ?", "0")
+    }
+
+    /// The address's verification request from the account page.
+    fn ask_verification(&self, a: &Account) -> SitePage {
+        let home = self.get("/home.php", Some(&a.auth), &[]);
+        self.submit(&home, "/validate_email_addr.php", Some(&a.auth), &[])
+            .0
+    }
+
+    fn sign_up(&self, name: &str, email: &str) -> SitePage {
+        self.post(
+            "/create_account_action.php",
+            None,
+            &[
+                ("new_name", name),
+                ("new_email_addr", email),
+                ("passwd", "secret1"),
+                ("passwd2", "secret1"),
+                ("country", "United Kingdom"),
+                ("postal_code", ""),
+            ],
+        )
+    }
+}
+
+const CANNOT_RECEIVE: &str = "cannot receive mail";
+
+#[test]
+fn a_reserved_address_is_not_mailed_or_counted() {
+    let w = World::with_guard();
+    for (i, addr) in [
+        "ada@example.com",
+        "ada@example.net",
+        "ada@example.org",
+        "eve@EXAMPLE.ORG",
+        "bob@mail.example.com",
+        "cy@host.test",
+        "dee@x.example",
+        "fay@y.invalid",
+        "gus@z.localhost",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // An operator can make an account with any address.
+        let a = w.account(addr, "secret", "Ada");
+        let page = w.ask_verification(&a);
+        assert_eq!(page.status, 400, "{addr}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{addr}: {}", page.body);
+        assert_eq!(w.mail.calls.get(), 0, "{addr}: the provider is not called");
+        assert!(w.mails().is_empty());
+        assert_eq!(w.mail_days(), 0, "{addr}: the counter is not used");
+        assert_eq!(w.token_rows("V"), 0, "{addr}: no link is made");
+        assert_eq!(w.mail.refused.borrow().len(), i + 1);
+    }
+    assert!(w
+        .mail
+        .refused
+        .borrow()
+        .iter()
+        .all(|(_, r)| !r.contains('@')));
+}
+
+/// Addresses the loose syntax test lets an old account hold but the guard
+/// classifies; an operator cannot make them now, so the tests set them
+/// directly.
+const OLD_FORMS: [&str; 3] = ["a@localhost", "a@example.com.", "a@[192.0.2.1]"];
+
+impl World {
+    /// An account that was made with `old@gmail.com` and now has `addr`, with
+    /// no password (its account key proves it).
+    fn account_with_old_address(&self, addr: &str) -> Account {
+        let a = self.account("old@gmail.com", "secret", "Old");
+        self.sql(&format!(
+            "UPDATE user SET email_addr = '{addr}', passwd_hash = '' WHERE id = {}",
+            a.id
+        ));
+        a
+    }
+}
+
+#[test]
+fn verification_names_an_old_address_the_guard_classifies() {
+    for addr in OLD_FORMS {
+        let w = World::with_guard();
+        let a = w.account_with_old_address(addr);
+        let page = w.ask_verification(&a);
+        assert_eq!(page.status, 400, "{addr}: {}", page.body);
+        assert!(page.body.contains(CANNOT_RECEIVE), "{addr}: {}", page.body);
+        assert_eq!(w.mail.calls.get(), 0);
+        assert_eq!(w.mail_days(), 0);
+        assert_eq!(w.token_rows("V"), 0);
+        assert_eq!(w.mail.refused.borrow().len(), 1, "{addr}: logged");
+        assert!(w.mail.refused.borrow()[0].1 != "unknown");
+    }
+}
+
+#[test]
+fn recovery_stays_neutral_for_an_old_address_the_guard_classifies() {
+    let w = World::with_guard();
+    for addr in OLD_FORMS {
+        w.account_with_old_address(addr);
+        w.sql("DELETE FROM user WHERE email_addr = 'old@gmail.com'");
+        let known = w.request_login_link(addr);
+        let unknown = w.request_login_link(&addr.replace("a@", "nobody@"));
+        let generic = |p: &SitePage, a: &str| (p.status, p.body.replace(a, "ADDR"));
+        assert_eq!(
+            generic(&known, addr),
+            generic(&unknown, &addr.replace("a@", "nobody@")),
+            "{addr}"
+        );
+        w.sql("DELETE FROM user WHERE id > 0");
+    }
+    assert_eq!(w.mail.calls.get(), 0);
+    assert_eq!(w.token_rows("L"), 0);
+}
+
+#[test]
+fn an_address_change_logs_a_refused_old_address_the_guard_classifies() {
+    for addr in OLD_FORMS {
+        let w = World::with_guard();
+        let a = w.account_with_old_address(addr);
+        let page = w.change_email(&a.auth, "new@sub.gmail.com", &a.auth);
+        assert_eq!(w.user(a.id).email_addr, "new@sub.gmail.com", "{addr}");
+        assert!(
+            page.body.contains("unable to send"),
+            "{addr}: {}",
+            page.body
+        );
+        assert_eq!(w.mails().len(), 1, "only the new address is mailed");
+        assert_eq!(w.mail.refused.borrow().len(), 1, "{addr}: logged");
+    }
+}
+
+#[test]
+fn the_forms_name_these_forms_as_unable_to_receive_mail() {
+    let w = World::with_guard();
+    let ada = w.account("ada@gmail.com", "secret", "Ada");
+    for to in OLD_FORMS {
+        let page = w.change_email(&ada.auth, to, "secret");
+        assert_eq!(page.status, 400, "{to}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{to}: {}", page.body);
+        let page = w.sign_up("n", to);
+        assert_eq!(page.status, 400, "{to}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{to}: {}", page.body);
+    }
+    // An empty field is still just invalid.
+    let page = w.sign_up("n", "");
+    assert_eq!(page.status, 400);
+    assert!(!page.body.contains(CANNOT_RECEIVE));
+}
+
+#[test]
+fn a_refused_send_is_logged_with_the_reason_and_the_account_only() {
+    let w = World::with_guard();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.ask_verification(&ada);
+    assert_eq!(
+        *w.mail.refused.borrow(),
+        vec![(ada.id, "reserved-domain".to_string())]
+    );
+}
+
+#[test]
+fn look_alike_addresses_are_mailed_and_counted() {
+    let w = World::with_guard();
+    for (i, addr) in [
+        "ada@example.com.au",
+        "ada@myexample.com",
+        "ada@test.org",
+        "ada@sub.gmail.com",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let a = w.account(addr, "secret", "Ada");
+        let page = w.ask_verification(&a);
+        assert_eq!(page.status, 200, "{addr}: {}", page.body);
+        assert_eq!(w.mails().len(), i + 1);
+        assert_eq!(w.mails()[i].to(), *addr);
+    }
+    assert!(w.mail.refused.borrow().is_empty());
+    assert_eq!(w.count("SELECT n AS n FROM mail_day WHERE day > ?", "0"), 4);
+}
+
+#[test]
+fn a_refused_message_does_not_use_the_cap() {
+    // A cap of 1: the refused message must leave the one message for a
+    // deliverable address.
+    let w = World::with_config(&MAIL_CONFIG.replace(
+        "<email_from_name>",
+        "<email_max_per_day>1</email_max_per_day>\n<email_from_name>",
+    ));
+    w.use_mail.set(true);
+    w.mail.guarded.set(true);
+    let bad = w.account("bad@example.net", "secret", "Bad");
+    let good = w.account("good@sub.gmail.com", "secret", "Good");
+    assert_eq!(w.ask_verification(&bad).status, 400);
+    assert_eq!(w.mail_days(), 0);
+    assert_eq!(w.ask_verification(&good).status, 200);
+    assert_eq!(w.mails().len(), 1);
+}
+
+#[test]
+fn recovery_keeps_its_neutral_answer_for_a_reserved_address() {
+    let w = World::with_guard();
+    w.account("ada@example.org", "secret", "Ada");
+    w.account("eve@sub.gmail.com", "secret", "Eve");
+    let generic = |p: &SitePage, addr: &str| (p.status, p.body.replace(addr, "ADDR"));
+    let reserved = w.request_login_link("ada@example.org");
+    let upper = w.request_login_link("ADA@EXAMPLE.ORG");
+    let unknown = w.request_login_link("nobody@example.org");
+    assert_eq!(w.mail.calls.get(), 0);
+    assert_eq!(w.mail_days(), 0);
+    assert_eq!(w.token_rows("L"), 0, "no link for what cannot be mailed");
+    let real = w.request_login_link("eve@sub.gmail.com");
+    assert_eq!(w.mails().len(), 1);
+    let expect = generic(&real, "eve@sub.gmail.com");
+    assert_eq!(generic(&reserved, "ada@example.org"), expect);
+    assert_eq!(
+        (
+            upper.status,
+            upper.body.to_lowercase().replace("ada@example.org", "addr")
+        ),
+        (expect.0, expect.1.to_lowercase())
+    );
+    assert_eq!(generic(&unknown, "nobody@example.org"), expect);
+    assert!(!reserved.body.contains(CANNOT_RECEIVE));
+}
+
+#[test]
+fn an_address_change_to_a_reserved_address_is_refused_at_the_form() {
+    let w = World::with_guard();
+    let ada = w.account("ada@gmail.com", "secret", "Ada");
+    for to in [
+        "ada@example.net",
+        "ada@Sub.Example.Com",
+        "ada@box.test",
+        "ada@x.invalid",
+    ] {
+        let page = w.change_email(&ada.auth, to, "secret");
+        assert_eq!(page.status, 400, "{to}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{to}: {}", page.body);
+        assert_eq!(w.user(ada.id).email_addr, "ada@gmail.com");
+        assert_eq!(w.user(ada.id).email_addr_change_time, 0);
+    }
+    assert_eq!(w.token_rows("E"), 0);
+    assert!(w.mails().is_empty());
+    assert_eq!(w.mail.calls.get(), 0);
+    // A look-alike is accepted, and the notices go out.
+    let page = w.change_email(&ada.auth, "ada@example.com.au", "secret");
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(w.user(ada.id).email_addr, "ada@example.com.au");
+    assert_eq!(w.mails().len(), 2);
+}
+
+#[test]
+fn a_site_without_email_still_takes_any_address() {
+    let w = World::with_config(MAIL_CONFIG);
+    let ada = w.account("ada@gmail.com", "secret", "Ada");
+    let page = w.change_email(&ada.auth, "ada@example.net", "secret");
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(w.user(ada.id).email_addr, "ada@example.net");
+}
+
+#[test]
+fn sign_up_with_a_reserved_address_is_refused_at_the_form() {
+    let w = World::with_guard();
+    for (i, to) in ["a@example.org", "b@Example.COM", "c@t.test", "d@x.example"]
+        .iter()
+        .enumerate()
+    {
+        let page = w.sign_up(&format!("n{i}"), to);
+        assert_eq!(page.status, 400, "{to}");
+        assert!(page.body.contains(CANNOT_RECEIVE), "{to}: {}", page.body);
+    }
+    assert_eq!(
+        w.count("SELECT count(*) AS n FROM user WHERE id > ?", "0"),
+        0
+    );
+    assert_eq!(w.mail.calls.get(), 0);
+    assert_eq!(w.mail_days(), 0);
+    let ok = w.sign_up("ok", "ok@myexample.com");
+    assert_eq!(ok.status, 303);
+    assert_eq!(w.mails().len(), 1);
+}
+
+#[test]
+fn the_notice_to_a_reserved_previous_address_is_not_sent() {
+    let w = World::with_guard();
+    let ada = w.account("ada@example.org", "secret", "Ada");
+    let page = w.change_email(&ada.auth, "ada@sub.gmail.com", "secret");
+    assert_eq!(w.user(ada.id).email_addr, "ada@sub.gmail.com");
+    assert!(page.body.contains("unable to send"), "{}", page.body);
+    let mails = w.mails();
+    assert_eq!(mails.len(), 1, "only the new address is mailed");
+    assert_eq!(mails[0].to(), "ada@sub.gmail.com");
+    assert_eq!(
+        *w.mail.refused.borrow(),
+        vec![(ada.id, "reserved-domain".to_string())]
+    );
 }
 
 #[test]

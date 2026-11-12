@@ -1551,6 +1551,27 @@ mailbox (plus tags, dots): each is a separate account with its own limits. A thi
 therefore still make the site mail an address that is not theirs, one message per account per
 ten minutes, up to the daily cap.
 
+**Addresses that cannot receive mail.** A message to an address that cannot receive mail is
+certain to bounce, and bounces count against the sending reputation that all of a project's
+volunteers share, so the site never hands such a message to the transport. `undeliverable` in
+`cloud/crates/cb-core/src/mail_guard.rs` names them, with no DNS lookup and no guess at typos,
+ignoring case and one trailing dot: the names reserved by RFC 2606 and RFC 6761 (`example.com`,
+`example.net` and `example.org` with every subdomain, and the top-level names `test`, `example`,
+`invalid` and `localhost`), an address with no domain or an empty local part, a domain with no dot,
+and a domain literal such as `user@[192.0.2.1]`. Look-alikes such as `example.com.au`,
+`myexample.com` and `test.org` are not refused. Every message goes out through `deliver` in
+`site_email.rs`, which asks before it counts the message in `mail_day` and before `Mail::send`
+calls the transport; `Mail::send` asks again, so a new send site cannot skip it. A refused message
+is not counted, makes no token where one would have been made, and is logged through
+`Mailer::log_refused` as the reason and the account ID, never the address. Pages that must not
+reveal whether an address has an account (password recovery) answer as before. Pages where the
+person acts on their own address say plainly that the address cannot receive mail: the
+verification button answers 400, and sign-up and address change refuse the address at the form,
+when the site sends email. Accounts made by an operator (`cboinc user-add`) and through the
+client RPCs may have any address; only the sending is refused. There is no setting that turns the
+check off. The one exception is the `test-support` feature of `cb-core`, which no deployment
+build enables: it lets a fake mailer in the tests keep `@example.org` fixtures.
+
 **Password recovery.** `mail_passwd.php` looks the account up by address, makes a login token
 (a day), and mails `login_action.php?id=&t=`. The link logs in for a year, as upstream's link
 does, and goes to `home.php`. A person who logged in this way and does not know the password can
@@ -1658,6 +1679,12 @@ trip on D1.
 - Replacing the account key (`reset_account_key.php`) is not in upstream. After an undo the
   account key is unchanged, so a session or key held by whoever made the change stays valid until
   the key is replaced; the undo page and mail point to the page for that reason.
+- Upstream checks an address's syntax only (`is_valid_email_syntax` in `html/inc/email.inc`, which
+  is `filter_var` with `FILTER_VALIDATE_EMAIL`, plus the optional `is_valid_email_sfs` lookup) and
+  sends whatever it is given. That filter accepts the reserved names and domain literals above and
+  refuses an address whose domain has no dot. Here the site refuses to send to the cases listed
+  under "Addresses that cannot receive mail", and refuses them at sign-up and address change when
+  it sends email.
 - `am_set_info` refuses an address change within seven days of the last and records the previous
   address like the site does, without mail; upstream's has no wait.
 - An address someone else registered first can receive recovery mail for that account, as in

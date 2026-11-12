@@ -16,6 +16,7 @@ use cb_crypto::account::{
 use cb_db::stmt;
 
 use crate::countries::{is_valid_country, COUNTRIES};
+use crate::mail_guard::{cannot_receive, CANNOT_RECEIVE};
 use crate::model::User;
 use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
@@ -212,6 +213,9 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
         return Ok(error_page(project, 400, e));
     }
     let email = str_param(q, "new_email_addr").to_lowercase();
+    if cannot_receive(ctx, &email) {
+        return Ok(error_page(project, 400, CANNOT_RECEIVE));
+    }
     if !is_strict_email(&email) {
         return Ok(error_page(
             project,
@@ -597,6 +601,9 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
         ));
     };
     let email = str_param(q, "email_addr").to_lowercase();
+    if cannot_receive(ctx, &email) {
+        return Ok(error_page(project, 400, CANNOT_RECEIVE));
+    }
     if !is_strict_email(&email) {
         return Ok(error_page(
             project,

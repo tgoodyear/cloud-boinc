@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 
+use crate::mail_guard::{lets_reserved_through, undeliverable, Undeliverable};
 use crate::web::is_strict_email;
 
 /// Longest subject sent, in characters.
@@ -24,6 +25,10 @@ pub enum MailError {
     /// The transport could not send it.
     #[error("mail: {0}")]
     Send(String),
+    /// The recipient cannot receive mail (see [`crate::mail_guard`]); the
+    /// transport was not called. The text names the rule, not the address.
+    #[error("mail: undeliverable address ({0})")]
+    Undeliverable(&'static str),
 }
 
 /// One checked message: one sender, one recipient, a subject and a plain-text
@@ -175,6 +180,21 @@ fn one_line(s: &str) -> String {
 #[async_trait(?Send)]
 pub trait Mailer {
     async fn send(&self, message: &MailMessage) -> Result<(), MailError>;
+
+    /// Tells the log that a message was not handed to the transport because
+    /// its recipient cannot receive mail. `reason` is a fixed word
+    /// ([`Undeliverable::as_str`]); neither the address nor anything of it is
+    /// passed. The default logs nothing.
+    fn log_refused(&self, _userid: i64, _reason: &str) {}
+
+    /// For fake transports in tests only, and only in a build with the
+    /// `test-support` feature: whether the reserved example names
+    /// (`@example.org`) go through to this transport. No deployment build has
+    /// this method, and no setting reaches it.
+    #[cfg(feature = "test-support")]
+    fn allows_reserved_recipients(&self) -> bool {
+        false
+    }
 }
 
 /// A mailer with the project's sender settings: what the site sends through.
@@ -182,6 +202,7 @@ pub struct Mail<'a> {
     mailer: &'a dyn Mailer,
     from_addr: &'a str,
     from_name: &'a str,
+    reserved_ok: bool,
 }
 
 impl<'a> Mail<'a> {
@@ -190,12 +211,32 @@ impl<'a> Mail<'a> {
             mailer,
             from_addr,
             from_name,
+            reserved_ok: lets_reserved_through(mailer),
         }
     }
 
+    /// Why mail to `to` would certain bounce, if it would (see
+    /// [`crate::mail_guard`]).
+    pub(crate) fn undeliverable(&self, to: &str) -> Option<Undeliverable> {
+        undeliverable(to).filter(|r| !(self.reserved_ok && *r == Undeliverable::Reserved))
+    }
+
+    /// [`Mail::undeliverable`] for the address of account `userid`, and when
+    /// it is refused, a line in the log with the reason and the account (never
+    /// the address). Every place that skips a message to such an address asks
+    /// here.
+    pub(crate) fn refuse(&self, userid: i64, to: &str) -> Option<Undeliverable> {
+        let reason = self.undeliverable(to)?;
+        self.mailer.log_refused(userid, reason.as_str());
+        Some(reason)
+    }
+
     /// Checks the message (see [`MailMessage::new`]) and hands it to the
-    /// transport.
+    /// transport, unless the recipient cannot receive mail.
     pub async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), MailError> {
+        if let Some(reason) = self.undeliverable(to) {
+            return Err(MailError::Undeliverable(reason.as_str()));
+        }
         let message = MailMessage::new(self.from_addr, self.from_name, to, subject, body)?;
         self.mailer.send(&message).await
     }
@@ -204,6 +245,47 @@ impl<'a> Mail<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// A transport that counts its calls; `open` lets reserved names through.
+    struct Counting {
+        calls: Cell<u32>,
+        open: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Mailer for Counting {
+        async fn send(&self, _: &MailMessage) -> Result<(), MailError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(())
+        }
+
+        fn allows_reserved_recipients(&self) -> bool {
+            self.open
+        }
+    }
+
+    #[test]
+    fn send_refuses_what_cannot_receive_mail_before_the_transport() {
+        let run = |open: bool, to: &str| {
+            let t = Counting {
+                calls: Cell::new(0),
+                open,
+            };
+            let mail = Mail::new(&t, "boinc@p.example", "P");
+            let out = futures_lite::future::block_on(mail.send(to, "s", "b"));
+            (out, t.calls.get())
+        };
+        assert_eq!(
+            run(false, "a@example.org"),
+            (Err(MailError::Undeliverable("reserved-domain")), 0)
+        );
+        assert_eq!(run(false, "a@sub.example.com").1, 0);
+        assert_eq!(run(false, "a@example.com.au"), (Ok(()), 1));
+        // A test transport that opts in gets the reserved names, nothing else.
+        assert_eq!(run(true, "a@example.org"), (Ok(()), 1));
+        assert!(run(true, "a@x.invalid").0.is_ok());
+    }
 
     #[test]
     fn line_breaks_cannot_leave_the_subject_or_name() {

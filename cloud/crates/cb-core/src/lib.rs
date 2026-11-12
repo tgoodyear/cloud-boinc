@@ -12,6 +12,7 @@ pub mod countries;
 pub mod host_misc;
 pub mod hr;
 pub mod mail;
+pub mod mail_guard;
 pub mod model;
 pub mod pipeline;
 pub mod plan_class;
