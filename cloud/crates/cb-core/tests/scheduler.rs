@@ -524,8 +524,8 @@ fn lost_results_are_resent() {
     // it. The deadline is the one it had.
     assert_eq!(w.results(wu)[0].sent_time, 2100);
     assert_eq!(w.results(wu)[0].report_deadline, 5600);
-    // The upload size query takes the pieces of the lost attempt for stale
-    // by the time recorded under the file's name.
+    // The resend moves the file's epoch to 1, so the pieces of the lost
+    // attempt are never counted by an upload.
     let r = &w.results(wu)[0];
     let name = cb_core::template::output_files(&r.xml_doc_in)[0]
         .name
