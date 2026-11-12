@@ -3,6 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
+use async_trait::async_trait;
 use cb_core::model::JobResult;
 use cb_core::plan_class::PlanClassSpecs;
 use cb_core::project::{
@@ -13,7 +14,7 @@ use cb_core::scheduler::{handle_request, Catalog, SchedCtx, SchedOutcome};
 use cb_core::work::{create_work, Assign, AssignTarget, JobSpec, Submission};
 use cb_core::Config;
 use cb_crypto::Signer;
-use cb_db::{query, stmt, Db};
+use cb_db::{query, stmt, Db, DbResult, Rows, Stmt};
 use cb_proto::consts::*;
 use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
@@ -37,8 +38,25 @@ fn signer() -> &'static Signer {
 
 /// One app with a version for Linux (ID 7, number 100) and one for macOS (ID 8,
 /// number 200); the test host can run both.
+/// Passes statements on and keeps their text.
+struct Recording<'a> {
+    inner: &'a SqliteDb,
+    log: &'a RefCell<Vec<String>>,
+}
+
+#[async_trait(?Send)]
+impl Db for Recording<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        self.log
+            .borrow_mut()
+            .extend(stmts.iter().map(|s| s.sql.clone()));
+        self.inner.batch(stmts).await
+    }
+}
+
 struct World {
     db: SqliteDb,
+    log: RefCell<Vec<String>>,
     config: Config,
     routing: RefCell<RoutingRules>,
     seq: Cell<u32>,
@@ -63,6 +81,7 @@ impl World {
         .unwrap();
         World {
             db,
+            log: RefCell::new(Vec::new()),
             config,
             routing: RefCell::new(RoutingRules::parse(rules).unwrap()),
             seq: Cell::new(0),
@@ -127,8 +146,12 @@ impl World {
         let random = || self.rand();
         let routing = self.routing.borrow();
         let plan_classes = PlanClassSpecs::default();
+        let recording = Recording {
+            inner: &self.db,
+            log: &self.log,
+        };
         let ctx = SchedCtx {
-            db: &self.db,
+            db: &recording,
             config: &self.config,
             plan_classes: &plan_classes,
             routing: &routing,
@@ -322,4 +345,33 @@ fn a_negative_batch_is_selected_like_any_other_when_no_minimum_is_set() {
     let out = w.rpc(host, 2, None, 2000);
     assert_eq!(out.n_sent, 0);
     assert_eq!(sent_with(&w, wu), None);
+}
+
+#[test]
+fn assigned_rules_do_not_spend_the_budget_of_queries_that_do_not_run() {
+    // Rules that apply to assigned jobs, large enough that the assigned query's
+    // conditions would use up most of a shared budget; assignment is off, so
+    // that query is never built and the regular one keeps its own conditions.
+    let rule = format!(
+        r#"{{"app":"a","name":"{}","min_batch":9223372036854775806,"max_batch":9223372036854775807,"assigned":true,"allow":[]}}"#,
+        "x".repeat(50)
+    );
+    let rules = vec![rule; 64].join(",");
+    let mut w = World::new(&format!(r#"{{"rules":[{rules}]}}"#));
+    w.config.enable_assignment = false;
+    let host = w.host();
+    w.submit(&["j1"], 0, None);
+    w.log.borrow_mut().clear();
+    w.rpc(host, 2, None, 2000);
+    let log = w.log.borrow();
+    let regular: Vec<&String> = log
+        .iter()
+        .filter(|s| s.contains("r.server_state = 2 AND r.appid"))
+        .collect();
+    assert!(!regular.is_empty());
+    assert!(
+        regular.iter().all(|s| s.contains("CASE WHEN")),
+        "{regular:?}"
+    );
+    assert!(log.iter().all(|s| !s.contains("FROM assignment")));
 }

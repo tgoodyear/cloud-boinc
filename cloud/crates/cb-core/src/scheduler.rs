@@ -2223,20 +2223,20 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // without a feeder" in `docs/architecture.md`. The IDs and numbers are
     // integers of the catalog and the plan class file. The client's own
     // versions are none: an app with a client version has no clause.
-    // The routing conditions one request may write into its statements, in
-    // bytes. Past it a gate leaves them out, and `admitted` alone enforces the
-    // rules, which can let a window of refused results through. A statement is
-    // limited to 100,000 bytes on D1.
-    let routing_sql_left = std::cell::Cell::new(40_000usize);
-    let routing_sql = |text: String| -> String {
-        if text.len() <= routing_sql_left.get() {
-            routing_sql_left.set(routing_sql_left.get() - text.len());
+    // The routing conditions one statement may hold, in bytes (a fresh
+    // `Cell` for each statement that runs). Past it a gate leaves them out,
+    // and `admitted` alone enforces the rules, which can let a window of
+    // refused results through. A statement is limited to 100,000 bytes on D1.
+    let routing_budget = || std::cell::Cell::new(40_000usize);
+    let routing_sql = |left: &std::cell::Cell<usize>, text: String| -> String {
+        if text.len() <= left.get() {
+            left.set(left.get() - text.len());
             text
         } else {
             String::new()
         }
     };
-    let version_gate = |app_id: i64, assigned: bool| -> String {
+    let version_gate = |app_id: i64, assigned: bool, left: &std::cell::Cell<usize>| -> String {
         let app_name = catalog.app(app_id).map_or("", |a| a.name.as_str());
         let hav = catalog
             .app(app_id)
@@ -2246,7 +2246,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let Some(av) = v.av else {
                 // The client's own version takes any workunit of a plain
                 // app (`admitted` below), but not one a routing rule selects.
-                let refused = routing_sql(ctx.routing.sql_condition(app_name, assigned, None));
+                let refused =
+                    routing_sql(left, ctx.routing.sql_condition(app_name, assigned, None));
                 return if refused.is_empty() {
                     "1 = 1".to_string()
                 } else {
@@ -2282,15 +2283,18 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             };
             // A workunit a routing rule refuses this version for
             // (`RoutingRules::permits`, below in `admitted`).
-            let refused = routing_sql(ctx.routing.sql_condition(
-                app_name,
-                assigned,
-                Some(&VersionRef {
-                    platform: v.platform,
-                    plan_class: v.plan_class,
-                    version_num: v.version_num,
-                }),
-            ));
+            let refused = routing_sql(
+                left,
+                ctx.routing.sql_condition(
+                    app_name,
+                    assigned,
+                    Some(&VersionRef {
+                        platform: v.platform,
+                        plan_class: v.plan_class,
+                        version_num: v.version_num,
+                    }),
+                ),
+            );
             if !refused.is_empty() {
                 clause.push_str(" AND ");
                 clause.push_str(&refused);
@@ -2320,10 +2324,21 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             format!("({})", clauses.join(" OR "))
         }
     };
-    let assigned_version_gate: String = assigned_list
-        .iter()
-        .map(|id| format!(" AND (w.appid != {id} OR {})", version_gate(*id, true)))
-        .collect();
+    // Built only for a request that sends assigned jobs, from its own budget.
+    let assigned_version_gate: String = if want_assigned {
+        let left = routing_budget();
+        assigned_list
+            .iter()
+            .map(|id| {
+                format!(
+                    " AND (w.appid != {id} OR {})",
+                    version_gate(*id, true, &left)
+                )
+            })
+            .collect()
+    } else {
+        String::new()
+    };
     let assigned_class_gate: String = assigned_list
         .iter()
         .filter(|id| homog[id].hr_type != 0)
@@ -2375,7 +2390,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             sql.push_str(" AND w.hr_class IN (0, ?)");
             params.push(h.host_class.into());
         }
-        sql.push_str(&format!(" AND {}", version_gate(*id, false)));
+        sql.push_str(&format!(
+            " AND {}",
+            version_gate(*id, false, &routing_budget())
+        ));
         if replica_rule {
             // A workunit the host or user already has a result of
             // (`slow_check` in `sched/sched_check.cpp`).
