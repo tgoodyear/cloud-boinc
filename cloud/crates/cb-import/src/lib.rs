@@ -13,6 +13,7 @@
 pub mod config_xml;
 pub mod error;
 pub mod files;
+pub mod fsutil;
 pub mod import;
 pub mod schema;
 pub mod sink;

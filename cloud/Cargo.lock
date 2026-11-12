@@ -253,6 +253,7 @@ dependencies = [
  "cb-crypto",
  "cb-proto",
  "clap",
+ "fallible-iterator",
  "hex",
  "mysql",
  "rusqlite",

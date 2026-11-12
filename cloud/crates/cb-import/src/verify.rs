@@ -7,8 +7,8 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::error::{ImportError, Kind, Result};
-use crate::import::{preflight, run, Options};
+use crate::error::{ImportError, Result};
+use crate::import::{preflight, run, Options, Preflight};
 use crate::schema::{all_tables, TableInfo};
 use crate::sink::Sink;
 use crate::source::Source;
@@ -88,15 +88,22 @@ impl VerifyReport {
     }
 }
 
+/// A hash of the complete primary key (every column, in key order), so which rows are
+/// sampled does not depend on how IDs were allocated or on a composite key's first column.
 fn key_of(t: &TableInfo, vals: &[Value]) -> u64 {
-    let pk = t.pk_cols();
-    match pk.first().map(|&i| &vals[i]) {
-        Some(Value::Int(i)) => *i as u64,
-        Some(Value::Text(s)) => s.bytes().fold(0xcbf29ce484222325u64, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x100000001b3)
-        }),
-        _ => 0,
+    let mut h = 0xcbf29ce484222325u64;
+    let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    for &i in &t.pk_cols() {
+        match &vals[i] {
+            Value::Int(n) => n.to_le_bytes().into_iter().for_each(&mut eat),
+            Value::Text(s) => s.bytes().for_each(&mut eat),
+            Value::Real(r) => r.to_bits().to_le_bytes().into_iter().for_each(&mut eat),
+            Value::Null => eat(0),
+        }
+        eat(0xff);
     }
+    // The low bits of FNV are poor for small steps.
+    h ^ (h >> 29)
 }
 
 struct VerifySink<'a> {
@@ -128,8 +135,7 @@ impl Sink for VerifySink<'_> {
     fn row(&mut self, t: &TableInfo, vals: &[Value]) -> Result<()> {
         self.n += 1;
         let k = key_of(t, vals);
-        // The first and the last rows are always compared with the rest of
-        // the sample; ID order makes "first" the row with n == 1.
+        // The first row is always compared, so a non-empty table never goes unchecked.
         if !(self.n == 1 || k.is_multiple_of(self.step)) {
             return Ok(());
         }
@@ -177,6 +183,11 @@ impl Sink for VerifySink<'_> {
             .counts
             .insert(t.name.clone(), (self.n, self.target_count));
         self.report.sampled.insert(t.name.clone(), self.sampled);
+        if self.sample > 0 && self.n > 0 && self.sampled == 0 {
+            self.report
+                .other
+                .push(format!("no row of {} was compared", t.name));
+        }
         Ok(self.n)
     }
 
@@ -210,7 +221,7 @@ impl Sink for VerifySink<'_> {
     }
 }
 
-/// Compares the source with the SQLite file at `target`.
+/// Compares the source with the SQLite file at `target`, as the source is now.
 pub fn verify(
     src: &mut Source,
     target: &Path,
@@ -218,15 +229,43 @@ pub fn verify(
     sample: u64,
     summary: &mut Summary,
 ) -> Result<VerifyReport> {
+    verify_with(src, target, opts, sample, summary, None)
+}
+
+/// As [`verify`]. With `pre`, the facts the import took at the start of its snapshot
+/// (workunit scope, counts, `AUTO_INCREMENT`, which is live metadata outside the
+/// snapshot) are reused, so a verification inside the import's transaction cannot
+/// differ because the source moved.
+pub fn verify_with(
+    src: &mut Source,
+    target: &Path,
+    opts: &Options,
+    sample: u64,
+    summary: &mut Summary,
+    pre: Option<&Preflight>,
+) -> Result<VerifyReport> {
     let conn = Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| ImportError::usage("cannot open the --target-sqlite file"))?;
-    let pre = preflight(src, opts, summary)?;
+    let own;
+    let pre = match pre {
+        Some(p) => p,
+        None => {
+            own = preflight(src, opts, summary)?;
+            &own
+        }
+    };
     // The mapping needs the table layouts; they come from the migrations.
     let mem = Connection::open_in_memory()?;
     crate::schema::apply_migrations(&mem)?;
     let tables = all_tables(&mem)?;
     let mut vopts = opts.clone();
     vopts.files_manifest = None;
+    // The import wrote its time into the file (`user_version`): the open workunits'
+    // `transition_time` and the `recent` window were derived from it, not from now.
+    let recorded: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if recorded > 0 {
+        vopts.now = recorded;
+    }
     let mut sink = VerifySink {
         conn: &conn,
         sample,
@@ -236,13 +275,25 @@ pub fn verify(
         target_count: 0,
         report: VerifyReport::default(),
     };
-    run(src, &mut sink, &vopts, &pre, &tables, summary)?;
+    run(src, &mut sink, &vopts, pre, &tables, summary)?;
     let mut report = sink.report;
     // A table the source does not have is imported as empty: the target must hold no rows of it.
     for t in crate::schema::TABLES.iter().filter(|t| **t != "job_file") {
         if pre.src_cols.get(*t).is_some_and(|c| c.is_empty()) {
             let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?;
             report.counts.insert(t.to_string(), (0, n as u64));
+        }
+    }
+    // Tables the import never fills hold nothing.
+    for (t, _) in crate::schema::NOT_IMPORTED
+        .iter()
+        .filter(|(t, _)| !matches!(*t, "config" | "id_floor"))
+    {
+        let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?;
+        if n > 0 {
+            report
+                .other
+                .push(format!("{t} has {n} rows; the import writes none"));
         }
     }
     if let Some(text) = &opts.code_sign_public_key {
@@ -254,13 +305,57 @@ pub fn verify(
             )
             .ok();
         match stored {
-            Some(s) if s.trim() != text.trim() => report
-                .other
-                .push("the code_sign_public_key row of the target differs from the given key file".into()),
-            Some(_) => summary.note("the target's code_sign_public_key row matches the given key file"),
-            None => summary.note("the target has no code_sign_public_key row yet; the given key was checked against the app version signatures"),
+            Some(s) if s.trim() != text.trim() => report.other.push(
+                "the code_sign_public_key row of the target differs from the given key file".into(),
+            ),
+            Some(_) => {
+                summary.note("the target's code_sign_public_key row matches the given key file")
+            }
+            None => summary.note(
+                "the target has no code_sign_public_key row yet; the given key was checked against the app version signatures",
+            ),
         }
     }
-    let _ = Kind::Mismatch;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::table_info;
+
+    fn info(t: &str) -> TableInfo {
+        let c = Connection::open_in_memory().unwrap();
+        crate::schema::apply_migrations(&c).unwrap();
+        table_info(&c, t).unwrap()
+    }
+
+    #[test]
+    fn sampling_does_not_depend_on_id_allocation() {
+        // 2,000 rows with odd IDs only, asked for about 1,000.
+        let t = info("user");
+        let step = 2u64;
+        let n = (0..2000i64)
+            .filter(|i| {
+                let mut v: Vec<Value> = (0..t.cols.len()).map(|c| t.default_of(c)).collect();
+                v[t.index("id").unwrap()] = Value::Int(i * 2 + 1);
+                key_of(&t, &v).is_multiple_of(step)
+            })
+            .count();
+        assert!((800..1200).contains(&n), "{n}");
+    }
+
+    #[test]
+    fn a_composite_key_uses_every_column() {
+        let t = info("host_app_version");
+        let n = (0..400i64)
+            .filter(|i| {
+                let mut v: Vec<Value> = (0..t.cols.len()).map(|c| t.default_of(c)).collect();
+                v[t.index("host_id").unwrap()] = Value::Int(7);
+                v[t.index("app_version_id").unwrap()] = Value::Int(*i);
+                key_of(&t, &v).is_multiple_of(4)
+            })
+            .count();
+        assert!((50..150).contains(&n), "{n}");
+    }
 }

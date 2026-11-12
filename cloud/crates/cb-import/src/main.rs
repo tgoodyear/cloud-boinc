@@ -10,7 +10,7 @@ use cb_import::schema::{all_tables, apply_migrations};
 use cb_import::sink::{load_sql_dir, SqlDirSink, SqliteSink, DEFAULT_MAX_FILE_BYTES};
 use cb_import::source::Source;
 use cb_import::summary::Summary;
-use cb_import::verify::verify;
+use cb_import::verify::{verify, verify_with};
 
 #[derive(Parser)]
 #[command(
@@ -247,23 +247,31 @@ fn go() -> Result<i32, ImportError> {
             let Some(n) = verify_sample else {
                 return Ok(0);
             };
-            // Same session, same snapshot: the source cannot have drifted.
-            let (sqlite, temp) = match &target_sqlite {
-                Some(p) => (p.clone(), false),
+            // Same session, same snapshot: the source cannot have drifted, and the facts
+            // the import took at its start are reused.
+            let _tmp; // owner-only directory, removed when this scope ends
+            let sqlite = match &target_sqlite {
+                Some(p) => p.clone(),
                 None => {
-                    let p = std::env::temp_dir()
-                        .join(format!("cb-import-verify-{}.sqlite", std::process::id()));
-                    let _ = std::fs::remove_file(&p);
-                    load_sql_dir(target_sql_dir.as_ref().unwrap(), &p)?;
-                    (p, true)
+                    let dir = target_sql_dir.as_ref().unwrap();
+                    let parent = dir
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."));
+                    // Next to the output, where the data already is; 0700 by construction.
+                    let t = tempfile::Builder::new()
+                        .prefix(".cb-import-verify-")
+                        .tempdir_in(parent)
+                        .or_else(|_| tempfile::tempdir())
+                        .map_err(|_| ImportError::usage("cannot make a temporary directory"))?;
+                    let p = t.path().join("verify.sqlite");
+                    _tmp = t;
+                    load_sql_dir(dir, &p)?;
+                    p
                 }
             };
             let mut vsum = Summary::default();
-            let report = verify(&mut src, &sqlite, &opts, n, &mut vsum);
-            if temp {
-                let _ = std::fs::remove_file(&sqlite);
-            }
-            let report = report?;
+            let report = verify_with(&mut src, &sqlite, &opts, n, &mut vsum, Some(&pre))?;
             println!("verify inside the import's snapshot:");
             print!("{}", report.render());
             Ok(if report.ok() {

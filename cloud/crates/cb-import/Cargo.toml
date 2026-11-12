@@ -19,10 +19,11 @@ cb-core = { path = "../cb-core" }
 cb-crypto = { path = "../cb-crypto" }
 cb-proto = { path = "../cb-proto" }
 clap = { version = "4", features = ["derive"] }
+fallible-iterator = "0.3"
 hex = "0.4"
 mysql = { version = "28", default-features = false, features = ["minimal-rust", "buffer-pool", "rustls-tls-ring"] }
 rusqlite = { version = "0.42", features = ["bundled", "functions"] }
+tempfile = "3"
 
 [dev-dependencies]
 cb-crypto = { path = "../cb-crypto", features = ["keygen"] }
-tempfile = "3"

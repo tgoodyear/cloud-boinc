@@ -1,10 +1,11 @@
 //! Where mapped rows go: a SQLite file, or numbered `.sql` files for D1.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use fallible_iterator::FallibleIterator;
 use rusqlite::Connection;
 
 use crate::error::{ImportError, Result};
@@ -25,12 +26,19 @@ pub const STATEMENT_BUDGET: usize = 96_000;
 /// as hex it is twice that, under [`STATEMENT_BUDGET`].
 pub const CHUNK_BYTES: usize = 40_000;
 /// The default size of one `.sql` file.
+/// Written beside the `.sql` files: the Unix time of the import.
+pub const IMPORT_TIME_FILE: &str = "import_time.txt";
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub trait Sink {
     fn begin_table(&mut self, table: &TableInfo) -> Result<()>;
     fn row(&mut self, table: &TableInfo, vals: &[Value]) -> Result<()>;
     fn end_table(&mut self, table: &TableInfo) -> Result<u64>;
+    /// Records the time of the import, which later checks use for the one value the
+    /// import derives from it (see `Ctx::workunit`).
+    fn set_import_time(&mut self, _t: i64) -> Result<()> {
+        Ok(())
+    }
     /// `(name, last_id)` pairs for the `id_floor` table.
     fn finish(&mut self, floors: &[(String, i64)]) -> Result<()>;
 }
@@ -55,6 +63,8 @@ impl SqliteSink {
                 "the --target-sqlite file exists; give a path that does not",
             ));
         }
+        crate::fsutil::create_private_file(path)
+            .map_err(|_| ImportError::usage("cannot create the --target-sqlite file"))?;
         let conn = Connection::open(path)?;
         // The file is a build artefact; if the run fails it is deleted.
         conn.execute_batch(
@@ -97,6 +107,12 @@ impl Sink for SqliteSink {
         self.conn.execute_batch("COMMIT")?;
         Ok(self.written)
     }
+    fn set_import_time(&mut self, t: i64) -> Result<()> {
+        // In the SQLite file header, so it is not a table that could be loaded anywhere.
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {t}"))?;
+        Ok(())
+    }
     fn finish(&mut self, floors: &[(String, i64)]) -> Result<()> {
         for (name, id) in floors {
             self.conn.execute(
@@ -127,7 +143,7 @@ pub struct SqlDirSink {
 
 impl SqlDirSink {
     pub fn create(dir: &Path, max_file_bytes: u64) -> Result<SqlDirSink> {
-        std::fs::create_dir_all(dir)
+        crate::fsutil::create_private_dir_all(dir)
             .map_err(|_| ImportError::usage("cannot create the --target-sql-dir directory"))?;
         let any = std::fs::read_dir(dir)
             .map_err(|_| ImportError::usage("cannot read the --target-sql-dir directory"))?
@@ -161,10 +177,7 @@ impl SqlDirSink {
         let name = format!("{:04}_{label}.sql", self.next_no);
         self.next_no += 1;
         let path = self.dir.join(&name);
-        let f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let f = crate::fsutil::create_private_file(&path)
             .map_err(|_| ImportError::target(format!("cannot create {name}")))?;
         self.out = Some(BufWriter::with_capacity(1 << 20, f));
         self.files.push(path);
@@ -313,6 +326,13 @@ impl Sink for SqlDirSink {
         self.close()?;
         Ok(self.written)
     }
+    fn set_import_time(&mut self, t: i64) -> Result<()> {
+        // Not a `.sql` file, so nothing that loads the directory's `.sql` files sees it.
+        use std::io::Write as _;
+        let mut f = crate::fsutil::create_private_file(&self.dir.join(IMPORT_TIME_FILE))
+            .map_err(|_| ImportError::target("cannot write the import time file"))?;
+        writeln!(f, "{t}").map_err(|_| ImportError::target("cannot write the import time file"))
+    }
     fn finish(&mut self, floors: &[(String, i64)]) -> Result<()> {
         self.table_name = "id_floor".into();
         self.part = 0;
@@ -345,11 +365,18 @@ pub fn load_sql_dir(dir: &Path, target: &Path) -> Result<HashMap<String, u64>> {
 }
 
 fn load_sql_dir_into(dir: &Path, target: &Path) -> Result<HashMap<String, u64>> {
+    crate::fsutil::create_private_file(target)
+        .map_err(|_| ImportError::usage("cannot create the --target-sqlite file"))?;
     let conn = Connection::open(target)?;
     conn.execute_batch(
         "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA locking_mode = EXCLUSIVE;",
     )?;
     apply_migrations(&conn)?;
+    if let Ok(t) = std::fs::read_to_string(dir.join(IMPORT_TIME_FILE)) {
+        if let Ok(t) = t.trim().parse::<i64>() {
+            conn.execute_batch(&format!("PRAGMA user_version = {t}"))?;
+        }
+    }
     let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|_| ImportError::usage("cannot read the --sql-dir directory"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -361,12 +388,37 @@ fn load_sql_dir_into(dir: &Path, target: &Path) -> Result<HashMap<String, u64>> 
         let sql = std::fs::read_to_string(&p)
             .map_err(|_| ImportError::usage("cannot read a .sql file"))?;
         conn.execute_batch("BEGIN")?;
-        if let Err(e) = conn.execute_batch(&sql) {
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(ImportError::target(format!(
-                "applying {} failed: {e}",
-                p.file_name().unwrap_or_default().to_string_lossy()
-            )));
+        // Statement by statement, so a failure can say which one. The error is the code
+        // and class only: the text of a damaged dump is data.
+        let fname = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let mut n = 0u64;
+        let mut batch = rusqlite::Batch::new(&conn, &sql);
+        loop {
+            match batch.next() {
+                Ok(Some(mut stmt)) => {
+                    n += 1;
+                    if let Err(e) = stmt.execute([]) {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(ImportError::target(format!(
+                            "applying {fname} failed at statement {n}: {}",
+                            crate::error::sqlite_message(&e)
+                        )));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(ImportError::target(format!(
+                        "applying {fname} failed at statement {}: {}",
+                        n + 1,
+                        crate::error::sqlite_message(&e)
+                    )));
+                }
+            }
         }
         conn.execute_batch("COMMIT")?;
         *counts
@@ -385,6 +437,30 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         apply_migrations(&conn).unwrap();
         table_info(&conn, table).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outputs_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let d = tempfile::tempdir().unwrap();
+        let t = info("platform");
+        let dir = d.path().join("new/sql");
+        let mut sink = SqlDirSink::create(&dir, DEFAULT_MAX_FILE_BYTES).unwrap();
+        sink.begin_table(&t).unwrap();
+        let vals: Vec<Value> = (0..t.cols.len()).map(|i| t.default_of(i)).collect();
+        sink.row(&t, &vals).unwrap();
+        sink.end_table(&t).unwrap();
+        sink.set_import_time(1_700_000_000).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&d.path().join("new")), 0o700);
+        for f in std::fs::read_dir(&dir).unwrap() {
+            assert_eq!(mode(&f.unwrap().path()), 0o600);
+        }
+        let db = d.path().join("t.sqlite");
+        let _s = SqliteSink::create(&db).unwrap();
+        assert_eq!(mode(&db), 0o600);
     }
 
     #[test]

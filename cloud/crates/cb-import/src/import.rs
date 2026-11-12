@@ -511,7 +511,7 @@ impl Ctx {
         }
     }
 
-    fn template(&mut self, file: &str) -> Result<String> {
+    fn template(&mut self, file: &str, wu: i64) -> Result<String> {
         if file.is_empty() {
             return Ok(String::new());
         }
@@ -535,8 +535,9 @@ impl Ctx {
                     "workunits are imported and --project-dir is not given; the result template files are read from it (--rows-only skips them for a rehearsal)",
                 )
             } else {
+                // The file name is a value of the source; the workunit ID finds it.
                 ImportError::refused(format!(
-                    "cannot read the result template file {file} (under --project-dir) that workunits name"
+                    "cannot read the result template file (under --project-dir) that workunit {wu} names in result_template_file"
                 ))
             });
         };
@@ -714,7 +715,7 @@ impl Ctx {
             }
         }
         let file = row.text("result_template_file").unwrap_or_default();
-        let text = self.template(&file)?;
+        let text = self.template(&file, id)?;
         set(info, vals, "result_template", Value::Text(text));
         Ok(())
     }
@@ -941,6 +942,9 @@ pub fn run(
         if f > 0 {
             floors.push((t.to_string(), f));
         }
+    }
+    if opts.now > 0 {
+        sink.set_import_time(opts.now)?;
     }
     sink.finish(&floors)?;
 

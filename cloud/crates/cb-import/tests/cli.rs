@@ -64,3 +64,76 @@ fn a_misspelt_tls_setting_is_a_usage_error_that_does_not_echo_the_dsn() {
     assert!(!err.contains("sentinel") && !err.contains("requred"));
     assert!(!dir.path().join("o.sqlite").exists());
 }
+
+const SENTINELS: &[&str] = &[
+    "alice.sentinel@example.org",
+    "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+    "$2y$10$sentinelbcrypthashvalue",
+];
+
+fn load(sql: &str) -> (Option<i32>, String, std::path::PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("sql");
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("0001_user.sql"), sql).unwrap();
+    let target = dir.path().join("t.sqlite");
+    let out = bin()
+        .args(["load-sql", "--sql-dir"])
+        .arg(&d)
+        .arg("--target-sqlite")
+        .arg(&target)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        target,
+        dir,
+    )
+}
+
+#[test]
+fn a_damaged_sql_file_does_not_print_its_text() {
+    let user = "INSERT INTO user (id, create_time, email_addr, authenticator, passwd_hash) VALUES (1, 5, 'alice.sentinel@example.org', 'c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1', '$2y$10$sentinelbcrypthashvalue');\n";
+    // Truncated in the middle of a value.
+    let (code, err, target, _d) = load(&user[..user.len() - 20]);
+    assert_eq!(code, Some(4));
+    assert!(err.contains("failed at statement 1"), "{err}");
+    for s in SENTINELS {
+        assert!(!err.contains(s), "{err}");
+    }
+    assert!(!target.exists());
+    // A syntax error with the values after it, and a wrong column count.
+    for bad in [
+        user.replace("INSERT INTO", "INSERT INTOO"),
+        user.replace("(id, create_time,", "(id,"),
+        format!("{user}{}", user.replace("VALUES (1,", "VALUES (2,")),
+    ] {
+        let (code, err, _t, _d) = load(&bad);
+        assert_eq!(code, Some(4), "{err}");
+        for s in SENTINELS {
+            assert!(!err.contains(s), "{err}");
+        }
+    }
+    // A constraint failure names the column, not the value.
+    let (_, err, _t, _d) = load(&format!(
+        "{user}{}",
+        user.replace("VALUES (1,", "VALUES (2,")
+    ));
+    assert!(
+        err.contains("statement 2") && err.contains("UNIQUE constraint failed: user."),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_loaded_sqlite_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let (code, _err, target, _d) = load("");
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}

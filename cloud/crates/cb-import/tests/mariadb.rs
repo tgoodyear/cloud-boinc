@@ -15,7 +15,7 @@ use cb_import::schema::{all_tables, apply_migrations};
 use cb_import::sink::{load_sql_dir, SqlDirSink, SqliteSink};
 use cb_import::source::{is_read_only_statement, Source};
 use cb_import::summary::Summary;
-use cb_import::verify::verify;
+use cb_import::verify::{verify, verify_with};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Opts, Params, Value as My};
 use rusqlite::Connection;
@@ -982,6 +982,11 @@ fn sql_files_give_the_same_database_as_the_sqlite_file() {
     }
     let via = fx.dir.path().join("via.sqlite");
     load_sql_dir(&sql_dir, &via).unwrap();
+    assert_eq!(
+        q_i(&Connection::open(&via).unwrap(), "PRAGMA user_version"),
+        1_800_000_000
+    );
+    assert!(sql_dir.join("import_time.txt").exists());
 
     let a = Connection::open(&direct).unwrap();
     let b = Connection::open(&via).unwrap();
@@ -1047,6 +1052,8 @@ fn verify_passes_and_finds_a_changed_column_without_printing_values() {
     )
     .unwrap();
     t.execute("DELETE FROM assignment", []).unwrap();
+    t.execute("INSERT INTO mail_day (day, n) VALUES (1, 1)", [])
+        .unwrap();
     t.execute("UPDATE team SET nusers = 7 WHERE id = 2", [])
         .unwrap();
     drop(t);
@@ -1057,6 +1064,7 @@ fn verify_passes_and_finds_a_changed_column_without_printing_values() {
     assert!(text.contains("host.domain_name"), "{text}");
     assert!(text.contains("assignment") && text.contains("row count differs"));
     assert!(text.contains("team.nusers is wrong"));
+    assert!(text.contains("mail_day has 1 rows"), "{text}");
     assert!(!text.contains("changed-value-xyz"));
     for s in SENTINELS {
         assert!(!text.contains(s));
@@ -1115,7 +1123,8 @@ fn error_paths_do_not_print_values() {
     // A missing template file.
     std::fs::remove_file(fx.project.join("templates/upper_out")).unwrap();
     let e = fx.import_sqlite(&fx.options(), "o2.sqlite").unwrap_err();
-    assert!(e.message.contains("templates/upper_out"));
+    assert!(e.message.contains("workunit 2"), "{}", e.message);
+    assert!(!e.message.contains("templates/upper_out"));
     for s in SENTINELS {
         assert!(!e.message.contains(s));
     }
@@ -1392,8 +1401,21 @@ fn verify_in_the_import_snapshot_ignores_changes_made_after_it_started() {
     fx.admin
         .query_drop("UPDATE user SET total_credit = 5 WHERE id = 1")
         .unwrap();
-    let r = verify(&mut src, &path, &opts, 1000, &mut summary).unwrap();
+    // Live metadata outside the snapshot moves too (an insert raises AUTO_INCREMENT).
+    // (An ALTER would wait for the metadata lock the open transaction holds; an insert does not.)
+    insert(
+        &mut fx.admin,
+        "user",
+        &[
+            ("id", my_i(600)),
+            ("create_time", my_i(1)),
+            ("email_addr", my_s("late@example.org")),
+            ("authenticator", my_s("7777777777777777777777777777777a")),
+        ],
+    );
+    let r = verify_with(&mut src, &path, &opts, 1000, &mut summary, Some(&pre)).unwrap();
     assert!(r.ok(), "{}", r.render());
+    assert!(r.sampled["user"] >= 1);
     // A new session sees the drift.
     let mut fresh = Source::connect(&fx.dsn_file).unwrap();
     let r = verify(&mut fresh, &path, &opts, 1000, &mut summary).unwrap();
@@ -1423,6 +1445,34 @@ fn the_command_line_runs_import_with_verify_sample() {
     for s in SENTINELS {
         assert!(!text.contains(s));
     }
+    // With a directory of `.sql` files the check runs on a private temporary copy that is removed.
+    let out_dir = fx.dir.path().join("out");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cb-import"))
+        .args(["import", "--source-dsn-file"])
+        .arg(&fx.dsn_file)
+        .arg("--rows-only")
+        .arg("--target-sql-dir")
+        .arg(&out_dir)
+        .args(["--verify-sample", "100"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("verify: ok"), "{text}");
+    let left: Vec<_> = std::fs::read_dir(fx.dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".cb-import-verify-")
+        })
+        .collect();
+    assert!(left.is_empty());
     // With a manifest requested and --rows-only: a usage error, exit 2.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cb-import"))
         .args(["import", "--source-dsn-file"])
@@ -1524,4 +1574,21 @@ fn verify_checks_tables_the_source_does_not_have() {
     let r = verify(&mut src, &path, &o, 1000, &mut s).unwrap();
     assert!(!r.ok(), "{}", r.render());
     assert_eq!(r.counts["batch"], (0, 1));
+}
+
+#[test]
+fn verify_uses_the_import_time_recorded_in_the_file() {
+    let fx = fx!("recorded");
+    let o = fx.options();
+    let (_, path, _) = fx.import_sqlite(&o, "o.sqlite").unwrap();
+    let t = Connection::open(&path).unwrap();
+    assert_eq!(q_i(&t, "PRAGMA user_version"), 1_800_000_000);
+    drop(t);
+    // Verified later, by another run whose clock says something else.
+    let mut later = fx.options();
+    later.now = 1_900_000_000;
+    let mut src = Source::connect(&fx.dsn_file).unwrap();
+    let mut s = Summary::default();
+    let r = verify(&mut src, &path, &later, 1000, &mut s).unwrap();
+    assert!(r.ok(), "{}", r.render());
 }

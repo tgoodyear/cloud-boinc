@@ -18,7 +18,8 @@ use crate::value::Value;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DocFile {
     pub name: String,
-    pub url: Option<String>,
+    /// Every `<url>` of the description, in order.
+    pub urls: Vec<String>,
     pub md5: Option<String>,
     pub nbytes: Option<u64>,
     pub no_delete: bool,
@@ -48,9 +49,7 @@ pub fn doc_files(xml: &str) -> Vec<DocFile> {
             if let Some(n) = xp.parse_str("name") {
                 f.name = n;
             } else if let Some(u) = xp.parse_str("url") {
-                if f.url.is_none() {
-                    f.url = Some(u);
-                }
+                f.urls.push(u);
             } else if let Some(m) = xp.parse_str("md5_cksum") {
                 f.md5 = Some(m.trim().to_ascii_lowercase());
             } else if let Some(n) = xp.parse_double("nbytes") {
@@ -170,10 +169,10 @@ impl FileCollector {
         if self.own_origins.is_empty() {
             return true;
         }
-        match f.url.as_deref().and_then(url_origin) {
-            Some(o) => self.own_origins.contains(&comparable_url(o)),
-            None => false,
-        }
+        // Staged when any of its URLs is the project's: a mirror may be listed first.
+        f.urls
+            .iter()
+            .any(|u| url_origin(u).is_some_and(|o| self.own_origins.contains(&comparable_url(o))))
     }
 
     /// Checked with the rule the server applies to a name it stores (`is_flat_name`), before
@@ -255,7 +254,7 @@ impl FileCollector {
             docs = doc_files(xml_in);
         }
         for f in docs {
-            if !f.is_output && f.url.is_some() && f.md5.is_none() {
+            if !f.is_output && !f.urls.is_empty() && f.md5.is_none() {
                 continue;
             }
             if !self.name_ok(&f.name) {
@@ -326,7 +325,9 @@ impl FileCollector {
     /// (relative to the project directory)`, `bucket key`, `bytes`, `md5`,
     /// separated by tabs. Reads each file that is on disk to get its MD5.
     pub fn write_manifest(&self, out: &Path, list: usize, summary: &mut Summary) -> Result<()> {
-        let f = std::fs::File::create(out)
+        // A manifest of an earlier run is replaced, and the new file is private.
+        let _ = std::fs::remove_file(out);
+        let f = crate::fsutil::create_private_file(out)
             .map_err(|_| ImportError::usage("cannot create the --files-manifest file"))?;
         let mut w = std::io::BufWriter::new(f);
         let mut missing: Vec<String> = Vec::new();
@@ -519,6 +520,16 @@ mod tests {
         let xml = "<file_info>\n<name>r_0</name>\n<generated_locally/>\n<upload_when_present/>\n<max_nbytes>1e6</max_nbytes>\n<url>http://p.test/proj_cgi/file_upload_handler</url>\n</file_info>";
         let f = doc_files(xml);
         assert!(f[0].is_output);
+    }
+
+    #[test]
+    fn a_mirror_listed_first_does_not_hide_the_projects_url() {
+        let mut c = FileCollector::new(0, None, None, None, vec!["http://p.test".into()]);
+        c.workunit(
+            1,
+            "<file_info><name>m</name><url>http://mirror.test/m</url><url>http://p.test/proj/download/m</url><md5_cksum>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</md5_cksum><nbytes>5</nbytes></file_info>",
+        );
+        assert_eq!(c.download_count(), 1);
     }
 
     #[test]

@@ -45,7 +45,7 @@ cb-import load-sql --sql-dir DIR --target-sqlite FILE
 ```
 
 Every argument is a named flag. A target is created new: the tool refuses a SQLite file that exists and
-a directory that already holds `.sql` files, and when an import fails it removes what it wrote.
+a directory that already holds `.sql` files, and when an import fails it removes what it wrote (only what it created). Every file the tool writes (the SQLite file, the `.sql` files, the manifest) is created with mode 0600, and a directory it has to create with mode 0700, whatever the umask: they hold accounts' keys and password hashes. `import_time.txt` beside the `.sql` files is the Unix time of the import.
 
 | Flag | Meaning |
 |------|---------|
@@ -252,7 +252,7 @@ lookup of a client's computer by ID and the reset detection by `rpc_seqno` see w
 
 Every `<file_info>` of every carried `app_version.xml_doc` and `workunit.xml_doc` whose `<url>` is on the
 project's host (the master URL's or the download URL's, from `--config`; without `--config` every
-`<file_info>` counts) gets a row: name, `nbytes` and `md5` from the document (from the file when the
+`<file_info>` counts) gets a row (a description may list several URLs, and one on the project's host is enough): name, `nbytes` and `md5` from the document (from the file when the
 document has none), and `no_delete` 1 for app version files and for files the document marks
 `<no_delete/>`. Result output files are not `job_file` rows.
 
@@ -311,29 +311,29 @@ and so on, with `team` before `user`, and `NNNN_id_floor.sql` last.
 
 The tool prints counts, table names, column names and row IDs. It does not print an address, name,
 authenticator, password hash, cross-project ID, IP address, host name, account name of the database, or a
-DSN: a connection error says only that the connection or the login failed, with the server's error number.
+DSN: a connection error says only that the connection or the login failed, with the server's error number. SQLite errors (a damaged `.sql` file in `load-sql`) give the file, the number of the statement and the result code and class, and for a constraint failure the column names; never the statement. A missing result template is reported by workunit ID, not by file name.
 `verify` prints the table and column of a difference and the number of rows that differ, not the values.
 Tests check the summary, the verify report and the error messages against sentinel values placed in
 every such column of the synthetic database. The `.sql` and SQLite files hold the data. Keep them as private as the source.
 
 ## Verify
 
-A separate `verify` run compares the source as it is when `verify` reads it. That agrees with the import only on
+A separate `verify` run compares the source as it is when `verify` reads it, with one exception: the import's own time, which sets the `transition_time` of open workunits (see "Jobs") and the `recent` window, is read back from the target (`PRAGMA user_version` of the SQLite file; `load-sql` takes it from `import_time.txt`), not taken from the verifying run's clock. That agrees with the import only on
 a source that is not changing: a stopped project, or a replica whose replication is stopped. On a live source
 the counters, timestamps and row counts drift between the two runs and `verify` reports differences that are not
 errors. To compare against the exact data that was imported, use `import --verify-sample N`: after the last
 row is written, and before the read transaction ends, it compares `N` rows per table (and the counts) in the
 same consistent snapshot, and exits with status 6 on a difference. With `--target-sql-dir` it loads the
-files into a temporary SQLite file for the comparison and deletes it.
+files into a temporary SQLite file in a new owner-only directory next to the output, for the comparison, and deletes it. The facts the import took at the start of its snapshot (the carried workunits, row counts, `AUTO_INCREMENT`, which is live metadata and not part of the snapshot) are reused, so an insert on the source during the run cannot fail the check.
 
 ```
 cb-import verify --source-dsn-file dsn --target-sqlite imported.sqlite --sample 1000 [scope flags]
 ```
 
 For each table it prints the number of rows the import maps from the source and the number in the target,
-and compares a sample field by field: the first row and every row whose key is a multiple of
-`target rows / N`, found in the target by primary key. It checks that the `id_floor` rows are at or above the
-highest imported IDs, that a table the source does not have has no rows in the target, that `team.nusers` equals the member count, and, with `--code-sign-public-key`, that a
+and compares a sample field by field: the first row and every row whose hash of the whole primary key (all columns of a composite key) is a multiple of
+`target rows / N`, found in the target by primary key. The same rows are chosen on every run, however the IDs were allocated. The `sampled` column is the number of rows compared; a table with rows that compared none fails. It checks that the `id_floor` rows are at or above the
+highest imported IDs, that a table the source does not have has no rows in the target, that the tables the import never fills (`token`, `mail_day`, `upload_epoch`, `user_deletion`, `stats_bucket`, `stats_snapshot`) are empty, that `team.nusers` equals the member count, and, with `--code-sign-public-key`, that a
 `code_sign_public_key` row of the target (when it has one) is that key. A difference is reported as a table
 and column with the number of sampled rows; the exit status is 6.
 
