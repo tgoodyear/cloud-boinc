@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use cb_core::model::{Host, HostAppVersion, JobResult, Workunit};
 use cb_core::plan_class::PlanClassSpecs;
-use cb_core::scheduler::{handle_request, Catalog, SchedCtx, SchedOutcome};
+use cb_core::scheduler::{handle_request, Catalog, SchedCtx, SchedOutcome, HOST_NOT_FOUND};
 use cb_core::work::{create_work, Assign, AssignTarget, JobSpec, Submission};
 use cb_core::Config;
 use cb_crypto::Signer;
@@ -997,8 +997,9 @@ fn stale(w: &World, a: &Req) -> Req {
     c
 }
 
-/// The request with the host CPID element changed and nothing else (the domain name of a test
-/// client is its CPID string, so changing `cpid` changes that too).
+/// The request with the `<host_cpid>` element changed and nothing else. The domain name of a
+/// test client is its `cpid` string and stays as it was, so the request still looks like the same
+/// computer to `find_host_by_other`.
 fn with_host_cpid(req: &Req, cpid: &str) -> String {
     req.xml().replace(
         &format!("<host_cpid>{}</host_cpid>", req.cpid),
@@ -1187,7 +1188,7 @@ fn an_unknown_host_id_is_a_request_with_none_and_the_client_is_told() {
         .reply
         .messages
         .iter()
-        .find(|m| m.message == "Can't find host record")
+        .find(|m| m.message == HOST_NOT_FOUND)
         .expect("the message of `authenticate_user`");
     assert_eq!(note.priority, "low");
     // Then the other lookup: a CPID nobody has, on the computer of `a`.
@@ -1210,7 +1211,7 @@ fn an_unknown_host_id_is_a_request_with_none_and_the_client_is_told() {
     stranger.seqno = 0;
     let out = w.rpc(&stranger, 2000);
     assert!(out.host_id > 0 && out.host_id != a.hostid && out.host_id != 9999);
-    assert!(has_message(&out, "Can't find host record"));
+    assert!(has_message(&out, HOST_NOT_FOUND));
 }
 
 #[test]
@@ -1228,7 +1229,7 @@ fn no_host_id_looks_up_the_cpid_and_then_the_other_host() {
     let b = twin(&w, "b");
     let out = none(&w, &a, "b", true);
     assert_eq!(out.host_id, b.hostid);
-    assert!(!has_message(&out, "Can't find host record"));
+    assert!(!has_message(&out, HOST_NOT_FOUND));
     // A CPID nobody has, with the name, address, OS, model and memory of `a`.
     let w = World::new("", "");
     let a = computer_with_address(&w);
@@ -1252,7 +1253,7 @@ fn a_merged_host_is_followed_to_the_host_it_became() {
     assert_eq!(out.host_id, a.hostid);
     // The client is told its new ID.
     assert_eq!(out.reply.hostid, a.hostid as u64);
-    assert!(!has_message(&out, "Can't find host record"));
+    assert!(!has_message(&out, HOST_NOT_FOUND));
     // The client takes the ID and starts from 0 (`handle_scheduler_reply`), so 0 is what is
     // stored. Stock stores the request's 9 and treats the next request as a copied state file
     // (D20 in compatibility.md).
@@ -1301,17 +1302,17 @@ fn a_chain_of_merged_hosts_that_is_too_long_or_broken_is_an_unknown_host_id() {
     // Eleven links: `authenticate_user` stops after ten, and the CPID lookup finds `a`.
     req.hostid = 700;
     let out = w.rpc(&req, 2000);
-    assert!(has_message(&out, "Can't find host record"));
+    assert!(has_message(&out, HOST_NOT_FOUND));
     assert_eq!(out.host_id, a.hostid);
     // Ten links are followed.
     req.hostid = 701;
     let out = w.rpc(&req, 2100);
-    assert!(!has_message(&out, "Can't find host record"));
+    assert!(!has_message(&out, HOST_NOT_FOUND));
     assert_eq!(out.host_id, a.hostid);
     // A link to nothing.
     w.sql("INSERT INTO host (id, create_time, userid, rpc_seqno) VALUES (800, 0, 0, 12345)");
     req.hostid = 800;
-    assert!(has_message(&w.rpc(&req, 2200), "Can't find host record"));
+    assert!(has_message(&w.rpc(&req, 2200), HOST_NOT_FOUND));
 }
 
 // ---- Alternate platforms ---------------------------------------------------

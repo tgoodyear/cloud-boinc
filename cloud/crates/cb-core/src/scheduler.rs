@@ -66,6 +66,9 @@ const NPROC: usize = 5;
 const MAX_IN_LIST: usize = 90;
 /// Most results sent in one reply, whatever the configuration says.
 const MAX_SEND: usize = 100;
+/// The message that says the request's host ID names no host (`authenticate_user` in
+/// `sched/handle_request.cpp`).
+pub const HOST_NOT_FOUND: &str = "Can't find host record";
 /// Most links of a merged ("zombie") host's chain followed, as
 /// `authenticate_user` in `sched/handle_request.cpp` does.
 const MAX_ZOMBIE_HOPS: usize = 10;
@@ -1223,7 +1226,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     if host_row.is_none() && req.hostid > 0 {
         out.reply
             .messages
-            .push(UserMessage::new("Can't find host record", "low"));
+            .push(UserMessage::new(HOST_NOT_FOUND, "low"));
     }
 
     // The host, as `authenticate_user` in `sched/handle_request.cpp` finds it:
@@ -1379,11 +1382,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // or looked-up host (`got_host` in `authenticate_user`, even when the lookup
     // finds the host the request named), or the host a merged one became. The
     // client then takes the ID and starts its `rpc_seqno` again.
-    out.reply.hostid = if !named_host || host.id != req.hostid {
-        host.id as u64
-    } else {
-        0
-    };
+    let reply_names_host = !named_host || host.id != req.hostid;
+    out.reply.hostid = if reply_names_host { host.id as u64 } else { 0 };
     out.reply.host = ReplyHost {
         total_credit: host.total_credit,
         expavg_credit: host.expavg_credit,
@@ -2002,10 +2002,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         // Whenever the reply names the host the client starts from 0 again, so
         // that is what is stored. Stock stores the request's value for a merged
         // host's destination (D20 in compatibility.md).
-        if out.reply.hostid == 0 {
-            i64::from(req.rpc_seqno)
-        } else {
+        if reply_names_host {
             0
+        } else {
+            i64::from(req.rpc_seqno)
         },
         now,
         hi.timezone,
