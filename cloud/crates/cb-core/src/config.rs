@@ -4,6 +4,7 @@
 
 use cb_proto::xml::XmlParser;
 
+use crate::hr::HR_NTYPES;
 use crate::{CoreError, CoreResult};
 
 /// Upper bound on the CPU count used to scale per-host limits.
@@ -45,6 +46,12 @@ pub struct Config {
     pub strict_memory_bound: bool,
     pub ignore_delay_bound: bool,
     pub enable_assignment: bool,
+    /// The homogeneous redundancy type of apps that set none of their own:
+    /// 0 for none, 1 fine, 2 coarse.
+    pub homogeneous_redundancy: i32,
+    /// Keep a workunit committed to its class and app version after all its
+    /// results have failed.
+    pub hr_class_static: bool,
     pub default_disk_min_free_gb: f64,
     pub reliable_priority_on_over: i32,
     pub reliable_priority_on_over_except_error: i32,
@@ -105,6 +112,8 @@ impl Default for Config {
             strict_memory_bound: false,
             ignore_delay_bound: false,
             enable_assignment: false,
+            homogeneous_redundancy: 0,
+            hr_class_static: false,
             default_disk_min_free_gb: 1.0,
             reliable_priority_on_over: 0,
             reliable_priority_on_over_except_error: 0,
@@ -194,6 +203,17 @@ impl Config {
             take!(xp.parse_bool("strict_memory_bound") => c.strict_memory_bound);
             take!(xp.parse_bool("ignore_delay_bound") => c.ignore_delay_bound);
             take!(xp.parse_bool("enable_assignment") => c.enable_assignment);
+            if let Some(v) = xp.parse_int("homogeneous_redundancy") {
+                // Upstream's feeder refuses to start with a type it does not know.
+                if !(0..HR_NTYPES).contains(&v) {
+                    return Err(CoreError::Invalid(format!(
+                        "config: homogeneous_redundancy {v} is not 0, 1 or 2"
+                    )));
+                }
+                c.homogeneous_redundancy = v;
+                continue;
+            }
+            take!(xp.parse_bool("hr_class_static") => c.hr_class_static);
             take!(xp.parse_double("default_disk_min_free_gb") => c.default_disk_min_free_gb);
             take!(xp.parse_int("reliable_priority_on_over") => c.reliable_priority_on_over);
             take!(xp.parse_int("reliable_priority_on_over_except_error") => c.reliable_priority_on_over_except_error);
@@ -294,6 +314,25 @@ mod tests {
             (none.email_from.as_str(), none.email_from_name.as_str()),
             ("", "")
         );
+    }
+
+    #[test]
+    fn homogeneous_redundancy_options() {
+        let c = Config::parse(
+            "<config><homogeneous_redundancy>2</homogeneous_redundancy><hr_class_static/></config>",
+        )
+        .unwrap();
+        assert_eq!(c.homogeneous_redundancy, 2);
+        assert!(c.hr_class_static);
+        let c = Config::parse("<config></config>").unwrap();
+        assert_eq!(c.homogeneous_redundancy, 0);
+        assert!(!c.hr_class_static);
+        // Upstream's feeder refuses to start with a type it does not know.
+        for t in ["3", "-1"] {
+            let xml =
+                format!("<config><homogeneous_redundancy>{t}</homogeneous_redundancy></config>");
+            assert!(Config::parse(&xml).is_err(), "{t}");
+        }
     }
 
     #[test]

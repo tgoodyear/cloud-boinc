@@ -106,6 +106,14 @@ enum Command {
         assimilate_url: String,
         #[arg(long, default_value_t = 0)]
         target_nresults: i32,
+        /// Homogeneous redundancy: 0 none, 1 fine classes, 2 coarse classes. Not
+        /// changed when the flag is left out, unlike the other settings.
+        #[arg(long)]
+        homogeneous_redundancy: Option<i32>,
+        /// Homogeneous app version: send all results of a workunit with one app
+        /// version (true or false). Not changed when the flag is left out.
+        #[arg(long)]
+        homogeneous_app_version: Option<bool>,
     },
     /// Store a file under download/ and record it for use by jobs.
     FilePut {
@@ -448,18 +456,25 @@ fn run(cli: Cli) -> Res<()> {
             validator_url,
             assimilate_url,
             target_nresults,
-        } => show(&Client::new(&server)?.send(
-            "PUT",
-            "apps",
-            &json!({
+            homogeneous_redundancy,
+            homogeneous_app_version,
+        } => {
+            let mut body = json!({
                 "name": name,
                 "user_friendly_name": user_friendly_name,
                 "validator": validator,
                 "validator_url": validator_url,
                 "assimilate_url": assimilate_url,
                 "target_nresults": target_nresults,
-            }),
-        )?),
+            });
+            if let Some(t) = homogeneous_redundancy {
+                body["homogeneous_redundancy"] = json!(t);
+            }
+            if let Some(b) = homogeneous_app_version {
+                body["homogeneous_app_version"] = json!(b);
+            }
+            show(&Client::new(&server)?.send("PUT", "apps", &body)?)
+        }
         Command::FilePut {
             server,
             file,

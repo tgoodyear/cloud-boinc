@@ -776,8 +776,10 @@ fn assigned_jobs_the_host_cannot_run_do_not_hold_back_later_ones() {
     let mut w = World::new();
     w.config.enable_assignment = true;
     let req = computer(&w, "auth1", "aa", 1000);
-    // More jobs than one request looks at, pinned to a version the host
-    // has no use of, ahead of one it can run.
+    block_on(w.db.run(stmt!("UPDATE app SET homogeneous_app_version = 1"))).unwrap();
+    // More jobs than one request looks at, committed to a version the host
+    // has no use of (the app uses homogeneous app version), ahead of one it
+    // can run.
     for i in 0..25 {
         let wu = w.submit_assigned(&format!("p{i}"), 1100, 1, 1, to_host(req.hostid));
         block_on(w.db.run(stmt!(

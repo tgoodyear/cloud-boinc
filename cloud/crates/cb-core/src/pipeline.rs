@@ -318,8 +318,14 @@ fn transitioner_pass(st: &mut State, ctx: &Ctx) -> CoreResult<()> {
     if ncouldnt_send > 0 {
         wu.error_mask |= WU_ERROR_COULDNT_SEND_RESULT;
     }
-    // Only errors so far: let other app versions have a go.
-    if nerrors > 0 && !(nsuccess > 0 || ninprogress > 0 || nno_reply > 0) {
+    // A workunit that has results with errors and nothing else to wait for
+    // (no result succeeded, none is in progress, none timed out and may still
+    // come back) gives up its homogeneous redundancy class and app version, so
+    // that other platforms and versions can have a go (`handle_wu` in
+    // `sched/transitioner.cpp`).
+    if nerrors > 0 && !(nsuccess > 0 || ninprogress > 0 || nno_reply > 0) && !config.hr_class_static
+    {
+        wu.hr_class = 0;
         wu.app_version_id = 0;
     }
     if nerrors > wu.max_error_results {
@@ -1405,8 +1411,8 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
         let mut batch = vec![stmt!(
             "UPDATE workunit SET need_validate = ?, canonical_resultid = ?, canonical_credit = ?, \
              transition_time = ?, error_mask = ?, file_delete_state = ?, assimilate_state = ?, \
-             target_nresults = ?, app_version_id = ?, mod_time = ?, rev = rev + 1, commit_token = ? \
-             WHERE id = ? AND rev = ?",
+             target_nresults = ?, app_version_id = ?, hr_class = ?, mod_time = ?, rev = rev + 1, \
+             commit_token = ? WHERE id = ? AND rev = ?",
             wu.need_validate,
             wu.canonical_resultid,
             wu.canonical_credit,
@@ -1416,6 +1422,7 @@ pub async fn transition(ctx: &Ctx<'_>, wu_id: i64) -> CoreResult<TransitionRepor
             wu.assimilate_state,
             wu.target_nresults,
             wu.app_version_id,
+            wu.hr_class,
             ctx.now,
             token,
             wu.id,
