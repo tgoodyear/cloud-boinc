@@ -45,17 +45,28 @@ pub const NAV: &[NavItem] = &[
         account: false,
     },
     NavItem {
+        label: "Teams",
+        path: "team.php",
+        account: false,
+    },
+    NavItem {
         label: "Server status",
         path: "server_status.php",
         account: false,
     },
 ];
 
+/// Whether the project shows a navigation entry: the Teams entry goes when
+/// the project has turned teams off (`disable_teams`).
+pub fn shown(project: &Project, item: &NavItem) -> bool {
+    !(project.config.disable_teams && item.path == "team.php")
+}
+
 /// The header of every page: the project name as the home link and the
 /// navigation. It scrolls sideways on a narrow screen instead of wrapping.
 pub fn site_header(project: &Project) -> String {
     let mut nav = String::new();
-    for item in NAV.iter().filter(|i| !i.account) {
+    for item in NAV.iter().filter(|i| !i.account && shown(project, i)) {
         nav.push_str(&format!(
             "<a href=\"{}\">{}</a>",
             item.path,

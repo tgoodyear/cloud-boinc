@@ -27,6 +27,7 @@ use crate::site_account;
 use crate::site_boards;
 use crate::site_delete;
 use crate::site_email;
+use crate::site_teams;
 use crate::site_ui::{self, site_header};
 use crate::site_work;
 use crate::web::{html_escape, page, show_user_xml, weak_account_key, web_account_creation_closed};
@@ -177,7 +178,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 34] = [
+pub const SITE_PATHS: [&str; 56] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -212,6 +213,28 @@ pub const SITE_PATHS: [&str; 34] = [
     "/delete_account_request.php",
     "/delete_account_confirm.php",
     "/apps.php",
+    "/team.php",
+    "/team_search.php",
+    "/team_display.php",
+    "/team_members.php",
+    "/team_create_form.php",
+    "/team_create_action.php",
+    "/team_join.php",
+    "/team_join_form.php",
+    "/team_join_action.php",
+    "/team_quit_form.php",
+    "/team_quit_action.php",
+    "/team_edit_form.php",
+    "/team_edit_action.php",
+    "/team_manage.php",
+    "/team_remove_inactive_form.php",
+    "/team_remove_inactive_action.php",
+    "/team_change_founder_form.php",
+    "/team_change_founder_action.php",
+    "/team_founder_transfer_form.php",
+    "/team_founder_transfer_action.php",
+    "/team_lookup.php",
+    "/top_teams.php",
 ];
 
 /// Headers every site page is sent with: no framing by another site (the
@@ -310,6 +333,7 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/delete_account_request.php" => site_delete::delete_account_request(ctx, q).await?,
         "/delete_account_confirm.php" => site_delete::delete_account_confirm(ctx, q).await?,
         "/apps.php" => crate::site_apps::apps(ctx, q),
+        p if site_teams::TEAM_PATHS.contains(&p) => return site_teams::team_page(ctx, p, q).await,
         _ => return Ok(None),
     }))
 }
@@ -569,7 +593,7 @@ pub fn not_found_page(project: &Project, base: &str) -> SitePage {
     SitePage::html(404, page("Page not found", &head, &body))
 }
 
-fn int_param(q: &Params, name: &str) -> Option<i64> {
+pub(crate) fn int_param(q: &Params, name: &str) -> Option<i64> {
     q.get(name).and_then(|v| v.trim().parse().ok())
 }
 
@@ -831,19 +855,20 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     if ctx.mail().is_some() {
         email_cell.push_str(&site_email::verify_cell(&user, ctx.now));
     }
-    let info = site_ui::kv(&[
+    let member_since = format!("{} member since", project.config.long_name);
+    let mut info_rows: Vec<(&str, String)> = vec![
         ("Name", html_escape(&user.name)),
         ("Email address", email_cell),
-        (
-            &format!("{} member since", project.config.long_name),
-            date_str(user.create_time),
-        ),
+        (&member_since, date_str(user.create_time)),
         ("User ID", user.id.to_string()),
         (
             "Cross-project ID",
             user_cpid(&user.cross_project_id, &user.email_addr),
         ),
-    ]);
+    ];
+    // The team, and the teams the account founded (upstream's `show_community_private`).
+    info_rows.extend(site_teams::account_rows(ctx, &user).await?);
+    let info = site_ui::kv(&info_rows);
 
     let numbers = site_ui::stats(&[
         site_ui::stat("Total credit", &number_format(user.total_credit, 0), ""),
@@ -969,6 +994,11 @@ pub async fn show_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         "Recent average credit",
         &number_format(user.expavg_credit, 2),
     );
+    // Upstream's `community_links` shows the team, or a dash when there is none.
+    if !project.config.disable_teams {
+        let team = site_teams::public_team_row(ctx, user.teamid).await?;
+        row2(&mut b, "Team", &team.unwrap_or_else(|| "&mdash;".to_string()));
+    }
     if user.show_hosts != 0 || project.config.host_owner_public {
         row2(
             &mut b,

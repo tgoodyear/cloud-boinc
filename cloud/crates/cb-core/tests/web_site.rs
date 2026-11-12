@@ -871,8 +871,9 @@ fn home_shows_the_account_to_its_holder_only() {
     let wrong = w.get("/home.php", Some("0123456789abcdef0123456789abcdef"), &[]);
     assert_eq!(wrong.status, 303);
 
+    // The account, then its team and the teams it founded.
     let (page, n) = w.page("/home.php", Some(&ada.auth), false, &[]);
-    assert_eq!(n, 1);
+    assert_eq!(n, 2);
     assert_eq!(page.status, 200);
     assert!(page.body.contains("ada@example.com"));
     assert!(page.body.contains("Ada &lt;i&gt;x&lt;/i&gt;"));

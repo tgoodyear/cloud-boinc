@@ -32,11 +32,11 @@ In scope, because the reference deployment uses it:
 | Scheduler | account keys and weak keys, host records, result reporting, work requests for CPU and GPU, plan classes (container, NVIDIA, AMD, Intel, Apple GPU, multi-thread), client-version floors, batch and workunit-ID gates, per-app weights, assigned (targeted) jobs, homogeneous redundancy and homogeneous app version, `one_result_per_host_per_wu`, in-progress and daily limits, lost-result resend, request back-off |
 | Job pipeline | workunit and result state machine, deadlines and retries, error limits, quorum validation (trivial, bitwise, project-supplied), canonical result choice, credit, assimilation hand-off, output and input clean-up, purge |
 | Files | signed app versions, input downloads with range requests, multi-GB sticky files, upload certificates, uploads with size limits, checksums and resume |
-| Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
-| Site | project home (master URL), apps, server status, account, hosts and tasks pages; sign-up, account details, password and email address changes, computing and project preferences; password recovery, address verification and change notices through Cloudflare Email Service when the Worker has the binding |
+| Web RPCs | `get_project_config.php`, `lookup_account.php`, `create_account.php`, `server_status.php?xml=1`, `show_user.php?format=xml`, `team_lookup.php`, and the account manager RPCs `am_get_info.php`, `am_set_info.php`, `am_set_host_info.php` |
+| Site | project home (master URL), apps, server status, account, hosts and tasks pages; teams (list, search, team pages, members, create, join, quit, the founder's pages, `top_teams.php`); sign-up, account details, password and email address changes, computing and project preferences; password recovery, address verification and change notices through Cloudflare Email Service when the Worker has the binding |
 | Operations | app, platform, app-version and plan-class management, batch job submission, cancel, result feed for the project's pipeline, all over an authenticated HTTP API with a CLI |
 
-Out of scope for now: forums, teams, profiles, locality scheduling,
+Out of scope for now: forums, profiles, private messages, locality scheduling,
 trickle messages, BUDA, the XML stats export, and the full PFC credit model (see "Credit").
 
 ## Service map
@@ -856,7 +856,8 @@ The first version grants credit from elapsed time and the host's benchmark
 app version), takes the minimum claim among the valid results of a quorum, and maintains total
 and recent-average credit for hosts and users with the stock half-life. The full PFC model in
 `sched/credit.cpp` (cross-version and cross-host normalisation) is not ported yet. A validator
-webhook can override the granted credit.
+webhook can override the granted credit. An account's team is credited with the account (see
+"Teams").
 
 ## Files
 
@@ -1284,8 +1285,8 @@ key writes nothing. If a site request changed them meanwhile, nothing is written
 is `ERR_RETRY`. A project preferences document without a `<project_specific>`
 part inherits the stored one (or has none, if none was stored), so that write is conditional on
 `project_prefs` being still what was read; a site save of the application selection or task limit
-in between, including the first one, is not undone. `teamid` is accepted and ignored until there are
-teams, and the consent fields are ignored. A new address is also refused when it is another
+in between, including the first one, is not undone. `teamid` joins a team or, for 0, quits the
+current one (see "Teams" below), and the consent fields are ignored. A new address is also refused when it is another
 account's previous address within the seven days of an undo link (see Email); an address change
 is refused within seven days of the last change and otherwise records the previous address as
 the site does; and a change of address or password ends the account's unused login links (and an
@@ -1303,7 +1304,7 @@ weak key, which the scheduler accepts, gets `ERR_DB_NOT_FOUND` here, as upstream
 The site pages are in `cloud/crates/cb-core/src/site.rs`, reached through `site_page`:
 `login_form.php`, `login_action.php`, `logout.php`, `home.php`, `hosts_user.php`,
 `show_host_detail.php`, `results.php`, `result.php`, `workunit.php`, `show_user.php` and
-`apps.php`, and the account and preference pages listed below, and the pages that send email (see Email below). Logging in, with the account key or with email address and password, sets the `auth` cookie
+`apps.php`, the team pages (see "Teams" below), and the account and preference pages listed below, and the pages that send email (see Email below). Logging in, with the account key or with email address and password, sets the `auth` cookie
 to the account key as upstream does, with `HttpOnly`, `Secure` and `SameSite=Lax`. It lasts a
 year when "stay logged in" is ticked, and for the browser session otherwise. A password is
 taken from a POST only. Logging out is a POST with the form token, as described under the account pages below. Private fields follow upstream: the account page, the IP address,
@@ -1423,8 +1424,8 @@ that is not bounded by the limits below.
 
 Upstream's `top_users.php` and `top_hosts.php` (`html/user/`) list every account and computer with
 `offset` paging and team and search options. These list only accounts and computers with credit,
-cap the depth, and have no team boards, since the site has no teams. `work.php` and `activity.php`
-have no upstream counterpart; `server_status.php` is the nearest.
+cap the depth, and have no team filter or search. Teams have their own board, `top_teams.php`, under "Teams".
+`work.php` and `activity.php` have no upstream counterpart; `server_status.php` is the nearest.
 
 **Who owns a computer.** Upstream shows a computer's owner only when the account has `show_hosts`
 on, and lists another account's computers only then (`html/user/show_host_detail.php`,
@@ -1728,6 +1729,153 @@ have takes the in-use value; an empty `<tag></tag>` number is 0.
 
 A computing-preferences save keeps only the fields above, as upstream's form does; anything else
 a client stored in the document is dropped.
+
+### Teams
+
+A person may belong to one team. The pages and the RPC follow upstream's `html/user/team*.php`,
+`top_teams.php`, `html/inc/team.inc` and `html/inc/team_types.inc`; the logic is in
+`cloud/crates/cb-core/src/teams.rs` (what a team may hold, the statements, the search) and
+`site_teams.rs` (the pages and `team_lookup.php`), and the web Worker only routes to them. The
+differences from upstream are D18 to D20 in [compatibility.md](compatibility.md).
+
+**Data.** `migrations/0009_teams.sql` adds `team` with the columns of `db/schema.sql` that the pages
+and RPCs read: `id`, `create_time`, `userid` (the founder, 0 when that account was deleted), `name`,
+`name_lc`, `url`, `type`, `description`, `nusers`, `country`, `total_credit`, `expavg_credit`,
+`expavg_time` and `joinable`, and one of its own, `recent_key`, which orders by recent average
+as `user.recent_key` does. `user.teamid` was already there. `name_lc` is the name in lower case under a
+unique index, so a team is found and refused by its name without regard to case, as MySQL's
+collation does for upstream. Team IDs are not given out twice (`next_id_sql("team")`, the
+`id_floor` table of `0007`). The columns upstream has for what is not built (`name_html`,
+`seti_id`, `ping_user`, `ping_time`, `mod_time`) are not there.
+
+`team.nusers` is kept exactly. Two triggers on `user` (`user_team_changed`, `user_team_deleted`)
+add and take away one when `teamid` changes, whatever statement changes it: a member joining or
+quitting, the founder removing a member, an account deletion, an operator's `UPDATE`. Upstream
+keeps the column "temp" and recounts it daily in `update_stats` (`get_team_totals`); no such job is
+needed here. The other half of `update_stats` for teams, the decay of an idle average, is not needed
+either: pages show the average decayed to now (`decayed` in `avg.rs`) and order by `recent_key`, as
+the account leaderboard does (see "Dashboards"). Indexes: `team_total_credit` and `team_recent_key`
+(the two orders of `top_teams.php`), `team_founder` (the account page's "founded" list), and the
+partial `user_team ON user (teamid) WHERE teamid > 0` (the members of a team; an account with no team
+is not in it and a credit grant does not change it).
+
+**Pages.** All are in `SITE_PATHS`, under their upstream names. A page that changes something takes
+a POST with the form token its form page made, and its statement names the account key that was
+read (see "Account and preference pages").
+
+| Page | Method | Does |
+| --- | --- | --- |
+| `team.php` | GET | the introduction, the search form, links to the boards, the link to create a team |
+| `team_search.php` | GET | the form; with `submit` the matching teams; with `xml=1` the same as XML. One round trip, at most five statements |
+| `team_display.php?teamid=` | GET | a team: description (plain text, paragraphs), created, web site, country, type, founder, members, credit; for the visitor a join form, a quit link, the founder's link |
+| `team_members.php?teamid=&sort_by=&offset=` | GET | the members, 20 to a page, by recent average or total credit; the first 1000 only; blocked accounts left out |
+| `top_teams.php?sort_by=&type=&offset=` | GET | the board, 20 to a page, by recent average (default) or total credit, for all types or one; public and cached for 60 seconds like the other boards |
+| `team_create_form.php`, `team_create_action.php` | GET, POST | makes the team and joins its founder to it |
+| `team_join_form.php?id=`, `team_join_action.php`, `team_join.php` | GET, POST, POST | the notes and the form; the join; the join that returns to the account page (a GET of `team_join.php` goes to the form) |
+| `team_quit_form.php`, `team_quit_action.php` | GET, POST | quits the team the account is in |
+| `team_edit_form.php?teamid=`, `team_edit_action.php` | GET, POST | the founder edits name, address, description, type, country and whether the team takes new members |
+| `team_manage.php?teamid=` | GET | the founder's menu; with `action=delete` a page that asks, and a POST that removes a team with no members |
+| `team_remove_inactive_form.php`, `team_remove_inactive_action.php` | GET, POST | the founder removes members (50 listed to a page, up to 90 to a request) |
+| `team_change_founder_form.php`, `team_change_founder_action.php` | GET, POST | the founder hands the team to a member |
+| `team_founder_transfer_form.php`, `team_founder_transfer_action.php` | GET, POST | a member takes a team that has no founder |
+| `team_lookup.php` | GET | the RPC below |
+
+The Teams entry of `NAV` (`team.php`) is the one navigation entry, and a project that sets
+`disable_teams` does not show it (`shown` in `site_ui.rs`). The account page (`home.php`) has the
+team the account is in with links to quit it and, for its founder, to administer it, and a row for each
+team it founded and is not in, as upstream's `show_community_private` does; the public page
+(`show_user.php`) has the team, linked, or a dash.
+
+**What may be stored.** Everything a person types is stored as typed after these checks and escaped where
+it is written, in HTML and in XML. A name is 1 to 191 characters (the column of `db/schema.sql`),
+one line, with no `<` or `>`: upstream strips tags with `sanitize_tags`; here the name is refused, so
+what is stored is what was typed. The web address is empty, or `http://` or `https://` and a
+host name (letters, digits, dots, hyphens, an optional port, then printable ASCII without quotes or angle
+brackets), or the same without a scheme, which is shown as `https://`; `javascript:`, `data:` and
+other schemes, `//host` and an address with `user@` are refused. It is shown as a link with
+`rel="nofollow ugc noopener noreferrer"`. The description is plain text of up to 4000 characters,
+shown in paragraphs with its line ends kept; upstream's limited HTML (`sanitize_html`) is not accepted
+and tags show as typed. Type is 0 to 12 (`$team_types`), country one of upstream's list (empty is
+"International"), as `team_create_action.php`.
+
+**Who may do what.** Anyone sees teams. An account with a login joins a team that takes new members,
+quits, or creates a team (not while it is in one: upstream's form says to quit first, and here the
+action refuses too). The founder edits, removes members (not the founder itself), hands the team to a
+member and removes a team that has no members. Upstream also has team admins, who may edit and
+see the history; there are none here, and the founder is the only administrator. A team whose
+founder's account was deleted has no founder (`userid` 0), and one of its members can take it.
+Upstream's other route, a member asking and the founder being told by email and private message,
+and after 60 days the member taking the team, needs those messages, which this site does not send;
+it is not built.
+
+**Statements.** The state-changing pages read the account, the team, and then change one thing
+in a single statement or batch. Joining is one `UPDATE user SET teamid` that checks the team takes new
+members and the account key; the trigger moves the counts. Creating is one batch of two statements:
+`INSERT OR IGNORE INTO team ... WHERE EXISTS (the account, in no team, not blocked) RETURNING id`, which a
+taken name leaves empty, then the account's `teamid` set under `changes() > 0`. Editing, removing members,
+changing the founder and removing the team each name the founder in their `WHERE`, so a request
+from an account that stopped being the founder does nothing. Removing a team checks `NOT EXISTS` a
+member with the member index, not the count.
+
+| Page | Statements | Reads |
+| --- | --- | --- |
+| `team_display.php` | 2 (the visitor, the team and its founder's name), 1 for a visitor with no login | one row each |
+| `team_members.php` | 2 | the team's members by the member index, at most 21 rows to the page; sorting is done over the team's members, so a very large team reads them all |
+| `top_teams.php` | 1 | at most 21 index entries and rows at an offset; with a type, the index in order until the page is full |
+| `team_search.php` | 1 round trip, up to 5 statements | each at most 20 rows; the word match scans the teams (name and description) in `team_recent_key` order until it has 20 |
+| `team_lookup.php` | 1 | by ID, by up to 100 IDs, or by a name pattern (a scan in `team_recent_key` order until 100 match, as upstream's `LIKE '%...%'` scans) |
+| `home.php` | 2 (it was 1) | the account's team and the teams it founded, by `id` and by `team_founder` |
+| `show_user.php` | 2 for an account with a team (1 without) | the team by `id` |
+
+**`team_lookup.php`.** `team_id` answers one `<team>` with the elements of `show_team_xml` in
+`html/inc/xml.inc` (`id`, `create_time`, `userid`, `name`, `url`, `type`, `country`, `total_credit`,
+`expavg_credit`, `expavg_time`) and `ERR_DB_NOT_FOUND` for a team that is not there; `team_ids` (comma
+separated, the first 100 numeric ones, in the order given) answers `<teams>`; `team_name` finds names that contain it, best recent
+average first, at most 100, as XML with `format=xml` and as a page of links without. The text is escaped. The
+`expavg_credit` is the stored one, as `show_user.php?format=xml` writes for an account (upstream's
+`update_stats` decays it once a day; here the page shows the decayed value and the XML the stored one).
+
+**Account managers.** `am_set_info.php` with `teamid` 0 quits, and with a team's ID joins it when it
+takes new members; another ID, a team that does not take members or a value that is not a number changes
+nothing and the reply is still success, as upstream's code. It is one assignment of the same `UPDATE` as the
+other fields (`coalesce((SELECT id FROM team WHERE id = ? AND joinable = 1), teamid)`), so it costs no
+statement. `am_get_info.php` reports `<teamid>` and, for an account that founded the team it is in,
+`<teamfounder/>` after the venue, as upstream does; the team comes with the account in the one statement
+(a join on `teamid`). `show_user.php?format=xml` already had `<teamid>`; `lookup_account.php` has no team
+element upstream or here.
+
+**Credit.** Upstream's `grant_credit` in `sched/credit.cpp` grants the host, then the user, then the
+user's team (`team.total_credit`, `expavg_credit`, `expavg_time`), each with `update_average`.
+`host_statements` in `cloud/crates/cb-core/src/pipeline.rs` does the same: the read of the users in the
+transition's batch now joins `team` on `user.teamid`, which costs no statement and finds nothing for an
+account with no team, and each team credited gets one `UPDATE team SET total_credit = total_credit + ?,
+expavg_credit = ?, expavg_time = ?, recent_key = ?` in the batch that writes the host and user, guarded by the
+workunit's commit token like the others. Two accounts of one team in one transition make one update. A grant
+costs the statements it did, and for an account with a team one more, which writes the team row and its
+two index entries (`team_total_credit`, `team_recent_key`); for an account with no team (`teamid` 0, or a
+team that is gone) it costs nothing more. A test counts both
+(`a_grant_goes_to_the_accounts_team_in_one_more_statement` in `cloud/crates/cb-core/tests/pipeline.rs`).
+Joining a team does not move credit the account already has, as upstream's join page says.
+
+**Scheduler reply.** `SCHEDULER_REPLY::write` in `sched/sched_types.cpp` writes `<teamid>` and
+`<team_name>` for an account with a team and an empty `<team_name>` otherwise; the writer here
+(`cloud/crates/cb-proto/src/sched_reply.rs`) already had both forms and the scheduler now fills them. The
+first read of a request (the account, the computer, and for a weak key the account by ID) selects the
+account with a join on `team` by `teamid`, so the name costs no statement and, with `teamid` 0, no row. The
+client parses `<teamid>` and `<team_name>` in `SCHEDULER_REPLY::parse`
+(`client/scheduler_op.cpp`); the parser oracle already reads a reply with a team whose name has markup in
+it (`cloud/crates/cb-core/tests/parser_oracle/scheduler.rs`). Upstream's `<gui_urls>` substitution of
+`<teamid/>` and `<team_name/>` is not done, as the project has no `<gui_urls>` (D1).
+
+**Settings.** `<disable_teams/>` turns the feature off: every team page answers 404 ("Teams are
+disabled."), `team_lookup.php` answers an XML error with number -1, `am_set_info.php` ignores
+`teamid`, and the navigation, the account pages and the master page do not mention teams. It is on by
+default. `<disable_team_creation/>` and `<team_create_need_credit/>` restrict creation as upstream's
+`project_config_bool("disable_team_creation")` and `TEAM_CREATE_NEED_CREDIT` do. A change to the config
+shows within the settings cache's 30 seconds, and `top_teams.php` for up to its 60 seconds in the edge
+cache. Moving the `team` rows of a stock server is by SQL: the columns above have upstream's names and
+meanings; `name_lc` (the lower-case name) and `recent_key` (`-1e9` for no average) must be set. There is no
+importer.
 
 ### Email
 
@@ -2156,13 +2304,13 @@ back after the obfuscation, or from making a computer for a wiped account. The t
 (`cloud/crates/cb-core/tests/scheduler.rs`) start the deletion between the read and each write.
 
 Differences from upstream: no `user_deleted` and `host_deleted` rows (they feed the `db_dump`
-stats export, which does not exist here); no teams, forum, private messages, profiles, friends,
+stats export, which does not exist here); no forum, private messages, profiles, friends,
 credited jobs, donations or consent rows (none of those tables exist); `assignment` rows are
 deleted and `batch` rows lose their owner (upstream's wipe leaves both, and stock IDs are not reused,
 as here); `external_ip_addr` of a
 computer is cleared by the obfuscate method too, and the account's URL, venue, both preference
 documents, password hash, cross-project ID, previous address, `show_hosts`, `send_email`,
-`email_validated` and `teamid` are cleared and the account is blocked, where upstream's obfuscate
+`email_validated` and `teamid` are cleared (the team's member count follows, see "Teams"; a team the account founded is left with no founder, as `user_erase_team_owner` in `html/inc/team.inc` does) and the account is blocked, where upstream's obfuscate
 changes only the email address, key, name, country and postal code; the wipe deletes in bounded
 statements over several runs instead of one pass. The confirmation message goes through the mail
 abstraction (`Mailer`), so on a deployment without the `EMAIL` binding the request page says the
@@ -2181,6 +2329,9 @@ Read from an imported `config.xml` by `Config::parse` (`cloud/crates/cb-core/src
 | `show_results` | `0` makes `results.php` answer 404 and removes the task links from `home.php`, `hosts_user.php` and `show_host_detail.php` | `html/user/results.php`, `html/inc/host.inc` |
 | `enable_delete_account` | see Account deletion | `html/inc/delete_account.inc` |
 | `robots_tag` | value of an `X-Robots-Tag` header on the account pages | not in upstream, which sets no such header |
+| `disable_teams` | no team pages (they answer 404), no Teams entry in the navigation, no team row on the account pages, `team_lookup.php` answers an XML error, `am_set_info.php` ignores `teamid` | `DISABLE_TEAMS` in `html/inc/util.inc` (a PHP constant set in `project.inc`) |
+| `disable_team_creation` | the team creation page and action refuse | `html/user/team_create_action.php` |
+| `team_create_need_credit` | an account with no credit may not create a team | `TEAM_CREATE_NEED_CREDIT` in `html/user/team_create_form.php` (a PHP constant set in `project.inc`) |
 
 Three of these differ on purpose from the upstream default for an option that is not stated, so
 that a deployment made before they were read does not change: with none of `account_creation`,
@@ -2514,6 +2665,10 @@ Not implemented yet:
 - Plan classes hard-coded in `sched/sched_customize.cpp`. A plan class has to be in the spec
   file. The differences from `sched/plan_class_spec.cpp` are listed at the top of
   `crates/cb-core/src/plan_class.rs`.
+- Teams: team admins (`team_admins.php`), the join and quit history (`team_delta.php`), the
+  member email list, team forums, the foundership request flow of `team_founder_transfer_*.php`,
+  `create_team.php`, `team_import` (BOINC-wide teams), team badges and cross-project statistics
+  links; see "Teams".
 - On the site: invitation codes, consent records, merging and deleting computers, per-app
   details of a computer, cross-project statistics links and certificates, the project-defined
   method of account deletion, and any email beyond the messages under Email.

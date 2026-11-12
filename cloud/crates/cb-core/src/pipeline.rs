@@ -1028,6 +1028,13 @@ struct CreditRow {
     expavg_credit: f64,
     expavg_time: f64,
     avg_turnaround: f64,
+    /// An account's team (0 for none) and, from the join in the same read, the
+    /// team's average: `team_id` is null when the account has no team or
+    /// the team is gone.
+    teamid: i64,
+    team_id: Option<i64>,
+    team_expavg_credit: f64,
+    team_expavg_time: f64,
 }
 
 fn guard_sql(wu_id: i64, token: i64) -> (&'static str, [Value; 2]) {
@@ -1097,8 +1104,14 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
             "SELECT id, expavg_credit, expavg_time, avg_turnaround FROM host WHERE id IN ({})",
             id_list(&host_ids)
         )));
+        // The team's average comes in the same statement: a join on `teamid`,
+        // which finds nothing for an account with no team (`teamid` 0), so a
+        // grant to an account without a team reads and writes nothing more.
         reads.push(Stmt::new(format!(
-            "SELECT id, expavg_credit, expavg_time FROM user WHERE id IN ({})",
+            "SELECT u.id, u.expavg_credit, u.expavg_time, u.teamid, t.id AS team_id, \
+             coalesce(t.expavg_credit, 0) AS team_expavg_credit, \
+             coalesce(t.expavg_time, 0) AS team_expavg_time \
+             FROM user u LEFT JOIN team t ON t.id = u.teamid WHERE u.id IN ({})",
             id_list(&user_ids)
         )));
     }
@@ -1145,6 +1158,21 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         );
     }
 
+    // The teams of the accounts credited, by team ID: the average as it is
+    // brought up to date by each grant, as `grant_credit` in `sched/credit.cpp`
+    // does for `team.expavg_credit` after the user's.
+    let mut teams: BTreeMap<i64, CreditRow> = BTreeMap::new();
+    for u in users.values() {
+        if let Some(team_id) = u.team_id.filter(|_| u.teamid > 0) {
+            teams.entry(team_id).or_insert(CreditRow {
+                id: team_id,
+                expavg_credit: u.team_expavg_credit,
+                expavg_time: u.team_expavg_time,
+                ..Default::default()
+            });
+        }
+    }
+    let mut team_credit: BTreeMap<i64, f64> = BTreeMap::new();
     let mut host_credit: BTreeMap<i64, f64> = BTreeMap::new();
     let mut user_credit: BTreeMap<i64, f64> = BTreeMap::new();
     // Valid tasks, for the leaderboards' "jobs completed".
@@ -1223,6 +1251,18 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
                     );
                     *user_credit.entry(*user_id).or_default() += credit;
                     *user_valid.entry(*user_id).or_default() += 1;
+                    if let Some(t) = u.team_id.filter(|_| u.teamid > 0).and_then(|id| teams.get_mut(&id))
+                    {
+                        update_average(
+                            now,
+                            *sent_time,
+                            *credit,
+                            CREDIT_HALF_LIFE,
+                            &mut t.expavg_credit,
+                            &mut t.expavg_time,
+                        );
+                        *team_credit.entry(t.id).or_default() += credit;
+                    }
                 }
                 if let Some(h) = havs.get_mut(&(*host_id, *gavid)) {
                     h.row.max_jobs_per_day += 1;
@@ -1273,6 +1313,24 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
                 u.expavg_time,
                 user_valid.get(id).copied().unwrap_or(0),
                 crate::avg::recent_key(u.expavg_credit, u.expavg_time),
+                *id
+            ),
+            wu_id,
+            token,
+        ));
+    }
+    // The team, when an account credited has one: one statement for each team,
+    // in the same batch.
+    for (id, credit) in &team_credit {
+        let t = &teams[id];
+        out.push(guarded(
+            stmt!(
+                "UPDATE team SET total_credit = total_credit + ?, expavg_credit = ?, \
+                 expavg_time = ?, recent_key = ? WHERE id = ?",
+                *credit,
+                t.expavg_credit,
+                t.expavg_time,
+                crate::avg::recent_key(t.expavg_credit, t.expavg_time),
                 *id
             ),
             wu_id,

@@ -55,6 +55,7 @@ impl SqliteDb {
         db.apply(include_str!("../../../migrations/0006_homogeneous.sql"))?;
         db.apply(include_str!("../../../migrations/0007_site_ops.sql"))?;
         db.apply(include_str!("../../../migrations/0008_dashboards.sql"))?;
+        db.apply(include_str!("../../../migrations/0009_teams.sql"))?;
         Ok(db)
     }
 

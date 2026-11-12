@@ -309,6 +309,47 @@ fn new_host_is_created_and_sent_work() {
     assert!(has_message(&out2, "Project has no tasks available"));
 }
 
+/// `SCHEDULER_REPLY::write` sends `<teamid>` and `<team_name>` for an account
+/// with a team and an empty `<team_name>` for one without; the team comes with
+/// the account in the first read, so the request costs no more statements.
+#[test]
+fn the_reply_names_the_accounts_team() {
+    let w = World::new();
+    w.db.apply(
+        "INSERT INTO team (id, create_time, userid, name, name_lc, expavg_time) \
+         VALUES (5, 1, 1, 'Team <A> & B', 'team <a> & b', 1);",
+    )
+    .unwrap();
+    let statements = |w: &World, req: &Req, now| {
+        let before = w.db.statements();
+        let out = w.rpc(req, now);
+        (out, w.db.statements() - before)
+    };
+    let (out, _) = statements(&w, &Req::new(0), 2000);
+    let xml = out.reply.write().unwrap();
+    assert!(xml.contains("<team_name></team_name>\n") && !xml.contains("<teamid>"));
+
+    w.db.apply("UPDATE user SET teamid = 5 WHERE id = 1;").unwrap();
+    let mut req = Req::new(out.host_id);
+    req.seqno = 2;
+    let (out, with_team) = statements(&w, &req, 2100);
+    let xml = out.reply.write().unwrap();
+    assert!(
+        xml.contains("<teamid>5</teamid>\n<team_name>Team &lt;A> &amp; B</team_name>\n"),
+        "{xml}"
+    );
+    // A team that no longer exists is no team, and the same request costs the same.
+    w.db.apply("DELETE FROM team;").unwrap();
+    req.seqno = 3;
+    let (out, without) = statements(&w, &req, 2200);
+    assert!(out
+        .reply
+        .write()
+        .unwrap()
+        .contains("<team_name></team_name>\n"));
+    assert_eq!(with_team, without);
+}
+
 #[test]
 fn reported_results_are_recorded() {
     let w = World::new();
