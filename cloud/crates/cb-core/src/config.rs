@@ -11,6 +11,10 @@ use crate::{CoreError, CoreResult};
 /// Upper bound on the CPU count used to scale per-host limits.
 pub const MAX_NCPUS: i32 = 64;
 
+/// `maintenance_delay` when the config does not set it
+/// (`SCHED_CONFIG::parse` in `sched/sched_config.cpp`).
+pub const DEFAULT_MAINTENANCE_DELAY: f64 = 3600.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub master_url: String,
@@ -28,6 +32,16 @@ pub struct Config {
     pub min_sendwork_interval: i32,
     pub next_rpc_delay: f64,
     pub min_core_client_version: i32,
+    /// A client older than this is warned that the project will require
+    /// `min_core_client_version_announced` before
+    /// `min_core_client_upgrade_deadline` (`warn_user_if_core_client_upgrade_scheduled`
+    /// in `sched/handle_request.cpp`). 0 for no warning.
+    pub min_core_client_version_announced: i32,
+    /// Unix time at which the announced minimum applies.
+    pub min_core_client_upgrade_deadline: i64,
+    /// Seconds a client waits after a reply sent because the server could not
+    /// work (`maintenance_delay` in `sched/sched_config.cpp`).
+    pub maintenance_delay: f64,
     pub one_result_per_user_per_wu: bool,
     pub one_result_per_host_per_wu: bool,
     pub resend_lost_results: bool,
@@ -135,6 +149,9 @@ impl Default for Config {
             min_sendwork_interval: 0,
             next_rpc_delay: 0.0,
             min_core_client_version: 0,
+            min_core_client_version_announced: 0,
+            min_core_client_upgrade_deadline: 0,
+            maintenance_delay: DEFAULT_MAINTENANCE_DELAY,
             one_result_per_user_per_wu: false,
             one_result_per_host_per_wu: false,
             resend_lost_results: false,
@@ -183,26 +200,433 @@ impl Default for Config {
     }
 }
 
-macro_rules! take {
-    ($xp:ident . $method:ident ( $name:literal ) => $dst:expr) => {
-        if let Some(v) = $xp.$method($name) {
-            $dst = v;
-            continue;
+/// How the loader reads an option's text: the `XmlParser` method it calls.
+/// The same method decides what `config-set` accepts
+/// ([`Config::check_option`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionKind {
+    Str,
+    Int,
+    Long,
+    Double,
+    Bool,
+}
+
+/// What the loader read for an option.
+enum Parsed {
+    Str(String),
+    Int(i32),
+    Long(i64),
+    Double(f64),
+    Bool(bool),
+}
+
+impl Parsed {
+    fn str(self) -> String {
+        match self {
+            Parsed::Str(v) => v,
+            _ => unreachable!("kind and reader agree"),
         }
+    }
+    fn int(self) -> i32 {
+        match self {
+            Parsed::Int(v) => v,
+            _ => unreachable!("kind and reader agree"),
+        }
+    }
+    fn long(self) -> i64 {
+        match self {
+            Parsed::Long(v) => v,
+            _ => unreachable!("kind and reader agree"),
+        }
+    }
+    fn double(self) -> f64 {
+        match self {
+            Parsed::Double(v) => v,
+            _ => unreachable!("kind and reader agree"),
+        }
+    }
+    fn bool(self) -> bool {
+        match self {
+            Parsed::Bool(v) => v,
+            _ => unreachable!("kind and reader agree"),
+        }
+    }
+}
+
+/// What `Config::parse` builds up before `finish`.
+#[derive(Default)]
+struct Parsing {
+    c: Config,
+    spec: StockSpec,
+    /// What the three tags say about account creation, until `finish`.
+    disable: Option<bool>,
+    explicit: Option<bool>,
+}
+
+/// One option of the config: its tag, how its text is read, and what reading
+/// it does. `Config::parse` and `Config::check_option` both go through this
+/// table, so a value the loader would skip is a value `config-set` refuses.
+struct ConfigOption {
+    name: &'static str,
+    kind: OptionKind,
+    set: fn(&mut Parsing, Parsed) -> CoreResult<()>,
+}
+
+macro_rules! option {
+    ($name:literal, Str, $($path:tt)+) => {
+        ConfigOption { name: $name, kind: OptionKind::Str, set: |p, v| { p.$($path)+ = v.str(); Ok(()) } }
+    };
+    ($name:literal, Int, $($path:tt)+) => {
+        ConfigOption { name: $name, kind: OptionKind::Int, set: |p, v| { p.$($path)+ = v.int(); Ok(()) } }
+    };
+    ($name:literal, Long, $($path:tt)+) => {
+        ConfigOption { name: $name, kind: OptionKind::Long, set: |p, v| { p.$($path)+ = v.long(); Ok(()) } }
+    };
+    ($name:literal, Double, $($path:tt)+) => {
+        ConfigOption { name: $name, kind: OptionKind::Double, set: |p, v| { p.$($path)+ = v.double(); Ok(()) } }
+    };
+    ($name:literal, Bool, $($path:tt)+) => {
+        ConfigOption { name: $name, kind: OptionKind::Bool, set: |p, v| { p.$($path)+ = v.bool(); Ok(()) } }
     };
 }
 
+/// The options the loader reads. Other tags of a stock `config.xml` are
+/// skipped.
+static OPTIONS: &[ConfigOption] = &[
+    option!("master_url", Str, c.master_url),
+    option!("long_name", Str, c.long_name),
+    option!("download_url", Str, c.download_url),
+    option!("upload_url", Str, c.upload_url),
+    option!("daily_result_quota", Int, c.daily_result_quota),
+    option!("max_wus_to_send", Int, c.max_wus_to_send),
+    option!("max_wus_in_progress", Int, c.max_wus_in_progress),
+    option!("max_wus_in_progress_gpu", Int, c.max_wus_in_progress_gpu),
+    option!("max_ncpus", Int, c.max_ncpus),
+    option!("gpu_multiplier", Int, c.gpu_multiplier),
+    option!("min_sendwork_interval", Int, c.min_sendwork_interval),
+    option!("next_rpc_delay", Double, c.next_rpc_delay),
+    ConfigOption {
+        name: "min_core_client_version",
+        kind: OptionKind::Int,
+        set: |p, v| {
+            // Accept both 70000 and the older 700 form, as upstream does.
+            let v = v.int();
+            p.c.min_core_client_version = if v < 10000 { v * 100 } else { v };
+            Ok(())
+        },
+    },
+    ConfigOption {
+        name: "min_core_client_version_announced",
+        kind: OptionKind::Int,
+        set: |p, v| {
+            let v = v.int();
+            p.c.min_core_client_version_announced = if v != 0 && v < 10000 { v * 100 } else { v };
+            Ok(())
+        },
+    },
+    option!(
+        "min_core_client_upgrade_deadline",
+        Long,
+        c.min_core_client_upgrade_deadline
+    ),
+    option!("maintenance_delay", Double, c.maintenance_delay),
+    option!(
+        "one_result_per_user_per_wu",
+        Bool,
+        c.one_result_per_user_per_wu
+    ),
+    option!(
+        "one_result_per_host_per_wu",
+        Bool,
+        c.one_result_per_host_per_wu
+    ),
+    option!("resend_lost_results", Bool, c.resend_lost_results),
+    option!("send_result_abort", Bool, c.send_result_abort),
+    ConfigOption {
+        name: "grace_period_hours",
+        kind: OptionKind::Double,
+        set: |p, v| {
+            p.c.report_grace_period = (v.double() * 3600.0) as i32;
+            Ok(())
+        },
+    },
+    option!("report_grace_period", Int, c.report_grace_period),
+    option!("report_max", Int, c.report_max),
+    option!("max_results_accepted", Int, c.max_results_accepted),
+    ConfigOption {
+        name: "delete_delay_hours",
+        kind: OptionKind::Double,
+        set: |p, v| {
+            p.c.delete_delay = v.double() * 3600.0;
+            Ok(())
+        },
+    },
+    option!(
+        "dont_generate_upload_certificates",
+        Bool,
+        c.dont_generate_upload_certificates
+    ),
+    option!(
+        "ignore_upload_certificates",
+        Bool,
+        c.ignore_upload_certificates
+    ),
+    option!(
+        "dont_store_success_stderr",
+        Bool,
+        c.dont_store_success_stderr
+    ),
+    option!("dont_send_jobs", Bool, c.dont_send_jobs),
+    option!("ended", Bool, c.ended),
+    option!("non_cpu_intensive", Bool, c.non_cpu_intensive),
+    option!(
+        "verify_files_on_app_start",
+        Bool,
+        c.verify_files_on_app_start
+    ),
+    option!("strict_memory_bound", Bool, c.strict_memory_bound),
+    option!("ignore_delay_bound", Bool, c.ignore_delay_bound),
+    option!("enable_assignment", Bool, c.enable_assignment),
+    ConfigOption {
+        name: "homogeneous_redundancy",
+        kind: OptionKind::Int,
+        set: |p, v| {
+            // Upstream's feeder refuses to start with a type it does not know.
+            let v = v.int();
+            if !(0..HR_NTYPES).contains(&v) {
+                return Err(CoreError::Invalid(format!(
+                    "config: homogeneous_redundancy {v} is not 0, 1 or 2"
+                )));
+            }
+            p.c.homogeneous_redundancy = v;
+            Ok(())
+        },
+    },
+    option!("hr_class_static", Bool, c.hr_class_static),
+    option!(
+        "default_disk_min_free_gb",
+        Double,
+        c.default_disk_min_free_gb
+    ),
+    option!(
+        "reliable_priority_on_over",
+        Int,
+        c.reliable_priority_on_over
+    ),
+    option!(
+        "reliable_priority_on_over_except_error",
+        Int,
+        c.reliable_priority_on_over_except_error
+    ),
+    option!(
+        "version_select_random_factor",
+        Double,
+        c.version_select_random_factor
+    ),
+    option!("prefer_primary_platform", Bool, c.prefer_primary_platform),
+    option!("user_url", Bool, c.user_url),
+    option!("user_country", Bool, c.user_country),
+    option!("email_from", Str, c.email_from),
+    option!("email_from_name", Str, c.email_from_name),
+    option!("email_max_per_day", Int, c.email_max_per_day),
+    ConfigOption {
+        name: "account_creation",
+        kind: OptionKind::Bool,
+        set: |p, v| {
+            p.explicit = Some(v.bool());
+            Ok(())
+        },
+    },
+    ConfigOption {
+        name: "disable_account_creation",
+        kind: OptionKind::Bool,
+        set: |p, v| {
+            p.disable = Some(v.bool());
+            Ok(())
+        },
+    },
+    option!(
+        "disable_account_creation_rpc",
+        Bool,
+        c.disable_account_creation_rpc
+    ),
+    ConfigOption {
+        name: "no_web_account_creation",
+        kind: OptionKind::Bool,
+        set: |p, v| {
+            p.c.disable_web_account_creation |= v.bool();
+            Ok(())
+        },
+    },
+    ConfigOption {
+        name: "disable_web_account_creation",
+        kind: OptionKind::Bool,
+        set: |p, v| {
+            p.c.disable_web_account_creation |= v.bool();
+            Ok(())
+        },
+    },
+    ConfigOption {
+        name: "enable_privacy_by_default",
+        kind: OptionKind::Bool,
+        set: |p, v| {
+            p.c.default_show_hosts = !v.bool();
+            Ok(())
+        },
+    },
+    option!("show_results", Bool, c.show_results),
+    ConfigOption {
+        name: "enable_delete_account",
+        kind: OptionKind::Int,
+        set: |p, v| {
+            let v = v.int();
+            p.c.enable_delete_account = if (1..=2).contains(&v) { v } else { 0 };
+            Ok(())
+        },
+    },
+    option!("robots_tag", Str, c.robots_tag),
+    option!("max_granted_credit", Double, c.max_granted_credit),
+    option!("max_upload_nbytes", Double, c.max_upload_nbytes),
+    option!("purge_days", Double, c.purge_days),
+    ConfigOption {
+        name: "dashboard_feed_url",
+        kind: OptionKind::Str,
+        set: |p, v| {
+            // The panels' feed is fetched from the project's own Worker, so
+            // an address that is not `https` is refused where it is set.
+            let url = v.str();
+            if !url.is_empty() && !crate::feed::valid_https_url(&url) {
+                return Err(CoreError::Invalid(
+                    "config: <dashboard_feed_url> must be an https URL".into(),
+                ));
+            }
+            p.c.dashboard_feed_url = url;
+            Ok(())
+        },
+    },
+    option!("host_owner_public", Bool, c.host_owner_public),
+    option!("uldl_dir_fanout", Int, c.uldl_dir_fanout),
+    option!("stock_short_name", Str, spec.short_name),
+    option!("stock_cgi_prefix", Str, spec.cgi_prefix),
+    option!("stock_upload_prefix", Str, spec.upload_prefix),
+    option!("stock_download_prefix", Str, spec.download_prefix),
+    ConfigOption {
+        name: "stock_page_prefix",
+        kind: OptionKind::Str,
+        set: |p, v| {
+            p.spec.page_prefix = Some(v.str());
+            Ok(())
+        },
+    },
+    ConfigOption {
+        name: "stock_advertise",
+        kind: OptionKind::Bool,
+        set: |p, v| {
+            p.spec.advertise = Some(v.bool());
+            Ok(())
+        },
+    },
+];
+
+/// Options that feed one setting, so that one spelling set to 0 while another
+/// holds 1 does not leave the setting on. `grace_period_hours` and
+/// `report_grace_period` write the same field (the later one read wins), the
+/// two spellings of the flag that closes sign-up on the web accumulate (any
+/// 1 closes it), and `account_creation` and `disable_account_creation` are
+/// combined when the config is finished (closed if either says so).
+static ALIAS_GROUPS: &[&[&str]] = &[
+    &["grace_period_hours", "report_grace_period"],
+    &["no_web_account_creation", "disable_web_account_creation"],
+    &["account_creation", "disable_account_creation"],
+];
+
+/// Reads the option the parser is at, the way the loader does.
+fn read_option(xp: &mut XmlParser<'_>, opt: &ConfigOption) -> Option<Parsed> {
+    match opt.kind {
+        OptionKind::Str => xp.parse_str(opt.name).map(Parsed::Str),
+        OptionKind::Int => xp.parse_int(opt.name).map(Parsed::Int),
+        OptionKind::Long => xp.parse_long(opt.name).map(Parsed::Long),
+        OptionKind::Double => xp.parse_double(opt.name).map(Parsed::Double),
+        OptionKind::Bool => xp.parse_bool(opt.name).map(Parsed::Bool),
+    }
+}
+
 impl Config {
+    /// What the loader does with `<tag>value</tag>` in the config: `None` for
+    /// a tag it does not read, `Some(kind)` for one it does, and an error if
+    /// it would skip this value (text that is not a number for a number
+    /// option, say) or reject the config for it. It runs the loader's own
+    /// reader on the element, so the answer is the loader's.
+    pub fn check_option(tag: &str, value: &str) -> CoreResult<Option<OptionKind>> {
+        let Some(opt) = OPTIONS.iter().find(|o| o.name == tag) else {
+            return Ok(None);
+        };
+        let doc = format!("<{tag}>{}</{tag}>", cb_proto::xml::xml_escape(value));
+        let mut xp = XmlParser::new(&doc);
+        xp.get_tag();
+        let Some(parsed) = read_option(&mut xp, opt) else {
+            return Err(CoreError::Invalid(format!(
+                "config: <{tag}> {value:?} is not a value the server reads for this option, \
+                 and it would ignore it"
+            )));
+        };
+        (opt.set)(&mut Parsing::default(), parsed)?;
+        Ok(Some(opt.kind))
+    }
+
+    /// The tags that set the same thing as `tag`, `tag` included, when the
+    /// loader reads `tag`; `None` for a tag it does not read. An option with
+    /// no alias is a group of its own.
+    pub fn option_group(tag: &str) -> Option<Vec<&'static str>> {
+        let opt = OPTIONS.iter().find(|o| o.name == tag)?;
+        Some(
+            ALIAS_GROUPS
+                .iter()
+                .find(|g| g.contains(&tag))
+                .map_or_else(|| vec![opt.name], |g| g.to_vec()),
+        )
+    }
+
+    /// The settings of `self` that differ from `other`, by field name, with
+    /// the value each has in `self`. (From the derived `Debug` text, so it
+    /// follows the fields without a list of them.)
+    pub fn changed_fields(&self, other: &Config) -> Vec<(String, String)> {
+        fn fields(c: &Config) -> Vec<(String, String)> {
+            let text = format!("{c:#?}");
+            let mut out: Vec<(String, String)> = Vec::new();
+            for line in text.lines().skip(1) {
+                let top = line.starts_with("    ") && !line.starts_with("     ");
+                match (top, line.trim_start().split_once(": ")) {
+                    (true, Some((name, value))) => out.push((name.to_string(), value.to_string())),
+                    _ => {
+                        if let Some(last) = out.last_mut() {
+                            last.1.push('\n');
+                            last.1.push_str(line);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        let theirs = fields(other);
+        fields(self)
+            .into_iter()
+            .filter(|f| !theirs.contains(f))
+            .collect()
+    }
+
+    /// The tags the loader reads, with how it reads them.
+    pub fn option_kinds() -> impl Iterator<Item = (&'static str, OptionKind)> {
+        OPTIONS.iter().map(|o| (o.name, o.kind))
+    }
+
     /// Parses `<boinc><config>...</config></boinc>` or a bare `<config>`.
     pub fn parse(xml: &str) -> CoreResult<Config> {
-        let mut c = Config::default();
+        let mut p = Parsing::default();
         let mut xp = XmlParser::new(xml);
         let mut in_config = false;
-        let mut spec = StockSpec::default();
-        // What the three tags say about account creation, until `finish`.
-        let mut disable: Option<bool> = None;
-        let mut explicit: Option<bool> = None;
-        while xp.get_tag() {
+        'tokens: while xp.get_tag() {
             if !xp.is_tag() {
                 continue;
             }
@@ -213,9 +637,10 @@ impl Config {
                 continue;
             }
             if xp.match_tag("/config") {
-                c.stock = spec.resolve(c.uldl_dir_fanout)?;
+                let mut c = p.c;
+                c.stock = p.spec.resolve(c.uldl_dir_fanout)?;
                 c.finish();
-                c.account_creation = match (disable, explicit) {
+                c.account_creation = match (p.disable, p.explicit) {
                     (Some(true), _) => false,
                     (_, Some(open)) => open,
                     (Some(false), None) => true,
@@ -223,112 +648,11 @@ impl Config {
                 };
                 return Ok(c);
             }
-            take!(xp.parse_str("master_url") => c.master_url);
-            take!(xp.parse_str("long_name") => c.long_name);
-            take!(xp.parse_str("download_url") => c.download_url);
-            take!(xp.parse_str("upload_url") => c.upload_url);
-            take!(xp.parse_int("daily_result_quota") => c.daily_result_quota);
-            take!(xp.parse_int("max_wus_to_send") => c.max_wus_to_send);
-            take!(xp.parse_int("max_wus_in_progress") => c.max_wus_in_progress);
-            take!(xp.parse_int("max_wus_in_progress_gpu") => c.max_wus_in_progress_gpu);
-            take!(xp.parse_int("max_ncpus") => c.max_ncpus);
-            take!(xp.parse_int("gpu_multiplier") => c.gpu_multiplier);
-            take!(xp.parse_int("min_sendwork_interval") => c.min_sendwork_interval);
-            take!(xp.parse_double("next_rpc_delay") => c.next_rpc_delay);
-            if let Some(v) = xp.parse_int("min_core_client_version") {
-                // Accept both 70000 and the older 700 form, as upstream does.
-                c.min_core_client_version = if v < 10000 { v * 100 } else { v };
-                continue;
-            }
-            take!(xp.parse_bool("one_result_per_user_per_wu") => c.one_result_per_user_per_wu);
-            take!(xp.parse_bool("one_result_per_host_per_wu") => c.one_result_per_host_per_wu);
-            take!(xp.parse_bool("resend_lost_results") => c.resend_lost_results);
-            take!(xp.parse_bool("send_result_abort") => c.send_result_abort);
-            if let Some(v) = xp.parse_double("grace_period_hours") {
-                c.report_grace_period = (v * 3600.0) as i32;
-                continue;
-            }
-            take!(xp.parse_int("report_grace_period") => c.report_grace_period);
-            take!(xp.parse_int("report_max") => c.report_max);
-            take!(xp.parse_int("max_results_accepted") => c.max_results_accepted);
-            if let Some(v) = xp.parse_double("delete_delay_hours") {
-                c.delete_delay = v * 3600.0;
-                continue;
-            }
-            take!(xp.parse_bool("dont_generate_upload_certificates") => c.dont_generate_upload_certificates);
-            take!(xp.parse_bool("ignore_upload_certificates") => c.ignore_upload_certificates);
-            take!(xp.parse_bool("dont_store_success_stderr") => c.dont_store_success_stderr);
-            take!(xp.parse_bool("dont_send_jobs") => c.dont_send_jobs);
-            take!(xp.parse_bool("ended") => c.ended);
-            take!(xp.parse_bool("non_cpu_intensive") => c.non_cpu_intensive);
-            take!(xp.parse_bool("verify_files_on_app_start") => c.verify_files_on_app_start);
-            take!(xp.parse_bool("strict_memory_bound") => c.strict_memory_bound);
-            take!(xp.parse_bool("ignore_delay_bound") => c.ignore_delay_bound);
-            take!(xp.parse_bool("enable_assignment") => c.enable_assignment);
-            if let Some(v) = xp.parse_int("homogeneous_redundancy") {
-                // Upstream's feeder refuses to start with a type it does not know.
-                if !(0..HR_NTYPES).contains(&v) {
-                    return Err(CoreError::Invalid(format!(
-                        "config: homogeneous_redundancy {v} is not 0, 1 or 2"
-                    )));
+            for opt in OPTIONS {
+                if let Some(v) = read_option(&mut xp, opt) {
+                    (opt.set)(&mut p, v)?;
+                    continue 'tokens;
                 }
-                c.homogeneous_redundancy = v;
-                continue;
-            }
-            take!(xp.parse_bool("hr_class_static") => c.hr_class_static);
-            take!(xp.parse_double("default_disk_min_free_gb") => c.default_disk_min_free_gb);
-            take!(xp.parse_int("reliable_priority_on_over") => c.reliable_priority_on_over);
-            take!(xp.parse_int("reliable_priority_on_over_except_error") => c.reliable_priority_on_over_except_error);
-            take!(xp.parse_double("version_select_random_factor") => c.version_select_random_factor);
-            take!(xp.parse_bool("prefer_primary_platform") => c.prefer_primary_platform);
-            take!(xp.parse_bool("user_url") => c.user_url);
-            take!(xp.parse_bool("user_country") => c.user_country);
-            take!(xp.parse_str("email_from") => c.email_from);
-            take!(xp.parse_str("email_from_name") => c.email_from_name);
-            take!(xp.parse_int("email_max_per_day") => c.email_max_per_day);
-            if let Some(v) = xp.parse_bool("account_creation") {
-                explicit = Some(v);
-                continue;
-            }
-            if let Some(v) = xp.parse_bool("disable_account_creation") {
-                disable = Some(v);
-                continue;
-            }
-            take!(xp.parse_bool("disable_account_creation_rpc") => c.disable_account_creation_rpc);
-            if let Some(v) = xp
-                .parse_bool("no_web_account_creation")
-                .or_else(|| xp.parse_bool("disable_web_account_creation"))
-            {
-                c.disable_web_account_creation |= v;
-                continue;
-            }
-            if let Some(v) = xp.parse_bool("enable_privacy_by_default") {
-                c.default_show_hosts = !v;
-                continue;
-            }
-            take!(xp.parse_bool("show_results") => c.show_results);
-            if let Some(v) = xp.parse_int("enable_delete_account") {
-                c.enable_delete_account = if (1..=2).contains(&v) { v } else { 0 };
-                continue;
-            }
-            take!(xp.parse_str("robots_tag") => c.robots_tag);
-            take!(xp.parse_double("max_granted_credit") => c.max_granted_credit);
-            take!(xp.parse_double("max_upload_nbytes") => c.max_upload_nbytes);
-            take!(xp.parse_double("purge_days") => c.purge_days);
-            take!(xp.parse_str("dashboard_feed_url") => c.dashboard_feed_url);
-            take!(xp.parse_bool("host_owner_public") => c.host_owner_public);
-            take!(xp.parse_int("uldl_dir_fanout") => c.uldl_dir_fanout);
-            take!(xp.parse_str("stock_short_name") => spec.short_name);
-            take!(xp.parse_str("stock_cgi_prefix") => spec.cgi_prefix);
-            take!(xp.parse_str("stock_upload_prefix") => spec.upload_prefix);
-            take!(xp.parse_str("stock_download_prefix") => spec.download_prefix);
-            if let Some(v) = xp.parse_str("stock_page_prefix") {
-                spec.page_prefix = Some(v);
-                continue;
-            }
-            if let Some(v) = xp.parse_bool("stock_advertise") {
-                spec.advertise = Some(v);
-                continue;
             }
             // There are many upstream tags cloud-boinc has no use for.
             xp.skip_unexpected();

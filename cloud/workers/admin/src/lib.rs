@@ -2,10 +2,11 @@
 //! every request. It replaces the project's command-line tools.
 
 use cb_core::admin::{
-    add_app_version, job_status, list_catalog, put_app, put_platform, set_app_version_deprecated,
-    set_host_max_results_day, set_user_blocked, NewApp, NewAppVersion, NewPlatform,
+    add_app_version, job_status, list_catalog, put_app, put_platform, reset_homogeneous,
+    set_app_version_deprecated, set_host_max_results_day, set_user_blocked, NewApp, NewAppVersion,
+    NewPlatform, ResetTarget, ResetWhat,
 };
-use cb_core::project::{get_setting, put_setting};
+use cb_core::project::{change_config_tag, get_setting, put_setting, SETTING_CONFIG};
 use cb_core::status::{operator_summary, STATUS_COUNTS_TTL};
 use cb_core::web::{make_user, server_status, NewAccount};
 use cb_core::work::{
@@ -114,6 +115,30 @@ struct RegisterFile {
 struct Cancel {
     workunit_ids: Vec<i64>,
     batch: Option<i64>,
+}
+
+/// Releases workunits from their homogeneous redundancy class or app
+/// version. Give `hr_class` for a whole class, or `names`.
+#[derive(Deserialize)]
+#[serde(default)]
+struct ResetHr {
+    hr_class: Option<i32>,
+    names: Vec<String>,
+    /// Release the class (the default).
+    reset_hr_class: bool,
+    /// Release the app version commitment.
+    reset_app_version: bool,
+}
+
+impl Default for ResetHr {
+    fn default() -> Self {
+        ResetHr {
+            hr_class: None,
+            names: Vec::new(),
+            reset_hr_class: true,
+            reset_app_version: false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -275,6 +300,33 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
             }
         }
 
+        // One tag of the `config` setting, changed as one guarded
+        // read-modify-write on the stored document.
+        (Method::Put, ["config", name, "tags", tag])
+        | (Method::Delete, ["config", name, "tags", tag]) => {
+            if *name != SETTING_CONFIG {
+                return error(400, "tags are only in the config setting");
+            }
+            let value = if method == Method::Put {
+                let Some(value) = read_body(&mut req, 8 * 1024).await? else {
+                    return error(413, "the value is too large");
+                };
+                let Ok(value) = String::from_utf8(value) else {
+                    return error(400, "the value is not UTF-8 text");
+                };
+                Some(value)
+            } else {
+                None
+            };
+            match change_config_tag(&db, tag, value.as_deref(), now()).await {
+                Ok(change) => {
+                    forget_project();
+                    ok(&change)
+                }
+                Err(e) => core_error(e),
+            }
+        }
+
         (Method::Get, ["catalog"]) => reply(list_catalog(&db).await),
         (Method::Put, ["platforms"]) => {
             let p: NewPlatform = parse!(req);
@@ -367,6 +419,23 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
                 }
                 Err(e) => core_error(e),
             }
+        }
+        (Method::Post, ["jobs", "reset-hr"]) => {
+            let r: ResetHr = parse!(req);
+            let target = match (r.hr_class, r.names.is_empty()) {
+                (Some(c), true) => ResetTarget::Class(c),
+                (None, false) => ResetTarget::Names(r.names),
+                _ => return error(400, "give hr_class or names, one of them"),
+            };
+            let what = ResetWhat {
+                hr_class: r.reset_hr_class,
+                app_version: r.reset_app_version,
+            };
+            reply(
+                reset_homogeneous(&db, &target, what, now())
+                    .await
+                    .map(|n| json!({ "reset": n })),
+            )
         }
         (Method::Get, ["jobs", name]) => match job_status(&db, name).await {
             Ok(Some(s)) => ok(&s),

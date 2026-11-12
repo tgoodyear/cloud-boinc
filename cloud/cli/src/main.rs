@@ -90,6 +90,32 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Set one option of the config, leaving the rest as it is. The server
+    /// reads the stored config, changes the tag and writes it back only if
+    /// nothing changed it meanwhile, so two operators cannot undo each
+    /// other's options.
+    ConfigSet {
+        #[command(flatten)]
+        server: Server,
+        /// The setting; only `config` has options.
+        #[arg(long, default_value = "config")]
+        name: String,
+        /// The tag, for example `maintenance_delay`.
+        #[arg(long)]
+        tag: String,
+        /// The value. A flag option is set with 1.
+        #[arg(long)]
+        value: String,
+    },
+    /// Remove one option from the config, leaving the rest as it is.
+    ConfigUnset {
+        #[command(flatten)]
+        server: Server,
+        #[arg(long, default_value = "config")]
+        name: String,
+        #[arg(long)]
+        tag: String,
+    },
     /// Create or update a platform.
     PlatformPut {
         #[command(flatten)]
@@ -105,29 +131,49 @@ enum Command {
         #[arg(long)]
         deprecated: Option<bool>,
     },
-    /// Create or update an app.
+    /// Create or update an app. A setting left out keeps its stored value; a
+    /// new app takes the default.
     AppPut {
         #[command(flatten)]
         server: Server,
         #[arg(long)]
         name: String,
+        /// New apps: the name.
         #[arg(long)]
-        user_friendly_name: String,
-        /// trivial, bitwise or webhook
-        #[arg(long, default_value = "trivial")]
-        validator: String,
-        #[arg(long, default_value = "")]
-        validator_url: String,
-        #[arg(long, default_value = "")]
-        assimilate_url: String,
-        #[arg(long, default_value_t = 0)]
-        target_nresults: i32,
-        /// Homogeneous redundancy: 0 none, 1 fine classes, 2 coarse classes. Not
-        /// changed when the flag is left out, unlike the other settings.
+        user_friendly_name: Option<String>,
+        /// trivial, bitwise or webhook. New apps: trivial.
+        #[arg(long)]
+        validator: Option<String>,
+        #[arg(long)]
+        validator_url: Option<String>,
+        #[arg(long)]
+        assimilate_url: Option<String>,
+        /// Adaptive replication: above 1 sends the first result of a job
+        /// alone to a host with a record of valid results.
+        #[arg(long)]
+        target_nresults: Option<i32>,
+        /// Share of the work this app gets among the apps. New apps: 1.
+        #[arg(long)]
+        weight: Option<f64>,
+        /// true or false: work for volunteers who allow beta work only.
+        #[arg(long)]
+        beta: Option<bool>,
+        #[arg(long)]
+        non_cpu_intensive: Option<bool>,
+        #[arg(long)]
+        fraction_done_exact: Option<bool>,
+        /// Oldest version number sent; older ones are kept for jobs pinned
+        /// to them.
+        #[arg(long)]
+        min_version: Option<i32>,
+        /// true or false: stop sending the app.
+        #[arg(long)]
+        deprecated: Option<bool>,
+        /// Homogeneous redundancy: 0 none, 1 fine classes, 2 coarse classes.
         #[arg(long)]
         homogeneous_redundancy: Option<i32>,
         /// Homogeneous app version: send all results of a workunit with one app
-        /// version (true or false). Not changed when the flag is left out.
+        /// version (true or false).
         #[arg(long)]
         homogeneous_app_version: Option<bool>,
     },
@@ -172,6 +218,12 @@ enum Command {
         extra_files: Vec<String>,
         #[arg(long)]
         is_wrapper: bool,
+        /// Oldest client that gets the version, as 70000 for 7.0.0 (0: any).
+        #[arg(long, default_value_t = 0)]
+        min_core_version: i32,
+        /// Newest client that gets the version (0: any).
+        #[arg(long, default_value_t = 0)]
+        max_core_version: i32,
     },
     /// Stop sending an app version, or restore it with --restore.
     VersionDeprecate {
@@ -220,6 +272,32 @@ enum Command {
         /// Send the jobs only to this user's hosts, as --target-host.
         #[arg(long)]
         target_user: Option<i64>,
+        /// Send the jobs only with this version number of the app, as
+        /// `create_work --app_version_num`.
+        #[arg(long)]
+        app_version_num: Option<i32>,
+        /// Start the jobs committed to this homogeneous redundancy class, as
+        /// `create_work --hr_class`.
+        #[arg(long)]
+        hr_class: Option<i32>,
+    },
+    /// Release workunits from the homogeneous redundancy class or app version
+    /// they are committed to, so their remaining results may go to any host.
+    ResetHr {
+        #[command(flatten)]
+        server: Server,
+        /// Every workunit committed to this class, as `reset_hrclass.php`.
+        #[arg(long, conflicts_with = "name")]
+        hr_class: Option<i32>,
+        /// A workunit by name; may repeat.
+        #[arg(long = "name")]
+        name: Vec<String>,
+        /// Release the app version commitment as well.
+        #[arg(long)]
+        app_version: bool,
+        /// Release only the app version commitment, not the class.
+        #[arg(long, requires = "app_version")]
+        keep_hr_class: bool,
     },
     /// The state of a job and its results.
     Job {
@@ -472,6 +550,26 @@ fn run(cli: Cli) -> Res<()> {
                     .send_string(&body),
             )?;
         }
+        Command::ConfigSet {
+            server,
+            name,
+            tag,
+            value,
+        } => {
+            let c = Client::new(&server)?;
+            show(&Client::json(Client::finish(
+                c.request("PUT", &format!("config/{name}/tags/{tag}"))
+                    .set("Content-Type", "text/plain")
+                    .send_string(&value),
+            )?)?)
+        }
+        Command::ConfigUnset { server, name, tag } => {
+            let c = Client::new(&server)?;
+            show(&Client::json(Client::finish(
+                c.request("DELETE", &format!("config/{name}/tags/{tag}"))
+                    .call(),
+            )?)?)
+        }
         Command::PlatformPut {
             server,
             name,
@@ -495,22 +593,36 @@ fn run(cli: Cli) -> Res<()> {
             validator_url,
             assimilate_url,
             target_nresults,
+            weight,
+            beta,
+            non_cpu_intensive,
+            fraction_done_exact,
+            min_version,
+            deprecated,
             homogeneous_redundancy,
             homogeneous_app_version,
         } => {
-            let mut body = json!({
-                "name": name,
-                "user_friendly_name": user_friendly_name,
-                "validator": validator,
-                "validator_url": validator_url,
-                "assimilate_url": assimilate_url,
-                "target_nresults": target_nresults,
-            });
-            if let Some(t) = homogeneous_redundancy {
-                body["homogeneous_redundancy"] = json!(t);
-            }
-            if let Some(b) = homogeneous_app_version {
-                body["homogeneous_app_version"] = json!(b);
+            // Only what was given: the server keeps the rest.
+            let mut body = json!({ "name": name });
+            let given = [
+                ("user_friendly_name", json!(user_friendly_name)),
+                ("validator", json!(validator)),
+                ("validator_url", json!(validator_url)),
+                ("assimilate_url", json!(assimilate_url)),
+                ("target_nresults", json!(target_nresults)),
+                ("weight", json!(weight)),
+                ("beta", json!(beta)),
+                ("non_cpu_intensive", json!(non_cpu_intensive)),
+                ("fraction_done_exact", json!(fraction_done_exact)),
+                ("min_version", json!(min_version)),
+                ("deprecated", json!(deprecated)),
+                ("homogeneous_redundancy", json!(homogeneous_redundancy)),
+                ("homogeneous_app_version", json!(homogeneous_app_version)),
+            ];
+            for (key, value) in given {
+                if !value.is_null() {
+                    body[key] = value;
+                }
             }
             show(&Client::new(&server)?.send("PUT", "apps", &body)?)
         }
@@ -538,6 +650,8 @@ fn run(cli: Cli) -> Res<()> {
             main_program,
             extra_files,
             is_wrapper,
+            min_core_version,
+            max_core_version,
         } => {
             let client = Client::new(&server)?;
             let key = private_key(&key)?;
@@ -579,6 +693,8 @@ fn run(cli: Cli) -> Res<()> {
                     "plan_class": plan_class,
                     "api_version": api_version,
                     "is_wrapper": is_wrapper,
+                    "min_core_version": min_core_version,
+                    "max_core_version": max_core_version,
                     "files": files,
                 }),
             )?)
@@ -607,6 +723,8 @@ fn run(cli: Cli) -> Res<()> {
             delay_bound,
             target_host,
             target_user,
+            app_version_num,
+            hr_class,
         } => {
             let assign = match (target_host, target_user) {
                 (Some(id), _) => json!({ "target": "host", "id": id }),
@@ -631,6 +749,8 @@ fn run(cli: Cli) -> Res<()> {
                                     "target_nresults": quorum,
                                     "delay_bound": delay_bound,
                                     "assign": assign,
+                                    "app_version_num": app_version_num,
+                                    "hr_class": hr_class,
                                 })
                             })
                             .collect(),
@@ -645,6 +765,27 @@ fn run(cli: Cli) -> Res<()> {
                     "input_template": read(&input_template)?,
                     "result_template": read(&result_template)?,
                     "jobs": jobs,
+                }),
+            )?)
+        }
+        Command::ResetHr {
+            server,
+            hr_class,
+            name,
+            app_version,
+            keep_hr_class,
+        } => {
+            if hr_class.is_none() && name.is_empty() {
+                return Err("give --hr-class or --name".into());
+            }
+            show(&Client::new(&server)?.send(
+                "POST",
+                "jobs/reset-hr",
+                &json!({
+                    "hr_class": hr_class,
+                    "names": name,
+                    "reset_hr_class": !keep_hr_class,
+                    "reset_app_version": app_version,
                 }),
             )?)
         }

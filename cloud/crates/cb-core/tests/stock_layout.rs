@@ -110,7 +110,7 @@ fn run_with(config_xml: &str) -> Run {
         1,
         &NewApp {
             name: "worker".into(),
-            user_friendly_name: "Worker".into(),
+            user_friendly_name: Some("Worker".into()),
             ..Default::default()
         },
     ))

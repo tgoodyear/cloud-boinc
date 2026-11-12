@@ -11,6 +11,7 @@ pub mod charts;
 pub mod config;
 pub mod countries;
 pub mod feed;
+pub mod host_misc;
 pub mod hr;
 pub mod mail;
 pub mod mail_guard;
