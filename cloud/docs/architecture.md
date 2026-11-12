@@ -916,12 +916,12 @@ entry points of upstream's validator framework (`check_set` and `check_pair` in
 ```
 
 - `call_id` is `wu<workunit id>-rev<revision>-<mode>`. The revision is the workunit's
-  `rev` as the transition read it. A transition that did not commit (it lost the revision race, or
-  the Worker was stopped) and runs again sees the same revision and sends the same `call_id`. A
-  call that is repeated after a failure is not a repeat in this sense: the failed transition wrote
-  the workunit (it set the retry time), so the revision, and the ID, are new. A validator that
-  keeps records can use the ID to ignore a duplicate delivery of one transition, not to match a
-  retry with the call that failed.
+  `rev` as the transition read it. The ID repeats only when a Worker is stopped after the call and
+  the transition runs again on a workunit whose revision and mode have not changed. A transition
+  that loses the revision race reloads the workunit at its newer revision, so its next call has a
+  new ID, as does a call repeated after a failure: the failed transition wrote the workunit (it
+  set the retry time). A validator that keeps records can use the ID to ignore a duplicate
+  delivery in the stopped-Worker case, not to match a retry with the call that failed.
 - `mode` is `check_set` or `check_pair`. `canonical_result_id` is null in `check_set`, and the
   canonical result's ID in `check_pair`, where the result with that ID also has
   `"canonical": true`. Its fingerprint, with the others, is what the pass compares.
@@ -1059,8 +1059,10 @@ marks files for deletion (see "Job pipeline"). `POST /admin/v1/assimilate/reopen
   about to schedule its deletion loses the revision race and runs again against the new row.
 - It sets `transition_time` to the time of the call, so the next sweep runs a transition that
   works out again what is pending (a replica still in progress, a validation retry) while
-  assimilation is ready. That pass schedules and does no file deletion, which the transitioner
-  does only for an acknowledged workunit. The next acknowledgement enqueues a transition, and the
+  assimilation is ready. That pass keeps the canonical result's outputs and makes no new deletion
+  reservation, because the transitioner reserves deletion only for an acknowledged workunit. It
+  does not promise that nothing is deleted: a non-canonical result already marked for deletion
+  (`file_delete_state` ready) has its files deleted by the pass, as before. The next acknowledgement enqueues a transition, and the
   delay is counted from the most recently returned result as always, so a re-opened workunit is
   deleted on its original schedule, or at once if that time has passed, and re-opening gains no
   extra time.

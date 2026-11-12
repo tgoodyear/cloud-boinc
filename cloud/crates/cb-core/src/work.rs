@@ -670,8 +670,10 @@ pub async fn acknowledge_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> Cor
 /// finds the files marked, never both outcomes. `transition_time` is set to
 /// `now`, so the next sweep runs a transition that works out again what is
 /// pending (a replica's deadline, a validation retry) while assimilation is
-/// ready; that pass schedules and does no file deletion, which starts only
-/// once the workunit is acknowledged again. The delay then still counts from
+/// ready; that pass keeps the canonical result's outputs and makes no new
+/// deletion reservation (reserving starts only once the workunit is
+/// acknowledged again). It does not stop the deletion of a non-canonical
+/// result that was already marked for it. The delay then still counts from
 /// the most recently returned result, so a re-opened workunit is deleted on
 /// the original schedule or at once if that has passed, exactly as a first
 /// acknowledgement is. Returns the IDs that changed.

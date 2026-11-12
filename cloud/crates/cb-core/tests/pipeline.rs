@@ -1856,7 +1856,7 @@ fn a_failed_webhook_call_waits_the_fixed_retry_delay() {
 }
 
 #[test]
-fn reopening_keeps_a_running_replica_on_the_schedule_and_deletes_nothing() {
+fn reopening_keeps_a_running_replica_on_the_schedule_and_reserves_no_deletion() {
     let w = World::new("trivial");
     let wu = w.submit("r5", 1000, 1, 2);
     let rs = w.results(wu);
@@ -1879,7 +1879,8 @@ fn reopening_keeps_a_running_replica_on_the_schedule_and_deletes_nothing() {
     assert_eq!(rep.files_deleted, 0);
     assert_eq!(rep.transition_time, 1100 + 3600);
     // Long after the delete delay, with the replica timed out: assimilation
-    // is still ready, so the pass schedules and does no file deletion.
+    // is still ready, so the pass reserves no deletion and keeps the
+    // canonical result's output.
     let rep = w.transition(wu, 9000);
     assert_eq!(rep.files_deleted, 0);
     let row = w.wu(wu);
