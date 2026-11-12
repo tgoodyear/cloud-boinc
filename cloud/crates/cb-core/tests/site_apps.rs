@@ -2,9 +2,11 @@
 //! leaves out, escaping, the statements it runs, and who gets the styled 404
 //! and who the plain text.
 
+use cb_core::model::{App, AppVersion, Platform};
 use cb_core::project::{put_setting, Project, SETTING_CONFIG};
 use cb_core::site::{
-    is_rpc_path, not_found_page, site_page, wants_html_404, Params, SiteCtx, SitePage, SITE_HEADERS,
+    is_rpc_path, not_found_headers, not_found_page, site_page, wants_html_404, Params, SiteCtx,
+    SitePage, SITE_HEADERS,
 };
 use cb_db::{stmt, Db};
 use cb_sqlite::SqliteDb;
@@ -544,4 +546,219 @@ fn the_security_headers_of_the_site_pages_exist() {
     // The Worker sends the 404 page through `site_response`, which sets these.
     assert!(SITE_HEADERS.contains(&("X-Content-Type-Options", "nosniff")));
     assert!(cb_core::web::html_cache_control("private, no-store").contains("no-transform"));
+}
+
+#[test]
+fn the_404_headers_name_accept_and_the_plain_form_is_not_stored() {
+    let html = not_found_headers(true);
+    assert_eq!(html, &[("Vary", "Accept")]);
+    let plain = not_found_headers(false);
+    assert!(plain.contains(&("Cache-Control", "no-store")));
+    assert!(plain.contains(&("Vary", "Accept")));
+    // Both forms vary on Accept; neither can be handed to the other's request.
+    assert!(
+        html.iter()
+            .chain(plain)
+            .filter(|(n, _)| *n == "Vary")
+            .count()
+            == 2
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The index of current versions, against a plain reference.
+
+/// The page for a catalog built in memory, as XML.
+fn xml_for(catalog: cb_core::scheduler::Catalog) -> String {
+    let db = world();
+    let mut project = block_on(Project::load(&db)).unwrap();
+    project.catalog = catalog;
+    let q: Params = [("xml".to_string(), "1".to_string())].into();
+    let random = || 1u32;
+    let ctx = SiteCtx {
+        db: &db,
+        project: &project,
+        base: &project.config.master_url,
+        auth: None,
+        post: false,
+        pepper: None,
+        now: 1_800_000_000,
+        random: &random,
+        mailer: None,
+    };
+    let before = db.statements();
+    let page = block_on(site_page(&ctx, "/apps.php", &q)).unwrap().unwrap();
+    assert_eq!(db.statements(), before);
+    page.body
+}
+
+fn av(id: i64, appid: i64, platformid: i64, num: i32, plan: &str, beta: i32) -> AppVersion {
+    AppVersion {
+        id,
+        create_time: 1_700_000_000 + id,
+        appid,
+        version_num: num,
+        platformid,
+        plan_class: plan.into(),
+        beta,
+        ..Default::default()
+    }
+}
+
+fn plat(id: i64) -> Platform {
+    Platform {
+        id,
+        name: format!("plat{id}"),
+        user_friendly_name: format!("Platform {id}"),
+        deprecated: 0,
+    }
+}
+
+fn application(id: i64) -> App {
+    App {
+        id,
+        create_time: 1_700_000_000,
+        name: format!("app{id}"),
+        user_friendly_name: format!("App {id}"),
+        ..Default::default()
+    }
+}
+
+/// What the page lists for a catalog, as `(app, platform, version id)`, read
+/// from the XML: the `date_unix` of a version here is 1_700_000_000 + its id.
+fn listed(xml: &str) -> Vec<(i64, String, i64)> {
+    let (mut app, mut platform) = (0, String::new());
+    let mut out = Vec::new();
+    for line in xml.lines().map(str::trim) {
+        if let Some(v) = line.strip_prefix("<id>") {
+            app = v.trim_end_matches("</id>").parse().unwrap();
+        } else if let Some(v) = line.strip_prefix("<platform_short>") {
+            platform = v.trim_end_matches("</platform_short>").to_string();
+        } else if let Some(v) = line.strip_prefix("<date_unix>") {
+            let t: i64 = v.trim_end_matches("</date_unix>").parse().unwrap();
+            out.push((app, platform.clone(), t - 1_700_000_000));
+        }
+    }
+    out
+}
+
+/// `latest_avs_app_platform` as upstream writes it: for each version, mark
+/// every other version of the same plan class and beta flag with a lower
+/// number as deprecated.
+fn reference(
+    apps: &[App],
+    platforms: &[Platform],
+    versions: &[AppVersion],
+) -> Vec<(i64, String, i64)> {
+    let mut out = Vec::new();
+    for app in apps {
+        for platform in platforms {
+            let mut avs: Vec<&AppVersion> = versions
+                .iter()
+                .filter(|v| v.appid == app.id && v.platformid == platform.id && v.deprecated == 0)
+                .collect();
+            avs.sort_by_key(|v| v.id);
+            let mut dead = vec![false; avs.len()];
+            for a in &avs {
+                for (j, b) in avs.iter().enumerate() {
+                    if a.id != b.id
+                        && a.plan_class == b.plan_class
+                        && a.beta == b.beta
+                        && a.version_num > b.version_num
+                    {
+                        dead[j] = true;
+                    }
+                }
+            }
+            for (v, dead) in avs.iter().zip(dead) {
+                if !dead {
+                    out.push((app.id, platform.name.clone(), v.id));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn a_large_catalog_lists_what_the_reference_lists() {
+    let apps: Vec<App> = (1..=60).map(application).collect();
+    let platforms: Vec<Platform> = (1..=20).map(plat).collect();
+    let mut versions = Vec::new();
+    let mut seed = 12345u64;
+    let mut next = |n: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let mut id = 0;
+    for app in &apps {
+        for platform in &platforms {
+            // Plan classes and numbers drawn so that every case happens:
+            // replaced versions, tied numbers across plan classes and beta
+            // flags, deprecated versions, pairs with nothing.
+            if next(5) == 0 {
+                continue;
+            }
+            for plan in ["", "mt", "cuda", "opencl"] {
+                for _ in 0..next(4) {
+                    id += 1;
+                    let mut v = av(
+                        id,
+                        app.id,
+                        platform.id,
+                        100 + next(4) as i32,
+                        plan,
+                        next(2) as i32,
+                    );
+                    v.deprecated = i32::from(next(6) == 0);
+                    versions.push(v);
+                }
+            }
+        }
+    }
+    assert!(versions.len() > 3000, "{}", versions.len());
+    // Not in ID order: the page sorts.
+    let expected = reference(&apps, &platforms, &versions);
+    versions.reverse();
+    versions.rotate_left(777);
+    let xml = xml_for(cb_core::scheduler::Catalog {
+        platforms: platforms.clone(),
+        apps: apps.clone(),
+        app_versions: versions,
+        retired_versions: Vec::new(),
+    });
+    let got = listed(&xml);
+    assert!(expected.len() > 1500, "{}", expected.len());
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn versions_that_tie_for_the_highest_number_are_all_listed() {
+    let apps = vec![application(1)];
+    let platforms = vec![plat(1), plat(2)];
+    // Three of one plan class and flag share 102; the lower 101 goes. A beta
+    // and a release of the same number do not replace each other.
+    let versions = vec![
+        av(3, 1, 1, 102, "", 0),
+        av(1, 1, 1, 101, "", 0),
+        av(2, 1, 1, 102, "", 0),
+        av(5, 1, 1, 102, "", 0),
+        av(4, 1, 1, 102, "", 1),
+        av(6, 1, 2, 100, "mt", 0),
+        av(7, 1, 2, 100, "mt", 0),
+    ];
+    let expected = reference(&apps, &platforms, &versions);
+    assert_eq!(
+        expected.iter().map(|e| e.2).collect::<Vec<_>>(),
+        vec![2, 3, 4, 5, 6, 7]
+    );
+    let xml = xml_for(cb_core::scheduler::Catalog {
+        platforms,
+        apps,
+        app_versions: versions,
+        retired_versions: Vec::new(),
+    });
+    assert_eq!(listed(&xml), expected);
 }

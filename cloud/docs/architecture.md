@@ -1338,7 +1338,11 @@ deprecated, and not replaced by a version of the same application, platform, pla
 flag with a higher number. The page runs no statement. The web Worker has the catalog (platforms,
 applications and versions that are not deprecated) from the settings load that every request
 makes and keeps for 30 seconds in each isolate, so a change to a version shows within that time and
-the cost does not depend on the number of applications. A test counts the statements with 60
+the cost does not depend on the number of applications. The current versions of every application
+and platform come from one index built in two linear passes over the versions (the highest number of
+each application, platform, plan class and beta flag, then the versions that have it), so the work
+grows with the versions and not with the applications times the platforms; versions that tie for the
+highest number are all listed, as upstream lists them. A test counts the statements with 60
 applications and finds none. `apps.php?xml=1` is the XML list of `show_apps_xml` with the same
 elements and indentation. Upstream's `app_id` and `avid` pages (one application's versions with
 their average GFLOPS, one version's credit statistics) and the "Recent average GFLOPS" column are
@@ -1357,7 +1361,7 @@ below it. Every other request keeps the plain `not found` text: any method but `
 does not accept `text/html` (`curl`, a BOINC client and most tools send `*/*` or no `Accept`), and
 the RPC paths whatever the `Accept` header says (`is_rpc_path`: `*_account.php`, `am_*.php`,
 `get_project_config.php`, `server_status.php`, and the scheduler, upload and download paths). The
-choice is made by path and method and the `Accept` header, not by `User-Agent`. Only an explicit `text/html` entry counts (`text/*` and `*/*` do not); the media type and the `q` name are compared without regard to case, white space around `;` and `=` is ignored, and an entry with a weight of 0 or a malformed weight is refused (`accepts_html` in `site.rs`). `is_rpc_path` compares in lower case and without trailing slashes. Unknown paths of
+choice is made by path and method and the `Accept` header, not by `User-Agent`. Only an explicit `text/html` entry counts (`text/*` and `*/*` do not); the media type and the `q` name are compared without regard to case, white space around `;` and `=` is ignored, and an entry with a weight of 0 or a malformed weight is refused (`accepts_html` in `site.rs`). `is_rpc_path` compares in lower case and without trailing slashes. Both forms of the 404 carry `Vary: Accept`, and the plain-text one `Cache-Control: no-store`, so a cache cannot hand one form to a request that wants the other (`not_found_headers`). Unknown paths of
 the files and scheduler Workers keep their own plain replies.
 
 ### Dashboards

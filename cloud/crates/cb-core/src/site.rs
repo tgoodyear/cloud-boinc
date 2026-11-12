@@ -536,6 +536,19 @@ pub fn wants_html_404(is_get: bool, path: &str, accept: Option<&str>) -> bool {
     is_get && !is_rpc_path(path) && accept.is_some_and(accepts_html)
 }
 
+/// Headers a 404 for an unknown path carries besides its content type. The
+/// answer depends on the `Accept` header, so every one names it in `Vary`, and
+/// a cache that stored the plain-text form for a tool's request cannot hand it
+/// to a browser. The plain-text form is also `no-store` (the styled page gets
+/// `private, no-store, no-transform` from `site_response`).
+pub fn not_found_headers(html: bool) -> &'static [(&'static str, &'static str)] {
+    if html {
+        &[("Vary", "Accept")]
+    } else {
+        &[("Cache-Control", "no-store"), ("Vary", "Accept")]
+    }
+}
+
 /// The 404 page of a path the site does not have, in the site shell. It does
 /// not name the path that was asked for, and it needs nothing but the
 /// settings the Worker has loaded already: no statement. The links in the
