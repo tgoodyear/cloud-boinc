@@ -8,8 +8,8 @@ use cb_core::model::{JobResult, Workunit};
 use cb_core::pipeline::{due_workunits, transition, Ctx};
 use cb_core::purge::{commit_purge, plan_purge, purge_pass};
 use cb_core::work::{
-    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate, reopen_assimilation, Assign,
-    AssignTarget, AssimilateList, CancelTarget, JobSpec, Submission,
+    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate,
+    reopen_assimilation, Assign, AssignTarget, AssimilateList, CancelTarget, JobSpec, Submission,
 };
 use cb_core::{Config, CoreError, CoreResult, FileKind, FileStat, Files, Webhook, NEVER};
 use cb_crypto::Signer;
