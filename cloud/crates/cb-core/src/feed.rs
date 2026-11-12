@@ -416,6 +416,7 @@ fn render_section(s: &Section, now: i64, index: usize) -> String {
         let series = [Series {
             label: &line.title,
             values: &line.values,
+            at_least: &[],
         }];
         let chart = Chart {
             title: &line.title,

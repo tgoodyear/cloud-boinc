@@ -20,7 +20,8 @@
 //! 2. Records the tasks ready to send, in the open period (the "queued" chart).
 //!    One statement counts up to [`UNSENT_COUNT_CAP`] tasks in application
 //!    order; past the cap the applications from the last one counted on are
-//!    marked as lower bounds (`Overview::unsent_from`).
+//!    marked as lower bounds (`Overview::unsent_from`), and so is the period's
+//!    figure (`queued_capped`), which stays marked once the period is closed.
 //! 3. Writes the `overview` snapshot: per application the tasks ready to send,
 //!    in progress, workunits waiting for validation and for assimilation, and
 //!    what was completed and what failed in the last day and week (sums of the
@@ -30,7 +31,10 @@
 //!
 //! A pass is given a statement budget (the Free plan allows 50 queries an
 //! invocation, and the cron's purge shares it): it counts as many of the due
-//! periods as fit, newest first, and leaves the rest for the next pass.
+//! periods as fit, newest first, and leaves the rest for the next pass. What it
+//! sends is a function of the number of periods alone ([`statements_for`]):
+//! applications beyond the first [`TRACKED_APPS`] are counted together, and the
+//! queue gauge is one row.
 //!
 //! The count of timed-out tasks is the one figure the pass does not make: a task
 //! that misses its deadline is never returned, so no `received_time` marks it.
@@ -73,13 +77,23 @@ const BACKFILL_PER_PASS: usize = 6;
 pub const UNSENT_COUNT_CAP: i64 = 100_000;
 /// Most (computer, application) groups kept in the in-progress snapshot.
 pub const MAX_INFLIGHT_ROWS: i64 = 4000;
-/// Rows of one multi-row upsert (nine values a row; D1 allows 100 values).
+/// Rows of one multi-row upsert (ten values a row; D1 allows 100 values).
 const PERIOD_ROWS_PER_STMT: usize = 10;
-const QUEUED_ROWS_PER_STMT: usize = 30;
+/// Applications the rollup follows one by one, the live ones first, by id. The
+/// tasks of every other application are counted together as [`OTHER_APP`], so
+/// the rows and statements of a pass do not grow with the number of
+/// applications.
+pub const TRACKED_APPS: usize = 18;
+/// The `appid` of the row that holds all applications that are not tracked.
+pub const OTHER_APP: i64 = -1;
+/// Statements of a pass that do not depend on the periods it counts, and those
+/// each period costs; see [`statements_for`].
+const FIXED_STATEMENTS: usize = 3 + 6 + 3 + 3;
+const PERIOD_STATEMENTS: usize = 3;
 /// Queries a Worker invocation may make on the Free plan.
 pub const FREE_PLAN_QUERIES: usize = 50;
-/// The least budget a pass can work with: its fixed statements and one period.
-pub const MIN_BUDGET: usize = 18;
+/// The least budget a pass can work with: its fixed statements and one period (the open one).
+pub const MIN_BUDGET: usize = FIXED_STATEMENTS + PERIOD_STATEMENTS;
 /// Statements kept back for what the cron does after the rollup and for slack.
 const BUDGET_MARGIN: usize = 2;
 const SNAPSHOT_VERSION: u32 = 2;
@@ -112,15 +126,6 @@ pub fn bucket_start(t: i64) -> i64 {
 pub fn week_bounds(now: i64) -> (i64, i64) {
     let current = bucket_start(now);
     (current - (WEEK_BUCKETS as i64 - 1) * BUCKET_SECS, current)
-}
-
-/// How many of the `n` newest periods the rollup will ever count: those that do
-/// not start before the purge horizon (the open one always counts).
-fn expected_periods(now: i64, n: usize, not_before: i64) -> i64 {
-    let current = bucket_start(now);
-    (0..n as i64)
-        .filter(|i| *i == 0 || current - i * BUCKET_SECS >= not_before)
-        .count() as i64
 }
 
 /// The figures of one application, or of the whole project (`id` 0), in the
@@ -223,6 +228,8 @@ pub struct Period {
     pub failed: i64,
     pub timed_out: i64,
     pub queued: i64,
+    /// The queue length is a lower bound: the count stopped at the cap.
+    pub queued_capped: i64,
     pub users: i64,
     pub hosts: i64,
 }
@@ -340,24 +347,46 @@ pub fn timeout_statements(now: i64, appid: i64, n: i64, wu_id: i64, token: i64) 
         .collect()
 }
 
-/// One recounted period: its rows, application by application, and the
-/// project's.
+/// One recounted period: its rows, by tracked application, and the project's.
 struct Recount {
     bucket: i64,
-    by_app: BTreeMap<i64, Counts>,
+    by_slot: BTreeMap<i64, Counts>,
     users: i64,
     hosts: i64,
     pending: i64,
 }
 
-fn rows_in_chunks(n: usize, per: usize) -> usize {
-    n.div_ceil(per)
+/// The row an application's figures go in: its own when it is one of the
+/// [`TRACKED_APPS`] the pass follows, [`OTHER_APP`] otherwise.
+fn slot(tracked: &BTreeSet<i64>, app: i64) -> i64 {
+    if tracked.contains(&app) {
+        app
+    } else {
+        OTHER_APP
+    }
+}
+
+/// Statements a pass sends, at most, for `periods` periods: every count below
+/// is fixed, whatever the number of applications, users or computers.
+///
+/// - round trip 1: 3 (last run, tracked applications, the window's project rows);
+/// - round trip 2: 1 per period, and 6 (the queue, tasks in progress per
+///   application, the largest in-progress groups, who holds tasks, workunits
+///   awaiting validation and assimilation);
+/// - round trip 3: 2 per period (at most 20 rows of 10 to a statement: the
+///   project, [`TRACKED_APPS`] applications and the rest), then the queue gauge,
+///   the retention delete and the sums, 3;
+/// - round trip 4: the three snapshots.
+pub const fn statements_for(periods: usize) -> usize {
+    FIXED_STATEMENTS + PERIOD_STATEMENTS * periods
 }
 
 /// One rollup pass; see the module comment. `not_before` is the earliest time
 /// whose tasks may still be in the table: `now` minus the purge delay when
 /// workunits are purged, 0 otherwise. `budget` is how many statements the pass
-/// may send; a pass given less than [`MIN_BUDGET`] does nothing.
+/// may send; a pass given less than [`MIN_BUDGET`] does nothing, and one given
+/// more counts [`statements_for`] periods at most, so it never sends more
+/// than it was given.
 pub async fn rollup_pass(
     db: &dyn Db,
     now: i64,
@@ -371,18 +400,24 @@ pub async fn rollup_pass(
         return Ok(report);
     }
 
-    // Round trip 1: is it time, and which periods have rows.
+    // Round trip 1: is it time, which applications are tracked, which periods
+    // have been counted.
     let mut out = db
         .batch(vec![
             stmt!("SELECT at FROM stats_snapshot WHERE name = ?", SNAP_RUN),
             stmt!(
-                "SELECT appid, bucket, computed_at, pending FROM stats_bucket WHERE bucket >= ?",
+                "SELECT id FROM app ORDER BY deprecated, id LIMIT ?",
+                TRACKED_APPS
+            ),
+            stmt!(
+                "SELECT bucket, computed_at, pending FROM stats_bucket \
+                 WHERE appid = 0 AND bucket >= ? AND computed_at > 0",
                 first
             ),
         ])
         .await?
         .into_iter();
-    report.statements += 2;
+    report.statements += 3;
     let last_run = out
         .next()
         .and_then(|r| r.rows.first().map(|row| int(row, "at")))
@@ -390,37 +425,27 @@ pub async fn rollup_pass(
     if last_run <= now && now - last_run < MIN_INTERVAL_SECS {
         return Ok(report);
     }
-    // What the table holds for the window. A row with no count (made by a
-    // timeout before the first pass of its period) is not a counted period.
+    let tracked: BTreeSet<i64> = out
+        .next()
+        .map(|r| r.rows.iter().map(|row| int(row, "id")).collect())
+        .unwrap_or_default();
     let mut existing: BTreeMap<i64, Counted> = BTreeMap::new();
-    let mut known_apps: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
     for row in &out.next().unwrap_or_default().rows {
-        let (app, bucket) = (int(row, "appid"), int(row, "bucket"));
-        if app == 0 {
-            let at = int(row, "computed_at");
-            if at > 0 {
-                existing.insert(
-                    bucket,
-                    Counted {
-                        at,
-                        pending: int(row, "pending"),
-                    },
-                );
-            }
-        } else {
-            known_apps.entry(bucket).or_default().insert(app);
-        }
+        existing.insert(
+            int(row, "bucket"),
+            Counted {
+                at: int(row, "computed_at"),
+                pending: int(row, "pending"),
+            },
+        );
     }
     let mut due = due_periods(now, &existing, not_before);
 
-    // The statements that do not depend on how many periods are counted: two
-    // reads at the start, six counts, the queue gauges, the retention delete,
-    // the sums, the snapshots. Each period costs a read and at least one write.
-    const FIXED: usize = 2 + 6 + 1 + 1 + 1 + 3;
-    let spare = budget.saturating_sub(FIXED);
-    let max_periods = (spare / 2).max(1);
-    let postponed_by_reads = due.len().saturating_sub(max_periods);
-    due.truncate(max_periods);
+    // As many periods as the budget holds, the open one first. `MIN_BUDGET`
+    // holds one.
+    let max_periods = (budget - FIXED_STATEMENTS) / PERIOD_STATEMENTS;
+    let postponed = due.len().saturating_sub(max_periods);
+    due.truncate(max_periods.max(1));
 
     // Round trip 2: every count.
     let unsent = RESULT_SERVER_STATE_UNSENT;
@@ -476,16 +501,23 @@ pub async fn rollup_pass(
     report.statements += reads.len();
     let mut rows = db.batch(reads).await?.into_iter();
 
-    // The recount of each due period.
+    // The recount of each due period, by tracked application and the rest.
     let mut recounts: Vec<Recount> = Vec::new();
     for &b in &due {
         let groups = rows.next().unwrap_or_default();
         let mut user_set: BTreeSet<i64> = BTreeSet::new();
         let mut host_set: BTreeSet<i64> = BTreeSet::new();
-        let mut by_app: BTreeMap<i64, Counts> = BTreeMap::new();
+        let mut by_slot: BTreeMap<i64, Counts> = BTreeMap::new();
+        // Every tracked application has a row, with zero when it has no task:
+        // a recount overwrites what an earlier one wrote.
+        for app in tracked.iter().copied().chain(std::iter::once(OTHER_APP)) {
+            by_slot.entry(app).or_default();
+        }
         let mut pending = 0;
         for row in &groups.rows {
-            let c = by_app.entry(int(row, "appid")).or_default();
+            let c = by_slot
+                .entry(slot(&tracked, int(row, "appid")))
+                .or_default();
             let n = int(row, "n");
             user_set.insert(int(row, "userid"));
             host_set.insert(int(row, "hostid"));
@@ -505,47 +537,52 @@ pub async fn rollup_pass(
                 c.failed += n;
             }
         }
-        // An application that had rows for this period and has no tasks in it
-        // now (they were purged) is written as zero, not left as it was.
-        for app in known_apps.get(&b).into_iter().flatten() {
-            by_app.entry(*app).or_default();
-        }
         recounts.push(Recount {
             bucket: b,
-            by_app,
+            by_slot,
             users: user_set.len() as i64,
             hosts: host_set.len() as i64,
             pending,
         });
     }
 
-    // The queue, in application order, counted up to the cap.
+    // The gauges, by tracked application and the rest.
     let mut figures: BTreeMap<i64, AppFigures> = BTreeMap::new();
     let mut total = AppFigures::default();
     let mut counted_unsent = 0;
     let mut last_app = 0;
-    for row in &rows.next().unwrap_or_default().rows {
-        let id = int(row, "appid");
-        let n = int(row, "n");
+    let unsent_rows: Vec<(i64, i64)> = rows
+        .next()
+        .unwrap_or_default()
+        .rows
+        .iter()
+        .map(|r| (int(r, "appid"), int(r, "n")))
+        .collect();
+    for &(id, n) in &unsent_rows {
         counted_unsent += n;
         last_app = last_app.max(id);
-        figures.entry(id).or_insert_with(|| fig(id)).unsent = n;
     }
-    let unsent_from = if counted_unsent > UNSENT_COUNT_CAP {
-        // The cap cut the count off inside the last application's queue.
-        if let Some(f) = figures.get_mut(&last_app) {
-            f.unsent = (f.unsent - (counted_unsent - UNSENT_COUNT_CAP)).max(0);
+    let truncated = counted_unsent > UNSENT_COUNT_CAP;
+    let unsent_from = if truncated { last_app.max(1) } else { 0 };
+    let mut overshoot = counted_unsent - UNSENT_COUNT_CAP;
+    for &(id, n) in &unsent_rows {
+        let mut n = n;
+        if truncated && id == last_app {
+            // The cap cut the count off inside the last application's queue.
+            n = (n - overshoot.max(0)).max(0);
+            overshoot = 0;
         }
-        last_app.max(1)
-    } else {
-        0
-    };
+        figures
+            .entry(slot(&tracked, id))
+            .or_insert_with(|| fig(slot(&tracked, id)))
+            .unsent += n;
+    }
     total.unsent = figures.values().map(|f| f.unsent).sum();
     for row in &rows.next().unwrap_or_default().rows {
-        let id = int(row, "appid");
+        let id = slot(&tracked, int(row, "appid"));
         let n = int(row, "n");
         total.in_progress += n;
-        figures.entry(id).or_insert_with(|| fig(id)).in_progress = n;
+        figures.entry(id).or_insert_with(|| fig(id)).in_progress += n;
     }
     let mut inflight = Inflight {
         v: SNAPSHOT_VERSION,
@@ -570,51 +607,36 @@ pub async fn rollup_pass(
         inflight.working_users = int(row, "users");
     }
     for row in &rows.next().unwrap_or_default().rows {
-        let id = int(row, "appid");
+        let id = slot(&tracked, int(row, "appid"));
         let n = int(row, "n");
         total.wait_validate += n;
-        figures.entry(id).or_insert_with(|| fig(id)).wait_validate = n;
+        figures.entry(id).or_insert_with(|| fig(id)).wait_validate += n;
     }
     for row in &rows.next().unwrap_or_default().rows {
-        let id = int(row, "appid");
+        let id = slot(&tracked, int(row, "appid"));
         let n = int(row, "n");
         total.wait_assimilate += n;
-        figures.entry(id).or_insert_with(|| fig(id)).wait_assimilate = n;
+        figures.entry(id).or_insert_with(|| fig(id)).wait_assimilate += n;
     }
     for f in figures.values_mut() {
-        f.unsent_capped = unsent_from > 0 && f.id >= unsent_from;
+        f.unsent_capped = unsent_from > 0 && (f.id == OTHER_APP || f.id >= unsent_from);
     }
     total.unsent_capped = unsent_from > 0;
 
-    // Round trip 3: the period rows, trimmed to what the budget still allows,
-    // then the sums over them.
-    let tail = 1 + 1 + 1 + 3; // the queue gauges, the retention delete, the sums, the snapshots
-    let queued_rows: Vec<(i64, i64)> = std::iter::once((0, total.unsent))
-        .chain(figures.values().map(|f| (f.id, f.unsent)))
+    // Round trip 3: the period rows, then the queue gauge, the retention delete
+    // and the sums over the rows.
+    let mut writes: Vec<Stmt> = recounts
+        .iter()
+        .flat_map(|r| period_upserts(r, now))
         .collect();
-    let queued_stmts = rows_in_chunks(queued_rows.len(), QUEUED_ROWS_PER_STMT);
-    let mut period_stmts: Vec<Vec<Stmt>> =
-        recounts.iter().map(|r| period_upserts(r, now)).collect();
-    let mut spent = report.statements + queued_stmts + tail - 1;
-    let mut keep = 0;
-    for p in &period_stmts {
-        if spent + p.len() > budget {
-            break;
-        }
-        spent += p.len();
-        keep += 1;
-    }
-    // The open period always goes in: the pass has no use without it. (The
-    // fixed costs leave room for it: `FIXED` plus a period is below `MIN_BUDGET`.)
-    keep = keep.max(1.min(period_stmts.len()));
-    let postponed = recounts.len() - keep + postponed_by_reads;
-    recounts.truncate(keep);
-    period_stmts.truncate(keep);
-    let mut writes: Vec<Stmt> = period_stmts.into_iter().flatten().collect();
-    // The open period's queue length. The count is only made for the open one.
-    for chunk in queued_rows.chunks(QUEUED_ROWS_PER_STMT) {
-        writes.push(queued_upsert(chunk, current));
-    }
+    writes.push(stmt!(
+        "INSERT INTO stats_bucket (appid, bucket, queued, queued_capped) VALUES (0, ?, ?, ?) \
+         ON CONFLICT (appid, bucket) DO UPDATE SET queued = excluded.queued, \
+         queued_capped = excluded.queued_capped",
+        current,
+        total.unsent,
+        i64::from(truncated)
+    ));
     if !existing.contains_key(&current) {
         // The first pass of a period: drop what has aged out.
         writes.push(stmt!(
@@ -623,18 +645,35 @@ pub async fn rollup_pass(
         ));
     }
     let day = current - (DAY_BUCKETS as i64 - 1) * BUCKET_SECS;
+    // Rows of periods that have been counted only; an application that is not
+    // tracked (a timeout made its row) goes in the row of the rest.
+    let tracked_list = tracked
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let tracked_case = if tracked_list.is_empty() {
+        format!("CASE WHEN appid = 0 THEN 0 ELSE {OTHER_APP} END")
+    } else {
+        format!("CASE WHEN appid = 0 OR appid IN ({tracked_list}) THEN appid ELSE {OTHER_APP} END")
+    };
     writes.push(stmt!(
-        "SELECT appid, \
-         coalesce(sum(CASE WHEN bucket >= ? THEN returned_ok ELSE 0 END), 0) AS ok24, \
-         coalesce(sum(CASE WHEN bucket >= ? THEN failed + invalid + timed_out ELSE 0 END), 0) AS err24, \
-         coalesce(sum(returned_ok), 0) AS ok7, \
-         coalesce(sum(failed + invalid + timed_out), 0) AS err7, \
-         coalesce(sum(CASE WHEN bucket >= ? THEN 1 ELSE 0 END), 0) AS n24, \
-         count(*) AS n7 \
-         FROM stats_bucket WHERE bucket >= ? AND computed_at > 0 GROUP BY appid",
+        format!(
+            "SELECT {tracked_case} AS app, \
+             coalesce(sum(CASE WHEN bucket >= ? THEN returned_ok ELSE 0 END), 0) AS ok24, \
+             coalesce(sum(CASE WHEN bucket >= ? THEN failed + invalid + timed_out ELSE 0 END), 0) AS err24, \
+             coalesce(sum(returned_ok), 0) AS ok7, \
+             coalesce(sum(failed + invalid + timed_out), 0) AS err7, \
+             coalesce(sum(CASE WHEN appid = 0 AND bucket >= ? THEN 1 ELSE 0 END), 0) AS n24, \
+             coalesce(sum(CASE WHEN appid = 0 THEN 1 ELSE 0 END), 0) AS n7 \
+             FROM stats_bucket WHERE bucket >= ? \
+             AND bucket IN (SELECT bucket FROM stats_bucket WHERE appid = 0 AND bucket >= ? AND computed_at > 0) \
+             GROUP BY app"
+        ),
         day,
         day,
         day,
+        first,
         first
     ));
     report.statements += writes.len();
@@ -642,7 +681,7 @@ pub async fn rollup_pass(
     let sums = written.pop().unwrap_or_default();
     let (mut periods_24h, mut periods_7d) = (0, 0);
     for row in &sums.rows {
-        let id = int(row, "appid");
+        let id = int(row, "app");
         let target = if id == 0 {
             periods_24h = int(row, "n24");
             periods_7d = int(row, "n7");
@@ -666,9 +705,11 @@ pub async fn rollup_pass(
         working_hosts: inflight.working_hosts,
         unsent_from,
         periods_24h,
-        expected_24h: expected_periods(now, DAY_BUCKETS, not_before),
+        // The targets are the whole windows, however much of them can still
+        // be counted: a window part of which was purged stays marked short.
+        expected_24h: DAY_BUCKETS as i64,
         periods_7d,
-        expected_7d: expected_periods(now, WEEK_BUCKETS, not_before),
+        expected_7d: WEEK_BUCKETS as i64,
         apps,
     };
     let ov =
@@ -695,12 +736,13 @@ fn fig(id: i64) -> AppFigures {
     }
 }
 
-/// The upserts of one recounted period: the project's row and one per
-/// application, in statements of at most [`PERIOD_ROWS_PER_STMT`] rows. The
-/// columns the recount does not own (`timed_out`, `queued`) are left alone.
+/// The upserts of one recounted period: the project's row, one per tracked
+/// application and one for the rest, at most 20 rows, in statements of at most
+/// [`PERIOD_ROWS_PER_STMT`] rows (so at most two). The columns the recount does
+/// not own (`timed_out`, `queued`) are left alone.
 fn period_upserts(r: &Recount, now: i64) -> Vec<Stmt> {
     let mut project = Counts::default();
-    for c in r.by_app.values() {
+    for c in r.by_slot.values() {
         project.ok += c.ok;
         project.valid += c.valid;
         project.invalid += c.invalid;
@@ -709,7 +751,8 @@ fn period_upserts(r: &Recount, now: i64) -> Vec<Stmt> {
     // (app, counts, users, hosts, pending)
     let mut rows: Vec<(i64, Counts, i64, i64, i64)> =
         vec![(0, project, r.users, r.hosts, r.pending)];
-    rows.extend(r.by_app.iter().map(|(a, c)| (*a, *c, 0, 0, 0)));
+    rows.extend(r.by_slot.iter().map(|(a, c)| (*a, *c, 0, 0, 0)));
+    debug_assert!(rows.len() <= TRACKED_APPS + 2);
     rows.chunks(PERIOD_ROWS_PER_STMT)
         .map(|chunk| {
             let mut sql = String::from(
@@ -740,20 +783,6 @@ fn period_upserts(r: &Recount, now: i64) -> Vec<Stmt> {
         .collect()
 }
 
-fn queued_upsert(rows: &[(i64, i64)], bucket: i64) -> Stmt {
-    let mut sql = String::from("INSERT INTO stats_bucket (appid, bucket, queued) VALUES ");
-    let mut params: Vec<Value> = Vec::new();
-    for (i, (app, queued)) in rows.iter().enumerate() {
-        if i > 0 {
-            sql.push(',');
-        }
-        sql.push_str("(?,?,?)");
-        params.extend([Value::Int(*app), Value::Int(bucket), Value::Int(*queued)]);
-    }
-    sql.push_str(" ON CONFLICT (appid, bucket) DO UPDATE SET queued = excluded.queued");
-    Stmt { sql, params }
-}
-
 #[derive(Deserialize)]
 struct SnapshotRow {
     body: String,
@@ -774,7 +803,7 @@ pub async fn load_work(
                 SNAP_OVERVIEW
             ),
             stmt!(
-                "SELECT bucket, returned_ok, valid, invalid, failed, timed_out, queued, users, hosts \
+                "SELECT bucket, returned_ok, valid, invalid, failed, timed_out, queued, queued_capped, users, hosts \
                  FROM stats_bucket WHERE appid = 0 AND bucket >= ? AND bucket <= ? AND computed_at > 0 \
                  ORDER BY bucket",
                 first,
@@ -924,7 +953,5 @@ mod tests {
             due_periods(now + 7200, &existing, current - BUCKET_SECS + 1),
             vec![current]
         );
-        assert_eq!(expected_periods(now, 56, horizon), 2);
-        assert_eq!(expected_periods(now, 56, 0), 56);
     }
 }

@@ -11,9 +11,10 @@ use cb_core::project::{put_setting, Project, SETTING_CONFIG};
 use cb_core::site::{site_page, Params, SiteCtx, SITE_PATHS};
 use cb_core::site_boards::{public_cache_key, MAX_PAGE, PAGE_SIZE, PUBLIC_PATHS};
 use cb_core::site_work::{activity, work, FeedState};
+use cb_core::site_work::{MAX_ACCOUNT_STATEMENTS, MAX_APP_CARDS};
 use cb_core::stats::{
-    load_inflight, load_work, rollup_pass, BUCKET_SECS, MIN_BUDGET, MIN_INTERVAL_SECS,
-    UNSENT_COUNT_CAP,
+    load_inflight, load_work, rollup_pass, statements_for, BUCKET_SECS, MIN_BUDGET,
+    MIN_INTERVAL_SECS, UNSENT_COUNT_CAP,
 };
 use cb_db::{stmt, Db, DbResult, Rows, Stmt};
 use cb_sqlite::SqliteDb;
@@ -541,7 +542,6 @@ fn the_rollup_counts_periods_and_snapshots() {
     assert_eq!((cur("users", 0), cur("hosts", 0)), (2, 2));
     assert_eq!((cur("returned_ok", 1), cur("failed", 2)), (2, 1));
     assert_eq!(cur("queued", 0), 4);
-    assert_eq!(cur("queued", 1), 3);
     // A period counted only by backfill has no queue figure: unknown, -1.
     assert_eq!(
         figure(
@@ -746,7 +746,7 @@ fn activity_names_computers_only_for_owners_who_show_them() {
     let page = block_on(activity(&ctx(&db2, &project2, NOW), &query(&[])))
         .unwrap()
         .body;
-    assert!(page.contains("No task is in progress"));
+    assert!(page.contains("No task was in progress"));
 }
 
 #[test]
@@ -932,7 +932,7 @@ fn every_dashboard_page_has_balanced_markup() {
             get(&db, &project, "/work.php", &query(&[])),
         ),
         ("activity", get(&db, &project, "/activity.php", &query(&[]))),
-        ("home", master_page_with(&project, overview.as_ref())),
+        ("home", master_page_with(&project, overview.as_ref(), NOW)),
     ];
     for sort in ["total_credit", "expavg_credit", "valid_results"] {
         for path in ["/top_users.php", "/top_hosts.php"] {
@@ -1010,9 +1010,11 @@ fn a_period_that_straddles_the_purge_horizon_is_left_unknown() {
     let (overview, history) = block_on(load_work(&db, NOW)).unwrap();
     assert!(history[54].is_none() && history[55].is_some());
     let o = overview.unwrap();
-    // Only the open period can be counted, so the sums say they are partial.
-    assert_eq!((o.expected_24h, o.periods_24h), (1, 1));
-    assert!(o.day_complete());
+    // Only the open period can be counted, but the windows are still the whole
+    // day and week, so the sums stay marked as partial.
+    assert_eq!((o.expected_24h, o.periods_24h), (8, 1));
+    assert_eq!((o.expected_7d, o.periods_7d), (56, 1));
+    assert!(!o.day_complete() && !o.week_complete());
 }
 
 #[test]
@@ -1102,8 +1104,8 @@ fn a_pass_stays_inside_its_statement_budget_and_carries_the_rest() {
     let mut t = NOW;
     let mut first_counted = None;
     for pass in 0..40 {
-        let r = block_on(rollup_pass(&db, t, 0, 20)).unwrap();
-        assert!(r.ran && r.statements <= 20, "pass {pass}: {}", r.statements);
+        let r = block_on(rollup_pass(&db, t, 0, 26)).unwrap();
+        assert!(r.ran && r.statements <= 26, "pass {pass}: {}", r.statements);
         assert_eq!(r.recounted[0], cb_core::stats::bucket_start(t));
         first_counted.get_or_insert(r.recounted.len());
         t += 300;
@@ -1198,7 +1200,7 @@ fn a_queue_past_the_cap_is_a_lower_bound_and_names_what_it_did_not_count() {
     assert!(page.contains(">0+<"));
     assert!(page.contains(">100,000+<"));
     // And the home page's headline says the same.
-    let home = cb_core::web::master_page_with(&project, Some(&o));
+    let home = cb_core::web::master_page_with(&project, Some(&o), NOW);
     assert!(home.contains("100,000+"));
 }
 
@@ -1300,4 +1302,319 @@ fn the_last_leaderboard_page_has_no_next_link() {
         &query(&[("page", &(MAX_PAGE - 1).to_string())]),
     );
     assert!(before.contains("Next"));
+}
+
+/// Puts an `inflight` snapshot in the table, as the rollup would have written it.
+fn put_inflight(db: &SqliteDb, at: i64, rows: &[(i64, i64, i64, i64)]) {
+    let rows: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(host, user, app, n)| {
+            serde_json::json!({"host": host, "user": user, "app": app, "n": n, "rpc": NOW - 30})
+        })
+        .collect();
+    let hosts: std::collections::BTreeSet<i64> =
+        rows.iter().map(|r| r["host"].as_i64().unwrap()).collect();
+    let users: std::collections::BTreeSet<i64> =
+        rows.iter().map(|r| r["user"].as_i64().unwrap()).collect();
+    let body = serde_json::json!({"v": 2, "at": at, "truncated": false,
+        "working_users": users.len(), "working_hosts": hosts.len(), "rows": rows});
+    block_on(db.run(stmt!(
+        "INSERT INTO stats_snapshot (name, at, body) VALUES ('inflight', ?, ?) \
+         ON CONFLICT (name) DO UPDATE SET at = excluded.at, body = excluded.body",
+        at,
+        body.to_string()
+    )))
+    .unwrap();
+}
+
+fn statements_of(spy: &Spy<'_>) -> usize {
+    spy.log.borrow().len()
+}
+
+#[test]
+fn activity_looks_up_a_bounded_number_of_accounts_and_shows_only_those() {
+    let (db, project) = setup();
+    // 400 applications with ten holders each: 4,000 accounts.
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 4000) \
+         INSERT INTO user (id, create_time, email_addr, name, authenticator, total_credit, blocked) \
+         SELECT i, 1, 'e' || i, 'Holder' || i, 'a' || i, 1, 0 FROM c"
+    )))
+    .unwrap();
+    let mut rows = Vec::new();
+    for app in 1..=400 {
+        for k in 0..10 {
+            let user = (app - 1) * 10 + k + 1;
+            rows.push((user, user, app, 1 + (user % 7)));
+        }
+    }
+    // Application 1 has two more holders: a blocked account that would be
+    // among its ten, and one with no account row at all.
+    rows.push((5000, 5000, 1, 9));
+    rows.push((5001, 5001, 1, 9));
+    block_on(db.run(stmt!("UPDATE user SET blocked = 1 WHERE id = 3"))).unwrap();
+    put_inflight(&db, NOW - 10, &rows);
+    let spy = Spy {
+        inner: &db,
+        log: RefCell::new(Vec::new()),
+    };
+    let page = block_on(activity(&ctx(&spy, &project, NOW), &query(&[])))
+        .unwrap()
+        .body;
+    // The snapshot, and the accounts in a bounded number of statements.
+    assert!(
+        statements_of(&spy) <= 1 + MAX_ACCOUNT_STATEMENTS,
+        "{} statements",
+        statements_of(&spy)
+    );
+    assert!(spy.log.borrow().iter().all(|s| s.params.len() <= 100));
+    // The page says it lists only some applications.
+    assert_eq!(
+        page.matches("<section class=\"card\">").count(),
+        MAX_APP_CARDS
+    );
+    assert!(page.contains(&format!(
+        "The {MAX_APP_CARDS} applications with the most tasks in progress are listed, of 400."
+    )));
+    // A holder that was not looked up, or is blocked, is not shown, and is not
+    // shown as nobody either.
+    assert!(!page.contains("Anonymous"));
+    assert!(!page.contains("userid=3\""), "a blocked account is shown");
+    assert!(!page.contains("userid=5000\""));
+    assert!(!page.contains("userid=5001\""));
+    assert!(page.contains("userid=1\">Holder1</a>"));
+    assert!(balanced(&page).is_ok());
+}
+
+#[test]
+fn the_page_that_has_nothing_to_show_still_says_how_old_it_is() {
+    let (db, project) = setup();
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let fresh = block_on(activity(&ctx(&db, &project, NOW + 60), &query(&[])))
+        .unwrap()
+        .body;
+    assert!(fresh.contains("No task was in progress") && fresh.contains("badge ok\">counted"));
+    // The pipeline stops: hours later the same snapshot says so.
+    let later = block_on(activity(&ctx(&db, &project, NOW + 3 * 3600), &query(&[])))
+        .unwrap()
+        .body;
+    assert!(later.contains("badge warn\">stale, counted"), "{later}");
+    // As does the home page's card.
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    let home = cb_core::web::master_page_with(&project, Some(&o), NOW + 3 * 3600);
+    assert!(home.contains("stale, counted"));
+    let home = cb_core::web::master_page_with(&project, Some(&o), NOW + 60);
+    assert!(home.contains("badge ok\">counted"));
+}
+
+#[test]
+fn a_capped_queue_stays_marked_in_the_history_after_the_period_closes() {
+    let (db, project) = setup();
+    bulk_unsent(&db, 1_000_000, 100_050, 1);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let flag = |bucket: i64| {
+        figure(
+            &db,
+            &format!(
+                "SELECT queued_capped FROM stats_bucket WHERE appid = 0 AND bucket = {bucket}"
+            ),
+        )
+    };
+    assert_eq!(flag(CUR), 1);
+    // The queue drains, a new period opens and is counted.
+    block_on(db.run(stmt!("DELETE FROM result WHERE server_state = 2"))).unwrap();
+    let later = CUR + BUCKET_SECS + 600;
+    block_on(rollup_pass(&db, later, 0, BUDGET)).unwrap();
+    assert_eq!(flag(CUR), 1, "the closed period keeps its flag");
+    assert_eq!(flag(CUR + BUCKET_SECS), 0);
+    let page = block_on(work(
+        &ctx(&db, &project, later),
+        &query(&[]),
+        &FeedState::NotConfigured,
+    ))
+    .unwrap()
+    .body;
+    assert!(page.contains(">100,000+<"), "the table marks it");
+    // The next period's exact value has no mark.
+    assert!(page.contains("class=\"num\">0</td>"));
+}
+
+#[test]
+fn the_owner_of_a_blocked_account_is_not_named_on_the_computer_board() {
+    let (db, project) = setup();
+    add_user(&db, 1, "Fine", 5.0, 1.0, 1, 1, 0);
+    add_user(&db, 2, "Cheater", 5.0, 1.0, 1, 1, 1);
+    add_host(&db, 10, 1, 900.0, 9);
+    add_host(&db, 11, 2, 800.0, 8);
+    let page = get(&db, &project, "/top_hosts.php", &query(&[]));
+    assert!(page.contains(">Fine</a>"));
+    assert!(!page.contains("Cheater"));
+    assert!(page.contains("hostid=11\">#11<"));
+}
+
+#[test]
+fn blocked_accounts_are_not_in_the_account_indexes() {
+    let (db, project) = setup();
+    for index in ["user_total_credit", "user_recent_key", "user_valid_results"] {
+        let sql = block_on(db.run(stmt!("SELECT sql FROM sqlite_master WHERE name = ?", index)))
+            .unwrap()
+            .rows[0]["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            sql.contains("total_credit > 0 AND blocked = 0"),
+            "{index}: {sql}"
+        );
+    }
+    // A long run of blocked, high-credit accounts does not come before the
+    // others: the page reads the index, which does not hold them.
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) \
+         INSERT INTO user (id, create_time, email_addr, name, authenticator, total_credit, \
+         valid_results, recent_key, blocked) \
+         SELECT i, 1, 'e' || i, 'Blocked' || i, 'a' || i, 100000 + i, 1000, 50.0, 1 FROM c"
+    )))
+    .unwrap();
+    add_user(&db, 5000, "Open", 5.0, 1.0, 1, 0, 0);
+    let spy = Spy {
+        inner: &db,
+        log: RefCell::new(Vec::new()),
+    };
+    for sort in ["total_credit", "expavg_credit", "valid_results"] {
+        let page = block_on(site_page(
+            &ctx(&spy, &project, NOW),
+            "/top_users.php",
+            &query(&[("sort", sort)]),
+        ))
+        .unwrap()
+        .unwrap()
+        .body;
+        assert!(page.contains("userid=5000\">Open"));
+        assert_eq!(rows_in(&page), 1);
+    }
+    let lines = plans(&spy).join("\n");
+    for index in ["user_total_credit", "user_recent_key", "user_valid_results"] {
+        assert!(lines.contains(index), "{index}:\n{lines}");
+    }
+}
+
+#[test]
+fn every_request_path_makes_a_few_statements_whatever_the_data() {
+    // The worst each page can be given: 4,000 accounts, 400 applications, a
+    // queue past the cap, and a snapshot that says so.
+    let (db, project) = setup();
+    busy(&db);
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 4000) \
+         INSERT OR IGNORE INTO user (id, create_time, email_addr, name, authenticator, total_credit, \
+         valid_results, recent_key) SELECT i, 1, 'e' || i, 'U' || i, 'a' || i, 10, 1, 1.0 FROM c"
+    )))
+    .unwrap();
+    let mut rows = Vec::new();
+    for app in 1..=400 {
+        for k in 0..10 {
+            let user = (app - 1) * 10 + k + 1;
+            rows.push((user, user, app, 1));
+        }
+    }
+    put_inflight(&db, NOW - 10, &rows);
+    bulk_unsent(&db, 1_000_000, 100_050, 1);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    // `Project::load` is two statements in a Worker (and is cached).
+    const PROJECT_LOAD: usize = 2;
+    let spy = Spy {
+        inner: &db,
+        log: RefCell::new(Vec::new()),
+    };
+    let limits = [
+        ("/top_users.php", 1),
+        ("/top_hosts.php", 1),
+        ("/work.php", 2),
+        ("/activity.php", 1 + MAX_ACCOUNT_STATEMENTS),
+    ];
+    for (path, max) in limits {
+        spy.log.borrow_mut().clear();
+        let page = block_on(site_page(&ctx(&spy, &project, NOW), path, &query(&[])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.status, 200);
+        let n = statements_of(&spy);
+        assert!(n <= max, "{path}: {n} statements, at most {max}");
+        assert!(
+            n + PROJECT_LOAD <= 8,
+            "{path} is far inside the Free plan's 50"
+        );
+    }
+    // The home page's card is one row.
+    spy.log.borrow_mut().clear();
+    let o = block_on(cb_core::stats::load_overview(&spy)).unwrap();
+    assert_eq!(statements_of(&spy), 1);
+    assert!(o.is_some());
+}
+
+#[test]
+fn a_pass_sends_what_statements_for_says_whatever_the_applications() {
+    // 400 applications with returns in the open period and tasks waiting, 30 of
+    // them in the catalog: the first 18 live ones are tracked.
+    let (db, _) = setup();
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 3 UNION ALL SELECT i + 1 FROM c WHERE i < 30) \
+         INSERT INTO app (id, create_time, name, user_friendly_name) \
+         SELECT i, 1, 'a' || i, 'App ' || i FROM c"
+    )))
+    .unwrap();
+    add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+    add_host(&db, 1, 1, 1.0, 1);
+    for app in 1..=400 {
+        insert_result(&db, app, app, 5, 1, 1, CUR + 60, 1, 1);
+        insert_result(&db, 100_000 + app, app, 2, 0, 0, 0, 0, 0);
+    }
+    // The least budget: exactly one period, exactly the budget.
+    let spy = Spy {
+        inner: &db,
+        log: RefCell::new(Vec::new()),
+    };
+    let r = block_on(rollup_pass(&spy, NOW, 0, MIN_BUDGET)).unwrap();
+    assert!(r.ran);
+    assert_eq!(statements_of(&spy), MIN_BUDGET);
+    assert_eq!(statements_of(&spy), statements_for(1));
+    assert_eq!(r.recounted, vec![CUR]);
+    // The open period's rows were written: the whole project is in them.
+    assert_eq!(
+        figure(
+            &db,
+            &format!("SELECT returned_ok FROM stats_bucket WHERE appid = 0 AND bucket = {CUR}")
+        ),
+        400
+    );
+    // The applications that are not tracked are one row.
+    assert_eq!(
+        figure(
+            &db,
+            &format!("SELECT count(*) FROM stats_bucket WHERE bucket = {CUR}")
+        ),
+        1 + 18 + 1 // the project, the tracked applications, the rest
+    );
+    assert_eq!(
+        figure(
+            &db,
+            &format!("SELECT returned_ok FROM stats_bucket WHERE appid = -1 AND bucket = {CUR}")
+        ),
+        400 - 18
+    );
+    // Every budget from the least to well over: never more than given, and
+    // exactly the cost of the periods it counts.
+    for budget in MIN_BUDGET..=60 {
+        let spy = Spy {
+            inner: &db,
+            log: RefCell::new(Vec::new()),
+        };
+        let r = block_on(rollup_pass(&spy, NOW + 100_000 * budget as i64, 0, budget)).unwrap();
+        let n = statements_of(&spy);
+        assert!(n <= budget, "budget {budget}: {n}");
+        assert!(n <= statements_for(r.recounted.len()), "budget {budget}");
+    }
 }

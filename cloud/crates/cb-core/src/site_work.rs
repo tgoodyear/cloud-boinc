@@ -32,9 +32,19 @@ use crate::CoreResult;
 pub const MAX_VOLUNTEERS: usize = 50;
 /// Volunteers listed under each application.
 pub const MAX_PER_APP: usize = 10;
+/// Applications with a card of their own on `activity.php`, the ones with the
+/// most tasks in progress.
+pub const MAX_APP_CARDS: usize = 12;
+/// Holders kept per application while the page is built (more than are shown).
+const MAX_HOLDERS_KEPT: usize = MAX_PER_APP;
+/// Statements the account lookups of `activity.php` may take: with the snapshot
+/// read, the page sends at most `1 + MAX_ACCOUNT_STATEMENTS` of its own.
+pub const MAX_ACCOUNT_STATEMENTS: usize = 3;
 /// Computers listed under one volunteer.
 pub const MAX_COMPUTERS: usize = 20;
-/// Accounts looked up by one statement; D1 allows 100 bound values.
+/// Accounts looked up by one statement; D1 allows 100 bound values. The page
+/// shows at most `MAX_VOLUNTEERS + MAX_APP_CARDS * MAX_PER_APP` = 170 accounts,
+/// which is three statements.
 const LOOKUP_CHUNK: usize = 80;
 /// The counts are made every five minutes; older than this the page says so.
 const STALE_SECS: i64 = 20 * 60;
@@ -61,6 +71,9 @@ impl FeedState {
 }
 
 fn app_name(project: &Project, id: i64) -> String {
+    if id == crate::stats::OTHER_APP {
+        return "Other applications".into();
+    }
     project
         .catalog
         .apps
@@ -77,6 +90,9 @@ fn app_name(project: &Project, id: i64) -> String {
 }
 
 fn app_deprecated(project: &Project, id: i64) -> bool {
+    if id == crate::stats::OTHER_APP {
+        return false;
+    }
     project
         .catalog
         .apps
@@ -211,6 +227,10 @@ fn history_cards(history: &[Option<Period>], now: i64) -> String {
         history.iter().map(|p| p.as_ref().and_then(f)).collect()
     };
     let queued = col(&|p| (p.queued >= 0).then_some(p.queued as f64));
+    let queued_capped: Vec<bool> = history
+        .iter()
+        .map(|p| p.as_ref().is_some_and(|p| p.queued_capped != 0))
+        .collect();
     let completed = col(&|p| Some(p.returned_ok as f64));
     let users = col(&|p| Some(p.users as f64));
     let hosts = col(&|p| Some(p.hosts as f64));
@@ -219,6 +239,7 @@ fn history_cards(history: &[Option<Period>], now: i64) -> String {
     let series = [Series {
         label: "Tasks waiting to send",
         values: &queued,
+        at_least: &queued_capped,
     }];
     let c = Chart {
         title: "Tasks waiting to send",
@@ -235,13 +256,16 @@ fn history_cards(history: &[Option<Period>], now: i64) -> String {
             "<p>Tasks waiting to send, at the last count in each three-hour period.</p>\n{}{}{}",
             c.svg("chart-queue"),
             c.legend(),
-            c.data_details("Tasks ready to send. A period with no count is unknown.")
+            c.data_details(
+                "Tasks ready to send. A period with no count is unknown. A value marked + is at least that many: the count stopped at its cap.",
+            )
         ),
     ));
 
     let series = [Series {
         label: "Tasks completed",
         values: &completed,
+        at_least: &[],
     }];
     let c = Chart {
         title: "Tasks completed",
@@ -268,10 +292,12 @@ fn history_cards(history: &[Option<Period>], now: i64) -> String {
         Series {
             label: "Volunteers",
             values: &users,
+            at_least: &[],
         },
         Series {
             label: "Computers",
             values: &hosts,
+            at_least: &[],
         },
     ];
     let c = Chart {
@@ -366,7 +392,15 @@ fn volunteers(snap: &Inflight) -> BTreeMap<i64, Volunteer> {
 }
 
 async fn people(ctx: &SiteCtx<'_>, ids: &BTreeSet<i64>) -> CoreResult<BTreeMap<i64, Person>> {
-    let ids: Vec<i64> = ids.iter().copied().filter(|i| *i > 0).collect();
+    // A hard bound: whatever the caller asks for, at most this many accounts
+    // are looked up, in at most `MAX_ACCOUNT_STATEMENTS` statements. An account
+    // not looked up is not shown (see `activity`).
+    let ids: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|i| *i > 0)
+        .take(MAX_ACCOUNT_STATEMENTS * LOOKUP_CHUNK)
+        .collect();
     let stmts: Vec<Stmt> = ids
         .chunks(LOOKUP_CHUNK)
         .map(|chunk| {
@@ -447,11 +481,12 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
     order.sort_by(|a, b| by_user[b].total.cmp(&by_user[a].total).then(a.cmp(b)));
     let shown: Vec<i64> = order.iter().copied().take(MAX_VOLUNTEERS).collect();
 
-    // Per application, the largest holders.
-    let mut app_ids: BTreeSet<i64> = BTreeSet::new();
-    for v in by_user.values() {
-        app_ids.extend(v.per_app.keys().copied());
-    }
+    // Per application, the largest holders, for the applications with the
+    // most tasks. The holders are chosen before anything is known about their
+    // accounts, so what is looked up is fixed in advance: at most
+    // `MAX_VOLUNTEERS + MAX_APP_CARDS * MAX_PER_APP` accounts, in at most
+    // `MAX_ACCOUNT_STATEMENTS` statements, whatever the number of applications
+    // or volunteers.
     let mut app_totals: BTreeMap<i64, i64> = BTreeMap::new();
     let mut per_app: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
     for (user, v) in &by_user {
@@ -462,14 +497,21 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
     }
     for list in per_app.values_mut() {
         list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        list.truncate(MAX_HOLDERS_KEPT);
     }
+    let mut apps: Vec<i64> = app_totals.keys().copied().collect();
+    apps.sort_by(|a, b| app_totals[b].cmp(&app_totals[a]).then(a.cmp(b)));
+    let apps_all = apps.len();
+    apps.truncate(MAX_APP_CARDS);
     let mut wanted: BTreeSet<i64> = shown.iter().copied().collect();
-    for list in per_app.values() {
-        wanted.extend(list.iter().take(MAX_PER_APP).map(|(u, _)| *u));
+    for app in &apps {
+        wanted.extend(per_app[app].iter().take(MAX_PER_APP).map(|(u, _)| *u));
     }
     let names = people(ctx, &wanted).await?;
-    // A blocked account does not hold tasks it can report; leave it out.
-    let visible = |u: &i64| names.get(u).is_none_or(|p| p.blocked == 0);
+    // Only an account that was looked up and is not blocked is shown: a
+    // holder whose account was not fetched, or is blocked, is left out, never
+    // shown as if it were nobody.
+    let visible = |u: &i64| names.get(u).is_some_and(|p| p.blocked == 0);
 
     let in_progress: i64 = by_user.values().map(|v| v.total).sum();
     let mut body = String::new();
@@ -484,8 +526,14 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
             "",
         ),
     ]));
+    let age = snapshot_badge(snap.at, ctx.now);
     if by_user.is_empty() {
-        body.push_str(&empty("No task is in progress right now."));
+        // The counts say how old they are here too: an empty list that stopped
+        // being refreshed is not "right now".
+        body.push_str(&format!("<p>{age}</p>\n"));
+        body.push_str(&empty(
+            "No task was in progress when the server last counted.",
+        ));
         return Ok(SitePage::html(200, shell(project, "Activity", &body)));
     }
 
@@ -537,8 +585,7 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
         })
         .collect();
     let mut vol = format!(
-        "<p>{} <small>The server makes these counts every five minutes. {}</small></p>\n",
-        snapshot_badge(snap.at, ctx.now),
+        "<p>{age} <small>The server makes these counts every five minutes. {}</small></p>\n",
         if project.config.host_owner_public {
             "Computers are listed under their volunteers."
         } else {
@@ -562,22 +609,21 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
     body.push_str(&card_accent("Who is working", &vol));
 
     // By application.
-    let mut apps: Vec<i64> = app_ids.into_iter().collect();
-    apps.sort_by(|a, b| app_totals[b].cmp(&app_totals[a]).then(a.cmp(b)));
     let cards: Vec<String> = apps
         .iter()
         .map(|app| {
             let list = &per_app[app];
+            let holders = app_holders(&by_user, *app);
             let rows: Vec<Vec<String>> = list
                 .iter()
-                .filter(|(u, _)| visible(u))
                 .take(MAX_PER_APP)
+                .filter(|(u, _)| visible(u))
                 .map(|(u, n)| vec![person_link(*u, names.get(u)), count(*n)])
                 .collect();
             let mut b = format!(
                 "<p>{} in progress, held by {}.</p>\n",
                 plural(app_totals[app], "task"),
-                plural(list.len() as i64, "volunteer")
+                plural(holders as i64, "volunteer")
             );
             b.push_str(&stack_table(
                 &[
@@ -590,5 +636,21 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
         })
         .collect();
     body.push_str(&crate::site_ui::grid(&cards));
+    if apps_all > apps.len() {
+        body.push_str(&format!(
+            "<p><small>The {} applications with the most tasks in progress are listed, of {}.</small></p>\n",
+            apps.len(),
+            apps_all
+        ));
+    }
     Ok(SitePage::html(200, shell(project, "Activity", &body)))
+}
+
+/// How many volunteers hold tasks of `app` (the list kept per application is cut
+/// short, so this counts from the volunteers themselves).
+fn app_holders(by_user: &BTreeMap<i64, Volunteer>, app: i64) -> usize {
+    by_user
+        .values()
+        .filter(|v| v.per_app.contains_key(&app))
+        .count()
 }

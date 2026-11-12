@@ -342,6 +342,7 @@ struct HostRow {
     serialnum: String,
     owner_name: Option<String>,
     owner_show_hosts: Option<i64>,
+    owner_blocked: Option<i64>,
 }
 
 /// The CPU, operating system and GPUs of a computer, one per line. Escaped.
@@ -377,7 +378,8 @@ pub async fn top_hosts(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
             sql: format!(
                 "SELECT h.id, h.userid, h.total_credit, h.expavg_credit, h.expavg_time, \
                  h.valid_results, h.recent_key, h.p_vendor, h.p_model, h.p_ncpus, h.os_name, h.os_version, \
-                 h.serialnum, u.name AS owner_name, u.show_hosts AS owner_show_hosts \
+                 h.serialnum, u.name AS owner_name, u.show_hosts AS owner_show_hosts, \
+                 u.blocked AS owner_blocked \
                  FROM (SELECT id, userid, total_credit, expavg_credit, expavg_time, valid_results, \
                        recent_key, p_vendor, p_model, p_ncpus, os_name, os_version, serialnum FROM host \
                        WHERE total_credit > 0 ORDER BY {key} DESC, id LIMIT ? OFFSET ?) h \
@@ -409,11 +411,17 @@ pub async fn top_hosts(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         .map(|(i, r)| {
             let h = r;
             let owner = match (r.owner_show_hosts, &r.owner_name) {
-                (Some(show), Some(name)) if show != 0 || public => format!(
-                    "<a href=\"show_user.php?userid={}\">{}</a>",
-                    h.userid,
-                    name_or_anonymous(name)
-                ),
+                // A blocked account is left out of the account leaderboards, so
+                // its computers do not name it either.
+                (Some(show), Some(name))
+                    if (show != 0 || public) && r.owner_blocked.unwrap_or(0) == 0 =>
+                {
+                    format!(
+                        "<a href=\"show_user.php?userid={}\">{}</a>",
+                        h.userid,
+                        name_or_anonymous(name)
+                    )
+                }
                 _ => "Anonymous".into(),
             };
             vec![

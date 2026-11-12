@@ -578,7 +578,7 @@ pub fn login_form(project: &Project, q: &Params, can_mail: bool) -> SitePage {
          <p><label>Email address<br><input type=\"email\" name=\"email_addr\" autocomplete=\"username\"></label></p>\n\
          <p><label>Password<br><input type=\"password\" name=\"passwd\" autocomplete=\"current-password\"></label></p>\n\
          <p>or</p>\n\
-         <p><label>Account key<br><input type=\"password\" name=\"authenticator\" size=\"40\"></label></p>\n\
+         <p><label>Account key<br><input type=\"password\" name=\"authenticator\" size=\"40\" autocomplete=\"off\"></label></p>\n\
          <p><label><input type=\"checkbox\" name=\"stay_logged_in\" value=\"1\"> Stay logged in</label></p>\n\
          <p><input type=\"submit\" value=\"Log in\"></p>\n</form>\n\
          <p>Your account key is in the file <code>account_*.xml</code> for this project in the \

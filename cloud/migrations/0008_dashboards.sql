@@ -31,11 +31,13 @@ UPDATE host SET valid_results = (
 
 -- The three leaderboard orders (total credit, recent average by `recent_key`, valid
 -- tasks), for accounts and for computers. Partial, so
--- that an account or computer enters them with its first credit. Each page
+-- that an account or computer enters them with its first credit; an account
+-- leaves the account ones when it is blocked, since the page leaves it out and
+-- a run of blocked accounts would otherwise have to be read past. Each page
 -- reads the first rows of one index.
-CREATE INDEX user_total_credit ON user (total_credit DESC) WHERE total_credit > 0;
-CREATE INDEX user_recent_key ON user (recent_key DESC) WHERE total_credit > 0;
-CREATE INDEX user_valid_results ON user (valid_results DESC) WHERE total_credit > 0;
+CREATE INDEX user_total_credit ON user (total_credit DESC) WHERE total_credit > 0 AND blocked = 0;
+CREATE INDEX user_recent_key ON user (recent_key DESC) WHERE total_credit > 0 AND blocked = 0;
+CREATE INDEX user_valid_results ON user (valid_results DESC) WHERE total_credit > 0 AND blocked = 0;
 CREATE INDEX host_total_credit ON host (total_credit DESC) WHERE total_credit > 0;
 CREATE INDEX host_recent_key ON host (recent_key DESC) WHERE total_credit > 0;
 CREATE INDEX host_valid_results ON host (valid_results DESC) WHERE total_credit > 0;
@@ -59,7 +61,8 @@ CREATE INDEX IF NOT EXISTS wu_need_validate ON workunit (id) WHERE need_validate
 
 -- The rollup behind the history charts and the jobs overview: one row per
 -- three-hour period (`bucket` is its start, Unix seconds) and application, and
--- `appid` 0 for the whole project. `returned_ok` counts tasks received with a
+-- `appid` 0 for the whole project and -1 for the applications that are not
+-- tracked one by one (the first 18 live ones are). `returned_ok` counts tasks received with a
 -- success outcome, `valid` and `invalid` those of them the validator has judged,
 -- `failed` tasks received with any other outcome, `timed_out` tasks written off
 -- at their deadline (counted by the transition), `queued` the tasks ready to send
@@ -76,6 +79,8 @@ CREATE TABLE stats_bucket (
     failed INTEGER NOT NULL DEFAULT 0,
     timed_out INTEGER NOT NULL DEFAULT 0,
     queued INTEGER NOT NULL DEFAULT -1,
+    -- 1 when `queued` is a lower bound, because the count stopped at its cap
+    queued_capped INTEGER NOT NULL DEFAULT 0,
     users INTEGER NOT NULL DEFAULT 0,
     hosts INTEGER NOT NULL DEFAULT 0,
     -- project row only: tasks returned with a success outcome and not yet

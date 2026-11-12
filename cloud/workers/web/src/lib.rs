@@ -310,7 +310,7 @@ async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
                             None
                         })
                 };
-                html(master_page_with(&project, summary.as_ref()))?
+                html(master_page_with(&project, summary.as_ref(), now()))?
             };
             if let Some(key) = cache_key {
                 let copy = response.cloned()?;

@@ -33,6 +33,9 @@ pub enum Kind {
 pub struct Series<'a> {
     pub label: &'a str,
     pub values: &'a [Option<f64>],
+    /// Per slot: the value is a lower bound, drawn as it is and shown with a
+    /// `+` in the table. Empty when none is.
+    pub at_least: &'a [bool],
 }
 
 /// Where the x axis is labelled.
@@ -346,7 +349,15 @@ impl Chart<'_> {
             o.push_str(&format!("<tr><td>{}</td>", slot_label(t)));
             for s in self.series {
                 match s.values.get(i).copied().flatten() {
-                    Some(v) => o.push_str(&format!("<td class=\"num\">{}</td>", compact_full(v))),
+                    Some(v) => o.push_str(&format!(
+                        "<td class=\"num\">{}{}</td>",
+                        compact_full(v),
+                        if s.at_least.get(i) == Some(&true) {
+                            "+"
+                        } else {
+                            ""
+                        }
+                    )),
                     None => o.push_str("<td class=\"num muted\">unknown</td>"),
                 }
             }
@@ -406,6 +417,7 @@ mod tests {
         let series = [Series {
             label: "Tasks",
             values: &values,
+            at_least: &[],
         }];
         let chart = Chart {
             title: "Tasks",
@@ -432,6 +444,7 @@ mod tests {
         let series = [Series {
             label: "A <b>",
             values: &values,
+            at_least: &[],
         }];
         let chart = Chart {
             title: "T <script>",

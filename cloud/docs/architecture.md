@@ -1256,7 +1256,9 @@ and GPU.
 
 **Leaderboard indexes.** `migrations/0008_dashboards.sql` adds three partial indexes each to `user`
 and `host`: `total_credit DESC`, `recent_key DESC` and `valid_results DESC`, all
-`WHERE total_credit > 0`. A page runs one statement of `ORDER BY <column> DESC, id LIMIT 51 OFFSET n`
+`WHERE total_credit > 0`, and the three on `user` also `AND blocked = 0`, because the page leaves
+blocked accounts out and a run of them would otherwise be read past before the first row. A page
+runs one statement of `ORDER BY <column> DESC, id LIMIT 51 OFFSET n`
 whose `WHERE` repeats the index condition, so it reads at most 51 index entries and their rows
 plus, for computers, 51 owner rows; the deepest page allowed (40) reads about 2,000 index entries to
 skip to its offset, and has no "Next" link. The tests run `EXPLAIN QUERY PLAN` on every statement of
@@ -1287,10 +1289,11 @@ computers that have credit; tasks purged earlier are not counted.
 The pipeline Worker's five-minute cron (the one that runs the purge) calls `rollup_pass`
 (`cloud/crates/cb-core/src/stats.rs`) after the purge, and it writes two small tables:
 
-- `stats_bucket`: a row per three-hour period (UTC) and application, and one for the project as a
-  whole (`appid` 0): tasks returned with a success outcome, valid, invalid, failed (any other
-  outcome), timed out, the queue length at the last count, and the accounts and computers that
-  returned a task.
+- `stats_bucket`: a row per three-hour period (UTC) for the project (`appid` 0), each of the first
+  18 live applications and the rest together (`appid` -1): tasks returned with a success outcome,
+  valid, invalid, failed (any other outcome), timed out, and, in the project row, the queue length
+  at the last count (with a flag when the count stopped at its cap, kept after the period closes)
+  and the accounts and computers that returned a task.
 - `stats_snapshot`: three documents. `overview` has, per application and in total, tasks waiting to
   send, in progress, workunits awaiting validation and assimilation, the counts of the last day and
   week summed from `stats_bucket`, and the number of volunteers and computers holding tasks.
@@ -1318,20 +1321,50 @@ those counts read the index alone, and the accounts and computers holding tasks 
 separately over all of them, so they stay exact when the list of groups the activity page keeps
 (4,000) is cut off; the tasks in progress that page shows are then marked as at least. Waiting
 workunits use `wu_need_validate` and `wu_assim`. The sums of the last day and week cover only the
-periods that have been counted; the overview says how many of how many, and the pages mark the
-sums "+" and say so while the week is being filled in (or part of it has been purged).
+periods that have been counted; the overview says how many of the 8 and 56, and the pages mark the
+sums "+" and say so while the week is being filled in. The targets are always 8 and 56: a window
+part of which was purged (or never existed, on a new deployment with a short `purge_days`) stays
+marked as partial.
 
 **Statement budget.** A Worker invocation may make 50 queries on the Free plan, and the cron's
-purge and its account deletions share it (the cron runs the purge, then the deletions with what is
-left once the rollup has its minimum, then the rollup: `deletion_room` and `rollup_budget` in
-`stats.rs`, with a test over every purge cost). `rollup_pass` is given a budget (50 minus what the invocation has used, less a
-margin), counts as many of the due periods as fit, newest first, and leaves the rest for the next
-pass (`postponed` in its report); with less than `MIN_BUDGET` (18) it does nothing. Its fixed
-statements are 14 (two reads, six counts, the queue gauges, the retention delete, the sums, three
-snapshot writes) and each period costs a read and one write for every ten applications that have
-tasks in it. The tests build the worst case (40 applications with tasks in every period of the
-week) and check that the statements sent stay within the budget and that no statement binds more
-than 100 values. Dev: 36 to 48 statements while the week was being filled in, 19 in steady state.
+purge and its account deletions share it: the cron runs the purge, then the deletions with what is
+left once the rollup has its minimum, then the rollup (`deletion_room` and `rollup_budget` in
+`stats.rs`, with a test over every purge cost). Every part of a pass has a count that does not depend
+on the data, so the bound is enforced by construction and not by trimming:
+
+| Step | Statements |
+| --- | --- |
+| Round trip 1: last run, tracked applications, counted periods | 3 |
+| Round trip 2: one scan per period counted, and the queue, tasks in progress per application, the largest in-progress groups, who holds tasks, workunits awaiting validation and assimilation | 1 per period + 6 |
+| Round trip 3: the rows of each period (at most 20 rows, ten to a statement), the queue gauge (one row), the retention delete, the sums | 2 per period + 3 |
+| Round trip 4: the three snapshots | 3 |
+
+That is `FIXED + 3 * periods` (`statements_for` in `stats.rs`): 15 plus 3 a period, at least 18
+(`MIN_BUDGET`) for the open period alone, and a pass counts `(budget - 15) / 3` periods at most,
+the open one first, and leaves the rest for the next pass (`postponed` in its report); with less
+than `MIN_BUDGET` it does nothing. The count does not grow with the applications because the first
+18 live applications (`TRACKED_APPS`, by id) have rows of their own, and the tasks of all the
+others are counted together in a row with `appid` -1, shown as "Other applications"; the queue gauge
+is one row for the project. The tests build 400 applications with returns in the open period and
+tasks waiting, at the least budget, and check that exactly the budget is sent, that every budget from
+18 to 60 is respected, and that no statement binds more than 100 values. Dev: 19 to 20 statements in
+steady state.
+
+The requests are bounded the same way (statements a page makes after the settings load, which is
+two and cached for 30 seconds in each isolate):
+
+| Request | Statements |
+| --- | --- |
+| `top_users.php`, `top_hosts.php` | 1 |
+| `work.php` | 2 (overview and history in one round trip) |
+| `activity.php` | 1 for the snapshot, then at most 3 for accounts: 80 accounts to a statement, and the page shows at most 50 volunteers and the ten largest holders of each of the 12 applications with most tasks, so 170 accounts |
+| the home page's card | 1 |
+
+`activity.php` chooses what it will show before it looks anything up, and shows only an account that
+was looked up and is not blocked: a holder whose account was not fetched is left out, not shown as
+nobody. When more applications hold tasks than it lists, it says how many. A test drives 400
+applications with ten holders each, a blocked holder, and holders with no account row, and counts the
+statements.
 
 A row in `stats_bucket` with `computed_at` 0 (made by a timeout before its period was counted) is
 not a counted period: the pages show the period as unknown and the sums leave it out until a pass

@@ -915,7 +915,7 @@ pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
 
 /// The "Right now" card of the home page: what the project is doing, from the
 /// overview snapshot, with links to the pages behind each figure.
-fn summary_card(o: &crate::stats::Overview) -> String {
+fn summary_card(o: &crate::stats::Overview, now: i64) -> String {
     let n = |v: i64| crate::site::number_format(v as f64, 0);
     let total = o.apps.iter().find(|a| a.id == 0);
     let mut items = Vec::new();
@@ -932,7 +932,20 @@ fn summary_card(o: &crate::stats::Overview) -> String {
     }
     items.push(site_ui::stat("Volunteers working", &n(o.working_users), ""));
     items.push(site_ui::stat("Computers working", &n(o.working_hosts), ""));
-    let body = site_ui::stats(&items);
+    // How old the counts are, so that a pipeline that stopped is not "right now".
+    let age = (now - o.at).max(0);
+    let badge = if age <= 20 * 60 {
+        site_ui::badge(
+            &format!("counted {}", crate::feed::age_text(age)),
+            site_ui::Tone::Good,
+        )
+    } else {
+        site_ui::badge(
+            &format!("stale, counted {}", crate::feed::age_text(age)),
+            site_ui::Tone::Warning,
+        )
+    };
+    let body = format!("<p>{badge}</p>\n{}", site_ui::stats(&items));
     site_ui::card("Right now", &body)
 }
 
@@ -940,14 +953,18 @@ fn summary_card(o: &crate::stats::Overview) -> String {
 /// `<link rel="boinc_scheduler">` element, and older clients through the
 /// `<scheduler>` element in a comment (`SCHEDULER_OP::parse_master_file`).
 pub fn master_page(project: &Project) -> String {
-    master_page_with(project, None)
+    master_page_with(project, None, 0)
 }
 
 /// [`master_page`] with the headline figures of the rollup (see
 /// `cb_core::stats`) in a card under the join box. The page is cached for
 /// every visitor, so the figures are the project's and nothing on it depends
 /// on who is looking.
-pub fn master_page_with(project: &Project, summary: Option<&crate::stats::Overview>) -> String {
+pub fn master_page_with(
+    project: &Project,
+    summary: Option<&crate::stats::Overview>,
+    now: i64,
+) -> String {
     let c = &project.config;
     let sched = scheduler_url(c);
     let head = format!(
@@ -986,7 +1003,7 @@ pub fn master_page_with(project: &Project, summary: Option<&crate::stats::Overvi
     );
     body.push_str(&site_ui::card_accent("Join this project", &join));
     if let Some(o) = summary {
-        body.push_str(&summary_card(o));
+        body.push_str(&summary_card(o, now));
     }
     body.push_str(&site_ui::card("Explore", &site_ui::link_list(&links)));
     let mut apps = Vec::new();
