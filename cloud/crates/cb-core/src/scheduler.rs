@@ -372,6 +372,14 @@ impl Version<'_> {
     }
 }
 
+/// Whether workunits of the app can be pinned to a version, so that versions
+/// no longer sent to anyone are kept for the workunits pinned to them
+/// (`Version::pinned_only`). Today that is an app with homogeneous app
+/// version; a workunit pinned by `app_version_num` would add its own case.
+fn keeps_pinned_versions(app: &App) -> bool {
+    app.homogeneous_app_version != 0
+}
+
 /// What homogeneous redundancy and homogeneous app version ask of one app
 /// for the host of this request.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -1607,7 +1615,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             // one a homogeneous-app-version workunit is committed to.
             let pinned_only =
                 av.deprecated != 0 || catalog.superseded(av) || av.version_num < app.min_version;
-            if pinned_only && app.homogeneous_app_version == 0 {
+            if pinned_only && !keeps_pinned_versions(app) {
                 continue;
             }
             if !prefs.app_ids.is_empty() && !prefs.app_ids.contains(&app.id) {
@@ -1678,7 +1686,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let has_versions = if anonymous {
         (0..NPROC).any(|pt| client_has[pt] && (need_secs[pt] > 0.0 || need_inst[pt] > 0.0))
     } else {
-        versions.iter().any(|v| !v.pinned_only)
+        // A version kept only for committed workunits is enough to enter
+        // dispatch; `admitted` keeps it off uncommitted ones, and the queries
+        // below do not read uncommitted work for an app that has no other.
+        !versions.is_empty()
     };
     let send = work_requested
         && !hr_blocked
@@ -1867,22 +1878,46 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     };
     let assigned_apps = id_list(&mut assigned_list.iter().copied());
-    // Versions a workunit of an app with homogeneous app version may be
-    // committed to; the client's own are none.
-    let assigned_versions =
-        id_list(&mut std::iter::once(0).chain(versions.iter().filter_map(|v| v.av.map(|a| a.id))));
-    let hav_apps = id_list(
-        &mut catalog
-            .apps
-            .iter()
-            .filter(|a| a.homogeneous_app_version != 0)
-            .map(|a| a.id),
-    );
-    let assigned_version_gate = if hav_apps.is_empty() {
-        String::new()
-    } else {
-        format!(" AND (w.app_version_id IN ({assigned_versions}) OR w.appid NOT IN ({hav_apps}))")
+    // For an app whose workunits can be pinned to a version, which pins the
+    // host can be sent, as `(IDs, whether an unpinned workunit is also
+    // fine)`. An unpinned workunit is for an app with a version still sent
+    // to everyone; if all the host's versions of the app are kept only for
+    // pinned work, such a workunit cannot be sent and must not use up the
+    // window of a query. The client's own versions are none.
+    let pin_gate = |app_id: i64| -> Option<(String, bool)> {
+        if !catalog.app(app_id).is_some_and(keeps_pinned_versions) {
+            return None;
+        }
+        let mine = || versions.iter().filter(move |v| v.appid == app_id);
+        let ids = id_list(&mut mine().filter_map(|v| v.av.map(|a| a.id)));
+        Some((ids, mine().any(|v| !v.pinned_only)))
     };
+    let pin_sql = |column: &str, gate: &(String, bool)| {
+        let (ids, unpinned) = gate;
+        let list: Vec<&str> = [
+            unpinned.then_some("0"),
+            (!ids.is_empty()).then_some(ids.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if list.is_empty() {
+            "0 = 1".to_string()
+        } else {
+            format!("{column} IN ({})", list.join(","))
+        }
+    };
+    let assigned_version_gate: String = assigned_list
+        .iter()
+        .filter_map(|id| {
+            pin_gate(*id).map(|g| {
+                format!(
+                    " AND NOT (w.appid = {id} AND NOT {})",
+                    pin_sql("w.app_version_id", &g)
+                )
+            })
+        })
+        .collect();
     let assigned_class_gate: String = assigned_list
         .iter()
         .filter(|id| homog[id].hr_type != 0)
@@ -1932,15 +1967,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             sql.push_str(" AND w.hr_class IN (0, ?)");
             params.push(h.host_class.into());
         }
-        if h.hav {
-            let ids = id_list(
-                &mut versions
-                    .iter()
-                    .filter(|v| v.appid == *id)
-                    .filter_map(|v| v.av.map(|a| a.id)),
-            );
-            let ids = if ids.is_empty() { "0".into() } else { ids };
-            sql.push_str(&format!(" AND w.app_version_id IN (0, {ids})"));
+        if let Some(gate) = pin_gate(*id) {
+            sql.push_str(&format!(" AND {}", pin_sql("w.app_version_id", &gate)));
         }
         sql.push_str(" ORDER BY r.priority DESC, r.id LIMIT ?");
         params.push(fetch.into());

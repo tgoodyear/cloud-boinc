@@ -355,7 +355,7 @@ Two app settings keep the results of one workunit comparable. Both are off by de
   first send decides it. An anonymous-platform client is never sent a job of such an app, as in
   `get_app_version` in `sched/sched_version.cpp`.
 
-The commitment is `workunit.hr_class` (migration `0004_homogeneous.sql`) and
+The commitment is `workunit.hr_class` (migration `0005_homogeneous.sql`) and
 `workunit.app_version_id`, 0 while the workunit is uncommitted.
 
 **Choosing.** The query that reads the candidates for an app adds `AND w.hr_class IN (0, :class)`
@@ -363,7 +363,11 @@ for an app that uses HR and `AND w.app_version_id IN (0, :versions)` for one tha
 where the versions are those this host can run (as integers of the cached catalog, not bound
 parameters). A queue whose first rows are committed to other classes therefore cannot hide
 the ones this host can take, as it would if the window of `fetch` rows were cut first and
-filtered after. The in-memory loop then repeats the check against the row it read, picks the
+filtered after. For an app that uses HAV, workunits not yet committed are read only when the host
+has a version of the app that is still sent for new work; a host whose versions of the app are
+all withdrawn (deprecated, superseded or below `min_version`) reads only workunits committed to
+one of them, so uncommitted ones cannot fill the window ahead of them. Assigned jobs follow the
+same rule. The in-memory loop then repeats the check against the row it read, picks the
 version for a committed workunit (only its own, which can be a deprecated version, one
 superseded by a newer version of the same platform and plan class, or one below the app's
 `min_version`, as `check_homogeneous_app_version` allows) or, for an uncommitted one, the fastest version still

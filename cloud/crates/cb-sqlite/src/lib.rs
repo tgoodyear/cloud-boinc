@@ -40,7 +40,7 @@ impl SqliteDb {
         db.apply(include_str!("../../../migrations/0003_user_tasks.sql"))?;
         db.apply(include_str!("../../../migrations/0004_email.sql"))?;
         db.apply(include_str!("../../../migrations/0005_upload_epoch.sql"))?;
-        db.apply(include_str!("../../../migrations/0004_homogeneous.sql"))?;
+        db.apply(include_str!("../../../migrations/0005_homogeneous.sql"))?;
         Ok(db)
     }
 

@@ -230,7 +230,7 @@ An app can send all results of a workunit to hosts of one class (homogeneous red
 or with one app version (homogeneous app version, HAV). The behaviour is described under
 "Homogeneous redundancy and homogeneous app version" in `architecture.md`.
 
-`migrations/0004_homogeneous.sql` adds `app.homogeneous_redundancy`,
+`migrations/0005_homogeneous.sql` adds `app.homogeneous_redundancy`,
 `app.homogeneous_app_version` and `workunit.hr_class`. It adds columns and nothing else, so the Workers of
 an earlier release keep working on the migrated database. Apply it first, then deploy the
 `scheduler`, `pipeline` and `admin` Workers (the scheduler reads the new columns, the pipeline

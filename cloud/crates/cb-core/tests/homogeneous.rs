@@ -939,6 +939,118 @@ fn a_superseded_version_still_serves_its_committed_workunits() {
     assert_eq!(w.versions_of(wu2), vec![12]);
 }
 
+/// Every version of the HAV app is withdrawn, one way or another, so none is
+/// still sent for new work.
+fn withdraw_all_versions(w: &World, how: &str) {
+    match how {
+        "deprecated" => w.sql("UPDATE app_version SET deprecated = 1 WHERE appid = 4"),
+        "below the minimum" => w.sql("UPDATE app SET min_version = 200 WHERE id = 4"),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn a_host_with_only_withdrawn_versions_is_still_sent_committed_work() {
+    for how in ["deprecated", "below the minimum"] {
+        let w = World::new();
+        let wu1 = w.submit("h", "j1", 1000, 2);
+        let x = w.linux_intel("x");
+        let z = w.computer("z", LINUX_OS, INTEL, XEON, 4);
+        assert_eq!(w.rpc(&x, 2000).n_sent, 1, "{how}");
+        assert_eq!(w.wu(wu1).app_version_id, V_MT);
+        // No version is left for new work, in the whole project, but j1 is
+        // committed to one.
+        w.sql("DELETE FROM app_version WHERE appid <> 4");
+        withdraw_all_versions(&w, how);
+        let wu2 = w.submit("h", "j2", 2100, 2);
+        let out = w.rpc(&z, 2200);
+        assert_eq!(out.n_sent, 1, "{how}");
+        assert!(sent_names(&out)[0].starts_with("j1_"), "{how}");
+        assert_eq!(w.versions_of(wu1), vec![V_MT, V_MT]);
+        // The uncommitted workunit is not sent with a withdrawn version.
+        assert_eq!(w.unsent(wu2), 2, "{how}");
+    }
+}
+
+#[test]
+fn uncommitted_work_does_not_hide_committed_work_when_every_version_is_withdrawn() {
+    for how in ["deprecated", "below the minimum"] {
+        for other_app in [false, true] {
+            let w = World::new();
+            // More uncommitted workunits, ahead in the queue, than one request
+            // reads; then one committed to a version that is withdrawn.
+            for i in 0..130 {
+                w.submit("h", &format!("u{i}"), 1000, 1);
+            }
+            let committed = w.submit("h", "c1", 1100, 1);
+            w.sql(&format!(
+                "UPDATE workunit SET app_version_id = {V_MT} WHERE id = {committed}"
+            ));
+            let plain = other_app.then(|| w.submit("a", "p1", 1100, 1));
+            withdraw_all_versions(&w, how);
+            let z = w.computer("z", LINUX_OS, INTEL, XEON, 4);
+            let out = w.rpc(&z, 2000);
+            let mut names = sent_names(&out);
+            names.sort();
+            // Another app's non-pinned version does not open the HAV app to
+            // its uncommitted work.
+            let want: Vec<String> = if other_app {
+                vec!["c1_0".into(), "p1_0".into()]
+            } else {
+                vec!["c1_0".into()]
+            };
+            let got: Vec<String> = names
+                .iter()
+                .map(|n| n.split("_r").next().unwrap().to_string())
+                .collect();
+            assert_eq!(got, want, "{how} {other_app}");
+            assert_eq!(w.versions_of(committed), vec![V_MT]);
+            if let Some(p) = plain {
+                assert_eq!(w.versions_of(p), vec![7]);
+            }
+        }
+    }
+}
+
+#[test]
+fn uncommitted_assignments_do_not_hide_a_committed_one_when_every_version_is_withdrawn() {
+    let mut w = World::new();
+    w.config.enable_assignment = true;
+    let to_user = || {
+        Some(Assign {
+            target: AssignTarget::User,
+            id: 1,
+        })
+    };
+    // More uncommitted assignments than one request looks at, then one
+    // committed to a version that is withdrawn.
+    for i in 0..25 {
+        w.submit_with("h", &format!("u{i}"), 1000, 1, to_user());
+    }
+    let committed = w.submit_with("h", "c1", 1100, 1, to_user());
+    w.sql(&format!(
+        "UPDATE workunit SET app_version_id = {V_MT} WHERE id = {committed}"
+    ));
+    withdraw_all_versions(&w, "deprecated");
+    let z = w.computer("z", LINUX_OS, INTEL, XEON, 4);
+    let out = w.rpc(&z, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert!(sent_names(&out)[0].starts_with("c1_"));
+    assert_eq!(w.versions_of(committed), vec![V_MT]);
+
+    // With a version still sent for new work, uncommitted assignments are
+    // sent as before.
+    let w2 = {
+        let mut w2 = World::new();
+        w2.config.enable_assignment = true;
+        w2
+    };
+    let wu = w2.submit_with("h", "n1", 1000, 1, to_user());
+    let z = w2.computer("z", LINUX_OS, INTEL, XEON, 4);
+    assert_eq!(w2.rpc(&z, 2000).n_sent, 1);
+    assert_eq!(w2.versions_of(wu), vec![V_MT]);
+}
+
 #[test]
 fn a_workunit_committed_to_a_version_the_host_cannot_run_waits() {
     let w = World::new();
