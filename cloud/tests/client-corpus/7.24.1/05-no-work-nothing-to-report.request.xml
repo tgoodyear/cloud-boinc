@@ -1,0 +1,134 @@
+<scheduler_request>
+    <authenticator>fixture-authenticator</authenticator>
+    <hostid>103</hostid>
+    <rpc_seqno>3</rpc_seqno>
+    <core_client_major_version>7</core_client_major_version>
+    <core_client_minor_version>24</core_client_minor_version>
+    <core_client_release>1</core_client_release>
+    <resource_share_fraction>1.000000</resource_share_fraction>
+    <rrs_fraction>1.000000</rrs_fraction>
+    <prrs_fraction>1.000000</prrs_fraction>
+    <duration_correction_factor>1.000000</duration_correction_factor>
+    <allow_multiple_clients>1</allow_multiple_clients>
+    <sandbox>0</sandbox>
+    <dont_send_work>0</dont_send_work>
+    <work_req_seconds>207360.000000</work_req_seconds>
+    <cpu_req_secs>207360.000000</cpu_req_secs>
+    <cpu_req_instances>4.000000</cpu_req_instances>
+    <estimated_delay>0.000000</estimated_delay>
+    <client_cap_plan_class>1</client_cap_plan_class>
+    <platform_name>x86_64-pc-linux-gnu</platform_name>
+    <code_sign_key>
+1024
+fixture-code-sign-key
+.
+</code_sign_key>
+<working_global_preferences>
+<global_preferences>
+   <source_project>https://project.example/</source_project>
+   <mod_time>1794438563.000000</mod_time>
+   <battery_charge_min_pct>90.000000</battery_charge_min_pct>
+   <battery_max_temperature>40.000000</battery_max_temperature>
+   <run_on_batteries>0</run_on_batteries>
+   <run_if_user_active>1</run_if_user_active>
+   <run_gpu_if_user_active>0</run_gpu_if_user_active>
+   <suspend_if_no_recent_input>0.000000</suspend_if_no_recent_input>
+   <suspend_cpu_usage>0.000000</suspend_cpu_usage>
+   <start_hour>0.000000</start_hour>
+   <end_hour>0.000000</end_hour>
+   <net_start_hour>0.000000</net_start_hour>
+   <net_end_hour>0.000000</net_end_hour>
+   <leave_apps_in_memory>0</leave_apps_in_memory>
+   <confirm_before_connecting>0</confirm_before_connecting>
+   <hangup_if_dialed>0</hangup_if_dialed>
+   <dont_verify_images>0</dont_verify_images>
+   <work_buf_min_days>0.100000</work_buf_min_days>
+   <work_buf_additional_days>0.500000</work_buf_additional_days>
+   <max_ncpus_pct>100.000000</max_ncpus_pct>
+   <niu_max_ncpus_pct>100.000000</niu_max_ncpus_pct>
+   <niu_cpu_usage_limit>100.000000</niu_cpu_usage_limit>
+   <niu_suspend_cpu_usage>0.000000</niu_suspend_cpu_usage>
+   <cpu_scheduling_period_minutes>60.000000</cpu_scheduling_period_minutes>
+   <disk_interval>60.000000</disk_interval>
+   <disk_max_used_gb>0.000000</disk_max_used_gb>
+   <disk_max_used_pct>90.000000</disk_max_used_pct>
+   <disk_min_free_gb>1.000000</disk_min_free_gb>
+   <vm_max_used_pct>75.000000</vm_max_used_pct>
+   <ram_max_used_busy_pct>50.000000</ram_max_used_busy_pct>
+   <ram_max_used_idle_pct>90.000000</ram_max_used_idle_pct>
+   <idle_time_to_run>3.000000</idle_time_to_run>
+   <max_bytes_sec_up>0.000000</max_bytes_sec_up>
+   <max_bytes_sec_down>0.000000</max_bytes_sec_down>
+   <cpu_usage_limit>100.000000</cpu_usage_limit>
+   <daily_xfer_limit_mb>0.000000</daily_xfer_limit_mb>
+   <daily_xfer_period_days>0</daily_xfer_period_days>
+   <override_file_present>1</override_file_present>
+   <network_wifi_only>1</network_wifi_only>
+</global_preferences>
+</working_global_preferences>
+<cross_project_id>fixture-cross-project-id</cross_project_id>
+<time_stats>
+    <on_frac>1.000000</on_frac>
+    <connected_frac>-1.000000</connected_frac>
+    <cpu_and_network_available_frac>1.000000</cpu_and_network_available_frac>
+    <active_frac>1.000000</active_frac>
+    <gpu_active_frac>1.000000</gpu_active_frac>
+    <client_start_time>1794460571.059510</client_start_time>
+    <total_start_time>1794460571.300548</total_start_time>
+    <total_duration>30.197528</total_duration>
+    <total_active_duration>30.197528</total_active_duration>
+    <total_gpu_active_duration>30.197528</total_gpu_active_duration>
+    <now>1794460611.542192</now>
+    <previous_uptime>0.000000</previous_uptime>
+    <session_active_duration>30.197528</session_active_duration>
+    <session_gpu_active_duration>30.197528</session_gpu_active_duration>
+</time_stats>
+<net_stats>
+    <bwup>19519573.095873</bwup>
+    <avg_up>1709594965690.754150</avg_up>
+    <avg_time_up>1794460605.519445</avg_time_up>
+    <bwdown>23949735.718169</bwdown>
+    <avg_down>2117695906699.194824</avg_down>
+    <avg_time_down>1794460591.527477</avg_time_down>
+</net_stats>
+<host_info>
+    <timezone>0</timezone>
+    <domain_name>fixture-host</domain_name>
+    <ip_addr>192.0.2.1</ip_addr>
+    <host_cpid>fixture-host-cpid</host_cpid>
+    <p_ncpus>4</p_ncpus>
+    <p_vendor>GenuineIntel</p_vendor>
+    <p_model>Fixture CPU @ 3.00GHz</p_model>
+    <p_features>fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt avx avx2</p_features>
+    <p_fpops>1000000000.000000</p_fpops>
+    <p_iops>1000000000.000000</p_iops>
+    <p_membw>1000000000.000000</p_membw>
+    <p_calculated>1794460571.059510</p_calculated>
+    <p_vm_extensions_disabled>0</p_vm_extensions_disabled>
+    <m_nbytes>12884901888.000000</m_nbytes>
+    <m_cache>8388608.000000</m_cache>
+    <m_swap>2147483648.000000</m_swap>
+    <d_total>214748364800.000000</d_total>
+    <d_free>134581714944.000000</d_free>
+    <os_name>Linux Debian</os_name>
+    <os_version>Debian GNU/Linux 13 (trixie) [6.12.0|libc 2.41]</os_version>
+    <n_usable_coprocs>0</n_usable_coprocs>
+    <wsl_available>0</wsl_available>
+</host_info>
+    <disk_usage>
+        <d_boinc_used_total>392192.000000</d_boinc_used_total>
+        <d_boinc_used_project>296448.000000</d_boinc_used_project>
+        <d_project_share>146859201843.200012</d_project_share>
+    </disk_usage>
+<app_versions>
+<app_version>
+    <app_name>upper2</app_name>
+    <version_num>101</version_num>
+    <platform>x86_64-pc-linux-gnu</platform>
+    <avg_ncpus>1.000000</avg_ncpus>
+    <flops>1000000000.000000</flops>
+</app_version>
+</app_versions>
+<other_results>
+</other_results>
+</scheduler_request>

@@ -135,7 +135,8 @@ has not finished after 120 seconds.
 - One client version. The oracle is the client in this tree (see `version.h`). Older clients
   parse with older code. The scheduler reply writer follows the
   stock server's per-version forms (`core_client_version` in `SchedulerReply`), and they are
-  tested in `cb-proto`, but not against old client code.
+  tested in `cb-proto`, but not against old client code. Six real clients from 7.16.6 to 8.2.15
+  were run against a deployment; see "Client matrix and request corpus".
 - Direction. The oracle reads server replies. The requests a client sends are checked by the
   fixtures in `cb-proto` and, for uploads, by the request `FILE_XFER::init_upload` builds, as above.
 - Network behaviour. No HTTP, TLS, redirects, proxies, retries or timeouts; the client's HTTP code
@@ -205,6 +206,107 @@ The run found nothing else: every field listed above matched, the client linked 
 workunit, result and file of the work replies, verified the application file signatures against the
 key in the reply, accepted the stored preferences, and built upload requests the upload handler
 accepts.
+
+## Client matrix and request corpus
+
+Stock clients of six versions were attached to a dev deployment and run through the same steps,
+and the requests they sent were kept as fixtures (`cloud/tests/client-corpus/`, with a README
+that says how to capture and scrub a new one; the test is
+`cloud/crates/cb-core/tests/client_corpus.rs`). Every client ran in a new data directory, on its
+own GUI RPC port, as a new computer of one test account, on x86-64 Linux (Debian 13), CPU only.
+
+| Client | Binary | Attached | Work fetched | Jobs validated | Output uploaded | Re-attach in the same data directory |
+|--------|--------|----------|--------------|----------------|-----------------|--------------------------------------|
+| 7.16.6 | Ubuntu 20.04 package `boinc-client` 7.16.6+dfsg-1, extracted, with libssl1.1 from the same release | yes | yes | 9 of 9 | 9 of 9 | same host ID |
+| 7.18.1 | Ubuntu 22.04 package 7.18.1+dfsg-4ubuntu0.1, extracted | yes | yes | 5 of 5 | 5 of 5 | same host ID |
+| 7.20.5 | Debian 12 package 7.20.5+dfsg-1.1, extracted | yes | yes | 5 of 5 | 5 of 5 | same host ID |
+| 7.24.1 | Ubuntu 24.04 package 7.24.1+dfsg-4build1, extracted | yes | yes | 5 of 5 | 5 of 5 | same host ID |
+| 8.0.4 | Debian 13 package 8.0.4+dfsg-1 | yes | yes | 5 of 5 | 5 of 5 | same host ID |
+| 8.2.15 | Built from the upstream tag `client_release/8.2/8.2.15` (client and library only) | yes | yes | 5 of 5 | 5 of 5 | same host ID |
+
+The 7.x versions are the ones packaged in Ubuntu 20.04, Ubuntu 22.04, Debian 12 and Ubuntu 24.04;
+8.0.4 is the Debian 13 package and 8.2.15 is built from its upstream tag.
+The same project's application was used throughout: a small program that upper-cases a file and
+takes a second (`cloud/tests/app`), run with an optional `--seconds` delay.
+
+"Validated" is read from the deployment's admin API after the run: for each job the result is
+over (server state 5), successful (outcome 1) and valid (validate state 1), it is the workunit's
+canonical result, and the workunit waits for assimilation. Each client ran these steps; 7.16.6 also ran four extra jobs while the steps were being worked
+out, which is why it has nine jobs and the others five:
+
+- three jobs fetched at attach, with the first request asking for one second of work, then the
+  request that fetches the rest;
+- the report of those results, with other tasks still held (`<other_results>`);
+- requests with nothing to report, from `boinccmd --project URL update`, for work the project did
+  not have: the reply says "Project has no tasks available";
+- `boinccmd --get_project_config` and `--lookup_account` with the test account's address and a
+  wrong password, which the server refuses with `ERR_BAD_PASSWD` (the client prints "bad password"; D2);
+- one job with a 40 second delay, with the client quit while it ran and started again, which
+  reports it afterwards;
+- `boinccmd --project URL detach`, then attach again with the account key, and one more job.
+
+After the re-attach the client sends `<hostid>0</hostid>` and `<rpc_seqno>0</rpc_seqno>` and the
+same host CPID (seen in the live runs; the scrubbed fixtures carry a placeholder CPID). The server answers with the same host ID, as the stock server does (it looks the
+host up by user and CPID in `handle_request.cpp`), and the client stores it. No second host was
+made in any run.
+
+### What the clients logged
+
+With `<sched_op_debug>`, `<unparsed_xml>` and the other flags on, no client logged a parse
+warning, an unrecognized element in a reply, a signature complaint, a backoff, a project message
+other than "Project has no tasks available", or an error. The replies to the first five requests
+of each client (first contact, work, two reports, no work) were equal apart from job and file
+names, times, credit, and the `<flops>` of the 8.2.15 computer, which had run its benchmark. The
+messages that a stock server would not cause, and what causes them:
+
+- 7.18.1 and 7.20.5 print "This a development version of BOINC and may not function properly" at
+  start. It comes from the client, not from the server's reply.
+- 7.16.6 prints "Message from task: " with nothing after it when each task finishes. 7.18.1 and
+  later print "Found finish file for <task>; exit code 0" and "Task <task>: no shared memory
+  segment" for the task that was running when the client was quit. The test application does
+  not link the BOINC library and only writes `boinc_finish_called` (an exit status and an empty
+  message), which these messages are about.
+- "Project has no tasks available" is the stock message (D10 describes when the two servers say
+  it).
+
+### Elements the server ignores
+
+`unread_elements_are_the_documented_ones` changes each value in each request and checks whether
+the parsed request changes. Every client sends these, except `wsl_available`, which clients up to
+8.0.4 send, and they are not read; the stock parser (`SCHEDULER_REQUEST::parse` and the functions
+it calls in `sched/sched_types.cpp`) either names them and drops the value, or (the `time_stats`
+ones) skips them without logging, so nothing is lost that the stock server keeps:
+
+- `host_info`: `n_usable_coprocs`, `p_calculated`, and `wsl_available` (clients up to 8.0.4);
+- `net_stats`: `avg_up`, `avg_time_up`, `avg_down`, `avg_time_down`;
+- `result`: `platform`, `version_num`;
+- `time_stats`: `now`, `total_start_time`, `total_duration`, `total_active_duration`,
+  `total_gpu_active_duration`, `session_active_duration`, `session_gpu_active_duration`
+  (the stock parser does not name these and skips them without a log message).
+
+The preferences the server reads from `<working_global_preferences>` are the eight that
+`GLOBAL_PREFS::parse` reads: `mod_time`, `disk_max_used_gb`, `disk_max_used_pct`,
+`disk_min_free_gb`, `work_buf_min_days`, `ram_max_used_busy_pct`, `ram_max_used_idle_pct` and
+`max_ncpus_pct`. After the first contact, clients 7.16 to 7.20 also send their own `<global_preferences>` (with
+`<source_scheduler>`), which the server keeps as text. 7.24 and later do not. 8.2.15 is the
+first to send `<docker_version>` and `<docker_type>` on this host (Podman is installed on that computer);
+the parser reads both.
+
+### What this does not cover
+
+- Windows, macOS and Android clients. They need an application version for their platform in the
+  project, or the anonymous platform, and a computer to run on; none was run. They differ in
+  `platform_name`, in `host_info` (for example the `<wsl>` elements the parser reads for
+  Windows) and in the application files they fetch; this is from the parser, not from a capture.
+- 32-bit and aarch64 Linux clients, and GPU hosts with plan classes.
+- Client behaviour over time: the runs lasted a few minutes each, so backoff after repeated
+  failures, daily transfer limits, and client updates were not exercised. The dev project has
+  `min_sendwork_interval` 0, so no reply carried a `<request_delay>`.
+- A quorum above one, and an account or computer other than the one test account's.
+- The replies were read from the clients' logs and the `sched_reply_*.xml` files, not
+  compared with a stock server's. The differential test below does that for 8.0.4's requests.
+- The test world has no code-signing key: what the server sends when a client reports another
+  key is not replayed.
 
 ## Differential test against the stock server
 
@@ -424,7 +526,8 @@ and used nowhere else.
 ### What it does not cover
 
 - One client version. The requests are from the stock 8.0.4 client. A client of this tree
-  (8.3.0) was not run, and older clients send other requests.
+  (8.3.0) was not run. The requests of other versions are in the client corpus (above), which is
+  replayed against this server but not compared with the stock server's replies.
 - Only the paths a single computer takes: attach, work, upload and report, no work, report only,
   anonymous platform, lost tasks, requests that come too soon. Not covered: several computers or
   accounts, GPU and plan class applications, quorums of two or more (the replies of a workunit

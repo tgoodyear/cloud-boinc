@@ -1,0 +1,256 @@
+{
+  "clients": [
+    {
+      "version": "7.16.6",
+      "binary": "Ubuntu 20.04 (focal) universe package boinc-client 7.16.6+dfsg-1 with libboinc7 of the same version, libssl1.1 1.1.1f-1ubuntu2.24 from focal-updates; files extracted with dpkg-deb -x",
+      "files": [
+        {
+          "file": "7.16.6/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "7.16.6/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.16.6/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.16.6/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.16.6/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "7.16.6/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.16.6/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.16.6/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "7.16.6/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "7.18.1",
+      "binary": "Ubuntu 22.04 (jammy-updates) package boinc-client 7.18.1+dfsg-4ubuntu0.1 with libboinc7 of the same version; files extracted with dpkg-deb -x",
+      "files": [
+        {
+          "file": "7.18.1/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "7.18.1/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.18.1/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.18.1/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.18.1/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "7.18.1/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.18.1/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.18.1/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "7.18.1/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "7.20.5",
+      "binary": "Debian 12 (bookworm) package boinc-client 7.20.5+dfsg-1.1 with libboinc7 of the same version; files extracted with dpkg-deb -x",
+      "files": [
+        {
+          "file": "7.20.5/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "7.20.5/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.20.5/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.20.5/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.20.5/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "7.20.5/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.20.5/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.20.5/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "7.20.5/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "7.24.1",
+      "binary": "Ubuntu 24.04 (noble) universe package boinc-client 7.24.1+dfsg-4build1 with libboinc7t64 of the same version; files extracted with dpkg-deb -x",
+      "files": [
+        {
+          "file": "7.24.1/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "7.24.1/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.24.1/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.24.1/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.24.1/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "7.24.1/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "7.24.1/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "7.24.1/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "7.24.1/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.0.4",
+      "binary": "Debian 13 (trixie) package boinc-client 8.0.4+dfsg-1, installed",
+      "files": [
+        {
+          "file": "8.0.4/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.0.4/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.0.4/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.0.4/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.2.15",
+      "binary": "built from the upstream tag client_release/8.2/8.2.15 (commit 3422898505b7), client and lib only: ./configure --disable-server --disable-manager --disable-fcgi --enable-client",
+      "files": [
+        {
+          "file": "8.2.15/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.2.15/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.2.15/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.2.15/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    }
+  ]
+}
