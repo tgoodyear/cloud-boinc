@@ -1819,8 +1819,11 @@ in a single statement or batch. Joining is one `UPDATE user SET teamid` that che
 members and the account key; the trigger moves the counts. Creating is one batch of two statements:
 `INSERT OR IGNORE INTO team ... WHERE EXISTS (the account, in no team, not blocked) RETURNING id`, which a
 taken name leaves empty, then the account's `teamid` set under `changes() > 0`. Editing, removing members,
-changing the founder and removing the team each name the founder in their `WHERE`, so a request
-from an account that stopped being the founder does nothing. Removing a team checks `NOT EXISTS` a
+changing the founder and removing the team each name the founder in their `WHERE` and end with
+`AND EXISTS (SELECT 1 FROM user WHERE id = ? AND authenticator = ? AND blocked = 0)` (`ACTOR_STILL_OK` in
+`site_teams.rs`), the compare-and-swap of the account pages, so a request from an account that stopped
+being the founder, replaced its key or was blocked after the page read it does nothing. Join, quit,
+create and taking a founderless team carry the same key and `blocked = 0` test. Removing a team checks `NOT EXISTS` a
 member with the member index, not the count.
 
 | Page | Statements | Reads |
@@ -1830,7 +1833,7 @@ member with the member index, not the count.
 | `top_teams.php` | 1 | at most 21 index entries and rows at an offset; with a type, the index in order until the page is full |
 | `team_search.php` | 1 round trip, up to 5 statements | each at most 20 rows; the word match scans the teams (name and description) in `team_recent_key` order until it has 20 |
 | `team_lookup.php` | 1 | by ID, by up to 100 IDs, or by a name pattern (a scan in `team_recent_key` order until 100 match, as upstream's `LIKE '%...%'` scans) |
-| `home.php` | 2 (it was 1) | the account's team and the teams it founded, by `id` and by `team_founder` |
+| `home.php` | 2 (it was 1) | one statement for the teams: the current team by `id`, then at most 20 others the account founded by `team_founder` (a `UNION ALL`, so a long list cannot push the current team out) |
 | `show_user.php` | 2 for an account with a team (1 without) | the team by `id` |
 
 **`team_lookup.php`.** `team_id` answers one `<team>` with the elements of `show_team_xml` in

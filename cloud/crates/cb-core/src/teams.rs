@@ -409,7 +409,8 @@ pub fn join_statement(user_id: i64, authenticator: &str, team_id: i64) -> Stmt {
 /// quit a team joined since.
 pub fn quit_statement(user_id: i64, authenticator: &str, team_id: i64) -> Stmt {
     stmt!(
-        "UPDATE user SET teamid = 0 WHERE id = ? AND authenticator = ? AND teamid = ? RETURNING id",
+        "UPDATE user SET teamid = 0 WHERE id = ? AND authenticator = ? AND blocked = 0 AND teamid = ? \
+         RETURNING id",
         user_id,
         authenticator,
         team_id

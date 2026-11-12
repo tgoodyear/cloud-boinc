@@ -57,6 +57,16 @@ pub const TEAM_PATHS: [&str; 22] = [
     "/top_teams.php",
 ];
 
+/// The clause every write of a founder's page ends with: the account that
+/// asked must still have the key that was read and still be allowed to act (not
+/// blocked, as `user_by_auth_stmt` requires). The compare-and-swap of the
+/// account pages in `site_account.rs` (`... AND authenticator = ?`, or `AND
+/// EXISTS (SELECT 1 FROM user WHERE id = ? AND authenticator = ?)` for a
+/// statement on another table) is the pattern; two parameters follow it, the
+/// account's ID and key.
+const ACTOR_STILL_OK: &str =
+    " AND EXISTS (SELECT 1 FROM user WHERE id = ? AND authenticator = ? AND blocked = 0)";
+
 /// Members listed on one page of the founder's forms.
 const FORM_PAGE: usize = 50;
 /// Members one removal takes at most: below D1's 100 bound parameters.
@@ -1038,10 +1048,15 @@ pub async fn team_create_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
 
 /// The notes of `team_join_form.php`, with the form.
 pub async fn team_join_form(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
-    let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(ctx.base, "team_join_form.php"));
-    };
     let id = if q.contains_key("id") { "id" } else { "teamid" };
+    // Only the parsed number goes into the address the login returns to.
+    let next = match int_param(q, id) {
+        Some(n) => format!("team_join_form.php?id={n}"),
+        None => "team_join_form.php".to_string(),
+    };
+    let Some(user) = viewer(ctx).await? else {
+        return Ok(to_login(ctx.base, &next));
+    };
     let team = match team_from_query(ctx, q, id).await? {
         Ok(t) => t,
         Err(page) => return Ok(page),
@@ -1201,8 +1216,13 @@ async fn founder_of(
     q: &Params,
     form_path: &str,
 ) -> CoreResult<Result<(User, Team), SitePage>> {
+    // The team's ID, parsed, goes back through the login with the page.
+    let next = match int_param(q, "teamid") {
+        Some(n) => format!("{form_path}?teamid={n}"),
+        None => form_path.to_string(),
+    };
     let Some(user) = viewer(ctx).await? else {
-        return Ok(Err(to_login(ctx.base, form_path)));
+        return Ok(Err(to_login(ctx.base, &next)));
     };
     let team = match team_from_query(ctx, q, "teamid").await? {
         Ok(t) => t,
@@ -1259,8 +1279,10 @@ pub async fn team_edit_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
     let done = ctx
         .db
         .run(stmt!(
+            format!(
             "UPDATE OR IGNORE team SET name = ?, name_lc = ?, url = ?, description = ?, type = ?, \
-             country = ?, joinable = ? WHERE id = ? AND userid = ? RETURNING id",
+             country = ?, joinable = ? WHERE id = ? AND userid = ?{ACTOR_STILL_OK} RETURNING id"
+        ),
             input.name.as_str(),
             input.name.to_lowercase(),
             input.url.as_str(),
@@ -1269,14 +1291,19 @@ pub async fn team_edit_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
             input.country.as_str(),
             input.joinable,
             team.id,
-            user.id
+            user.id,
+            user.id,
+            user.authenticator.as_str()
         ))
         .await?;
     if done.rows.is_empty() {
         return Ok(error_page(
             project,
             409,
-            &format!("The name '{}' is being used by another team.", input.name),
+            &format!(
+                "The name '{}' is being used by another team, or your account changed meanwhile.",
+                input.name
+            ),
         ));
     }
     Ok(go_to_team(ctx, team.id))
@@ -1316,15 +1343,24 @@ pub async fn team_manage(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
         let done = ctx
             .db
             .run(stmt!(
-                "DELETE FROM team WHERE id = ? AND userid = ? \
-                 AND NOT EXISTS (SELECT 1 FROM user WHERE teamid = ? AND teamid > 0) RETURNING id",
+                format!(
+                    "DELETE FROM team WHERE id = ? AND userid = ? \
+                     AND NOT EXISTS (SELECT 1 FROM user WHERE teamid = ? AND teamid > 0)\
+                     {ACTOR_STILL_OK} RETURNING id"
+                ),
                 team.id,
                 user.id,
-                team.id
+                team.id,
+                user.id,
+                user.authenticator.as_str()
             ))
             .await?;
         if done.rows.is_empty() {
-            return Ok(error_page(project, 409, "Can't delete non-empty team."));
+            return Ok(error_page(
+                project,
+                409,
+                "Can't delete non-empty team, or your account changed meanwhile.",
+            ));
         }
         return Ok(page(
             ctx,
@@ -1526,14 +1562,18 @@ pub async fn team_remove_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
     let marks = vec!["?"; ids.len()].join(",");
     let mut st = cb_db::Stmt::new(format!(
         "UPDATE user SET teamid = 0 WHERE teamid = ? AND teamid > 0 AND id != ? AND id IN ({marks}) \
-         AND EXISTS (SELECT 1 FROM team WHERE id = ? AND userid = ?) RETURNING id"
+         AND EXISTS (SELECT 1 FROM team WHERE id = ? AND userid = ?){ACTOR_STILL_OK} RETURNING id"
     ))
     .bind(team.id)
     .bind(team.userid);
     for id in &ids {
         st = st.bind(*id);
     }
-    st = st.bind(team.id).bind(user.id);
+    st = st
+        .bind(team.id)
+        .bind(user.id)
+        .bind(user.id)
+        .bind(user.authenticator.as_str());
     let removed = ctx.db.run(st).await?.rows.len();
     Ok(page(
         ctx,
@@ -1566,14 +1606,18 @@ pub async fn team_change_founder_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreRe
         .db
         .batch(vec![
             stmt!(
-                "UPDATE team SET userid = ? WHERE id = ? AND userid = ? \
-                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND teamid = ? AND blocked = 0) \
-                 RETURNING id",
+                format!(
+                    "UPDATE team SET userid = ? WHERE id = ? AND userid = ? \
+                 AND EXISTS (SELECT 1 FROM user WHERE id = ? AND teamid = ? AND blocked = 0)\
+                 {ACTOR_STILL_OK} RETURNING id"
+                ),
                 new_id,
                 team.id,
                 user.id,
                 new_id,
-                team.id
+                team.id,
+                user.id,
+                user.authenticator.as_str()
             ),
             stmt!("SELECT name FROM user WHERE id = ?", new_id),
         ])
@@ -1582,7 +1626,10 @@ pub async fn team_change_founder_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreRe
         return Ok(error_page(
             project,
             409,
-            &format!("User is not a member of {}.", team.name),
+            &format!(
+                "User is not a member of {}, or your account changed meanwhile.",
+                team.name
+            ),
         ));
     }
     let new_name = out[1]
@@ -1714,9 +1761,17 @@ pub async fn account_rows(
     let teams: Vec<Team> = ctx
         .db
         .run(stmt!(
-            "SELECT id, name, userid FROM team WHERE id = ? OR userid = ? ORDER BY id LIMIT 20",
+            // The current team on its own, so a long list of founded teams cannot
+            // push it out, then at most 20 others the account founded: one
+            // statement, a primary key lookup and the `team_founder` index.
+            "SELECT id, name, userid FROM (\
+             SELECT id, name, userid, 0 AS rank FROM team WHERE id = ? \
+             UNION ALL \
+             SELECT id, name, userid, 1 AS rank FROM (SELECT id, name, userid FROM team \
+             WHERE userid = ? AND id != ? ORDER BY id LIMIT 20)) ORDER BY rank, id",
             user.teamid,
-            user.id
+            user.id,
+            user.teamid
         ))
         .await?
         .decode()?;

@@ -120,13 +120,25 @@ impl World {
         post: bool,
         params: &[(&str, &str)],
     ) -> (SitePage, u64) {
+        self.page_on(&self.db, path, auth, post, params)
+    }
+
+    /// The same, through another handle on the database.
+    fn page_on(
+        &self,
+        db: &dyn Db,
+        path: &str,
+        auth: Option<&str>,
+        post: bool,
+        params: &[(&str, &str)],
+    ) -> (SitePage, u64) {
         let q: Params = params
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let random = || self.rand();
         let ctx = SiteCtx {
-            db: &self.db,
+            db,
             project: &self.project,
             base: "https://p.example/",
             auth,
@@ -1584,4 +1596,343 @@ fn page_costs_are_bounded() {
     // A credit grant does not touch the member index: it is partial and its
     // column is not in the grant's `SET`.
     assert_eq!(w.f("SELECT total_credit FROM team WHERE id = 1"), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// The writes of the team pages compare the account key they read.
+
+/// A database that, just before the first batch that starts with `prefix`,
+/// runs `change` (one `?`: the account's ID), as a request that arrived
+/// between the page's read of the account and its write would.
+struct Between<'a> {
+    inner: &'a SqliteDb,
+    prefix: &'static str,
+    change: &'static str,
+    user_id: i64,
+    fired: Cell<bool>,
+}
+
+const REKEY: &str =
+    "UPDATE user SET authenticator = 'replacedkey0000000000000000000000' WHERE id = ?";
+const BLOCK: &str = "UPDATE user SET blocked = 1 WHERE id = ?";
+
+#[async_trait(?Send)]
+impl Db for Between<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if !self.fired.get()
+            && stmts
+                .iter()
+                .any(|s| s.sql.trim_start().starts_with(self.prefix))
+        {
+            self.fired.set(true);
+            self.inner
+                .batch(vec![stmt!(self.change, self.user_id)])
+                .await?;
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+/// Submits `form` to `action` as `who`, with the account changed by `change`
+/// just before the statement that starts with `prefix`. Returns the page.
+fn raced(
+    w: &World,
+    who: &Account,
+    prefix: &'static str,
+    change: &'static str,
+    form: &SitePage,
+    action: &str,
+    changes: &[(&str, &str)],
+) -> SitePage {
+    let db = Between {
+        inner: &w.db,
+        prefix,
+        change,
+        user_id: who.id,
+        fired: Cell::new(false),
+    };
+    let mut q = hidden_fields(&form.body);
+    for (k, v) in changes {
+        q.retain(|(name, _)| name != k);
+        q.push((k.to_string(), v.to_string()));
+    }
+    let pairs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let page = w.page_on(&db, action, Some(&who.auth), true, &pairs).0;
+    assert!(db.fired.get(), "no statement started with {prefix}");
+    page
+}
+
+#[test]
+fn a_write_after_the_key_was_replaced_or_the_account_blocked_changes_nothing() {
+    for change in [REKEY, BLOCK] {
+        let w = World::new();
+        let ada = w.account("Ada");
+        let bob = w.account("Bob");
+        let cy = w.account("Cy");
+        let t = w.create(&ada, "Alpha", &[("joinable", "on")]);
+        w.join(&bob, t);
+        let id = t.to_string();
+        let q = [("teamid", id.as_str())];
+        let team = |w: &World| {
+            (
+                w.n("SELECT userid FROM team WHERE id = 1"),
+                w.n("SELECT nusers FROM team WHERE id = 1"),
+            )
+        };
+        let name = |w: &World| {
+            block_on(w.db.run(stmt!("SELECT name FROM team WHERE id = 1")))
+                .unwrap()
+                .rows[0]["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let reset = |w: &World, who: &Account| {
+            w.sql(&format!(
+                "UPDATE user SET authenticator = '{}', blocked = 0 WHERE id = {}",
+                who.auth, who.id
+            ));
+        };
+
+        // Edit the team.
+        let form = w.get("/team_edit_form.php", Some(&ada), &q);
+        let page = raced(
+            &w,
+            &ada,
+            "UPDATE OR IGNORE team",
+            change,
+            &form,
+            "/team_edit_action.php",
+            &[("name", "Renamed")],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!(name(&w), "Alpha");
+        reset(&w, &ada);
+
+        // Remove a member.
+        let form = w.get("/team_remove_inactive_form.php", Some(&ada), &q);
+        let page = raced(
+            &w,
+            &ada,
+            "UPDATE user SET teamid = 0 WHERE teamid",
+            change,
+            &form,
+            "/team_remove_inactive_action.php",
+            &[("remove_0", &bob.id.to_string())],
+        );
+        assert!(page.body.contains("0 members removed"), "{}", page.body);
+        assert_eq!(w.team_of(&bob), t);
+        reset(&w, &ada);
+
+        // Hand the team over.
+        let form = w.get("/team_change_founder_form.php", Some(&ada), &q);
+        let page = raced(
+            &w,
+            &ada,
+            "UPDATE team SET userid = ? WHERE id = ? AND userid = ?",
+            change,
+            &form,
+            "/team_change_founder_action.php",
+            &[("userid", &bob.id.to_string())],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!(team(&w), (ada.id, 2));
+        reset(&w, &ada);
+
+        // Join a team.
+        let form = w.get("/team_display.php", Some(&cy), &q);
+        let page = raced(
+            &w,
+            &cy,
+            "UPDATE user SET teamid = ? WHERE id",
+            change,
+            &form,
+            "/team_join.php",
+            &[],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!(w.team_of(&cy), 0);
+        reset(&w, &cy);
+
+        // Quit it.
+        let form = w.get("/team_quit_form.php", Some(&bob), &[]);
+        let page = raced(
+            &w,
+            &bob,
+            "UPDATE user SET teamid = 0 WHERE id",
+            change,
+            &form,
+            "/team_quit_action.php",
+            &[],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!(w.team_of(&bob), t);
+        reset(&w, &bob);
+
+        // Create a team.
+        let form = w.get("/team_create_form.php", Some(&cy), &[]);
+        let page = raced(
+            &w,
+            &cy,
+            "INSERT OR IGNORE INTO team",
+            change,
+            &form,
+            "/team_create_action.php",
+            &[("name", "Beta")],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!((w.n("SELECT count(*) FROM team"), w.team_of(&cy)), (1, 0));
+        reset(&w, &cy);
+
+        // Take a team with no founder.
+        w.sql("UPDATE team SET userid = 0 WHERE id = 1");
+        let form = w.get("/team_founder_transfer_form.php", Some(&bob), &[]);
+        let page = raced(
+            &w,
+            &bob,
+            "UPDATE team SET userid = ? WHERE id = ? AND userid = 0",
+            change,
+            &form,
+            "/team_founder_transfer_action.php",
+            &[],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!(w.n("SELECT userid FROM team WHERE id = 1"), 0);
+        reset(&w, &bob);
+
+        // Remove an empty team: the founder is not a member.
+        w.sql("UPDATE team SET userid = 1");
+        w.sql("UPDATE user SET teamid = 0");
+        let form = w.get(
+            "/team_manage.php",
+            Some(&ada),
+            &[("teamid", &id), ("action", "delete")],
+        );
+        assert!(form.body.contains("name=\"ttok\""), "{}", form.body);
+        let page = raced(
+            &w,
+            &ada,
+            "DELETE FROM team",
+            change,
+            &form,
+            "/team_manage.php",
+            &[("teamid", &id), ("action", "delete")],
+        );
+        assert_eq!(page.status, 409, "{}", page.body);
+        assert_eq!(w.n("SELECT count(*) FROM team"), 1);
+    }
+}
+
+#[test]
+fn the_login_returns_to_the_team_asked_for() {
+    let w = World::new();
+    let next = |path: &str, params: &[(&str, &str)]| {
+        let (page, _) = w.page(path, None, false, params);
+        assert_eq!(page.status, 303, "{path}");
+        page.location.unwrap()
+    };
+    let login = "https://p.example/login_form.php?next_url=";
+    assert_eq!(
+        next("/team_join_form.php", &[("id", "7")]),
+        format!("{login}team_join_form.php%3Fid%3D7")
+    );
+    assert_eq!(
+        next("/team_join_form.php", &[("teamid", " 8 ")]),
+        format!("{login}team_join_form.php%3Fid%3D8")
+    );
+    for path in [
+        "/team_edit_form.php",
+        "/team_manage.php",
+        "/team_remove_inactive_form.php",
+        "/team_change_founder_form.php",
+    ] {
+        let want = if path == "/team_edit_form.php" {
+            "team_manage.php"
+        } else {
+            &path[1..]
+        };
+        assert_eq!(
+            next(path, &[("teamid", "9")]),
+            format!("{login}{want}%3Fteamid%3D9"),
+            "{path}"
+        );
+    }
+    // Only the number: text that is not one is dropped, not copied.
+    for bad in ["1&x=2", "1/../..", "<script>", "", "1e3"] {
+        assert_eq!(
+            next("/team_join_form.php", &[("id", bad)]),
+            format!("{login}team_join_form.php"),
+            "{bad}"
+        );
+        assert_eq!(
+            next("/team_manage.php", &[("teamid", bad)]),
+            format!("{login}team_manage.php"),
+            "{bad}"
+        );
+    }
+    // The login form accepts the address it is given.
+    let page = w.get(
+        "/login_form.php",
+        None,
+        &[("next_url", "team_join_form.php?id=7")],
+    );
+    assert!(
+        page.body.contains("value=\"team_join_form.php?id=7\""),
+        "{}",
+        page.body
+    );
+}
+
+#[test]
+fn the_account_page_keeps_the_current_team_whatever_the_account_founded() {
+    let w = World::new();
+    let ada = w.account("Ada");
+    // 21 teams founded by Ada, which she is not in, and a newer one by someone else.
+    for i in 1..=21 {
+        w.sql(&format!(
+            "INSERT INTO team (id, create_time, userid, name, name_lc, expavg_time) VALUES ({i}, 1, {}, 'Founded {i:02}', 'founded {i:02}', 1)",
+            ada.id
+        ));
+    }
+    w.sql("INSERT INTO team (id, create_time, userid, name, name_lc, expavg_time, joinable) VALUES (22, 1, 99, 'Newest', 'newest', 1, 1)");
+    w.join(&ada, 22);
+    assert_eq!(w.team_of(&ada), 22);
+    let (home, n) = w.page("/home.php", Some(&ada.auth), false, &[]);
+    assert_eq!(n, 2, "the account and one statement for the teams");
+    assert!(home.body.contains("Member of team"), "{}", home.body);
+    assert!(home
+        .body
+        .contains("teamid=22\">Newest</a> &middot; <a href=\"team_quit_form.php\">Quit team</a>"));
+    assert!(!home.body.contains("<dt>Team</dt>"));
+    // The others are limited to 20, the oldest first.
+    assert_eq!(home.body.matches("Founder but not member of").count(), 20);
+    assert!(home.body.contains("Founded 20") && !home.body.contains("Founded 21"));
+
+    // As founder and member of one team too: its own Administer link.
+    w.sql(&format!(
+        "UPDATE team SET userid = {} WHERE id = 22",
+        ada.id
+    ));
+    let home = w.get("/home.php", Some(&ada), &[]);
+    assert!(home.body.contains("team_manage.php?teamid=22\">Administer"));
+    assert_eq!(home.body.matches("Founder but not member of").count(), 20);
+
+    // One statement: a primary key lookup and the founder index.
+    let plan = block_on(w.db.run(stmt!(
+        "EXPLAIN QUERY PLAN SELECT id, name, userid FROM (\
+         SELECT id, name, userid, 0 AS rank FROM team WHERE id = ? \
+         UNION ALL \
+         SELECT id, name, userid, 1 AS rank FROM (SELECT id, name, userid FROM team \
+         WHERE userid = ? AND id != ? ORDER BY id LIMIT 20)) ORDER BY rank, id",
+        22,
+        1,
+        22
+    )))
+    .unwrap();
+    let text: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r["detail"].as_str().unwrap().to_string())
+        .collect();
+    assert!(text.iter().all(|d| !d.starts_with("SCAN team")), "{text:?}");
 }
