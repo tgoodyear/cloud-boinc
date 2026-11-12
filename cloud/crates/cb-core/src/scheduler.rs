@@ -55,6 +55,7 @@ use crate::model::{
     AppVersion, Host, HostAppVersion, Platform, User, Workunit,
 };
 use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost, DEFAULT_FPOPS};
+use crate::site_delete::{account_guard, is_guard_failure};
 use crate::template::output_files;
 use crate::{Config, CoreError, CoreResult};
 
@@ -1121,20 +1122,40 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     let host = match host {
         Some(h) => h,
         None => {
-            let id = ctx
+            // Only while the account still has the key this request
+            // authenticated with and is not blocked (an account being deleted
+            // is): a request that began before the deletion makes no host.
+            let sql = format!(
+                "INSERT INTO host (id, create_time, userid, venue, host_cpid, expavg_time) \
+                 SELECT {}, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM user WHERE id = ? \
+                 AND authenticator = ? AND blocked = 0) RETURNING id",
+                crate::web::next_id_sql("host")
+            );
+            let inserted = ctx
                 .db
                 .run(stmt!(
-                    "INSERT INTO host (create_time, userid, venue, host_cpid, expavg_time) \
-                     VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    sql,
                     now,
                     user.id,
                     user.venue.as_str(),
                     request_cpid.as_str(),
-                    now
+                    now,
+                    user.id,
+                    user.authenticator.as_str()
                 ))
                 .await?
-                .scalar_i64()
-                .ok_or_else(|| CoreError::Invalid("host insert returned no id".into()))?;
+                .scalar_i64();
+            let Some(id) = inserted else {
+                out.reply.nucleus_only = true;
+                refuse(
+                    &mut out,
+                    "Invalid or missing account key.  To fix, remove and add this project.",
+                    "notice",
+                    DELAY_MISSING_KEY,
+                    "bad authenticator",
+                );
+                return Ok(out);
+            };
             Host {
                 id,
                 create_time: now,
@@ -1316,7 +1337,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         }
     }
 
-    let mut writes: Vec<Stmt> = Vec::new();
+    // The first statement stops the whole batch if the account was blocked or
+    // its key changed since this request read it (see `account_guard`).
+    let mut writes: Vec<Stmt> = vec![account_guard(user.id, &user.authenticator)];
     let mut transition: Vec<i64> = Vec::new();
 
     // A new day: the daily counts start again.
@@ -2734,7 +2757,31 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     }
 
     // Batch 5: everything this request changes.
-    let written = ctx.db.batch(writes).await?;
+    let written = match ctx.db.batch(writes).await {
+        Ok(w) => w,
+        Err(e) => {
+            let e = CoreError::from(e);
+            if !is_guard_failure(&e) {
+                return Err(e);
+            }
+            // Nothing was written. Reply as to an unknown key, without what
+            // the request had put in the reply so far.
+            let mut refused = SchedOutcome {
+                user_id: out.user_id,
+                host_id: out.host_id,
+                ..Default::default()
+            };
+            refused.reply.nucleus_only = true;
+            refuse(
+                &mut refused,
+                "Invalid or missing account key.  To fix, remove and add this project.",
+                "notice",
+                DELAY_MISSING_KEY,
+                "bad authenticator",
+            );
+            return Ok(refused);
+        }
+    };
 
     // The reply carries the results whose claims went through.
     let mut sent_versions: Vec<i64> = Vec::new();

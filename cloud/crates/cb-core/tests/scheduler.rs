@@ -1091,3 +1091,172 @@ fn a_resend_says_the_project_has_no_tasks_only_if_it_has_none() {
     assert!(!has_message(&out, "No tasks sent"));
     assert_eq!(probes(&sqls), 1);
 }
+
+// ---------------------------------------------------------------------------
+// An account that is deleted while one of its requests is under way.
+
+/// A database that starts the deletion of account 1 (the key changes and the
+/// account is blocked, as `start_deletion` does in one transaction) just before
+/// the first batch that has a statement starting with `trigger`: the request
+/// read the account, then the deletion committed, then the request writes.
+struct DeletedMeanwhile<'a> {
+    inner: &'a SqliteDb,
+    trigger: &'static str,
+    fired: Cell<bool>,
+}
+
+#[async_trait(?Send)]
+impl Db for DeletedMeanwhile<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if !self.fired.get() && stmts.iter().any(|s| s.sql.starts_with(self.trigger)) {
+            self.fired.set(true);
+            self.inner
+                .batch(vec![stmt!(
+                    "UPDATE user SET authenticator = 'deleted_1_x', email_addr = 'deleted_1_x', \
+                     name = 'deleted', blocked = 1 WHERE id = 1"
+                )])
+                .await?;
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+impl World {
+    fn rpc_on(&self, db: &dyn Db, req: &Req, now: i64) -> SchedOutcome {
+        let catalog = block_on(Catalog::load(&self.db)).unwrap();
+        let random = || self.rand();
+        let ctx = SchedCtx {
+            db,
+            config: &self.config,
+            plan_classes: &self.plan_classes,
+            catalog: &catalog,
+            code_sign_key: "",
+            now,
+            random: &random,
+            client_ip: "198.51.100.9",
+        };
+        block_on(handle_request(&ctx, &req.xml())).unwrap()
+    }
+}
+
+fn refused_as_unknown(out: &SchedOutcome) {
+    assert!(has_message(out, "Invalid or missing account key"));
+    assert_eq!((out.n_sent, out.n_reported, out.n_resent), (0, 0, 0));
+    assert!(out.transition.is_empty());
+    assert!(out.reply.results.is_empty() && out.reply.wus.is_empty());
+}
+
+#[test]
+fn a_request_cannot_make_a_computer_for_an_account_being_deleted() {
+    let w = World::new();
+    w.submit("j1", 1000, 1, 1);
+    let racing = DeletedMeanwhile {
+        inner: &w.db,
+        trigger: "INSERT INTO host",
+        fired: Cell::new(false),
+    };
+    let out = w.rpc_on(&racing, &Req::new(0), 2000);
+    assert!(racing.fired.get());
+    refused_as_unknown(&out);
+    assert_eq!(out.host_id, 0);
+    let hosts = block_on(w.db.run(stmt!("SELECT count(*) AS n FROM host"))).unwrap();
+    assert_eq!(hosts.scalar_i64(), Some(0));
+    let claimed = block_on(w.db.run(stmt!(
+        "SELECT count(*) AS n FROM result WHERE server_state = 4"
+    )))
+    .unwrap();
+    assert_eq!(claimed.scalar_i64(), Some(0));
+}
+
+#[test]
+fn the_writes_of_a_request_do_nothing_for_an_account_deleted_after_it_read_it() {
+    let w = World::new();
+    let wu1 = w.submit("j1", 1000, 1, 1);
+    w.submit("j2", 1000, 1, 1);
+    // A host with a task in progress.
+    let mut first = Req::new(0);
+    first.work_secs = 100.0;
+    first.ncpus = 1;
+    let out = w.rpc(&first, 2000);
+    assert_eq!(out.n_sent, 1);
+    let host = out.host_id;
+    let before_host = w.host(host);
+    let before_wu = w.wu(wu1);
+    let before_results: Vec<_> = w
+        .results(wu1)
+        .iter()
+        .map(|r| (r.server_state, r.received_time, r.outcome))
+        .collect();
+
+    // It reports the task, asks for work and changes the host's details; the
+    // deletion commits between the read and the batch of writes.
+    let mut req = Req::new(host);
+    req.seqno = 2;
+    req.domain = "changed-name".into();
+    req.reports = vec![("j1_0".into(), RESULT_FILES_UPLOADED, 0)];
+    let racing = DeletedMeanwhile {
+        inner: &w.db,
+        trigger: "SELECT CASE WHEN EXISTS (SELECT 1 FROM user WHERE id = ?",
+        fired: Cell::new(false),
+    };
+    let out = w.rpc_on(&racing, &req, 2500);
+    assert!(racing.fired.get());
+    refused_as_unknown(&out);
+
+    // The report, the host's new details, the claim of the next task and
+    // everything else the batch held were not written.
+    let after_host = w.host(host);
+    assert_eq!(after_host.rpc_time, before_host.rpc_time);
+    assert_eq!(after_host.domain_name, before_host.domain_name);
+    assert_eq!(after_host.rpc_seqno, before_host.rpc_seqno);
+    let after_wu = w.wu(wu1);
+    assert_eq!(
+        (after_wu.rev, after_wu.transition_time),
+        (before_wu.rev, before_wu.transition_time)
+    );
+    let after_results: Vec<_> = w
+        .results(wu1)
+        .iter()
+        .map(|r| (r.server_state, r.received_time, r.outcome))
+        .collect();
+    assert_eq!(after_results, before_results);
+    let sent = block_on(w.db.run(stmt!(
+        "SELECT count(*) AS n FROM result WHERE server_state = 4"
+    )))
+    .unwrap();
+    assert_eq!(sent.scalar_i64(), Some(1));
+
+    // The same request from an account that is not being deleted goes through.
+    let w2 = World::new();
+    w2.submit("j1", 1000, 1, 1);
+    let out = w2.rpc(&first, 2000);
+    assert_eq!(out.n_sent, 1);
+}
+
+#[test]
+fn a_new_computer_never_gets_the_id_of_one_that_was_deleted() {
+    let w = World::new();
+    let first = w.rpc(&Req::new(0), 2000).host_id;
+    assert_eq!(first, 1);
+    // The highest computer goes, and so does the table's only row.
+    block_on(w.db.run(stmt!("DELETE FROM host WHERE id = ?", first))).unwrap();
+    let mut again = Req::new(0);
+    again.cpid = "another".into();
+    again.domain = "other-box".into();
+    let second = w.rpc(&again, 2100).host_id;
+    assert!(second > first, "{second} after {first}");
+    // A computer that is not the highest changes nothing for the next.
+    let mut third = Req::new(0);
+    third.cpid = "third".into();
+    third.domain = "third-box".into();
+    let third = w.rpc(&third, 2200).host_id;
+    block_on(w.db.run(stmt!("DELETE FROM host WHERE id = ?", second))).unwrap();
+    let mut fourth = Req::new(0);
+    fourth.cpid = "fourth".into();
+    fourth.domain = "fourth-box".into();
+    let fourth = w.rpc(&fourth, 2300).host_id;
+    assert!(
+        fourth > third && third > second,
+        "{second} {third} {fourth}"
+    );
+}

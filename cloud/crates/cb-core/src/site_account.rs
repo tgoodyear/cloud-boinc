@@ -26,8 +26,8 @@ use crate::site::{
 };
 use crate::site_email::{self, EMAIL_CHANGE_WAIT_SECS};
 use crate::web::{
-    account_creation_refusal, html_escape, is_strict_email, is_valid_postal_code,
-    is_valid_user_name, is_valid_user_url, make_user, random_bytes, NewAccount,
+    html_escape, is_strict_email, is_valid_postal_code, is_valid_user_name, is_valid_user_url,
+    make_user, random_bytes, web_account_creation_closed, NewAccount,
 };
 use crate::CoreResult;
 
@@ -154,7 +154,7 @@ pub async fn logout(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
 
 /// `create_account_form.php` (and `signup.php`).
 pub fn create_account_form(project: &Project, q: &Params) -> SitePage {
-    if account_creation_refusal(&project.config).is_some() {
+    if web_account_creation_closed(&project.config) {
         return error_page(project, 403, "Account creation is disabled.");
     }
     let next = local_url(str_param(q, "next_url")).unwrap_or("home.php");
@@ -191,7 +191,7 @@ pub fn create_account_form(project: &Project, q: &Params) -> SitePage {
 /// in to it.
 pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
-    if account_creation_refusal(&project.config).is_some() {
+    if web_account_creation_closed(&project.config) {
         return Ok(error_page(project, 403, "Account creation is disabled."));
     }
     if !ctx.post {
@@ -259,6 +259,7 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
             user_name: name,
             country,
             postal_code,
+            show_hosts: project.config.default_show_hosts,
         },
     )
     .await?;
@@ -405,7 +406,7 @@ pub async fn edit_user_info_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
 // Password and email address.
 
 /// Whether `given` is the account's password or its account key.
-fn proves_account(pepper: &[u8], user: &User, given: &str) -> bool {
+pub(crate) fn proves_account(pepper: &[u8], user: &User, given: &str) -> bool {
     !given.is_empty()
         && (constant_time_eq(user.authenticator.as_bytes(), given.as_bytes())
             || (!user.passwd_hash.is_empty()
@@ -771,15 +772,33 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
 /// is derived from the key), ends the account's unused login and verification
 /// links, and logs this browser in with the new key. It asks for the session
 /// and the token only, since after an address undo the password is not known.
-/// The undo link of an address change is left alone: whoever has the key could
-/// otherwise end it. Computers attached with the old key stop working until
-/// they are attached again, and so do account managers that hold it.
+///
+/// The password goes with the key, in the same statement. Whoever had the old
+/// key could have set a password they know (the key is all `am_set_info.php`
+/// and the password page ask for), and `lookup_account.php` gives the key to
+/// an address and password: that password would be a way back to the new key.
+/// An account that has a password gets the peppered hash of a random value
+/// nobody knows (as an address undo does); one without stays without, which
+/// the `CASE` decides at write time, so a password set by a request racing
+/// this one is replaced as well. The holder sets a new password with the
+/// account key (the password page takes it for the current password), which
+/// the page says. The undo link of an address change is left alone: whoever
+/// has the key could otherwise end it. Computers attached with the old key
+/// stop working until they are attached again, and so do account managers that
+/// hold it.
 pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
     let Some(user) = viewer(ctx).await? else {
         return Ok(to_login(ctx.base, "reset_account_key.php"));
     };
     if !ctx.post {
+        let password = if user.passwd_hash.is_empty() {
+            ""
+        } else {
+            " Your password is removed too: it is replaced by one nobody knows, so that \
+             someone who set a password with the old key cannot use it to get the new \
+             key. You set a new one afterwards with the new key."
+        };
         return Ok(page(
             project,
             "Replace the account key",
@@ -787,11 +806,15 @@ pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
                 "<p>Your account key is what logs this browser in and what the computers \
                  attached to your account use. Replace it if someone else may have it: the \
                  old key and every session with it stop working, and so does the weak \
-                 account key. <strong>Every computer attached with the old key has to be \
-                 attached again</strong>, with the new key shown on your account page, and \
-                 so does every account manager that has it.</p>\n\
+                 account key.{password} <strong>Every computer attached with the old key has \
+                 to be attached again</strong>, with the new key shown on your account page, \
+                 and so does every account manager that has it.</p>\n\
+                 <p>This does not change the email address. If the address was changed and \
+                 that was not you, undo the change with the link sent to the previous \
+                 address first (it also ends the links sent to the new one), then replace \
+                 the key.</p>\n\
                  <form method=\"post\" action=\"reset_account_key.php\">\n{}\
-                 <p><input type=\"submit\" value=\"Replace the account key\"></p>\n</form>\n",
+                 <p><input type=\"submit\" class=\"danger\" value=\"Replace the account key\"></p>\n</form>\n",
                 token_fields(&user, ctx.now)
             ),
         ));
@@ -799,13 +822,24 @@ pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
     }
+    let Some(pepper) = ctx.pepper else {
+        return Ok(error_page(
+            project,
+            503,
+            "Replacing the account key is not available now.",
+        ));
+    };
     let new_key = random_hex_string(&random_bytes(ctx.random));
+    let unusable = pepper_passwd_hash(pepper, &random_hex_string(&random_bytes(ctx.random)));
     let out = ctx
         .db
         .batch(vec![
             stmt!(
-                "UPDATE user SET authenticator = ? WHERE id = ? AND authenticator = ? RETURNING id",
+                "UPDATE user SET authenticator = ?, \
+                 passwd_hash = CASE WHEN passwd_hash = '' THEN '' ELSE ? END \
+                 WHERE id = ? AND authenticator = ? RETURNING id",
                 new_key.as_str(),
+                unusable.as_str(),
                 user.id,
                 user.authenticator.as_str()
             ),
@@ -826,10 +860,22 @@ pub async fn reset_account_key(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
             "The account changed meanwhile; please try again.",
         ));
     }
-    let mut out = done(
+    let password = if user.passwd_hash.is_empty() {
+        ""
+    } else {
+        " Your password has been removed as well; set a new one on the password page, \
+         with the new account key in place of the current password."
+    };
+    let mut out = page(
         project,
         "Replace the account key",
-        "Your account key has been replaced. Attach your computers again with the new key shown on your account page.",
+        &format!(
+            "<p>Your account key has been replaced. Attach your computers again with the new \
+             key shown on your account page.{}</p>\n\
+             <p><a href=\"edit_passwd_form.php\">Set a password</a> \
+             \u{b7} <a href=\"home.php\">Your account</a></p>\n",
+            html_escape(password)
+        ),
     );
     // The server does not know how long the cookie it replaces was meant to
     // last (it only gets the value), so this one ends with the browser.
@@ -886,7 +932,7 @@ pub async fn prefs(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         if prefs.mod_time > 0.0 {
             b.push_str(&format!(
                 "<p>Last modified: {}</p>\n",
-                crate::site::time_str(prefs.mod_time as i64)
+                crate::site::time_str(prefs.mod_time.min(ctx.now as f64) as i64)
             ));
         }
     }

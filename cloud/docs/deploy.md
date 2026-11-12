@@ -286,6 +286,11 @@ site is unchanged. To turn email on:
    not onboarded or not yet verified, or `E_SENDER_DOMAIN_NOT_AVAILABLE`). It does not log
    addresses or message text.
 
+Account deletion (`enable_delete_account` in the config, see "Account deletion" in
+[architecture.md](architecture.md)) sends its confirmation link through the same transport, so it
+works only where email does. The pipeline Worker's purge cron finishes the deletion of large
+accounts in the background.
+
 The binding is commented out in the repository's `wrangler.toml` because the Cloudflare docs
 do not say whether a deploy of a Worker with a `send_email` binding succeeds on the Workers
 Free plan or before a sending domain exists. A deployment that is not ready for email keeps it
@@ -334,6 +339,49 @@ A deprecated version of an HAV app, a version superseded by a newer one and one 
 app's minimum version keep being sent for the workunits committed to them, so deprecate an old
 version when it should stop taking new workunits, and expect its files to be fetched until
 those workunits are done.
+
+## Health read
+
+One request tells an operator or a monitor whether the project is moving:
+
+```
+cboinc summary --url https://<host> --token-file <file>
+curl -H "Authorization: Bearer <token>" "https://<host>/admin/v1/summary?max_age=300"
+```
+
+The reply is JSON, one entry per application (deprecated ones are marked) and totals:
+
+| Field | Meaning |
+| --- | --- |
+| `unsent`, `in_progress` | tasks ready to send; tasks sent and not yet reported |
+| `oldest_unsent_age_secs` | age of the oldest unsent task; null when none is unsent. A number that keeps growing while hosts are asking for work suggests work that is not being sent |
+| `received_24h`, `validated_24h` | tasks reported in the last 24 hours, and how many of them have validated |
+| `errors_24h` | of those reported, by outcome: `client_error`, `couldnt_send`, `no_reply`, `didnt_need`, `validate_error`, `client_detached`, and `invalid` (ran, failed validation) |
+| `workunits_awaiting_validation`, `workunits_awaiting_assimilation` | workunits in those states; assimilation is waiting for the project to acknowledge |
+| `pipeline.running`, `last_sweep`, `sweep_age_secs` | whether the pipeline's cron ran in the last five minutes, from the time it records each minute; `running` stays true when no sweep was ever recorded |
+| `pipeline.transitions_due`, `transitioner_backlog_hours` | workunits whose next transition is due, and how long the earliest has waited |
+
+As a guide, not a rule from the code: `pipeline.running` true, a backlog of a few minutes at most, `workunits_awaiting_validation`
+near 0 (a workunit sits there only between a result arriving and its transition), and
+`workunits_awaiting_assimilation` falling to 0 as the project's assimilator acknowledges. The
+numbers come from a snapshot at most `max_age` seconds old (default 600; `as_of` and `age_secs` say
+which). Computing one reads the tasks received in the last day, so poll with the default or a
+larger age and use `max_age=0` only when needed; the read cost is in "Server status" in
+[architecture.md](architecture.md). `cboinc summary --check` prints the same and exits non-zero when
+`pipeline.running` is false, for a cron job or a monitor; `--app <name>` narrows it to one
+application.
+
+The same figures in the shape of the stock page are at `server_status.php?xml=1`, without a token.
+
+## Migration `0007`
+
+`migrations/0007_site_ops.sql` adds the `user_deletion` table (account deletion), the partial
+index `res_received` on `result (received_time)` (the 24-hour figures of the status page and the
+summary) and `wu_need_validate`. It is a prerequisite of the web Worker of this build (the status
+queries and the account deletion name them), of the admin Worker's `summary` and of the pipeline
+Worker's account deletion steps. It follows `0006_homogeneous.sql`; apply the files in numeric order. Its statements are written with
+`IF NOT EXISTS`, so running it again is harmless. Building `res_received` on a large `result`
+table writes one index entry per received task, once.
 
 ## Checks
 

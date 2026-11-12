@@ -5,12 +5,13 @@ use std::cell::{Cell, RefCell};
 use async_trait::async_trait;
 use cb_db::{normalize_number, Db, DbError, DbResult, Row, Rows, Stmt, Value};
 use rusqlite::types::ValueRef;
-use rusqlite::Connection;
+use rusqlite::{Connection, StatementStatus};
 
 pub struct SqliteDb {
     conn: RefCell<Connection>,
     written: Cell<u64>,
     statements: Cell<u64>,
+    steps: Cell<u64>,
 }
 
 fn err(e: rusqlite::Error) -> DbError {
@@ -24,6 +25,7 @@ impl SqliteDb {
             conn: RefCell::new(conn),
             written: Cell::new(0),
             statements: Cell::new(0),
+            steps: Cell::new(0),
         })
     }
 
@@ -41,7 +43,15 @@ impl SqliteDb {
         db.apply(include_str!("../../../migrations/0004_email.sql"))?;
         db.apply(include_str!("../../../migrations/0005_upload_epoch.sql"))?;
         db.apply(include_str!("../../../migrations/0006_homogeneous.sql"))?;
+        db.apply(include_str!("../../../migrations/0007_site_ops.sql"))?;
         Ok(db)
+    }
+
+    /// Virtual machine steps SQLite has taken for the statements run through
+    /// this handle: a measure of the rows a statement reads, for tests that
+    /// check that work is bounded.
+    pub fn vm_steps(&self) -> u64 {
+        self.steps.get()
     }
 
     /// Statements executed through this handle; each is a round trip on D1.
@@ -50,7 +60,7 @@ impl SqliteDb {
     }
 }
 
-fn run_one(conn: &Connection, stmt: &Stmt) -> rusqlite::Result<Rows> {
+fn run_one(conn: &Connection, stmt: &Stmt) -> rusqlite::Result<(Rows, u64)> {
     let mut prepared = conn.prepare_cached(&stmt.sql)?;
     for (i, p) in stmt.params.iter().enumerate() {
         match p {
@@ -80,9 +90,11 @@ fn run_one(conn: &Connection, stmt: &Stmt) -> rusqlite::Result<Rows> {
         out.rows.push(map);
     }
     drop(rows);
+    let steps = prepared.get_status(StatementStatus::VmStep) as u64;
+    prepared.reset_status(StatementStatus::VmStep);
     drop(prepared);
     out.rows_read = out.rows.len() as u64;
-    Ok(out)
+    Ok((out, steps))
 }
 
 #[async_trait(?Send)]
@@ -93,8 +105,9 @@ impl Db for SqliteDb {
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
             let before = tx.total_changes();
-            let mut rows =
+            let (mut rows, steps) =
                 run_one(&tx, stmt).map_err(|e| DbError::Backend(format!("{e}: {}", stmt.sql)))?;
+            self.steps.set(self.steps.get() + steps);
             rows.changes = tx.total_changes() - before;
             rows.rows_written = rows.changes;
             self.written.set(self.written.get() + rows.changes);

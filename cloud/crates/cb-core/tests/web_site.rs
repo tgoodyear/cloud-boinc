@@ -170,19 +170,19 @@ impl World {
     }
 
     fn host(&self, userid: i64, domain: &str, rpc_time: i64) -> i64 {
-        block_on(self.db.run(stmt!(
-            "INSERT INTO host (create_time, userid, rpc_time, domain_name, last_ip_addr, \
+        // The way the scheduler makes one: the ID comes from `next_id_sql`.
+        let sql = format!(
+            "INSERT INTO host (id, create_time, userid, rpc_time, domain_name, last_ip_addr, \
              external_ip_addr, p_vendor, p_model, p_ncpus, os_name, os_version, m_nbytes, d_total, \
-             serialnum) VALUES (1, ?, ?, ?, '192.0.2.7', '198.51.100.7', 'Vendor', \
+             serialnum) VALUES ({}, 1, ?, ?, ?, '192.0.2.7', '198.51.100.7', 'Vendor', \
              'Model <script>alert(1)</script>', 4, 'Linux', '6.1', 8e9, 1e11, \
              '[BOINC|8.0.4][CUDA|1|8192MB]') RETURNING id",
-            userid,
-            rpc_time,
-            domain
-        )))
-        .unwrap()
-        .scalar_i64()
-        .unwrap()
+            cb_core::web::next_id_sql("host")
+        );
+        block_on(self.db.run(stmt!(sql, userid, rpc_time, domain)))
+            .unwrap()
+            .scalar_i64()
+            .unwrap()
     }
 
     fn workunit(&self, name: &str, appid: i64) -> i64 {
@@ -301,6 +301,16 @@ impl World {
         }
         let pairs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         self.page(action, auth, true, &pairs)
+    }
+
+    fn workunit_rev(&self, id: i64) -> i64 {
+        block_on(
+            self.db
+                .run(stmt!("SELECT rev FROM workunit WHERE id = ?", id)),
+        )
+        .unwrap()
+        .scalar_i64()
+        .unwrap()
     }
 
     fn user(&self, id: i64) -> cb_core::model::User {
@@ -3468,6 +3478,9 @@ fn the_account_key_can_be_replaced_by_the_session_and_the_token() {
     );
     let new_info = block_on(am_get_info(&w.db, &new_key)).unwrap();
     assert!(new_info.contains("<success/>"));
+    // The password went with the key: it no longer finds the new key, and the
+    // address-and-password login no longer works. The key is what logs in, and
+    // with it the holder sets a new password.
     let found = block_on(cb_core::web::lookup_account(
         &w.db,
         PEPPER,
@@ -3475,7 +3488,8 @@ fn the_account_key_can_be_replaced_by_the_session_and_the_token() {
         &passwd_hash("secret", "ada@new.example"),
     ))
     .unwrap();
-    assert!(found.contains(&new_key) && !found.contains(&ada.auth));
+    assert_eq!(error_num(&found), Some(-206), "{found}");
+    assert!(!found.contains(&new_key) && !found.contains(&ada.auth));
     // The form of the old key is no good with the new one.
     assert_eq!(
         w.submit(&form, "/reset_account_key.php", Some(&new_key), &[])
@@ -4978,4 +4992,1403 @@ fn secondary_and_danger_buttons_out_rank_the_primary_rule() {
     let ada = verify.account("ada@example.com", "secret", "Ada");
     let body = verify.get("/home.php", Some(&ada.auth), &[]).body;
     assert!(body.contains("class=\"secondary\" value=\"Send verification email\""));
+}
+
+// ---------------------------------------------------------------------------
+// Replacing the account key takes the password with it.
+
+fn key_of(page: &SitePage) -> String {
+    page.set_cookie
+        .as_deref()
+        .unwrap()
+        .trim_start_matches("auth=")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn replace_key(w: &World, auth: &str) -> String {
+    let form = w.get("/reset_account_key.php", Some(auth), &[]);
+    let (done, _) = w.submit(&form, "/reset_account_key.php", Some(auth), &[]);
+    assert_eq!(done.status, 200, "{}", done.body);
+    key_of(&done)
+}
+
+fn lookup(w: &World, email: &str, password: &str) -> String {
+    block_on(cb_core::web::lookup_account(
+        &w.db,
+        PEPPER,
+        email,
+        &passwd_hash(password, email),
+    ))
+    .unwrap()
+}
+
+#[test]
+fn a_password_set_with_the_old_key_does_not_survive_its_replacement() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+
+    // Whoever has the key sets a password they know, by the account manager
+    // RPC and by the password page (which takes the key for the current
+    // password), and could then ask `lookup_account.php` for the key.
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            (
+                "password_hash",
+                &passwd_hash("attacker1", "ada@example.com"),
+            ),
+        ],
+    );
+    assert!(reply.contains("<success/>"), "{reply}");
+    assert!(lookup(&w, "ada@example.com", "attacker1").contains(&ada.auth));
+    let form = w.get("/edit_passwd_form.php", Some(&ada.auth), &[]);
+    let (page, _) = w.submit(
+        &form,
+        "/edit_passwd_action.php",
+        Some(&ada.auth),
+        &[
+            ("old_passwd", &ada.auth),
+            ("passwd", "attacker2"),
+            ("passwd2", "attacker2"),
+        ],
+    );
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(lookup(&w, "ada@example.com", "attacker2").contains(&ada.auth));
+    let before = w.user(ada.id);
+
+    // The page says what happens to the password.
+    let ask = w.get("/reset_account_key.php", Some(&ada.auth), &[]);
+    assert!(ask.body.contains("password is removed too"), "{}", ask.body);
+    assert!(ask.body.contains("email address"));
+
+    let new_key = replace_key(&w, &ada.auth);
+    let after = w.user(ada.id);
+    assert_eq!(after.authenticator, new_key);
+    assert_ne!(after.passwd_hash, before.passwd_hash);
+    assert!(!after.passwd_hash.is_empty());
+
+    // Neither password finds the new key or logs in; nor does the old key.
+    for pw in ["attacker1", "attacker2", "secret"] {
+        let found = lookup(&w, "ada@example.com", pw);
+        assert_eq!(error_num(&found), Some(-206), "{pw}: {found}");
+        assert!(!found.contains(&new_key));
+        assert_eq!(w.login_by_password("ada@example.com", pw), 403, "{pw}");
+    }
+    let (reply, _) = am_set_info(
+        &w,
+        &[
+            ("account_key", &ada.auth),
+            (
+                "password_hash",
+                &passwd_hash("attacker3", "ada@example.com"),
+            ),
+        ],
+    );
+    assert_eq!(error_num(&reply), Some(-136), "{reply}");
+    assert_eq!(w.user(ada.id).passwd_hash, after.passwd_hash);
+
+    // The holder, logged in with the new key, sets a new password with it.
+    let done_page = w.get("/edit_passwd_form.php", Some(&new_key), &[]);
+    let (page, _) = w.submit(
+        &done_page,
+        "/edit_passwd_action.php",
+        Some(&new_key),
+        &[
+            ("old_passwd", &new_key),
+            ("passwd", "fresh-pass"),
+            ("passwd2", "fresh-pass"),
+        ],
+    );
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(lookup(&w, "ada@example.com", "fresh-pass").contains(&new_key));
+    assert_eq!(w.login_by_password("ada@example.com", "fresh-pass"), 303);
+
+    // Or through a login link mailed to the address, which gets the same key.
+    w.request_login_link("ada@example.com");
+    let login = w.last_link("ada@example.com", "login_action.php");
+    assert!(logged_in_as(
+        &w.follow(&login, None, true),
+        &Account {
+            id: ada.id,
+            auth: new_key.clone()
+        }
+    ));
+}
+
+#[test]
+fn an_account_without_a_password_stays_without_one() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.sql("UPDATE user SET passwd_hash = ''");
+    let ask = w.get("/reset_account_key.php", Some(&ada.auth), &[]);
+    assert!(!ask.body.contains("password is removed"));
+    let new_key = replace_key(&w, &ada.auth);
+    assert_eq!(w.user(ada.id).passwd_hash, "");
+    assert_eq!(w.user(ada.id).authenticator, new_key);
+}
+
+#[test]
+fn a_password_set_by_a_request_racing_the_replacement_is_replaced_too() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let form = w.get("/reset_account_key.php", Some(&ada.auth), &[]);
+    let sent = hidden_fields(&form.body);
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    // Before the replacement writes, the other request has set a password
+    // (after reading the same account, with the old key).
+    let raced = "attacker-hash-before";
+    let racing = changed_meanwhile(
+        &w,
+        stmt!(
+            "UPDATE user SET passwd_hash = ? WHERE id = ?",
+            raced,
+            ada.id
+        ),
+    );
+    let (page, _) = w.page_on(
+        &racing,
+        "/reset_account_key.php",
+        Some(&ada.auth),
+        true,
+        &pairs,
+    );
+    assert_eq!(page.status, 200, "{}", page.body);
+    let u = w.user(ada.id);
+    assert_ne!(u.passwd_hash, raced);
+    assert!(!u.passwd_hash.is_empty());
+    let new_key = u.authenticator.clone();
+    assert_ne!(new_key, ada.auth);
+
+    // After it: the other request's own update is conditional on the key it
+    // read, as every write is, and finds another key.
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let form = w.get("/reset_account_key.php", Some(&ada.auth), &[]);
+    let sent = hidden_fields(&form.body);
+    let pairs: Vec<(&str, &str)> = sent.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let racing = changed_around_tokens(
+        &w,
+        stmt!(
+            "UPDATE user SET passwd_hash = 'attacker-hash-after' WHERE id = ? AND authenticator = ?",
+            ada.id,
+            ada.auth.as_str()
+        ),
+        true,
+    );
+    let (page, _) = w.page_on(
+        &racing,
+        "/reset_account_key.php",
+        Some(&ada.auth),
+        true,
+        &pairs,
+    );
+    assert_eq!(page.status, 200);
+    assert_ne!(w.user(ada.id).passwd_hash, "attacker-hash-after");
+}
+
+// ---------------------------------------------------------------------------
+// Account deletion.
+
+fn delete_world(method: i32) -> World {
+    let w = World::with_config(&MAIL_CONFIG.replace(
+        "</config>",
+        &format!("<enable_delete_account>{method}</enable_delete_account>\n</config>"),
+    ));
+    w.use_mail.set(true);
+    w
+}
+
+/// A workunit with one result per state a user's task can be in.
+fn tasks_of(w: &World, userid: i64, hostid: i64) -> [i64; 3] {
+    let wu = w.workunit("wu_a", 1);
+    let in_progress = w.result(wu, "r_in_progress", hostid, userid, 4, "");
+    let unvalidated = w.result(wu, "r_unvalidated", hostid, userid, 5, "");
+    w.sql("UPDATE result SET validate_state = 0 WHERE name = 'r_unvalidated'");
+    let valid = w.result(wu, "r_valid", hostid, userid, 5, "");
+    [in_progress, unvalidated, valid]
+}
+
+/// The request page, then the link of the message, as a browser would.
+fn ask_for_the_link(w: &World, auth: &str, password: &str) -> Link {
+    let form = w.get("/delete_account_request.php", Some(auth), &[]);
+    assert_eq!(form.status, 200, "{}", form.body);
+    let (page, _) = w.submit(
+        &form,
+        "/delete_account_request.php",
+        Some(auth),
+        &[("passwd", password)],
+    );
+    assert_eq!(page.status, 200, "{}", page.body);
+    w.last_link("ada@example.com", "delete_account_confirm.php")
+}
+
+fn confirm(w: &World, link: &Link, password: &str) -> SitePage {
+    let mut pairs: Vec<(&str, &str)> = link
+        .1
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    pairs.push(("passwd", password));
+    w.page(&link.0, None, true, &pairs).0
+}
+
+fn rows(w: &World, sql: &str) -> i64 {
+    block_on(w.db.run(stmt!(sql)))
+        .unwrap()
+        .scalar_i64()
+        .unwrap()
+}
+
+#[test]
+fn deleting_an_account_in_wipe_mode_removes_it_and_detaches_its_tasks() {
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    let h1 = w.host(ada.id, "box1", 5);
+    let h2 = w.host(ada.id, "box2", 5);
+    let bobs_host = w.host(bob.id, "bobs", 5);
+    let [in_progress, unvalidated, valid] = tasks_of(&w, ada.id, h1);
+    let bobs = w.result(w.workunit("wu_b", 1), "r_bob", bobs_host, bob.id, 5, "");
+    w.sql("INSERT INTO host_app_version (host_id, app_version_id) VALUES (1, 1), (2, 1), (3, 1)");
+
+    // The page is for a logged-in account, and the request needs the form
+    // token and the password.
+    assert_eq!(w.get("/delete_account_request.php", None, &[]).status, 303);
+    let form = w.get("/delete_account_request.php", Some(&ada.auth), &[]);
+    assert!(form.body.contains("cannot be undone"), "{}", form.body);
+    assert_eq!(
+        w.post(
+            "/delete_account_request.php",
+            Some(&ada.auth),
+            &[("passwd", "secret")]
+        )
+        .status,
+        403
+    );
+    let (wrong, _) = w.submit(
+        &form,
+        "/delete_account_request.php",
+        Some(&ada.auth),
+        &[("passwd", "nope")],
+    );
+    assert_eq!(wrong.status, 403);
+    assert!(w.mails().is_empty());
+    assert!(w
+        .get("/home.php", Some(&ada.auth), &[])
+        .body
+        .contains("delete_account_request.php"));
+
+    // The right password mails a link; a second request in ten minutes sends
+    // nothing.
+    let (page, _) = w.submit(
+        &form,
+        "/delete_account_request.php",
+        Some(&ada.auth),
+        &[("passwd", "secret")],
+    );
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(w.mails().len(), 1);
+    assert_eq!(w.mails()[0].to(), "ada@example.com");
+    assert!(w.mails()[0]
+        .body()
+        .contains("delete_account_confirm.php?id="));
+    assert!(!w.mails()[0].body().contains("Ada"), "no name in a message");
+    let (again, _) = w.submit(
+        &form,
+        "/delete_account_request.php",
+        Some(&ada.auth),
+        &[("passwd", "secret")],
+    );
+    assert_eq!(again.status, 429);
+    assert_eq!(w.mails().len(), 1);
+    let link = w.last_link("ada@example.com", "delete_account_confirm.php");
+
+    // The link: a GET shows the form without deleting; a wrong password or a
+    // bad token deletes nothing and keeps the link.
+    let shown = w.follow(&link, None, false);
+    assert_eq!(shown.status, 200);
+    assert!(shown.body.contains("cannot be recovered"));
+    assert_eq!(confirm(&w, &link, "nope").status, 403);
+    let mut bad = link.clone();
+    for (k, v) in bad.1.iter_mut() {
+        if k == "token" {
+            *v = "0".repeat(64);
+        }
+    }
+    assert_eq!(w.follow(&bad, None, false).status, 403);
+    assert_eq!(confirm(&w, &bad, "secret").status, 403);
+    assert_eq!(w.user(ada.id).name, "Ada");
+
+    let done = confirm(&w, &link, "secret");
+    assert_eq!(done.status, 200, "{}", done.body);
+    assert!(done.body.contains("has been deleted"));
+    assert!(done.set_cookie.as_deref().unwrap().starts_with("auth=;"));
+
+    // The account is gone, with its computers and its tokens; nothing else is.
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM user WHERE id = {}", ada.id)
+        ),
+        0
+    );
+    assert_eq!(rows(&w, "SELECT count(*) FROM user"), 1);
+    assert_eq!(rows(&w, "SELECT count(*) FROM host"), 1);
+    assert_eq!(rows(&w, "SELECT count(*) FROM host_app_version"), 1);
+    assert_eq!(rows(&w, "SELECT count(*) FROM token"), 0);
+    assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 0);
+    let state = |id: i64| -> (i64, i64, i64, i64, i64) {
+        let r = block_on(w.db.run(stmt!(
+            "SELECT server_state, outcome, validate_state, userid, hostid FROM result WHERE id = ?",
+            id
+        )))
+        .unwrap();
+        let row = &r.rows[0];
+        let g = |c: &str| row[c].as_i64().unwrap();
+        (
+            g("server_state"),
+            g("outcome"),
+            g("validate_state"),
+            g("userid"),
+            g("hostid"),
+        )
+    };
+    // In progress and waiting for validation: cancelled, as upstream does,
+    // and detached. A validated one is only detached.
+    assert_eq!(state(in_progress), (5, 7, 2, 0, 0));
+    assert_eq!(state(unvalidated), (5, 7, 2, 0, 0));
+    assert_eq!(state(valid), (5, 1, 1, 0, 0));
+    assert_eq!(state(bobs), (5, 1, 1, bob.id, bobs_host));
+    let _ = h2;
+    // The workunit of a cancelled task is due, for the transitioner.
+    assert_eq!(
+        rows(
+            &w,
+            "SELECT transition_time FROM workunit WHERE name = 'wu_a'"
+        ),
+        NOW
+    );
+    assert_eq!(
+        rows(
+            &w,
+            "SELECT transition_time FROM workunit WHERE name = 'wu_b'"
+        ),
+        2147483647
+    );
+
+    // The key, the address and the link no longer reach anything.
+    assert_eq!(w.get("/home.php", Some(&ada.auth), &[]).status, 303);
+    assert_eq!(w.login_by_password("ada@example.com", "secret"), 403);
+    assert_eq!(w.follow(&link, None, false).status, 403);
+    let found = lookup(&w, "ada@example.com", "secret");
+    assert_eq!(error_num(&found), Some(-136));
+}
+
+#[test]
+fn deleting_an_account_in_obfuscate_mode_keeps_the_row_and_clears_the_person() {
+    let w = delete_world(1);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.sql(
+        "UPDATE user SET country = 'United Kingdom', postal_code = 'X1', url = 'u.example', \
+           show_hosts = 1, venue = 'home', total_credit = 123, cross_project_id = 'cpid', \
+           project_prefs = '<project_preferences>\n</project_preferences>'",
+    );
+    let h = w.host(ada.id, "box1", 5);
+    let [in_progress, ..] = tasks_of(&w, ada.id, h);
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+
+    let u = w.user(ada.id);
+    assert_eq!(u.name, "deleted");
+    assert!(u.email_addr.starts_with("deleted_") && u.authenticator.starts_with("deleted_"));
+    assert_eq!(u.email_addr, u.authenticator);
+    assert_eq!(
+        (
+            u.country.as_str(),
+            u.postal_code.as_str(),
+            u.url.as_str(),
+            u.venue.as_str()
+        ),
+        ("", "", "", "")
+    );
+    assert_eq!(
+        (
+            u.passwd_hash.as_str(),
+            u.project_prefs.as_str(),
+            u.show_hosts
+        ),
+        ("", "", 0)
+    );
+    assert_eq!(u.cross_project_id, "");
+    assert_eq!(u.total_credit, 123.0);
+    assert_eq!(u.blocked, 1);
+    // The computer lost its names and addresses and stays; the tasks stay
+    // where they are, as upstream leaves them.
+    let host = block_on(w.db.run(stmt!(
+        "SELECT domain_name, last_ip_addr, external_ip_addr, userid FROM host WHERE id = ?",
+        h
+    )))
+    .unwrap();
+    let row = &host.rows[0];
+    assert_eq!(row["domain_name"], "deleted");
+    assert_eq!(
+        (
+            row["last_ip_addr"].as_str(),
+            row["external_ip_addr"].as_str()
+        ),
+        (Some(""), Some(""))
+    );
+    assert_eq!(row["userid"], ada.id);
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT userid FROM result WHERE id = {in_progress}")
+        ),
+        ada.id
+    );
+    assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 0);
+    assert_eq!(rows(&w, "SELECT count(*) FROM token"), 0);
+    assert_eq!(w.get("/home.php", Some(&ada.auth), &[]).status, 303);
+    assert_eq!(w.login_by_password("ada@example.com", "secret"), 403);
+    // A blocked account is unknown to the RPCs.
+    assert_eq!(
+        error_num(&block_on(am_get_info(&w.db, &u.authenticator)).unwrap()),
+        Some(-136)
+    );
+}
+
+#[test]
+fn account_deletion_has_conditions() {
+    // Off by default, and a project that sends no email cannot send the link.
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    assert_eq!(
+        w.get("/delete_account_request.php", Some(&ada.auth), &[])
+            .status,
+        404
+    );
+    assert_eq!(w.get("/delete_account_confirm.php", None, &[]).status, 404);
+    assert!(!w
+        .get("/home.php", Some(&ada.auth), &[])
+        .body
+        .contains("delete_account_request.php"));
+    // Upstream's value 3 (project-defined code) and unknown values are off.
+    for value in [0, 3, 7] {
+        let w = delete_world(value);
+        let ada = w.account("ada@example.com", "secret", "Ada");
+        assert_eq!(
+            w.get("/delete_account_request.php", Some(&ada.auth), &[])
+                .status,
+            404,
+            "{value}"
+        );
+    }
+    let w = World::with_config(&CONFIG.replace(
+        "</config>",
+        "<enable_delete_account>2</enable_delete_account></config>",
+    ));
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let page = w.get("/delete_account_request.php", Some(&ada.auth), &[]);
+    assert_eq!(page.status, 503);
+    assert!(page.body.contains("does not send email"));
+
+    // Not within seven days of an address change.
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    assert_eq!(
+        w.change_email(&ada.auth, "ada@new.example", "secret")
+            .status,
+        200
+    );
+    let page = w.get("/delete_account_request.php", Some(&ada.auth), &[]);
+    assert_eq!(page.status, 403);
+    assert!(page.body.contains("7 days"));
+    w.at(EMAIL_WAIT + 10);
+    assert_eq!(
+        w.get("/delete_account_request.php", Some(&ada.auth), &[])
+            .status,
+        200
+    );
+
+    // The change time is checked again when the link is used: an address
+    // changed after the request keeps the account.
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    w.sql("UPDATE user SET email_addr_change_time = 2000000000");
+    assert_eq!(confirm(&w, &link, "secret").status, 403);
+    assert_eq!(w.user(ada.id).name, "Ada");
+
+    // An account with no password proves itself with its key.
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    w.sql("UPDATE user SET passwd_hash = ''");
+    let link = ask_for_the_link(&w, &ada.auth, &ada.auth);
+    assert_eq!(confirm(&w, &link, "secret").status, 403);
+    assert_eq!(confirm(&w, &link, &ada.auth).status, 200);
+}
+
+const EMAIL_WAIT: i64 = 7 * 86400;
+
+/// Records what each statement binds and how many a batch has.
+struct Counting<'a> {
+    inner: &'a SqliteDb,
+    most_params: Cell<usize>,
+    statements: Cell<usize>,
+}
+
+#[async_trait(?Send)]
+impl Db for Counting<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        for s in &stmts {
+            self.most_params
+                .set(self.most_params.get().max(s.params.len()));
+        }
+        self.statements.set(self.statements.get() + stmts.len());
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn a_large_account_is_removed_in_bounded_steps() {
+    use cb_core::site_delete::{delete_account_steps, HOSTS_PER_STATEMENT, TASKS_PER_STATEMENT};
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    let (hosts, tasks) = (HOSTS_PER_STATEMENT * 2 + 7, TASKS_PER_STATEMENT * 16 + 11);
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {hosts}) \
+         INSERT INTO host (create_time, userid, domain_name) SELECT 1, {}, 'h' || n FROM c",
+        ada.id
+    ));
+    w.sql("INSERT INTO host (create_time, userid, domain_name) VALUES (1, 2, 'bobs')");
+    let wu = w.workunit("wu_big", 1);
+    // Every fourth task is in progress, so that both kinds are in the chunks.
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {tasks}) \
+         INSERT INTO result (create_time, workunitid, server_state, outcome, hostid, userid, name, \
+         xml_doc_in, appid, validate_state) \
+         SELECT 1, {wu}, CASE WHEN n % 4 = 0 THEN 4 ELSE 5 END, CASE WHEN n % 4 = 0 THEN 0 ELSE 1 END, \
+         1 + n % {hosts}, {}, 'r' || n, '', 1, 1 FROM c",
+        ada.id
+    ));
+    w.sql(&format!(
+        "INSERT INTO result (create_time, workunitid, server_state, outcome, hostid, userid, name, \
+         xml_doc_in, appid, validate_state) VALUES (1, {wu}, 5, 1, {}, {}, 'bobs', '', 1, 1)",
+        hosts + 1,
+        bob.id
+    ));
+    // Assignments to the account (more than a chunk) and to some of its
+    // computers (three each, so a chunk of computers has to wait for them), and
+    // one to a computer of another account.
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {}) \
+         INSERT INTO assignment (create_time, target_id, target_type, multi, workunitid) \
+         SELECT 1, {}, 2, 0, {wu} FROM c",
+        TASKS_PER_STATEMENT + 100,
+        ada.id
+    ));
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) \
+         INSERT INTO assignment (create_time, target_id, target_type, multi, workunitid) \
+         SELECT 1, h.id, 1, 0, {wu} FROM c, host h WHERE h.userid = {} AND h.id <= 5",
+        ada.id
+    ));
+    w.sql(&format!(
+        "INSERT INTO assignment (create_time, target_id, target_type, multi, workunitid) \
+         VALUES (1, {}, 1, 0, {wu}), (1, {}, 2, 0, {wu})",
+        hosts + 1,
+        bob.id
+    ));
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+
+    // The page did a few steps and no more; the account is queued.
+    assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 1);
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM user WHERE id = {}", ada.id)
+        ),
+        1
+    );
+    assert_eq!(w.user(ada.id).blocked, 1);
+    assert!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM result WHERE userid = {}", ada.id)
+        ) > 0
+    );
+
+    // Each pass runs at most its statements, binds few values, and gets
+    // there.
+    let counting = Counting {
+        inner: &w.db,
+        most_params: Cell::new(0),
+        statements: Cell::new(0),
+    };
+    let mut passes = 0;
+    loop {
+        passes += 1;
+        let before = counting.statements.get();
+        let report = block_on(delete_account_steps(&counting, NOW + 5, 22)).unwrap();
+        assert!(counting.statements.get() - before <= 22, "{report:?}");
+        assert_eq!(report.statements, counting.statements.get() - before);
+        if report.pending == 0 {
+            assert!(report.finished <= 1);
+            break;
+        }
+        assert!(passes < 50, "no end in sight");
+    }
+    assert!(passes > 1, "the work was not split");
+    assert!(
+        counting.most_params.get() <= 10,
+        "{}",
+        counting.most_params.get()
+    );
+    assert_eq!(rows(&w, "SELECT count(*) FROM user"), 1);
+    assert_eq!(rows(&w, "SELECT count(*) FROM host"), 1);
+    assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 0);
+    // Only the other account's two assignments are left.
+    assert_eq!(rows(&w, "SELECT count(*) FROM assignment"), 2);
+    assert_eq!(rows(&w, "SELECT count(*) FROM result WHERE userid > 0"), 1);
+    assert_eq!(rows(&w, "SELECT count(*) FROM result WHERE hostid > 0"), 1);
+    // Every task that was in progress was cancelled, and none other.
+    assert_eq!(
+        rows(
+            &w,
+            "SELECT count(*) FROM result WHERE outcome = 7 AND validate_state = 2"
+        ),
+        tasks / 4
+    );
+    assert_eq!(
+        rows(&w, "SELECT count(*) FROM result WHERE server_state = 4"),
+        0
+    );
+    // A pass with nothing queued reads the queue and stops.
+    let report = block_on(delete_account_steps(&counting, NOW + 5, 22)).unwrap();
+    assert_eq!(
+        (report.finished, report.pending, report.statements),
+        (0, 0, 1)
+    );
+}
+
+#[test]
+fn a_task_that_appears_while_the_account_is_removed_keeps_the_row_until_it_is_dealt_with() {
+    use cb_core::site_delete::delete_account_steps;
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+    // The account finished; make another one that is only queued, with a
+    // task that a scheduler request which was under way writes after the
+    // task pass.
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    w.sql(&format!(
+        "UPDATE user SET blocked = 1, authenticator = 'deleted_bob_x', email_addr = 'deleted_bob_x' \
+         WHERE id = {}",
+        bob.id
+    ));
+    w.sql(&format!(
+        "INSERT INTO user_deletion (userid, mode, create_time, gen) \
+         VALUES ({}, 2, 1, 'deleted_bob_x')",
+        bob.id
+    ));
+    let wu = w.workunit("wu_late", 1);
+    let racing = ChangedMeanwhile {
+        inner: &w.db,
+        other: RefCell::new(vec![stmt!(
+            "INSERT INTO result (create_time, workunitid, server_state, outcome, hostid, userid, \
+             name, xml_doc_in, appid) VALUES (1, ?, 5, 1, 0, ?, 'late', '', 1)",
+            wu,
+            bob.id
+        )]),
+        trigger: &["DELETE FROM user WHERE"],
+        after: false,
+    };
+    // The last batch finds the task and leaves the account for the next pass.
+    let report = block_on(delete_account_steps(&racing, NOW, 14)).unwrap();
+    assert_eq!((report.finished, report.pending), (0, 1), "{report:?}");
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM user WHERE id = {}", bob.id)
+        ),
+        1
+    );
+    let report = block_on(delete_account_steps(&w.db, NOW, 16)).unwrap();
+    assert_eq!((report.finished, report.pending), (1, 0), "{report:?}");
+    assert_eq!(rows(&w, "SELECT count(*) FROM user"), 0);
+    assert_eq!(rows(&w, "SELECT userid FROM result WHERE name = 'late'"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Stock options of an imported config.
+
+fn config_with(tags: &str) -> String {
+    CONFIG.replace("</config>", &format!("{tags}\n</config>"))
+}
+
+const NEW_ACCOUNT: [(&str, &str); 4] = [
+    ("new_name", "Ada"),
+    ("new_email_addr", "ada@example.com"),
+    ("passwd", "secret1"),
+    ("passwd2", "secret1"),
+];
+
+/// What the RPC, the sign-up page and the pages that link to it say.
+fn creation(tags: &str) -> (Option<i32>, String, u16, u16, bool, bool) {
+    let w = World::with_config(&config_with(tags));
+    let random = || w.rand();
+    let reply = block_on(cb_core::web::create_account(
+        &w.db,
+        &w.project.config,
+        PEPPER,
+        NOW,
+        &random,
+        &NewAccount {
+            email_addr: "rpc@example.com",
+            passwd_hash: &passwd_hash("secret1", "rpc@example.com"),
+            user_name: "Rpc",
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let message = reply
+        .split("<error_msg>")
+        .nth(1)
+        .and_then(|m| m.split("</error_msg>").next())
+        .unwrap_or("")
+        .to_string();
+    (
+        error_num(&reply),
+        message,
+        w.get("/create_account_form.php", None, &[]).status,
+        w.post("/create_account_action.php", None, &NEW_ACCOUNT)
+            .status,
+        cb_core::web::master_page(&w.project).contains("create_account_form.php"),
+        cb_core::web::project_config(&w.project).contains("<account_creation_disabled/>"),
+    )
+}
+
+#[test]
+fn account_creation_follows_the_stock_options() {
+    const NOT_ACCEPTING: &str = "The project is not accepting new accounts.";
+    const VISIT: &str = "Please visit the project web site to create an account, then try again.";
+    // Nothing stated: closed everywhere, and the project config says so.
+    assert_eq!(
+        creation(""),
+        (Some(-1), NOT_ACCEPTING.into(), 403, 403, false, true)
+    );
+    // `make_project`'s config states it as 0: open everywhere.
+    assert_eq!(
+        creation("<disable_account_creation>0</disable_account_creation>"),
+        (None, String::new(), 200, 303, true, false)
+    );
+    // `disable_account_creation` closes the RPC and the page, and says so.
+    assert_eq!(
+        creation("<disable_account_creation/>"),
+        (Some(-1), NOT_ACCEPTING.into(), 403, 403, false, true)
+    );
+    // `disable_account_creation_rpc`: the RPC sends the client to the web
+    // site, where sign-up stays open; the config does not call it disabled.
+    assert_eq!(
+        creation("<disable_account_creation>0</disable_account_creation><disable_account_creation_rpc>1</disable_account_creation_rpc>"),
+        (Some(-1), VISIT.into(), 200, 303, true, false)
+    );
+    // With the site closed as well, there is nothing to send the client to.
+    assert_eq!(
+        creation("<disable_account_creation>0</disable_account_creation><disable_account_creation_rpc>1</disable_account_creation_rpc><no_web_account_creation>1</no_web_account_creation>"),
+        (Some(-1), NOT_ACCEPTING.into(), 403, 403, false, false)
+    );
+    // The web site only: the tag upstream's PHP reads, and the one
+    // `setup_project.py` writes.
+    for tag in [
+        "<no_web_account_creation/>",
+        "<disable_web_account_creation>1</disable_web_account_creation>",
+    ] {
+        assert_eq!(
+            creation(&format!(
+                "<disable_account_creation>0</disable_account_creation>{tag}"
+            )),
+            (None, String::new(), 403, 403, false, false),
+            "{tag}"
+        );
+    }
+    // The fork's own option keeps working, and `0` for either stock tag
+    // leaves things open.
+    assert_eq!(
+        creation("<account_creation>1</account_creation><no_web_account_creation>0</no_web_account_creation>"),
+        (None, String::new(), 200, 303, true, false)
+    );
+    assert_eq!(
+        creation("<account_creation>0</account_creation>"),
+        (Some(-1), NOT_ACCEPTING.into(), 403, 403, false, true)
+    );
+}
+
+#[test]
+fn new_accounts_show_their_computers_as_the_config_says() {
+    let shown = |tags: &str| -> (i64, i64) {
+        let w = World::with_config(&config_with(&format!(
+            "<disable_account_creation>0</disable_account_creation>{tags}"
+        )));
+        let random = || w.rand();
+        let reply = block_on(cb_core::web::create_account(
+            &w.db,
+            &w.project.config,
+            PEPPER,
+            NOW,
+            &random,
+            &NewAccount {
+                email_addr: "rpc@example.com",
+                passwd_hash: &passwd_hash("secret1", "rpc@example.com"),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        assert!(reply.contains("<authenticator>"), "{reply}");
+        let via_rpc = w.user(1).show_hosts as i64;
+        assert_eq!(
+            w.post("/create_account_action.php", None, &NEW_ACCOUNT)
+                .status,
+            303
+        );
+        (via_rpc, w.user(2).show_hosts as i64)
+    };
+    // Upstream's `default_show_hosts`: shown unless privacy is on by default.
+    // The config of `make_project` says `enable_privacy_by_default` is 0.
+    assert_eq!(
+        shown("<enable_privacy_by_default>0</enable_privacy_by_default>"),
+        (1, 1)
+    );
+    assert_eq!(
+        shown("<enable_privacy_by_default>1</enable_privacy_by_default>"),
+        (0, 0)
+    );
+    assert_eq!(shown("<enable_privacy_by_default/>"), (0, 0));
+    // Not stated: private, as accounts here always were.
+    assert_eq!(shown(""), (0, 0));
+}
+
+#[test]
+fn results_pages_follow_show_results() {
+    let on = World::with_config(&config_with("<show_results>1</show_results>"));
+    let off = World::with_config(&config_with("<show_results>0</show_results>"));
+    let unstated = World::new();
+    for (w, shown) in [(&on, true), (&off, false), (&unstated, true)] {
+        let ada = w.account("ada@example.com", "secret", "Ada");
+        let h = w.host(ada.id, "box", NOW - 10);
+        w.sql("UPDATE user SET show_hosts = 1");
+        let results = w.get(
+            "/results.php",
+            Some(&ada.auth),
+            &[("hostid", &h.to_string())],
+        );
+        assert_eq!(results.status, if shown { 200 } else { 404 });
+        let results = w.get(
+            "/results.php",
+            Some(&ada.auth),
+            &[("userid", &ada.id.to_string())],
+        );
+        assert_eq!(results.status, if shown { 200 } else { 404 });
+        let has_link = |page: SitePage| page.body.contains("results.php");
+        assert_eq!(has_link(w.get("/home.php", Some(&ada.auth), &[])), shown);
+        assert_eq!(
+            has_link(w.get("/hosts_user.php", Some(&ada.auth), &[])),
+            shown
+        );
+        assert_eq!(
+            has_link(w.get(
+                "/show_host_detail.php",
+                Some(&ada.auth),
+                &[("hostid", &h.to_string())]
+            )),
+            shown
+        );
+    }
+}
+
+#[test]
+fn robots_txt_covers_the_upstream_sample() {
+    // `html/user/sample_robots.txt` of this tree (the build container has only
+    // `cloud/`, so it is copied here).
+    let sample = "User-agent: *\nDisallow: /account\nDisallow: /add_venue\nDisallow: /am_\n\
+                  Disallow: /bug_report\nDisallow: /edit_\nDisallow: /host_\nDisallow: /prefs_\n\
+                  Disallow: /result\nDisallow: /team\nDisallow: /workunit\n";
+    for line in sample.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            cb_core::site::ROBOTS_TXT.contains(&format!("{line}\n")),
+            "{line}"
+        );
+    }
+    // And the pages of this site that upstream's list leaves out.
+    for page in [
+        "/home.php",
+        "/reset_account_key.php",
+        "/delete_account",
+        "/login_",
+    ] {
+        assert!(
+            cb_core::site::ROBOTS_TXT.contains(&format!("Disallow: {page}")),
+            "{page}"
+        );
+    }
+    // Pages a crawler should reach are not listed.
+    for page in [
+        "/server_status.php",
+        "/index.php",
+        "/get_project_config.php",
+    ] {
+        assert!(!cb_core::site::ROBOTS_TXT.contains(page));
+    }
+}
+
+#[test]
+fn am_set_info_refuses_a_global_prefs_mod_time_far_in_the_future() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let doc = |t: &str| {
+        format!("<global_preferences>\n<mod_time>{t}</mod_time>\n<max_ncpus_pct>50</max_ncpus_pct>\n</global_preferences>")
+    };
+    for bad in ["1e30", "9223372036854775807", "inf", "NaN", "2000100000"] {
+        let (reply, _) = am_set_info(
+            &w,
+            &[("account_key", &ada.auth), ("global_prefs", &doc(bad))],
+        );
+        assert_eq!(
+            error_num(&reply),
+            Some(cb_proto::web_rpc::err::ERR_XML_PARSE),
+            "{bad}: {reply}"
+        );
+        assert!(reply.contains("mod_time"), "{reply}");
+        assert_eq!(w.user(ada.id).global_prefs, "");
+    }
+    // Zero, negative, past and a little ahead are stored as they come.
+    for ok in ["0", "-5", "1700000000", "2000000100"] {
+        let (reply, _) = am_set_info(
+            &w,
+            &[("account_key", &ada.auth), ("global_prefs", &doc(ok))],
+        );
+        assert!(reply.contains("<success/>"), "{ok}: {reply}");
+        assert!(w
+            .user(ada.id)
+            .global_prefs
+            .contains(&format!("<mod_time>{ok}<")));
+    }
+}
+
+#[test]
+fn a_wiped_account_leaves_nothing_that_names_its_ids() {
+    let w = delete_world(2);
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    // Ada has the highest IDs: nothing else keeps them from being given out
+    // again, so everything that names them has to go first.
+    let h = w.host(ada.id, "box1", 5);
+    w.sql(&format!(
+        "INSERT INTO host_app_version (host_id, app_version_id) VALUES ({h}, 1)"
+    ));
+    let wu = w.workunit("wu_v", 1);
+    let valid = w.result(wu, "r_valid", h, ada.id, 5, "");
+    let reserved = w.result(wu, "r_reserved", 0, 0, 1, "");
+    w.sql(&format!(
+        "INSERT INTO assignment (create_time, target_id, target_type, multi, workunitid, resultid) \
+         VALUES (1, {}, 2, 0, {wu}, {reserved}), (1, {h}, 1, 0, {wu}, {reserved})",
+        ada.id
+    ));
+    w.sql(&format!(
+        "INSERT INTO batch (user_id, create_time, name) VALUES ({}, 1, 'b1'), ({}, 1, 'b2')",
+        ada.id, bob.id
+    ));
+    let rev = w.workunit_rev(wu);
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+
+    // Every table that names the IDs, by the schema: `host.userid`,
+    // `result.userid`, `result.hostid`, `host_app_version.host_id`,
+    // `assignment.target_id`, `batch.user_id`, `token.userid`.
+    assert_eq!(rows(&w, "SELECT count(*) FROM assignment"), 0);
+    assert_eq!(rows(&w, "SELECT count(*) FROM host_app_version"), 0);
+    assert_eq!(rows(&w, "SELECT count(*) FROM token"), 0);
+    assert_eq!(rows(&w, "SELECT user_id FROM batch WHERE name = 'b1'"), 0);
+    assert_eq!(
+        rows(&w, "SELECT user_id FROM batch WHERE name = 'b2'"),
+        bob.id
+    );
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT hostid + userid FROM result WHERE id = {valid}")
+        ),
+        0
+    );
+    // The workunit of a task that was only detached has a new revision.
+    assert!(w.workunit_rev(wu) > rev);
+
+    // The IDs are not given out again: a new account and a new computer get
+    // IDs above the ones that went (`id_floor`), so nothing that might still
+    // name the old ones can be taken for them.
+    let signup = [
+        ("new_name", "Cy"),
+        ("new_email_addr", "cy@example.com"),
+        ("passwd", "secret1"),
+        ("passwd2", "secret1"),
+        ("country", "United Kingdom"),
+        ("postal_code", ""),
+    ];
+    assert_eq!(
+        w.post("/create_account_action.php", None, &signup).status,
+        303
+    );
+    let cy = rows(
+        &w,
+        "SELECT id FROM user WHERE email_addr = 'cy@example.com'",
+    );
+    assert!(cy > ada.id, "{cy} after {}", ada.id);
+    let new_host = w.host(cy, "cy-box", 5);
+    assert!(new_host > h, "{new_host} after {h}");
+    assert_eq!(
+        rows(
+            &w,
+            &format!(
+                "SELECT count(*) FROM assignment WHERE (target_type = 2 AND target_id = {cy}) \
+                 OR (target_type = 1 AND target_id = {new_host})"
+            )
+        ),
+        0
+    );
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM result WHERE userid = {cy} OR hostid = {new_host}")
+        ),
+        0
+    );
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM batch WHERE user_id = {cy}")
+        ),
+        0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// IDs are not given out twice.
+
+#[test]
+fn user_and_host_ids_are_not_reused_after_deletes() {
+    let w = World::with_config(OPEN_CONFIG);
+    let sign_up = |name: &str| -> i64 {
+        let email = format!("{}@example.com", name.to_lowercase());
+        let q = [
+            ("new_name", name),
+            ("new_email_addr", email.as_str()),
+            ("passwd", "secret1"),
+            ("passwd2", "secret1"),
+            ("country", "United Kingdom"),
+            ("postal_code", ""),
+        ];
+        assert_eq!(w.post("/create_account_action.php", None, &q).status, 303);
+        rows(
+            &w,
+            &format!("SELECT id FROM user WHERE email_addr = '{email}'"),
+        )
+    };
+    let (a, b, c) = (sign_up("Ann"), sign_up("Bea"), sign_up("Cat"));
+    assert_eq!((a, b, c), (1, 2, 3));
+    let (h1, h2, h3) = (w.host(a, "h1", 5), w.host(a, "h2", 5), w.host(a, "h3", 5));
+    assert_eq!((h1, h2, h3), (1, 2, 3));
+
+    // The highest user and the highest host go: the next ones are higher still.
+    w.sql("DELETE FROM user WHERE id = 3");
+    w.sql("DELETE FROM host WHERE id = 3");
+    let d = sign_up("Dan");
+    let h4 = w.host(d, "h4", 5);
+    assert_eq!((d, h4), (4, 4));
+
+    // One that is not the highest changes nothing for the next.
+    w.sql("DELETE FROM user WHERE id = 2");
+    w.sql("DELETE FROM host WHERE id = 1");
+    let (e, h5) = (sign_up("Eve"), w.host(a, "h5", 5));
+    assert_eq!((e, h5), (5, 5));
+
+    // Nor does the table being empty: the floor stays.
+    w.sql("DELETE FROM user");
+    w.sql("DELETE FROM host");
+    assert_eq!(rows(&w, "SELECT count(*) FROM user"), 0);
+    let f = sign_up("Fay");
+    let h6 = w.host(f, "h6", 5);
+    assert_eq!((f, h6), (6, 6));
+
+    // Raised by whoever deletes, an operator included, and never lowered.
+    assert_eq!(
+        rows(&w, "SELECT last_id FROM id_floor WHERE name = 'user'"),
+        5
+    );
+    w.sql("DELETE FROM user WHERE id = 6");
+    w.sql("INSERT INTO user (id, create_time, email_addr, authenticator) VALUES (2, 1, 'z@x.example', 'kz')");
+    w.sql("DELETE FROM user WHERE id = 2");
+    assert_eq!(
+        rows(&w, "SELECT last_id FROM id_floor WHERE name = 'user'"),
+        6
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A pass that is stale, and the cost of a pass.
+
+/// Runs a whole deletion, and puts an account in its place with the same ID, a
+/// computer and a task in progress, before the first destructive batch of the
+/// pass under test: the pass read its queue row, another pass finished it, and a
+/// new account has the ID (which nothing does now, see above, but nothing
+/// should depend on it).
+struct Superseded<'a> {
+    inner: &'a SqliteDb,
+    fired: Cell<bool>,
+    /// The obfuscate method keeps the account's row, so there is no new account
+    /// to put in its place; a computer is given details again instead.
+    obfuscate: bool,
+}
+
+#[async_trait(?Send)]
+impl Db for Superseded<'_> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        let first = if self.obfuscate {
+            "UPDATE host SET domain_name = 'deleted'"
+        } else {
+            "UPDATE workunit SET transition_time = ?"
+        };
+        let destructive = stmts.iter().any(|s| s.sql.starts_with(first));
+        if destructive && !self.fired.replace(true) {
+            cb_core::site_delete::delete_account_steps(self.inner, NOW, 14)
+                .await
+                .unwrap();
+            if self.obfuscate {
+                self.inner
+                    .batch(vec![stmt!(
+                        "UPDATE host SET domain_name = 'keep-me', last_ip_addr = '203.0.113.1'"
+                    )])
+                    .await
+                    .unwrap();
+                return self.inner.batch(stmts).await;
+            }
+            self.inner
+                .batch(vec![
+                    stmt!("INSERT INTO user (id, create_time, email_addr, name, authenticator) VALUES (1, 1, 'new@example.com', 'New', 'newkey')"),
+                    stmt!("INSERT INTO host (id, create_time, userid, domain_name) VALUES (1, 1, 1, 'newbox')"),
+                    stmt!("INSERT INTO result (id, create_time, workunitid, server_state, hostid, userid, name, xml_doc_in, appid) VALUES (900, 1, 1, 4, 1, 1, 'new_task', '', 1)"),
+                    stmt!("INSERT INTO assignment (create_time, target_id, target_type, multi, workunitid) VALUES (1, 1, 2, 0, 1), (1, 1, 1, 0, 1)"),
+                    stmt!("INSERT INTO batch (user_id, create_time, name) VALUES (1, 1, 'new_batch')"),
+                    stmt!("INSERT INTO token (userid, type, token_hash, create_time, expire_time) VALUES (1, 'L', 'x', 1, 2)"),
+                ])
+                .await
+                .unwrap();
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn a_pass_that_read_a_finished_deletion_changes_nothing_that_is_not_its_own() {
+    for mode in [1, 2] {
+        let w = delete_world(mode);
+        let ada = w.account("ada@example.com", "secret", "Ada");
+        w.host(ada.id, "box", 5);
+        let wu = w.workunit("wu_s", 1);
+        w.result(wu, "old_task", 1, ada.id, 4, "");
+        let link = ask_for_the_link(&w, &ada.auth, "secret");
+        // Not through the page, which would run the steps: start it only.
+        let hash = cb_crypto::account::token_hash(param(&link, "token"));
+        block_on(w.db.run(stmt!(
+            "UPDATE token SET data = '' WHERE token_hash = ?",
+            hash.as_str()
+        )))
+        .unwrap();
+        let user = w.user(ada.id);
+        let started = block_on(cb_core::site_delete::start_deletion(
+            &w.db,
+            &user,
+            &hash,
+            "deleted_9_gen",
+            mode,
+            NOW,
+        ))
+        .unwrap();
+        assert!(started);
+        assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 1);
+
+        let stale = Superseded {
+            inner: &w.db,
+            fired: Cell::new(false),
+            obfuscate: mode == 1,
+        };
+        let report = block_on(cb_core::site_delete::delete_account_steps(&stale, NOW, 14)).unwrap();
+        assert!(stale.fired.get());
+        assert_eq!(report.pending, 0, "{report:?}");
+        // The queue row is gone with the deletion that finished, and what the
+        // stale pass would have changed is as it was left.
+        assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 0);
+        if mode == 1 {
+            assert_eq!(
+                rows(&w, "SELECT count(*) FROM host WHERE domain_name = 'keep-me' AND last_ip_addr = '203.0.113.1'"),
+                1
+            );
+            continue;
+        }
+        assert_eq!(rows(&w, "SELECT blocked FROM user WHERE name = 'New'"), 0);
+        assert_eq!(
+            rows(
+                &w,
+                "SELECT count(*) FROM host WHERE domain_name = 'newbox' AND userid = 1"
+            ),
+            1
+        );
+        assert_eq!(
+            rows(
+                &w,
+                "SELECT count(*) FROM result WHERE name = 'new_task' AND server_state = 4 \
+                 AND userid = 1 AND hostid = 1"
+            ),
+            1
+        );
+        assert_eq!(rows(&w, "SELECT count(*) FROM assignment"), 2);
+        assert_eq!(
+            rows(&w, "SELECT user_id FROM batch WHERE name = 'new_batch'"),
+            1
+        );
+        assert_eq!(rows(&w, "SELECT count(*) FROM token WHERE userid = 1"), 1);
+    }
+}
+
+#[test]
+fn no_task_is_left_naming_a_computer_that_is_gone() {
+    use cb_core::site_delete::{delete_account_steps, TASKS_PER_STATEMENT};
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let bob = w.account("bob@example.com", "secret", "Bob");
+    let host = w.host(ada.id, "box", 5);
+    // One computer, a window of tasks in progress and one more.
+    let wu = w.workunit("wu_501", 1);
+    let tasks = TASKS_PER_STATEMENT + 1;
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {tasks}) \
+         INSERT INTO result (create_time, workunitid, server_state, outcome, hostid, userid, name, \
+         xml_doc_in, appid, validate_state) SELECT 1, {wu}, 4, 0, {host}, {}, 't' || n, '', 1, 0 FROM c",
+        ada.id
+    ));
+    let dangling = "SELECT count(*) FROM result WHERE hostid > 0 \
+                    AND hostid NOT IN (SELECT id FROM host)";
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    // The confirm page does one inline round: a window of 500 is cancelled.
+    // Whatever happens to the computer, no task is left that names one that is
+    // not there.
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+    assert_eq!(rows(&w, dangling), 0);
+    assert_eq!(rows(&w, "SELECT count(*) FROM user_deletion"), 1);
+    assert_eq!(
+        rows(&w, "SELECT count(*) FROM result WHERE server_state = 4"),
+        1,
+        "the task outside the window is still in progress"
+    );
+
+    // Another account's next computer gets a new ID, and could not get the
+    // remaining task through the old one if it did.
+    let other = w.host(bob.id, "bobs", 5);
+    assert!(other > host);
+    assert_eq!(
+        rows(
+            &w,
+            &format!("SELECT count(*) FROM result WHERE hostid = {other}")
+        ),
+        0
+    );
+    // The next pass finishes and cancels the rest.
+    let report = block_on(delete_account_steps(&w.db, NOW + 1, 14)).unwrap();
+    assert_eq!((report.finished, report.pending), (1, 0), "{report:?}");
+    assert_eq!(
+        rows(&w, &format!("SELECT count(*) FROM host WHERE id = {host}")),
+        0
+    );
+    assert_eq!(rows(&w, "SELECT count(*) FROM result WHERE hostid > 0"), 0);
+    assert_eq!(
+        rows(&w, "SELECT count(*) FROM result WHERE server_state = 4"),
+        0
+    );
+    assert_eq!(rows(&w, dangling), 0);
+}
+
+#[test]
+fn the_work_of_a_pass_does_not_grow_with_the_tasks_left() {
+    use cb_core::site_delete::{delete_account_steps, TASKS_PER_STATEMENT};
+    let w = delete_world(2);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let wu = w.workunit("wu_many", 1);
+    // Several thousand validated tasks and none that can be cancelled: a search
+    // for those must not read them all on every round.
+    let tasks = TASKS_PER_STATEMENT * 12;
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {tasks}) \
+         INSERT INTO result (create_time, workunitid, server_state, outcome, hostid, userid, name, \
+         xml_doc_in, appid, validate_state) SELECT 1, {wu}, 5, 1, 0, {}, 'v' || n, '', 1, 1 FROM c",
+        ada.id
+    ));
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+    let left = |w: &World| rows(w, "SELECT count(*) FROM result WHERE userid > 0");
+    assert!(left(&w) > 0);
+
+    // The plan of each statement that takes the window is a search of the
+    // account's entries in `res_user` with a limit.
+    let plan = block_on(w.db.run(Stmt {
+        sql: format!(
+            "EXPLAIN QUERY PLAN SELECT id FROM result WHERE userid = ? AND userid > 0 \
+             ORDER BY id LIMIT {TASKS_PER_STATEMENT}"
+        ),
+        params: vec![1.into()],
+    }))
+    .unwrap();
+    let plan: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r["detail"].as_str().unwrap().into())
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|d| d.contains("USING INDEX res_user")
+                || d.contains("USING COVERING INDEX res_user")),
+        "{plan:?}"
+    );
+    assert!(!plan.iter().any(|d| d.contains("TEMP B-TREE")), "{plan:?}");
+
+    // The steps each pass takes read about the same however many tasks are
+    // left, and the passes are as many as the windows.
+    let mut costs = Vec::new();
+    let mut passes = 0;
+    while left(&w) > 0 {
+        let before = w.db.vm_steps();
+        let remaining = left(&w);
+        let report = block_on(delete_account_steps(&w.db, NOW + 1, 14)).unwrap();
+        let spent = w.db.vm_steps() - before;
+        // One round of a window each; the pass may also have done the last.
+        if remaining > TASKS_PER_STATEMENT * 2 {
+            costs.push(spent);
+        }
+        passes += 1;
+        assert!(passes <= 20, "{report:?}");
+    }
+    assert!(costs.len() >= 5, "{costs:?}");
+    let (first, last) = (costs[0], *costs.last().unwrap());
+    assert!(
+        last <= first + first / 4,
+        "a pass costs more as the tasks left grow fewer: {costs:?}"
+    );
+    // Linear: a window per round, the inline round, and one pass for the end.
+    assert!(passes <= 12 + 1, "{passes} passes for {tasks} tasks");
 }

@@ -24,9 +24,10 @@ use crate::mail::{Mail, Mailer};
 use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
 use crate::site_account;
+use crate::site_delete;
 use crate::site_email;
 use crate::site_ui::{self, site_header};
-use crate::web::{account_creation_refusal, html_escape, page, show_user_xml, weak_account_key};
+use crate::web::{html_escape, page, show_user_xml, weak_account_key, web_account_creation_closed};
 use crate::CoreResult;
 
 #[derive(serde::Deserialize)]
@@ -174,7 +175,7 @@ impl<'a> SiteCtx<'a> {
 }
 
 /// The paths [`site_page`] serves.
-pub const SITE_PATHS: [&str; 27] = [
+pub const SITE_PATHS: [&str; 29] = [
     "/login_form.php",
     "/login_action.php",
     "/logout.php",
@@ -202,6 +203,8 @@ pub const SITE_PATHS: [&str; 27] = [
     "/validate_email_addr.php",
     "/recover_email.php",
     "/reset_account_key.php",
+    "/delete_account_request.php",
+    "/delete_account_confirm.php",
 ];
 
 /// Headers every site page is sent with: no framing by another site (the
@@ -214,6 +217,31 @@ pub const SITE_HEADERS: [(&str, &str); 4] = [
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
 ];
+
+/// `robots.txt`. Upstream ships `html/user/sample_robots.txt`, which a project
+/// copies to `robots.txt` by hand; this is that file, plus the pages this site
+/// has that change or show an account.
+pub const ROBOTS_TXT: &str = "User-agent: *\n\
+Disallow: /account\n\
+Disallow: /add_venue\n\
+Disallow: /am_\n\
+Disallow: /bug_report\n\
+Disallow: /create_account\n\
+Disallow: /delete_account\n\
+Disallow: /edit_\n\
+Disallow: /home.php\n\
+Disallow: /host_\n\
+Disallow: /hosts_user.php\n\
+Disallow: /login_\n\
+Disallow: /logout.php\n\
+Disallow: /prefs.php\n\
+Disallow: /prefs_\n\
+Disallow: /reset_account_key.php\n\
+Disallow: /result\n\
+Disallow: /show_host_detail.php\n\
+Disallow: /team\n\
+Disallow: /validate_email_addr.php\n\
+Disallow: /workunit\n";
 
 /// Answers one of [`SITE_PATHS`]; `None` for any other path.
 pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<Option<SitePage>> {
@@ -246,6 +274,8 @@ pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<
         "/validate_email_addr.php" => site_email::validate_email_addr(ctx, q).await?,
         "/recover_email.php" => site_email::recover_email(ctx, q).await?,
         "/reset_account_key.php" => site_account::reset_account_key(ctx, q).await?,
+        "/delete_account_request.php" => site_delete::delete_account_request(ctx, q).await?,
+        "/delete_account_confirm.php" => site_delete::delete_account_confirm(ctx, q).await?,
         _ => return Ok(None),
     }))
 }
@@ -527,7 +557,7 @@ pub fn login_form(project: &Project, q: &Params, can_mail: bool) -> SitePage {
         } else {
             ""
         },
-        if account_creation_refusal(&project.config).is_none() {
+        if !web_account_creation_closed(&project.config) {
             "<p>No account yet? <a href=\"create_account_form.php\">Create one</a>.</p>\n"
         } else {
             ""
@@ -706,12 +736,16 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
             ));
         }
     }
-    let computing_links: Vec<(&str, String)> = vec![
-        ("Computers on this account", "hosts_user.php".into()),
-        ("Tasks", format!("results.php?userid={}", user.id)),
-        ("Computing preferences", "prefs.php?subset=global".into()),
-        ("Project preferences", "prefs.php?subset=project".into()),
-    ];
+    if project.config.enable_delete_account != 0 && ctx.mail().is_some() {
+        account_links.push(("Delete the account", "delete_account_request.php".into()));
+    }
+    let mut computing_links: Vec<(&str, String)> =
+        vec![("Computers on this account", "hosts_user.php".into())];
+    if project.config.show_results {
+        computing_links.push(("Tasks", format!("results.php?userid={}", user.id)));
+    }
+    computing_links.push(("Computing preferences", "prefs.php?subset=global".into()));
+    computing_links.push(("Project preferences", "prefs.php?subset=project".into()));
     let mut logout = String::from("<form method=\"post\" action=\"logout.php\">\n");
     logout.push_str(&site_account::token_fields(&user, ctx.now));
     logout.push_str("<p><input type=\"submit\" value=\"Log out\"></p>\n</form>\n");
@@ -1022,9 +1056,13 @@ pub async fn hosts_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let mut i = 0;
     for h in &hosts {
         i += 1;
+        let tasks = if ctx.project.config.show_results {
+            format!(" | <a href=\"results.php?hostid={}\">Tasks</a>", h.id)
+        } else {
+            String::new()
+        };
         b.push_str(&format!(
-            "<tr><td>{0}<br><a href=\"show_host_detail.php?hostid={0}\">Details</a> | \
-             <a href=\"results.php?hostid={0}\">Tasks</a></td>",
+            "<tr><td>{0}<br><a href=\"show_host_detail.php?hostid={0}\">Details</a>{tasks}</td>",
             h.id
         ));
         if private {
@@ -1231,11 +1269,13 @@ pub async fn show_host_detail(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SiteP
             &time_diff(h.avg_turnaround),
         );
     }
-    row2(
-        &mut b,
-        "Tasks",
-        &format!("<a href=\"results.php?hostid={}\">View</a>", h.id),
-    );
+    if ctx.project.config.show_results {
+        row2(
+            &mut b,
+            "Tasks",
+            &format!("<a href=\"results.php?hostid={}\">View</a>", h.id),
+        );
+    }
     row2(
         &mut b,
         "Number of times client has contacted server",
@@ -1600,6 +1640,10 @@ fn result_row(
 /// three with a filter.
 pub async fn results(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let project = ctx.project;
+    // `html/user/results.php` refuses unless `show_results` is set.
+    if !project.config.show_results {
+        return Ok(error_page(project, 404, "This feature is disabled."));
+    }
     let hostid = int_param(q, "hostid").filter(|&id| id > 0);
     let userid = int_param(q, "userid").filter(|&id| id > 0);
     let state = int_param(q, "state")
