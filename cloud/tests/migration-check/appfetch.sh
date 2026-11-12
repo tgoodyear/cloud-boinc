@@ -28,18 +28,39 @@ WORK="$work" CLIENTS="$clients"
 . "$(dirname "$0")/lib.sh"
 export PATH="/opt/node/bin:$PATH"
 cloud="$HERE/../.."
-# The other clients of FILE are told not to fetch work meanwhile, so the new client gets the job.
 others="$(awk '!/^#/ && NF {printf "%s ", $1}' "$CLIENTS")"
+load_client "$tag"
+new="${C_TAG}f"
+# The new client's identifiers are kept apart from C_*, which load_client overwrites.
+T_DIR="$WORK/clients/$new" T_PORT=$((C_PORT + 100)) T_BOINC="$C_BOINC" T_CMD="$C_BOINCCMD" T_LIB="$C_LIB"
+T_USER="$C_USER" T_STATE="$WORK/appfetch-client"
+[ ! -e "$T_DIR" ] && [ ! -e "$T_STATE" ] || die "$T_DIR or $T_STATE exists: a client of an earlier run is left (run.sh --steps down)"
+res="$WORK/results"
+mkdir -p "$res"
+status=0 logged=0
 other_clients() { # other_clients VERB: boinccmd --project URL VERB on each client of FILE
     for _t in $others; do load_client "$_t"; cc --project "$MASTER_URL" "$1" > /dev/null || true; done
 }
+save_log() { [ "$logged" -eq 1 ] || [ ! -f "$T_DIR/client.log" ] || { redact < "$T_DIR/client.log" > "$res/appfetch.log"; logged=1; }; }
+# Runs on every exit, signal included, and keeps the exit status: the other clients fetch work
+# again, the new client is stopped and its directory and state file are removed.
+cleanup() {
+    _rc=$?
+    trap - EXIT INT TERM
+    set +e
+    other_clients allowmorework
+    save_log
+    sh "$HERE/client.sh" --action stop --dir "$T_DIR" --boinccmd "$T_CMD" --lib "$T_LIB" > /dev/null 2>&1
+    rm -rf "$T_DIR" "$T_STATE"
+    exit "$_rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# The state file tells `run.sh --steps down` about a client this script did not get to stop.
+printf '%s\n%s\n%s\n' "$T_DIR" "$T_CMD" "$T_LIB" > "$T_STATE"
+# The other clients of FILE are told not to fetch work meanwhile, so the new client gets the job.
 other_clients nomorework
-load_client "$tag"
-new="${C_TAG}f"
-C_DIR="$WORK/clients/$new" C_PORT=$((C_PORT + 100))
-[ ! -e "$C_DIR" ] || die "$C_DIR exists"
-res="$WORK/results"
-mkdir -p "$res"
 d1_n() { # d1_n SQL: sets N to the first value of the first row
     _out="$(cd "$cloud/workers/scheduler" && npx wrangler d1 execute cloud-boinc-dev --local \
         --persist-to "$WORK/cloud-state/wrangler" --json --command "$1" 2>/dev/null)" ||
@@ -56,12 +77,12 @@ export CBOINC_URL="http://127.0.0.1:$port" CBOINC_TOKEN_FILE="$WORK/cloud-state/
     --name-prefix flat --input-file flat_input.txt --command-line="--seconds 5" > /dev/null
 
 log "$new: start and attach with the account's key"
-sh "$HERE/client.sh" --action start --dir "$C_DIR" --boinc "$C_BOINC" --port "$C_PORT" \
-    --name "cb-mig-$new" --lib "$C_LIB" > /dev/null
+sh "$HERE/client.sh" --action start --dir "$T_DIR" --boinc "$T_BOINC" --port "$T_PORT" \
+    --name "cb-mig-$new" --lib "$T_LIB" > /dev/null
 /bin/sleep 5
-cc --project_attach "$MASTER_URL" "$(secret "$C_USER" authenticator)" > /dev/null
+C_DIR="$T_DIR" C_PORT="$T_PORT" C_BOINCCMD="$T_CMD" C_LIB="$T_LIB"
+cc --project_attach "$MASTER_URL" "$(secret "$T_USER" authenticator)" > /dev/null
 i=0
-status=0
 while :; do
     /bin/sleep 5
     d1_n "SELECT count(*) FROM result WHERE name LIKE 'flat%' AND received_time > 0"
@@ -71,8 +92,8 @@ while :; do
 done
 log "results of the job received: $N"
 
-lg="$(client_log)"
-redact < "$lg" > "$res/appfetch.log"
+lg="$T_DIR/client.log"
+save_log
 dl="$(grep -E "Started download of " "$lg" | sed -E 's/.*Started download of //' | sort -u | tr '\n' ' ')"
 log "files downloaded: $dl"
 app="$(echo "$dl" | tr ' ' '\n' | grep -vE '^(flat_input\.txt|)$' | head -1)"
@@ -91,9 +112,5 @@ fi
 grep -q "Finished download of $app" "$lg" || { log "FAIL: the application download did not finish"; status=1; }
 d1_n "SELECT count(*) FROM result WHERE name LIKE 'flat%' AND outcome = 1"
 [ "$N" -ge 1 ] || { log "FAIL: the result's outcome is not success"; status=1; }
-other_clients allowmorework
-load_client "$tag"
-C_DIR="$WORK/clients/$new" C_PORT=$((C_PORT + 100))
-sh "$HERE/client.sh" --action stop --dir "$C_DIR" --boinccmd "$C_BOINCCMD" --lib "$C_LIB" > /dev/null || true
 [ "$status" -eq 0 ] && log "$new: the application was downloaded through its flat URL and the task completed"
 exit "$status"

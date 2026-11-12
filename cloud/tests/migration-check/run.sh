@@ -113,6 +113,12 @@ if has down; then
         load_client "$t"
         sh "$HERE/client.sh" --action stop --dir "$C_DIR" --boinccmd "$C_BOINCCMD" --lib "$C_LIB" > /dev/null || true
     done
+    # A client appfetch.sh did not get to stop: its state file has the directory, boinccmd and lib.
+    if [ -f "$WORK/appfetch-client" ]; then
+        { read -r _d; read -r _c; read -r _l; } < "$WORK/appfetch-client"
+        sh "$HERE/client.sh" --action stop --dir "$_d" --boinccmd "$_c" --lib "$_l" > /dev/null || true
+        rm -rf "$_d" "$WORK/appfetch-client"
+    fi
     sh "$HERE/cloud-down.sh" --work "$WORK"
     sh "$HERE/../differential/stock.sh" --action stop --name "$STOCK_NAME" || true
 fi
