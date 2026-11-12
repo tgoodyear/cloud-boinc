@@ -15,7 +15,11 @@ CREATE TABLE IF NOT EXISTS user_deletion (
     userid INTEGER PRIMARY KEY,
     mode INTEGER NOT NULL,
     create_time INTEGER NOT NULL,
-    gen TEXT NOT NULL DEFAULT ''
+    gen TEXT NOT NULL DEFAULT '',
+    -- The ID of the last computer an obfuscation has handled: it walks the
+    -- account's computers in ID order, 100 at a time, so a pass reads only the
+    -- ones after it.
+    host_cursor INTEGER NOT NULL DEFAULT 0
 );
 
 -- IDs of users and computers are never given out twice, as on a stock server
@@ -48,3 +52,6 @@ CREATE INDEX IF NOT EXISTS res_received ON result (received_time) WHERE received
 -- Workunits waiting for the validator. The state is normally set and cleared
 -- within one transition, so this holds almost nothing.
 CREATE INDEX IF NOT EXISTS wu_need_validate ON workunit (id) WHERE need_validate = 1;
+
+-- Batches an account submitted, for giving them no owner when it is deleted.
+CREATE INDEX IF NOT EXISTS batch_user ON batch (user_id) WHERE user_id > 0;

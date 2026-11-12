@@ -1728,9 +1728,33 @@ wrong whether or not an ID comes back: the columns that name a user or computer 
 types), `batch.user_id`, `token.userid` and `user_deletion.userid`. The workunit of an assignment keeps
 its reserved result, which is never sent: cancel the workunit through the admin API.
 
-*Obfuscate.* A chunk of computers gets `domain_name` `deleted` and no addresses; the tasks are left
-as upstream leaves them, to time out; the row stays, so no ID is freed, and the queue row goes at
-the end.
+*Obfuscate.* The computers lose their names and addresses (`anonymize_hosts`; `external_ip_addr` is
+an address of the same kind, so it goes too) in windows of 100 by ID, behind a cursor: the queue row's
+`host_cursor` is the ID of the last computer handled, a window is `WHERE userid = ? AND id > cursor
+ORDER BY id LIMIT 100` (a search of `host_user` from the cursor, no sort), and the same batch moves the
+cursor to the window's last ID. The computers stay in `host_user` once anonymized, so without the
+cursor each pass would read the finished ones again and the work would grow with the square of their
+number (`an_obfuscation_reads_each_computer_once` runs 1,200 computers and checks the cost of a pass
+stays the same and the passes are as many as the windows). The tasks are left as upstream leaves them,
+to time out; the rows stay, so no ID is freed, and the queue row goes at the end.
+
+*Why each loop reads a bounded amount.* A loop is bounded when the rows it has dealt with no longer
+match what it looks for, or when a cursor skips them, so a pass reads a window and not the history.
+- Tasks (wipe): the window leaves `res_user` (`userid` becomes 0) in the batch that handles it.
+- Assignments to the account: deleted, so the next `asgn_target` search starts at the first left;
+  those of the computers of the chunk are deleted in a `LIMIT` subquery with no `ORDER BY`, which stops
+  after 500 index entries (a sort would read all of them).
+- Computers (wipe): deleted, so they leave `host_user`; a computer that is kept for an assignment or a
+  task being detached is among the first 100 of the next round, and what keeps it is handled in that
+  round.
+- Computers (obfuscate): the cursor, above.
+- `host_app_version`: a primary-key range of the chunk's computers; the rows are deleted.
+- Tasks that still name a computer of the chunk: `res_host`, 500 at a time, and they stop matching.
+- `batch` rows: `batch_user`, a partial index on owned batches, in the last batch; the rows lose their
+  owner. The `token` rows of the account are deleted at the start in one statement; there are few (a
+  message of each kind per account every ten minutes, and rows older than eight days are removed by
+  whatever issues the next).
+- The queue read is `LIMIT 5` of a table with a row per deletion in progress.
 
 *Requests under way.* The scheduler reads the account at the start of a request and writes at the
 end, and a deletion can commit between them. Every write the scheduler makes for an authenticated
@@ -1782,10 +1806,13 @@ three. `account_creation` (the fork's own option) still decides when it is state
 over it. `maintenance_delay` is the scheduler's and is not read here. The tags are read as the
 client parser reads booleans (`<tag/>` is true, `<tag>N</tag>` is true for non-zero N).
 
-`robots.txt` is served by the web Worker from `ROBOTS_TXT` in `cloud/crates/cb-core/src/site.rs`:
-upstream's `html/user/sample_robots.txt` (a file a project copies by hand) plus the pages this
-site has that show or change an account. The master page, `get_project_config.php`
-and `server_status.php` are not listed. The `X-Robots-Tag` header is off unless
+`robots.txt` is served by the web Worker from `robots_txt` in `cloud/crates/cb-core/src/site.rs`,
+built from `ROBOTS_DISALLOW`: upstream's `html/user/sample_robots.txt` (a file a project copies by
+hand) plus the pages this site has that show or change an account. A directive names a path from
+the root of the host, so with a stock page prefix every directive is also written under the prefix
+(`/short/result` covers `/short/results.php`); a test checks that each page the root rules exclude
+is excluded under the prefix too. The master page, `get_project_config.php` and `server_status.php`
+are not listed. The `X-Robots-Tag` header is off unless
 `robots_tag` is set (for example `noindex, nofollow`); it goes on the account pages that
 `site_response` sends and not on the master page, the project config, the status page or `robots.txt`.
 

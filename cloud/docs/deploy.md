@@ -375,13 +375,29 @@ The same figures in the shape of the stock page are at `server_status.php?xml=1`
 
 ## Migration `0007`
 
-`migrations/0007_site_ops.sql` adds the `user_deletion` table (account deletion), the partial
-index `res_received` on `result (received_time)` (the 24-hour figures of the status page and the
-summary) and `wu_need_validate`. It is a prerequisite of the web Worker of this build (the status
-queries and the account deletion name them), of the admin Worker's `summary` and of the pipeline
-Worker's account deletion steps. It follows `0006_homogeneous.sql`; apply the files in numeric order. Its statements are written with
-`IF NOT EXISTS`, so running it again is harmless. Building `res_received` on a large `result`
-table writes one index entry per received task, once.
+`migrations/0007_site_ops.sql` adds:
+
+- `user_deletion`, the queue of account deletions in progress;
+- `id_floor` and two `AFTER DELETE` triggers (on `user` and `host`), which keep user and computer IDs
+  from being given out twice;
+- the partial indexes `res_received` (the 24-hour figures of the status page and the summary),
+  `wu_need_validate` and `batch_user`.
+
+Deployment order: **apply the migration first**, then deploy the Workers, in any order. The Workers
+of this build that create users or computers read `id_floor`: the scheduler (a new computer), the web
+Worker (sign-up and `create_account.php`) and the admin Worker (account creation). Deployed before the
+migration they fail with `no such table: id_floor`, which stops hosts from attaching and accounts from
+being created. The web Worker's status page and the admin Worker's `summary` read the new indexes,
+and the web Worker's deletion pages and the pipeline Worker's account deletion steps read
+`user_deletion`. The migration only adds objects, so Workers built before it keep working with it
+applied; roll back the Workers, not the migration. The number follows `0006_homogeneous.sql`; apply the
+files in numeric order. Its statements are written with `IF NOT EXISTS`, so running it again is
+harmless. A database that took the first form of `0007` by hand also needs
+`ALTER TABLE user_deletion ADD COLUMN gen TEXT NOT NULL DEFAULT ''` and
+`ALTER TABLE user_deletion ADD COLUMN host_cursor INTEGER NOT NULL DEFAULT 0`. Each trigger is one
+statement whose body contains `;`: where a tool splits on `;`, run the file with
+`wrangler d1 execute --file`. Building `res_received` on a large `result` table writes one index entry
+per received task, once.
 
 ## Checks
 

@@ -579,21 +579,47 @@ enum Progress {
 async fn step(db: &dyn Db, q: &Queued, now: i64) -> CoreResult<(usize, Progress)> {
     let (uid, gen) = (q.userid, q.gen.as_str());
     if q.mode != METHOD_WIPE {
+        // A window of the account's computers after the cursor, whatever their
+        // state, and the cursor moved to its last one in the same batch (the
+        // window does not depend on what the first statement changes, so both
+        // statements take the same one). The anonymized computers stay in
+        // `host_user`, so without the cursor each pass would read them again.
+        let window = format!(
+            "SELECT id FROM host WHERE userid = ? AND id > {{cursor}} ORDER BY id LIMIT {HOSTS_PER_STATEMENT}"
+        );
         let out = db
-            .run(stmt!(
-                format!(
-                    "UPDATE host SET domain_name = 'deleted', last_ip_addr = '', external_ip_addr = '' \
-                     WHERE id IN (SELECT id FROM host WHERE userid = ? AND (domain_name != 'deleted' \
-                     OR last_ip_addr != '' OR external_ip_addr != '') ORDER BY id LIMIT ?) AND {LIVE}"
+            .batch(vec![
+                stmt!(
+                    format!(
+                        "UPDATE host SET domain_name = 'deleted', last_ip_addr = '', external_ip_addr = '' \
+                         WHERE id IN ({}) AND {LIVE}",
+                        window.replace(
+                            "{cursor}",
+                            "(SELECT host_cursor FROM user_deletion WHERE userid = ? AND gen = ?)"
+                        )
+                    ),
+                    uid,
+                    uid,
+                    gen,
+                    uid,
+                    gen
                 ),
-                uid,
-                HOSTS_PER_STATEMENT,
-                uid,
-                gen
-            ))
+                stmt!(
+                    format!(
+                        "UPDATE user_deletion SET host_cursor = coalesce( \
+                         (SELECT max(id) FROM ({})), host_cursor) \
+                         WHERE userid = ? AND gen = ? AND EXISTS (SELECT 1 FROM user u \
+                         WHERE u.id = userid AND u.blocked = 1 AND u.authenticator = gen)",
+                        window.replace("{cursor}", "host_cursor")
+                    ),
+                    uid,
+                    uid,
+                    gen
+                ),
+            ])
             .await?;
-        if out.changes >= HOSTS_PER_STATEMENT as u64 {
-            return Ok((1, Progress::More));
+        if out[0].changes >= HOSTS_PER_STATEMENT as u64 {
+            return Ok((2, Progress::More));
         }
         let gone = db
             .run(stmt!(
@@ -604,7 +630,7 @@ async fn step(db: &dyn Db, q: &Queued, now: i64) -> CoreResult<(usize, Progress)
             .await?
             .changes
             == 0;
-        return Ok((2, if gone { Progress::Gone } else { Progress::Done }));
+        return Ok((3, if gone { Progress::Gone } else { Progress::Done }));
     }
     let c = cancelable();
     let window = format!(
@@ -719,7 +745,7 @@ async fn step(db: &dyn Db, q: &Queued, now: i64) -> CoreResult<(usize, Progress)
     let out = db
         .batch(vec![
             stmt!(
-                format!("UPDATE batch SET user_id = 0 WHERE user_id = ? AND {LIVE}"),
+                format!("UPDATE batch SET user_id = 0 WHERE user_id = ? AND user_id > 0 AND {LIVE}"),
                 uid,
                 uid,
                 gen

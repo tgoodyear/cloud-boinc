@@ -218,30 +218,49 @@ pub const SITE_HEADERS: [(&str, &str); 4] = [
     ("Referrer-Policy", "no-referrer"),
 ];
 
-/// `robots.txt`. Upstream ships `html/user/sample_robots.txt`, which a project
-/// copies to `robots.txt` by hand; this is that file, plus the pages this site
-/// has that change or show an account.
-pub const ROBOTS_TXT: &str = "User-agent: *\n\
-Disallow: /account\n\
-Disallow: /add_venue\n\
-Disallow: /am_\n\
-Disallow: /bug_report\n\
-Disallow: /create_account\n\
-Disallow: /delete_account\n\
-Disallow: /edit_\n\
-Disallow: /home.php\n\
-Disallow: /host_\n\
-Disallow: /hosts_user.php\n\
-Disallow: /login_\n\
-Disallow: /logout.php\n\
-Disallow: /prefs.php\n\
-Disallow: /prefs_\n\
-Disallow: /reset_account_key.php\n\
-Disallow: /result\n\
-Disallow: /show_host_detail.php\n\
-Disallow: /team\n\
-Disallow: /validate_email_addr.php\n\
-Disallow: /workunit\n";
+/// The path prefixes `robots.txt` disallows, as paths at the root: upstream's
+/// `html/user/sample_robots.txt`, a file a project copies by hand, plus the
+/// pages this site has that change or show an account.
+pub const ROBOTS_DISALLOW: [&str; 20] = [
+    "/account",
+    "/add_venue",
+    "/am_",
+    "/bug_report",
+    "/create_account",
+    "/delete_account",
+    "/edit_",
+    "/home.php",
+    "/host_",
+    "/hosts_user.php",
+    "/login_",
+    "/logout.php",
+    "/prefs.php",
+    "/prefs_",
+    "/reset_account_key.php",
+    "/result",
+    "/show_host_detail.php",
+    "/team",
+    "/validate_email_addr.php",
+    "/workunit",
+];
+
+/// `robots.txt`. A directive names a path from the root of the host, so with
+/// a stock page prefix (`/short`, see `cb_core::stock`) the pages that answer
+/// under it need their own: each directive is written for the root and for the
+/// prefix. The master page, `get_project_config.php` and `server_status.php`
+/// are not listed.
+pub fn robots_txt(stock: Option<&crate::stock::StockLayout>) -> String {
+    let mut out = String::from("User-agent: *\n");
+    for d in ROBOTS_DISALLOW {
+        out.push_str(&format!("Disallow: {d}\n"));
+    }
+    if let Some(s) = stock.filter(|s| !s.page_prefix.is_empty()) {
+        for d in ROBOTS_DISALLOW {
+            out.push_str(&format!("Disallow: {}{d}\n", s.page_prefix));
+        }
+    }
+    out
+}
 
 /// Answers one of [`SITE_PATHS`]; `None` for any other path.
 pub async fn site_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<Option<SitePage>> {

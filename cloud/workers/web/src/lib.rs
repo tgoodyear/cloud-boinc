@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use cb_core::mail::Mailer;
 use cb_core::site::{
-    auth_from_cookie, site_page, SiteCtx, SitePage, ROBOTS_TXT, SITE_HEADERS, SITE_PATHS,
+    auth_from_cookie, robots_txt, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS,
 };
 use cb_core::stock::{route_web, url_origin, WebRoute};
 use cb_core::web::{
@@ -210,7 +210,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 "Cache-Control",
                 &format!("public, max-age={PAGE_CACHE_SECS}"),
             )?
-            .fixed(ROBOTS_TXT.as_bytes().to_vec())),
+            .fixed(robots_txt(project.config.stock.as_ref()).into_bytes())),
         "/server_status.php" => {
             let q = params(&mut req).await?;
             let now = now();

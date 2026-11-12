@@ -5923,7 +5923,7 @@ fn robots_txt_covers_the_upstream_sample() {
                   Disallow: /result\nDisallow: /team\nDisallow: /workunit\n";
     for line in sample.lines().filter(|l| !l.trim().is_empty()) {
         assert!(
-            cb_core::site::ROBOTS_TXT.contains(&format!("{line}\n")),
+            cb_core::site::robots_txt(None).contains(&format!("{line}\n")),
             "{line}"
         );
     }
@@ -5935,7 +5935,7 @@ fn robots_txt_covers_the_upstream_sample() {
         "/login_",
     ] {
         assert!(
-            cb_core::site::ROBOTS_TXT.contains(&format!("Disallow: {page}")),
+            cb_core::site::robots_txt(None).contains(&format!("Disallow: {page}")),
             "{page}"
         );
     }
@@ -5945,8 +5945,60 @@ fn robots_txt_covers_the_upstream_sample() {
         "/index.php",
         "/get_project_config.php",
     ] {
-        assert!(!cb_core::site::ROBOTS_TXT.contains(page));
+        assert!(!cb_core::site::robots_txt(None).contains(page));
     }
+}
+
+/// The paths a robots.txt disallows, as prefixes.
+fn disallowed(robots: &str) -> Vec<String> {
+    robots
+        .lines()
+        .filter_map(|l| l.strip_prefix("Disallow: "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn robots_txt_covers_the_pages_under_a_stock_page_prefix() {
+    use cb_core::site::{robots_txt, SITE_PATHS};
+    use cb_core::stock::StockSpec;
+    let stock = StockSpec {
+        short_name: "proj".into(),
+        ..Default::default()
+    }
+    .resolve(1024)
+    .unwrap()
+    .unwrap();
+    assert_eq!(stock.page_prefix, "/proj");
+    let root = disallowed(&robots_txt(None));
+    let both = disallowed(&robots_txt(Some(&stock)));
+    let excluded =
+        |rules: &[String], path: &str| rules.iter().any(|d| path.starts_with(d.as_str()));
+    let mut checked = 0;
+    for page in SITE_PATHS {
+        if excluded(&root, page) {
+            checked += 1;
+            assert!(excluded(&both, page), "{page} at the root");
+            assert!(
+                excluded(&both, &format!("/proj{page}")),
+                "{page} under the prefix"
+            );
+        } else {
+            // What a crawler may reach at the root it may reach under the prefix.
+            assert!(!excluded(&both, &format!("/proj{page}")), "{page}");
+        }
+    }
+    assert!(checked >= 15, "{checked}");
+    // Without a page prefix there is nothing more to say.
+    let flat = StockSpec {
+        short_name: "proj".into(),
+        page_prefix: Some(String::new()),
+        ..Default::default()
+    }
+    .resolve(1024)
+    .unwrap()
+    .unwrap();
+    assert_eq!(robots_txt(Some(&flat)), robots_txt(None));
 }
 
 #[test]
@@ -6391,4 +6443,70 @@ fn the_work_of_a_pass_does_not_grow_with_the_tasks_left() {
     );
     // Linear: a window per round, the inline round, and one pass for the end.
     assert!(passes <= 12 + 1, "{passes} passes for {tasks} tasks");
+}
+
+#[test]
+fn an_obfuscation_reads_each_computer_once() {
+    use cb_core::site_delete::{delete_account_steps, HOSTS_PER_STATEMENT};
+    let w = delete_world(1);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let hosts = HOSTS_PER_STATEMENT * 12;
+    w.sql(&format!(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < {hosts}) \
+         INSERT INTO host (create_time, userid, domain_name, last_ip_addr, external_ip_addr) \
+         SELECT 1, {}, 'h' || n, '192.0.2.1', '198.51.100.1' FROM c",
+        ada.id
+    ));
+    let link = ask_for_the_link(&w, &ada.auth, "secret");
+    assert_eq!(confirm(&w, &link, "secret").status, 200);
+    let cursor = |w: &World| rows(w, "SELECT host_cursor FROM user_deletion");
+    assert!(cursor(&w) > 0, "the inline round moved the cursor");
+
+    // The plan of the window: a search of `host_user` from the cursor, with no sort.
+    let plan = block_on(
+        w.db.run(Stmt {
+            sql: "EXPLAIN QUERY PLAN SELECT id FROM host WHERE userid = ? AND id > ? \
+              ORDER BY id LIMIT 100"
+                .into(),
+            params: vec![1.into(), 100.into()],
+        }),
+    )
+    .unwrap();
+    let plan: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r["detail"].as_str().unwrap().into())
+        .collect();
+    assert!(plan.iter().any(|d| d.contains("host_user")), "{plan:?}");
+    assert!(!plan.iter().any(|d| d.contains("TEMP B-TREE")), "{plan:?}");
+
+    // Each pass reads about the same however many are done, and there are as
+    // many passes as windows.
+    let mut costs = Vec::new();
+    let mut passes = 0;
+    while rows(&w, "SELECT count(*) FROM user_deletion") > 0 {
+        let before = w.db.vm_steps();
+        let at = cursor(&w);
+        let report = block_on(delete_account_steps(&w.db, NOW + 1, 14)).unwrap();
+        let spent = w.db.vm_steps() - before;
+        if at + 2 * HOSTS_PER_STATEMENT < hosts {
+            costs.push(spent);
+        }
+        passes += 1;
+        assert!(passes <= 20, "{report:?}");
+    }
+    assert!(costs.len() >= 5, "{costs:?}");
+    let (first, last) = (costs[0], *costs.last().unwrap());
+    assert!(
+        last <= first + first / 4,
+        "a pass costs more as more computers are done: {costs:?}"
+    );
+    assert!(passes <= 12, "{passes} passes for {hosts} computers");
+    assert_eq!(
+        rows(
+            &w,
+            "SELECT count(*) FROM host WHERE domain_name = 'deleted' AND last_ip_addr = ''"
+        ),
+        hosts
+    );
 }
