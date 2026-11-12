@@ -21,6 +21,7 @@ pub mod scheduler;
 pub mod site;
 pub mod site_account;
 pub mod site_email;
+pub mod site_ui;
 pub mod template;
 pub mod upload;
 pub mod web;

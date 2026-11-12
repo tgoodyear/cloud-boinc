@@ -307,8 +307,8 @@ pub(crate) fn verify_cell(user: &User, now: i64) -> String {
     }
     format!(
         " <small>(not verified)</small>\n\
-         <form method=\"post\" action=\"validate_email_addr.php\" style=\"display:inline\">\n{}\
-         <input type=\"submit\" value=\"Send verification email\"></form>",
+         <form method=\"post\" action=\"validate_email_addr.php\">\n{}\
+         <input type=\"submit\" class=\"secondary\" value=\"Send verification email\"></form>",
         token_fields(user, now)
     )
 }
@@ -408,7 +408,7 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
         200,
         "Email sent",
         &format!(
-            "<p>If an account has the email address {}, instructions for logging in and \
+            "<p class=\"notice\">If an account has the email address {}, instructions for logging in and \
              resetting your password have been sent to it. At most one message is sent \
              every {} minutes.</p>\n\
              <p>If the email doesn't arrive in a few minutes, check your spam folder.</p>\n",
@@ -442,7 +442,7 @@ pub async fn login_via_link(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePag
             403,
             "Login link",
             &format!(
-                "<p>{}</p>\n<p><a href=\"get_passwd.php\">Get a new login link by email</a></p>\n",
+                "<p class=\"error\">{}</p>\n<p><a href=\"get_passwd.php\">Get a new login link by email</a></p>\n",
                 html_escape(BAD_LINK)
             ),
         )
@@ -662,7 +662,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
             ctx,
             200,
             "Validate email address",
-            "<p>The email address of your account has been validated.</p>\n",
+            "<p class=\"notice\">The email address of your account has been validated.</p>\n",
         ));
     }
     let Some(user) = viewer(ctx).await? else {
@@ -699,7 +699,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
             200,
             "Validate email address",
             &format!(
-                "<p>An email has been sent to {}. Visit the link it contains to validate your \
+                "<p class=\"notice\">An email has been sent to {}. Visit the link it contains to validate your \
                  email address.</p>\n<p>If you don't receive this email, check your spam folder.</p>\n",
                 html_escape(&user.email_addr)
             ),
@@ -709,7 +709,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
             429,
             "Validate email address",
             &format!(
-                "<p>A message was sent to {} a few minutes ago. Wait {} minutes from then \
+                "<p class=\"error\">A message was sent to {} a few minutes ago. Wait {} minutes from then \
                  before asking for another.</p>\n",
                 html_escape(&user.email_addr),
                 MAIL_INTERVAL_SECS / 60

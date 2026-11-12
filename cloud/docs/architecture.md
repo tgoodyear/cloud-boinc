@@ -1071,6 +1071,38 @@ does not show upstream's per-state counts, which would count every
 task of the computer or account. A computer page links to its tasks without counting them for
 the same reason.
 
+### Site pages: shell and building blocks
+
+Every HTML page comes out of `page` in `cloud/crates/cb-core/src/web.rs`: the viewport meta, the
+stylesheet inline (`cloud/crates/cb-core/src/site.css`, under 7 KB), the header, then the body in
+`<main>`. The stylesheet is inline and not a route because the pages are built in one function, the
+site's `Content-Security-Policy` sets only `frame-ancestors`, and a route would be one more path to
+keep in step with the URL layout. There are no images, web fonts, scripts or external requests.
+Colours are CSS variables with a light and a dark set chosen by `prefers-color-scheme`; text and
+controls meet WCAG AA contrast in both. Controls are 16 px and 44 px tall so a phone does not zoom
+on focus, and every `<table>` is wrapped in a `scroll` box so a wide one scrolls inside its own
+frame. In a form a layout table stacks into one column on a narrow screen.
+
+`cloud/crates/cb-core/src/site_ui.rs` holds the navigation and the builders pages use. Text
+arguments are escaped by the helper; arguments that are HTML are named `value`, `body`, `html` or
+`cells` and are escaped by the caller.
+
+| Piece | Use |
+| --- | --- |
+| `NAV` (`NavItem` with `label`, `path`, `account`) | The one list the header and the home page's links come from; a page is added to the menu with one line. `account` entries are for the account area and stay out of the header, which is the same for every visitor |
+| `site_header` | Project name as the home link, the `NAV` links, then "Your account"; scrolls sideways on a phone |
+| `card`, `card_accent`, `grid` | A titled section; the one section a page is about; cards side by side where there is room |
+| `stat`, `stats` | A headline number with a label and an optional note; a row of them |
+| `data_table`, `Col::text`, `Col::num`, `Col::rank` | A table with a header row; numbers right-aligned with equal-width digits; a narrow muted rank column |
+| `kv` | Label and value pairs as a definition list |
+| `badge` with `Tone` | A short label such as an application name or a state |
+| `empty`, `notice`, `error_note` | An empty list, a message, an error (`class="empty"`, `"notice"`, `"error"`) |
+| `button_link`, `actions`, `link_list` | A link that looks like a button (primary or `secondary`), a wrapping row of buttons, touch-sized link rows |
+
+Plain elements need no class: headings, paragraphs, lists, `code`, `pre`, `details`, and forms
+with labels above the fields. A submit button is the primary button; add `class="secondary"` or
+`class="danger"` for the others. New pages use the CSS variables and no inline `style` attributes.
+
 ### Account and preference pages
 
 The pages that change an account are in `cloud/crates/cb-core/src/site_account.rs`:

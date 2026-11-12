@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::model::{Host, User};
 use crate::project::{scheduler_url, Project};
+use crate::site_ui::{self, site_header};
 use crate::{Config, CoreError, CoreResult};
 
 /// Upper bounds on what an account RPC stores.
@@ -794,14 +795,37 @@ pub fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// The stylesheet of every page, inline in [`page`]: all pages come from this
+/// one shell, so there is no second request and no route to keep in step
+/// with the URL layout. The site's `Content-Security-Policy` only sets
+/// `frame-ancestors`, so inline styles are allowed.
+pub const SITE_CSS: &str = include_str!("site.css");
+
+/// The HTML shell. A body that starts with the site header (see
+/// `site_ui::site_header`) has the rest put in `<main>`. Tables are wrapped
+/// in a `scroll` box, so that a wide table scrolls sideways inside its own
+/// container and not the page. Page text is escaped, so `<table>` in a body
+/// is always a real table.
 pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
+    let body = body
+        .replace("<table>", "<div class=\"scroll\"><table>")
+        .replace("</table>", "</table></div>");
+    let (header, main) = match body.strip_prefix("<header class=\"top\">") {
+        Some(rest) => {
+            let (inner, after) = rest.split_once("</header>\n").unwrap_or((rest, ""));
+            (
+                format!("<header class=\"top\">{inner}</header>\n"),
+                after.to_string(),
+            )
+        }
+        None => (String::new(), body.clone()),
+    };
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <title>{}</title>\n{head}\
-         <style>body{{font-family:system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem;line-height:1.5}}\
-         table{{border-collapse:collapse}}td,th{{padding:.25rem .75rem;border-bottom:1px solid #ccc;text-align:left}}</style>\n\
-         </head>\n<body>\n{body}</body>\n</html>\n",
+         <style>{SITE_CSS}</style>\n\
+         </head>\n<body>\n{header}<main>\n{main}</main>\n</body>\n</html>\n",
         html_escape(title)
     )
 }
@@ -816,14 +840,42 @@ pub fn master_page(project: &Project) -> String {
         "<link rel=\"boinc_scheduler\" href=\"{0}\">\n<!--\n<scheduler>{0}</scheduler>\n-->\n",
         html_escape(&sched)
     );
-    let mut body = format!(
-        "<h1>{}</h1>\n<p>This is a BOINC project. To take part, install the \
+    let mut join = format!(
+        "<p>This is a BOINC project. To take part, install the \
          <a href=\"https://boinc.berkeley.edu/download.php\">BOINC client</a> and attach it to \
-         <code>{}</code>.</p>\n",
-        html_escape(&c.long_name),
+         <code class=\"key\">{}</code></p>\n",
         html_escape(&c.master_url)
     );
-    body.push_str("<h2>Applications</h2>\n<table>\n<tr><th>Application</th><th>Platform</th><th>Version</th><th>Plan class</th></tr>\n");
+    let mut buttons = Vec::new();
+    if account_creation_refusal(c).is_none() {
+        buttons.push(site_ui::button_link(
+            "Create an account",
+            "create_account_form.php",
+            false,
+        ));
+    }
+    buttons.push(site_ui::button_link(
+        "Your account",
+        "home.php",
+        !buttons.is_empty(),
+    ));
+    join.push_str(&site_ui::actions(&buttons));
+    let links: Vec<(&str, String)> = site_ui::NAV
+        .iter()
+        .filter(|i| !i.account)
+        .map(|i| (i.label, i.path.to_string()))
+        .collect();
+    let mut body = format!(
+        "{}<h1>{}</h1>\n",
+        site_header(project),
+        html_escape(&c.long_name)
+    );
+    body.push_str(&site_ui::card_accent("Join this project", &join));
+    // Summary cards of the dashboard pages go here: `site_ui::stats` or a
+    // `site_ui::grid` of `site_ui::card`s, built from data the page already
+    // has, so that this page stays cheap and cacheable.
+    body.push_str(&site_ui::card("Explore", &site_ui::link_list(&links)));
+    let mut apps = Vec::new();
     for av in &project.catalog.app_versions {
         let app = project.catalog.apps.iter().find(|a| a.id == av.appid);
         let platform = project
@@ -832,21 +884,28 @@ pub fn master_page(project: &Project) -> String {
             .iter()
             .find(|p| p.id == av.platformid);
         if let (Some(app), Some(platform)) = (app, platform) {
-            body.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}.{:02}</td><td>{}</td></tr>\n",
+            apps.push(vec![
                 html_escape(&app.user_friendly_name),
                 html_escape(&platform.user_friendly_name),
-                av.version_num / 100,
-                av.version_num % 100,
-                html_escape(&av.plan_class)
-            ));
+                format!("{}.{:02}", av.version_num / 100, av.version_num % 100),
+                html_escape(&av.plan_class),
+            ]);
         }
     }
-    body.push_str("</table>\n<p><a href=\"home.php\">Your account</a> &middot; ");
-    if account_creation_refusal(c).is_none() {
-        body.push_str("<a href=\"create_account_form.php\">Create an account</a> &middot; ");
-    }
-    body.push_str("<a href=\"server_status.php\">Server status</a></p>\n");
+    let table = if apps.is_empty() {
+        site_ui::empty("No applications are available yet.")
+    } else {
+        site_ui::data_table(
+            &[
+                site_ui::Col::text("Application"),
+                site_ui::Col::text("Platform"),
+                site_ui::Col::num("Version"),
+                site_ui::Col::text("Plan class"),
+            ],
+            &apps,
+        )
+    };
+    body.push_str(&site_ui::card("Applications", &table));
     page(&c.long_name, &head, &body)
 }
 
@@ -997,7 +1056,21 @@ pub fn server_status_xml(project: &Project, s: &ServerStatus, now: i64) -> Strin
 }
 
 pub fn server_status_page(project: &Project, s: &ServerStatus) -> String {
-    let rows = [
+    let group = |rows: &[(&str, i64)]| {
+        site_ui::stats(
+            &rows
+                .iter()
+                .map(|(label, n)| site_ui::stat(label, &n.to_string(), ""))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut body = format!(
+        "{}<h1>{} server status</h1>\n",
+        site_header(project),
+        html_escape(&project.config.long_name)
+    );
+    body.push_str("<h2>Tasks</h2>\n");
+    body.push_str(&group(&[
         ("Tasks ready to send", s.results_ready_to_send),
         ("Tasks in progress", s.results_in_progress),
         (
@@ -1005,19 +1078,14 @@ pub fn server_status_page(project: &Project, s: &ServerStatus) -> String {
             s.workunits_waiting_for_assimilation,
         ),
         ("Transitions due", s.transitions_due),
+    ]));
+    body.push_str("<h2>Accounts and computers</h2>\n");
+    body.push_str(&group(&[
         ("Accounts", s.users),
         ("Accounts with recent credit", s.users_with_recent_credit),
         ("Computers", s.hosts),
         ("Computers with recent credit", s.hosts_with_recent_credit),
-    ];
-    let mut body = format!(
-        "<h1>{} server status</h1>\n<table>\n",
-        html_escape(&project.config.long_name)
-    );
-    for (label, n) in rows {
-        body.push_str(&format!("<tr><td>{label}</td><td>{n}</td></tr>\n"));
-    }
-    body.push_str("</table>\n<p><a href=\"./\">Home</a></p>\n");
+    ]));
     page("Server status", "", &body)
 }
 
