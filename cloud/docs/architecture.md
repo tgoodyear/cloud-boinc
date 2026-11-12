@@ -929,7 +929,8 @@ entry points of upstream's validator framework (`check_set` and `check_pair` in
   `min_quorum`.
 - `files` lists the result's output files that were stored, in the order of the result template.
   `open_name` is the template's `<open_name>` (null when it has none), `index` is the position of
-  the `<file_ref>` in the template, counting from 0. A file left out (an optional file that was
+  the `<file_ref>` in the template, counting from 0 over every `<file_ref>`, one with no file
+  name included. A file left out (an optional file that was
   not uploaded, a file with `<no_validate/>`, a file with no upload URL) does not shift the
   others: the `index` values of the files that are listed are the template positions, so a gap
   shows a file that is not there.
@@ -1030,7 +1031,7 @@ reply:
 ```
 
 - `open_name` is the `<open_name>` of the result template's `<file_ref>` for the file (null when
-  the template has none), and `index` its position in the template from 0, so a puller can write
+  the template has none), and `index` its position in the template from 0 over every `<file_ref>`, one with no file name included, so a puller can write
   the names the stock assimilator writes (`<workunit name>__file_<open_name>`). `files` is in
   template order.
 - A file that is not in storage (an optional output that was not uploaded, or a file with no
@@ -1056,10 +1057,13 @@ marks files for deletion (see "Job pipeline"). `POST /admin/v1/assimilate/reopen
   not acknowledged, is ignored in the same way.
 - The update raises the workunit's `rev`, so a transition that read the workunit before and is
   about to schedule its deletion loses the revision race and runs again against the new row.
-- It sets `transition_time` to never, which drops the pending deferred deletion. The next
-  acknowledgement sets it back and enqueues a transition, and the delay is counted from the most
-  recently returned result as always, so a re-opened workunit is deleted on its original
-  schedule, or at once if that time has passed, and re-opening gains no extra time.
+- It sets `transition_time` to the time of the call, so the next sweep runs a transition that
+  works out again what is pending (a replica still in progress, a validation retry) while
+  assimilation is ready. That pass schedules and does no file deletion, which the transitioner
+  does only for an acknowledged workunit. The next acknowledgement enqueues a transition, and the
+  delay is counted from the most recently returned result as always, so a re-opened workunit is
+  deleted on its original schedule, or at once if that time has passed, and re-opening gains no
+  extra time.
 - Purge (`plan_purge` in `crates/cb-core/src/purge.rs`) takes only workunits whose
   `file_delete_state` is done, which a re-openable workunit never has, so the two cannot meet.
 - The list with `state=done` reads workunits by ID within the app with no index of its own (the

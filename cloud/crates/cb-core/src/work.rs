@@ -14,7 +14,7 @@ use crate::pipeline::{initial_results, insert_result_stmt, safety_net_time, WuGu
 use crate::template::{
     constant_file_names, output_files, process_input_template, InputFile, StagedFile,
 };
-use crate::{Config, CoreError, CoreResult, FileKind, Files, NEVER};
+use crate::{Config, CoreError, CoreResult, FileKind, Files};
 
 /// D1 allows 100 bound parameters per statement.
 const MAX_IN_LIST: usize = 90;
@@ -667,12 +667,14 @@ pub async fn acknowledge_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> Cor
 /// canonical result (`outputs_kept`). The update is one conditional
 /// statement, so a repeat finds nothing to change and a transition that is
 /// scheduling the deletion at the same moment loses the revision race or
-/// finds the files marked, never both outcomes. The deferred deletion
-/// is dropped from the schedule (`transition_time` is set to never) and comes
-/// back with the next acknowledgement, which enqueues a transition: the delay
-/// still counts from the most recently returned result, so a re-opened
-/// workunit is deleted on the original schedule or at once if that has passed,
-/// exactly as a first acknowledgement is. Returns the IDs that changed.
+/// finds the files marked, never both outcomes. `transition_time` is set to
+/// `now`, so the next sweep runs a transition that works out again what is
+/// pending (a replica's deadline, a validation retry) while assimilation is
+/// ready; that pass schedules and does no file deletion, which starts only
+/// once the workunit is acknowledged again. The delay then still counts from
+/// the most recently returned result, so a re-opened workunit is deleted on
+/// the original schedule or at once if that has passed, exactly as a first
+/// acknowledgement is. Returns the IDs that changed.
 pub async fn reopen_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> CoreResult<Vec<i64>> {
     let mut stmts = Vec::new();
     for chunk in ids.chunks(MAX_IN_LIST) {
@@ -683,7 +685,7 @@ pub async fn reopen_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> CoreResu
             in_list(chunk.len())
         ))
         .bind(ASSIMILATE_READY)
-        .bind(NEVER)
+        .bind(now)
         .bind(now);
         for id in chunk {
             s = s.bind(*id);

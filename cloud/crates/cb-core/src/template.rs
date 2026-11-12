@@ -537,8 +537,9 @@ pub struct OutputFile {
     /// the application knows it. Empty when the template gives none.
     pub open_name: String,
     /// Position of the `<file_ref>` among the result's file references, from
-    /// 0, in document order. It counts every reference, so it does not
-    /// depend on which files were uploaded.
+    /// 0, in document order. It counts every reference, including one with
+    /// no file name (which is not listed), so it does not depend on which
+    /// files were uploaded.
     pub index: usize,
     pub optional: bool,
     pub no_validate: bool,
@@ -595,14 +596,18 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
     let mut v = Vec::new();
     let uploadable = uploadable_names(xml_doc_in);
     let mut xp = XmlParser::new(xml_doc_in);
+    let mut refs = 0;
     while xp.get_tag() {
         if !xp.is_tag() || !xp.match_tag("file_ref") {
             continue;
         }
+        // Every `<file_ref>` takes a position, named or not.
+        let index = refs;
+        refs += 1;
         let mut f = OutputFile {
             name: String::new(),
             open_name: String::new(),
-            index: 0,
+            index,
             optional: false,
             no_validate: false,
             uploadable: false,
@@ -634,7 +639,6 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
         }
         if !f.name.is_empty() {
             f.uploadable = uploadable.contains(&f.name);
-            f.index = v.len();
             v.push(f);
         }
     }
@@ -701,7 +705,7 @@ mod tests {
             [
                 ("a".to_string(), "first".to_string(), 0),
                 ("b".to_string(), String::new(), 1),
-                ("c".to_string(), "c".to_string(), 2),
+                ("c".to_string(), "c".to_string(), 3),
             ]
         );
     }

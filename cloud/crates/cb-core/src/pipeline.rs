@@ -885,9 +885,19 @@ struct WebhookResult {
     invalid: bool,
     #[serde(default)]
     retry: bool,
-    /// Credit to grant for this result instead of the computed one.
-    #[serde(default)]
+    /// Credit to grant for this result instead of the computed one. Only a
+    /// JSON number counts; any other value is read as no credit, so it
+    /// cannot cost the reply its verdicts.
+    #[serde(default, deserialize_with = "number_or_none")]
     credit: Option<f64>,
+}
+
+fn number_or_none<'de, D>(d: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_f64())
 }
 
 /// The credit a validator asked for, if it is usable: a finite number that is

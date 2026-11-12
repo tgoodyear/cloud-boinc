@@ -1594,7 +1594,7 @@ fn an_acknowledged_workunit_can_be_listed_and_reopened_until_deletion_starts() {
     );
     let row = w.wu(wu);
     assert_eq!(row.assimilate_state, ASSIMILATE_READY);
-    assert_eq!(row.transition_time, NEVER);
+    assert_eq!(row.transition_time, 1400);
     assert_eq!(row.rev, rev + 1);
     // A repeat changes nothing.
     assert!(block_on(reopen_assimilation(&w.db, &[wu], 1401))
@@ -1853,4 +1853,60 @@ fn a_failed_webhook_call_waits_the_fixed_retry_delay() {
     assert_eq!(calls.len(), 2);
     // The workunit was written between the calls, so the IDs differ.
     assert_ne!(calls[0]["call_id"], calls[1]["call_id"]);
+}
+
+#[test]
+fn reopening_keeps_a_running_replica_on_the_schedule_and_deletes_nothing() {
+    let w = World::new("trivial");
+    let wu = w.submit("r5", 1000, 1, 2);
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.dispatch(&rs[1], 2, 1100);
+    w.report(&rs[0], 1200, Some("out"), 0);
+    w.transition(wu, 1200);
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_READY);
+    block_on(acknowledge_assimilation(&w.db, &[wu], 1300)).unwrap();
+    w.transition(wu, 1300);
+    // The second replica is still out, due at 1100 + 3600.
+    assert_eq!(
+        block_on(reopen_assimilation(&w.db, &[wu], 1400)).unwrap(),
+        vec![wu]
+    );
+    // The sweep picks it up at once, not never.
+    assert_eq!(block_on(due_workunits(&w.db, 1400, 10)).unwrap(), vec![wu]);
+    // Long after the delete delay: with assimilation ready the pass
+    // schedules nothing for deletion and deletes nothing, and it keeps the
+    // replica's deadline as the next look.
+    let rep = w.transition(wu, 9000);
+    assert_eq!(rep.files_deleted, 0);
+    let row = w.wu(wu);
+    assert_eq!(row.assimilate_state, ASSIMILATE_READY);
+    assert_eq!(row.file_delete_state, FILE_DELETE_INIT);
+    assert_eq!(w.results(wu)[0].file_delete_state, FILE_DELETE_INIT);
+    assert_eq!(w.files.objects.borrow().len(), 1);
+    assert_ne!(row.transition_time, NEVER);
+}
+
+#[test]
+fn an_unusable_credit_value_does_not_cost_the_reply_its_verdicts() {
+    let computed = 2e9 * 100.0 * 200.0 / 86400e9;
+    for bad in [
+        serde_json::json!("unknown"),
+        serde_json::json!(true),
+        serde_json::json!({"x": 1}),
+        serde_json::json!([1]),
+        serde_json::Value::Null,
+    ] {
+        let w = webhook_world();
+        let wu = w.submit("w5", 1000, 1, 1);
+        let rs = w.results(wu);
+        w.dispatch(&rs[0], 1, 1100);
+        w.report(&rs[0], 1200, Some("x"), 0);
+        *w.hook.reply.borrow_mut() = Some(serde_json::json!({
+            "results": [{"id": rs[0].id, "fingerprint": "f", "credit": bad}]
+        }));
+        w.transition(wu, 1200);
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id, "{bad}");
+        assert!((w.results(wu)[0].granted_credit - computed).abs() < 1e-9);
+    }
 }
