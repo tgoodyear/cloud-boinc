@@ -89,6 +89,15 @@ pub const RANDOM: &[(&str, &str)] = &[
 /// to both values before they are compared.
 pub const TRANSFORMS: &[(&str, &str, &str, &str)] = &[
     (
+        // The stock `update_versions` stages application files flat and
+        // writes flat URLs; an app version registered through this server
+        // gets the hash directory like any download file. See D12.
+        "app-file-url",
+        "scheduler_reply/file_info/url",
+        "/download/[0-9a-f]+/(upper_1\\.00_x86_64-pc-linux-gnu)",
+        "/download/$1",
+    ),
+    (
         // The seconds a host must wait: stock counts from the fraction of a
         // second its last request came in, this server from whole seconds.
         "wait-seconds",
@@ -316,8 +325,10 @@ pub fn compare(step: &str, stock: &str, ours: &str, used: &mut Used) -> Result<V
         for (pat, _) in RANDOM.iter().filter(|(p, _)| shape_matches(p, &sh)) {
             used.random.insert(*pat);
         }
+        let ours_value = ours_map.get(l.path.as_str()).copied().unwrap_or_default();
         for (id, pat, re, _) in TRANSFORMS {
-            if shape_matches(pat, &sh) && Regex::new(re).unwrap().is_match(&l.value) {
+            let re = Regex::new(re).unwrap();
+            if shape_matches(pat, &sh) && (re.is_match(&l.value) || re.is_match(ours_value)) {
                 used.transforms.insert(*id);
             }
         }
