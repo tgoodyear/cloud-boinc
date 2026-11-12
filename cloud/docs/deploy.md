@@ -120,7 +120,7 @@ ones. For the default layout:
 | `scheduler` | `<host>/example_cgi/cgi*` |
 | `files` | `<host>/example_cgi/file_upload_handler*` |
 | `files` | `<host>/example/download/*` |
-| `web` | `<host>/example` and `<host>/example/*`; needed when the short name begins with `sched` or `upload`, and harmless otherwise |
+| `web` | `<host>/example*` and `<host>/example/*`; needed when the short name begins with `sched` or `upload`, and harmless otherwise |
 
 Cloudflare picks the most specific matching pattern for a request, and a longer literal part is
 more specific (an exact pattern beats a wildcard one of the same length). That matters in three
@@ -133,8 +133,9 @@ route of its own, or the web Worker's `/*` takes it and answers 404. The pattern
 longer literal part, `example/download/*`, wins over `/*`. The third: a short name that begins
 with `sched` or `upload`, such as `scheduler` or `uploadtest`, has its pages under a path that
 the native `/sched*` or `/upload*` route also matches, and that route would send the master
-page and every page to the scheduler or files Worker. The web routes `<host>/scheduler` (the
-prefix without its slash, which redirects to it) and `<host>/scheduler/*` are more specific and
+page and every page to the scheduler or files Worker. The web routes `<host>/scheduler*` (the
+prefix without its slash, which redirects to it; the wildcard also covers a query string, which
+Cloudflare matches as part of the URL) and `<host>/scheduler/*` are more specific and
 win; they are listed for every short name and are only required for these. Short names that
 only resemble the native `/download/` and `/admin/` routes (`downloads`, `admin2`) do not
 overlap them, since those patterns end in a slash. If the stock project set its own
@@ -153,9 +154,11 @@ The `*` in a route pattern matches any characters, so `example_cgi/cgi*` also re
 scheduler Worker for `example_cgi/cgi-bin/...`, and `/sched*` reaches it for `/scheduler/...`;
 the Worker answers 404 for any path that is not exactly `/sched` or the stock scheduler path.
 
-The setting refuses prefixes that would need two routes with one pattern: the page, cgi, upload
-and download prefixes may not be equal to each other (the cgi and upload prefixes are one by
-default), a page, cgi or upload prefix may not start with `/admin`, `/download`, `/sched` or
+The setting refuses layouts that would need two routes with one pattern, or in which a page
+route would answer an endpoint: the page, cgi, upload and download prefixes and the two endpoint
+paths (`<cgi>/cgi` and `<upload>/file_upload_handler`) may not be equal to each other (the cgi and
+upload prefixes are one by default), the page prefix may not be, or lie under, an endpoint path,
+a page, cgi or upload prefix may not start with `/admin`, `/download`, `/sched` or
 `/upload` as a whole segment, and the download prefix may not start with `/admin`. Prefixes
 nested inside one another are accepted, because the longer route wins. `StockLayout::routes` in
 `cloud/crates/cb-core/src/stock.rs` produces the stock routes, and its test and

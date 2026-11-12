@@ -1009,7 +1009,7 @@ served at the root only. Prefixes are validated when the setting is stored (`put
 it): a path of letters, digits, `.`, `_`, `-` and `~`, no `..`, and not starting with a path
 the native layout uses (`admin`, `download`, `sched`, `upload`, as a whole first segment; the
 download prefix may start with any but `admin`). The page, cgi, upload and download prefixes must
-differ from one another, except that the cgi and upload prefixes may be one. Short names that
+differ from one another and from the two endpoint paths (`<cgi>/cgi`, `<upload>/file_upload_handler`), except that the cgi and upload prefixes may be one; the page prefix may not lie under an endpoint path. Short names that
 merely begin with a native prefix (`scheduler`, `uploadtest`) are accepted; their pages need the
 web routes of `StockLayout::routes`, which `docs/deploy.md` lists, because the native `/sched*`
 and `/upload*` routes also match their path.

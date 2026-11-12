@@ -21,9 +21,10 @@ zone_name = "usnewsmap.com"
 # `/example/` are covered by the route above, unless the short name begins with
 # `sched` or `upload` (for example `scheduler`): the native `/sched*` or `/upload*`
 # route then matches the pages' path as well, and these two, which are more specific,
-# are needed. The first is the prefix without its slash, which redirects to it.
+# are needed. The first is the prefix without its slash, which redirects to it; it ends
+# in a wildcard because Cloudflare matches the query string as part of the URL.
 # [[routes]]
-# pattern = "boinc-dev.usnewsmap.com/example"
+# pattern = "boinc-dev.usnewsmap.com/example*"
 # zone_name = "usnewsmap.com"
 #
 # [[routes]]

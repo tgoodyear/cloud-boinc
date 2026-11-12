@@ -1,6 +1,8 @@
 // The routes of a deployment as path patterns, and how Cloudflare picks one:
-// of the patterns that match a path, the one with the longest literal part
-// wins, and an exact pattern beats a wildcard one of the same length. The
+// a pattern is matched against the URL after the host, query string included,
+// so a wildcard has to cover it. Of the patterns that match, the one with the
+// longest literal part wins, and an exact pattern beats a wildcard one of the
+// same length. The
 // native routes are the ones in the Workers' wrangler.toml files; the stock
 // layout adds the ones in `StockLayout::routes` (cloud/crates/cb-core/src/stock.rs)
 // for the make_project default prefixes of a short name. The Rust test
@@ -20,12 +22,13 @@ export function stockRoutes(short) {
     [`/${short}_cgi/cgi*`, "SCHEDULER"],
     [`/${short}_cgi/file_upload_handler*`, "FILES"],
     [`/${short}/download/*`, "FILES"],
-    [`/${short}`, "WEB"],
+    [`/${short}*`, "WEB"],
     [`/${short}/*`, "WEB"],
   ];
 }
 
-// The binding a path goes to, or null for a tie between Workers.
+// The binding a path (with its query string, if any) goes to, or null for a
+// tie between Workers.
 export function pick(routes, path) {
   let best = null;
   let tie = false;

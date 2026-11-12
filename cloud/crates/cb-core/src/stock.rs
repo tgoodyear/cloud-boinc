@@ -147,25 +147,43 @@ impl StockSpec {
                 "config: <uldl_dir_fanout> must not be negative".into(),
             ));
         }
-        // Two groups of URLs on one prefix would need the same route
-        // pattern for different Workers, or let one Worker's route capture
-        // the other's paths. The cgi and upload prefixes may be one (the
-        // default); every other pair must differ. Nested prefixes are fine:
-        // the longer route is the more specific (see `StockLayout::routes`).
-        let named = [
+        // The paths the layout serves: the three prefixes, the page prefix and
+        // the two endpoints, each of which gets a route (see
+        // `StockLayout::routes`). Two equal paths would need one route
+        // pattern for two destinations, and a page prefix that is, or is
+        // under, an endpoint path would be answered by the endpoint's route
+        // or hide it. The cgi and upload directories may be one, which is the
+        // default. Other nesting is fine: the longer route is the more
+        // specific.
+        let scheduler_path = format!("{cgi_prefix}/{SCHEDULER_CGI}");
+        let handler_path = format!("{upload_prefix}/{UPLOAD_HANDLER}");
+        let named: [(&str, &String); 6] = [
             ("stock_page_prefix", &page_prefix),
             ("stock_cgi_prefix", &cgi_prefix),
             ("stock_upload_prefix", &upload_prefix),
             ("stock_download_prefix", &download_prefix),
+            ("the scheduler path", &scheduler_path),
+            ("the upload handler path", &handler_path),
         ];
-        for (i, (tag_a, a)) in named.iter().enumerate() {
-            for (tag_b, b) in &named[i + 1..] {
-                let both_cgi = *tag_a == "stock_cgi_prefix" && *tag_b == "stock_upload_prefix";
-                if a == b && !a.is_empty() && !both_cgi {
+        for (i, (name_a, a)) in named.iter().enumerate() {
+            for (name_b, b) in &named[i + 1..] {
+                let cgi_and_upload =
+                    *name_a == "stock_cgi_prefix" && *name_b == "stock_upload_prefix";
+                if a == b && !a.is_empty() && !cgi_and_upload {
                     return Err(CoreError::Invalid(format!(
-                        "config: <{tag_a}> and <{tag_b}> are both {a}; they must differ"
+                        "config: {name_a} and {name_b} are both {a}; they must differ"
                     )));
                 }
+            }
+        }
+        for (what, endpoint) in [
+            ("the scheduler path", &scheduler_path),
+            ("the upload handler path", &handler_path),
+        ] {
+            if !page_prefix.is_empty() && page_prefix.starts_with(&format!("{endpoint}/")) {
+                return Err(CoreError::Invalid(format!(
+                    "config: <stock_page_prefix> {page_prefix} is under {what} {endpoint}"
+                )));
             }
         }
         for (tag, p) in [
@@ -408,9 +426,13 @@ impl StockLayout {
     /// be more specific than the native route it overlaps: a short name that
     /// begins with `sched` or `upload` has its pages under a path that the
     /// native `/sched*` or `/upload*` also matches, so the pages need routes
-    /// of their own, and so does the page prefix without its slash, which is
-    /// redirected to it. Cloudflare sends a request to the route with the
-    /// most specific pattern, and a longer literal part is more specific.
+    /// of their own. The page prefix without its slash, which is redirected to
+    /// the one with it, has a wildcard too: Cloudflare matches the query
+    /// string as part of the URL, so an exact pattern would miss
+    /// `/<prefix>?x=1`. Cloudflare sends a request to the route with the most
+    /// specific pattern, and a longer literal part is more specific. The
+    /// validation in `StockSpec::resolve` refuses the layouts in which two
+    /// routes would tie, or a page route would capture an endpoint.
     pub fn routes(&self) -> Vec<(String, RouteTarget)> {
         let mut routes = vec![
             (format!("{}/cgi*", self.cgi_prefix), RouteTarget::Scheduler),
@@ -421,7 +443,7 @@ impl StockLayout {
             (format!("{}/*", self.download_prefix), RouteTarget::Files),
         ];
         if !self.page_prefix.is_empty() {
-            routes.push((self.page_prefix.clone(), RouteTarget::Web));
+            routes.push((format!("{}*", self.page_prefix), RouteTarget::Web));
             routes.push((format!("{}/*", self.page_prefix), RouteTarget::Web));
         }
         routes
@@ -744,7 +766,9 @@ mod tests {
     }
 
     /// A model of how Cloudflare picks a route: among the patterns that match
-    /// a path, the one with the longest literal part, and an exact pattern
+    /// the request's path and query string (a pattern is matched against the
+    /// URL after the host, so a query string is part of what a wildcard must
+    /// cover), the one with the longest literal part, and an exact pattern
     /// before a wildcard one of the same length. `None` when the best two
     /// patterns tie and name different Workers.
     fn pick(routes: &[(String, RouteTarget)], path: &str) -> Option<RouteTarget> {
@@ -780,12 +804,167 @@ mod tests {
         }
     }
 
+    fn with_native(s: &StockLayout) -> Vec<(String, RouteTarget)> {
+        let mut routes: Vec<(String, RouteTarget)> = NATIVE_ROUTES
+            .iter()
+            .map(|(p, t)| (p.to_string(), *t))
+            .collect();
+        routes.extend(s.routes());
+        routes
+    }
+
+    /// The URLs of a layout and of the native layout, each with and without a
+    /// query string, and the Worker that has to answer them.
+    fn expected(s: &StockLayout) -> Vec<(String, RouteTarget)> {
+        use RouteTarget::*;
+        let mut urls = vec![
+            (s.scheduler_path(), Scheduler),
+            (s.upload_path(), Files),
+            (
+                format!(
+                    "{}/{}",
+                    s.download_prefix,
+                    download_tail("wu_1_0", s.fanout)
+                ),
+                Files,
+            ),
+            ("/sched".to_string(), Scheduler),
+            ("/upload/file_upload_handler".to_string(), Files),
+            ("/download/wu_1_0".to_string(), Files),
+            ("/admin/v1/status".to_string(), Admin),
+            ("/".to_string(), Web),
+            ("/home.php".to_string(), Web),
+            ("/get_project_config.php".to_string(), Web),
+        ];
+        if !s.page_prefix.is_empty() {
+            for page in ["", "/", "/home.php", "/get_project_config.php"] {
+                urls.push((format!("{}{page}", s.page_prefix), Web));
+            }
+        }
+        let with_query: Vec<_> = urls.iter().map(|(u, t)| (format!("{u}?x=1"), *t)).collect();
+        urls.extend(with_query);
+        urls
+    }
+
+    /// Every combination of prefixes from a pool that has the cases that
+    /// overlap (a prefix equal to, under, or beginning with another, and
+    /// the endpoint paths themselves): each one the validation accepts routes
+    /// every one of its URLs, with and without a query string, to the right
+    /// Worker, with the routes of `StockLayout::routes` next to the native
+    /// ones. A combination that does not is a rule the validation lacks.
+    #[test]
+    fn every_accepted_layout_routes_its_urls() {
+        let pages = [
+            None,
+            Some("/x"),
+            Some("/x/cgi"),
+            Some("/x/cgi/sub"),
+            Some("/x_cgi"),
+            Some("/x/download"),
+            Some("/x/file_upload_handler"),
+            Some("/x/file_upload_handler/sub"),
+            Some("/a"),
+            Some("/scheduler"),
+            Some("/x/c"),
+        ];
+        let dirs = [
+            "/x",
+            "/x/cgi",
+            "/x_cgi",
+            "/x/download",
+            "/a",
+            "/a/download",
+            "/x/cgi/sub",
+            "/x/file_upload_handler",
+            "/xx",
+        ];
+        let (mut accepted, mut refused) = (0, 0);
+        for page in pages {
+            for cgi in dirs {
+                for upload in dirs {
+                    for download in dirs {
+                        for fanout in [0, 16] {
+                            let sp = StockSpec {
+                                short_name: "t".into(),
+                                cgi_prefix: cgi.into(),
+                                upload_prefix: upload.into(),
+                                download_prefix: download.into(),
+                                page_prefix: Some(page.unwrap_or("").into()),
+                                ..Default::default()
+                            };
+                            let Ok(Some(s)) = sp.resolve(fanout) else {
+                                refused += 1;
+                                continue;
+                            };
+                            accepted += 1;
+                            let routes = with_native(&s);
+                            for (url, want) in expected(&s) {
+                                assert_eq!(
+                                    pick(&routes, &url),
+                                    Some(want),
+                                    "{url} with page {page:?}, cgi {cgi}, upload {upload}, \
+                                     download {download}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The pool has both kinds.
+        assert!(accepted > 1000 && refused > 1000, "{accepted} {refused}");
+    }
+
+    /// The endpoint collisions: a page prefix that is, or lies under, the
+    /// scheduler path or the upload handler path, and equal endpoint paths.
+    #[test]
+    fn endpoint_paths_cannot_collide_with_prefixes() {
+        let mk = |page: &str, cgi: &str, upload: &str, download: &str| StockSpec {
+            short_name: "t".into(),
+            page_prefix: Some(page.into()),
+            cgi_prefix: cgi.into(),
+            upload_prefix: upload.into(),
+            download_prefix: download.into(),
+            ..Default::default()
+        };
+        // Refused: the page prefix is the scheduler path, or the completed
+        // upload handler path, or under either; a download prefix or another
+        // directory is an endpoint path.
+        for (page, cgi, upload, download) in [
+            ("/x/cgi", "/x", "/u", "/d"),
+            ("/x/cgi/sub", "/x", "/u", "/d"),
+            ("/x/file_upload_handler", "/c", "/x", "/d"),
+            ("/x/file_upload_handler/p", "/c", "/x", "/d"),
+            ("/p", "/x", "/u", "/x/cgi"),
+            ("/p", "/c", "/x", "/x/file_upload_handler"),
+            ("/p", "/c", "/c/cgi", "/d"),
+            ("/p", "/c", "/u", "/c/cgi"),
+        ] {
+            assert!(
+                mk(page, cgi, upload, download).resolve(0).is_err(),
+                "{page} {cgi} {upload} {download}"
+            );
+        }
+        // Accepted: the same paths one level apart, the other way round.
+        for (page, cgi, upload, download) in [
+            ("/x", "/x_cgi", "/x_cgi", "/d"),
+            ("/x_cgi", "/x", "/u", "/d"),
+            ("/x/c", "/x", "/u", "/d"),
+            ("/p", "/x/cgi", "/x/cgi", "/d"),
+            ("/a", "/x", "/u", "/a/download"),
+        ] {
+            assert!(
+                mk(page, cgi, upload, download).resolve(0).is_ok(),
+                "{page} {cgi} {upload} {download}"
+            );
+        }
+    }
+
     /// Short names that begin with a native prefix, or are one without being
     /// reserved, with the routes of the layout next to the native ones: every
     /// stock URL and every native URL reaches the right Worker.
     #[test]
     fn stock_routes_beat_the_native_ones_they_overlap() {
-        use RouteTarget::*;
         let shorts = [
             "example",
             "scheduler",
@@ -803,30 +982,8 @@ mod tests {
                     sp.download_prefix = d.clone();
                 }
                 let s = sp.resolve(fanout).unwrap().unwrap();
-                let mut routes: Vec<(String, RouteTarget)> = NATIVE_ROUTES
-                    .iter()
-                    .map(|(p, t)| (p.to_string(), *t))
-                    .collect();
-                routes.extend(s.routes());
-                let name = "wu_1_0";
-                let download = format!("{}/{}", s.download_prefix, download_tail(name, s.fanout));
-                let cases = [
-                    (s.scheduler_path(), Scheduler),
-                    (s.upload_path(), Files),
-                    (download, Files),
-                    (s.page_prefix.clone(), Web),
-                    (format!("{}/", s.page_prefix), Web),
-                    (format!("{}/home.php", s.page_prefix), Web),
-                    (format!("{}/get_project_config.php", s.page_prefix), Web),
-                    ("/sched".to_string(), Scheduler),
-                    ("/upload/file_upload_handler".to_string(), Files),
-                    ("/download/wu_1_0".to_string(), Files),
-                    ("/admin/v1/status".to_string(), Admin),
-                    ("/".to_string(), Web),
-                    ("/home.php".to_string(), Web),
-                    ("/get_project_config.php".to_string(), Web),
-                ];
-                for (path, want) in cases {
+                let routes = with_native(&s);
+                for (path, want) in expected(&s) {
                     assert_eq!(pick(&routes, &path), Some(want), "{short}: {path}");
                 }
                 // Without the layout's page routes the native ones capture
@@ -838,7 +995,11 @@ mod tests {
                     .map(|(p, t)| (p.to_string(), *t))
                     .collect();
                 let captured = short.starts_with("sched") || short.starts_with("upload");
-                assert_eq!(pick(&native, &page) != Some(Web), captured, "{short}");
+                assert_eq!(
+                    pick(&native, &page) != Some(RouteTarget::Web),
+                    captured,
+                    "{short}"
+                );
             }
         }
     }
