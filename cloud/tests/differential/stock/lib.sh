@@ -92,19 +92,28 @@ start_apache() {
 }
 
 start_feeder() {
-    # The scheduler reads the jobs the feeder keeps in shared memory.
-    as_boincadm "cd '$PROJECT_DIR' && rm -f reread_db && nohup bin/feeder -d 3 \
-        >> log_localhost/feeder.out 2>&1 & echo \$! > '$STATE/feeder.pid'"
-    for _ in $(seq 1 30); do
-        as_boincadm "cd '$PROJECT_DIR' && bin/show_shmem 2>/dev/null | grep -q 'ready'" && return
+    # The scheduler reads the jobs the feeder keeps in shared memory. The
+    # subshell execs the feeder, so the recorded PID is the feeder's own.
+    as_boincadm "( cd '$PROJECT_DIR' && rm -f reread_db && exec nohup bin/feeder -d 3 \
+        >> log_localhost/feeder.out 2>&1 ) & echo \$! > '$STATE/feeder.pid'"
+    for _ in $(seq 1 60); do
+        as_boincadm "cd '$PROJECT_DIR' && bin/show_shmem 2>/dev/null | grep -q '^ready: 1'" && return 0
         sleep 1
     done
+    echo "the feeder did not fill the shared memory; see $PROJECT_DIR/log_localhost/feeder.out" >&2
+    return 1
 }
 
 stop_feeder() {
     if [ -f "$STATE/feeder.pid" ]; then
-        kill "$(cat "$STATE/feeder.pid")" 2>/dev/null || true
-        sleep 1
+        pid="$(cat "$STATE/feeder.pid")"
+        kill "$pid" 2>/dev/null || true
+        # Wait for it to end, so that no feeder is left to fill a segment.
+        for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -9 "$pid" 2>/dev/null || true
         rm -f "$STATE/feeder.pid"
     fi
     # Remove the shared memory segment the feeder leaves behind.
