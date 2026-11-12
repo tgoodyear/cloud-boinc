@@ -837,7 +837,16 @@ mod tests {
             ("/get_project_config.php".to_string(), Web),
         ];
         if !s.page_prefix.is_empty() {
-            for page in ["", "/", "/home.php", "/get_project_config.php"] {
+            for page in [
+                "",
+                "/",
+                "/home.php",
+                "/get_project_config.php",
+                "/work.php",
+                "/activity.php",
+                "/top_users.php",
+                "/top_hosts.php",
+            ] {
                 urls.push((format!("{}{page}", s.page_prefix), Web));
             }
         }

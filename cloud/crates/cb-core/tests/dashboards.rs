@@ -763,6 +763,36 @@ fn the_option_is_read_from_the_config() {
 }
 
 #[test]
+fn the_pages_answer_under_a_stock_page_prefix_and_link_relatively() {
+    use cb_core::stock::{route_web, WebRoute};
+    let config = cb_core::Config::parse(
+        "<config><master_url>https://p.example/</master_url><stock_short_name>testproj</stock_short_name></config>",
+    )
+    .unwrap();
+    let stock = config.stock.as_ref().unwrap();
+    assert_eq!(stock.page_prefix, "/testproj");
+    let (db, project) = setup();
+    busy(&db);
+    block_on(rollup_pass(&db, NOW, 0)).unwrap();
+    for path in PUBLIC_PATHS {
+        // The web Worker routes the prefixed path to the page, which is
+        // named at the root, and the cache key is the root's.
+        assert_eq!(
+            route_web(&format!("/testproj{path}"), Some(stock)),
+            WebRoute::Page {
+                path,
+                prefixed: true
+            }
+        );
+        // A page links only relatively, so the same HTML serves both places.
+        let body = get(&db, &project, path, &query(&[]));
+        for bad in ["href=\"/", "src=\"/", "action=\"/", "https://p.example"] {
+            assert!(!body.contains(bad), "{path}: {bad}");
+        }
+    }
+}
+
+#[test]
 fn feed_url_is_checked_when_the_config_is_stored() {
     let db = SqliteDb::with_schema().unwrap();
     for (url, ok) in [
