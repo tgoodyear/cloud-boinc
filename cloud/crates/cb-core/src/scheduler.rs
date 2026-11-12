@@ -2903,9 +2903,32 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         // next one, up to `MAX_WINDOWS` in all.
         round += 1;
         let still_needed = (0..NPROC).any(|pt| need_secs[pt] > 0.0 || need_inst[pt] > 0.0);
+        // Another window can only help if some version could still take a
+        // job: one whose resource the client still wants work for, whose
+        // daily quota and limits on jobs in progress are not used up, and
+        // with disk left. (Assigned jobs sent, a full reply, a request
+        // satisfied, and a reply that resent lost tasks, which sends nothing
+        // else, stop it too; the other reasons a host gets no work, `dont_send_jobs`,
+        // a refused host, a client that is too old, never reach here: they
+        // leave `windows` empty.)
+        let a_version_is_open = versions.iter().any(|v| {
+            let pt = proc_index(v.hu.proc_type);
+            let (count, limit) = if v.gpu {
+                (n_gpu, gpu_limit)
+            } else {
+                (n_cpu, cpu_limit)
+            };
+            (need_secs[pt] > 0.0 || need_inst[pt] > 0.0)
+                && rows.get(&v.gavid).is_some_and(|r| r.n_today < r.quota)
+                && !(limit > 0 && count >= limit)
+                && !(total_limit > 0 && n_cpu + n_gpu >= total_limit)
+        });
         if n_assigned > 0
+            || resent_lost
             || n_new >= max_send
             || !still_needed
+            || !a_version_is_open
+            || disk <= 0.0
             || round >= MAX_WINDOWS
             || windows.is_empty()
         {

@@ -274,7 +274,9 @@ versions, committed versions and workunit-ID and batch bounds admit a workunit, 
 The test is the same as the one the loop applies to a row (`admitted`), so the rows read are
 the rows the loop can send. What the query cannot see is what depends on the size of the
 job against the host: memory, disk and the deadline. A window that comes back full while the
-request still wants work and has sent less than the most it may send is followed by the
+request still wants work, has sent less than the most it may send, has a version that could still
+take a job (resource wanted, daily limit and limit in progress not reached) and disk left, and
+resent no lost task (a reply that resends sends nothing else), is followed by the
 next one (`r.priority`, `r.id` after the last row), up to `MAX_WINDOWS` (4) in all, so a host
 reaches 400 rows of an app in one request. Beyond that, jobs the host is too small for in front
 of ones it is not stay in front: the host is told what stopped it ("Tasks need more memory than
@@ -2070,9 +2072,16 @@ which the loader would skip and replace with the default, is refused, as is a ho
 redundancy type the loader rejects. A tag that is not in the table is stored as it is, as the
 loader skips it. The result must
 pass the same checks as a whole-config write, so an edit that would leave the config unparseable,
-without a master URL, or with a bad sender address is refused and nothing is stored. A tag stated
-twice is changed in its last occurrence, which is the one the loader uses (each reading replaces the one
-before), and removed everywhere. The reply gives the value the tag had and whether the
+without a master URL, or with a bad sender address is refused and nothing is stored. For an option the
+loader reads, the edit is of the setting: every occurrence of the tag and of the tags that set the
+same thing (`ALIAS_GROUPS` in `config.rs`: the two spellings of the web sign-up flag, which the
+loader ORs; `account_creation` with `disable_account_creation`; `grace_period_hours` with
+`report_grace_period`) is taken out and the tag is stated once, at the place of its last
+occurrence, so a flag cannot stay on in a second element or an alias. A test finds options that
+write one setting, so a new alias cannot be missed. After the edit the lone element
+`<tag>value</tag>` is parsed and every setting it changes must hold that value in the edited
+document, or the edit is refused naming the setting. A tag the loader does not read is changed in
+its last occurrence only (a stock config repeats some, such as `ban_os`) and removed everywhere. The reply gives the value the tag had and whether the
 document changed. A flag is set with `--value 1`.
 
 The config is read with the loader's own tokenizer (`XmlParser`, `scan_config` in

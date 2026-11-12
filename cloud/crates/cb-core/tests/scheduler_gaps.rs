@@ -148,6 +148,22 @@ impl<'a> Db for Interleave<'a> {
     }
 }
 
+/// Records the SQL sent through it.
+struct Recording<'a> {
+    inner: &'a SqliteDb,
+    sql: RefCell<Vec<String>>,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for Recording<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        self.sql
+            .borrow_mut()
+            .extend(stmts.iter().map(|s| s.sql.clone()));
+        self.inner.batch(stmts).await
+    }
+}
+
 struct World {
     db: SqliteDb,
     config: Config,
@@ -316,6 +332,19 @@ impl World {
         let random = || self.rand();
         let ctx = self.ctx(&self.db, &catalog, &random, now);
         block_on(handle_request(&ctx, &req.xml())).unwrap()
+    }
+
+    /// A request, with the SQL it sent.
+    fn rpc_recorded(&self, req: &Req, now: i64) -> (SchedOutcome, Vec<String>) {
+        let catalog = block_on(Catalog::load(&self.db)).unwrap();
+        let random = || self.rand();
+        let db = Recording {
+            inner: &self.db,
+            sql: RefCell::new(Vec::new()),
+        };
+        let ctx = self.ctx(&db, &catalog, &random, now);
+        let out = block_on(handle_request(&ctx, &req.xml())).unwrap();
+        (out, db.sql.take())
     }
 
     /// `outer` reads, then `inner` runs completely, then `outer` writes.
@@ -1258,4 +1287,126 @@ fn a_pinned_job_goes_to_a_superseded_version_that_min_version_keeps() {
     let host = w.computer("a");
     let out = w.rpc(&host, 2000);
     assert_eq!(w.sent_versions(&out), vec![("old".into(), 100)]);
+}
+
+// ---- When the next window is not read ----------------------------------------
+
+/// Reads of a window after the first.
+fn next_windows(sql: &[String]) -> usize {
+    sql.iter().filter(|s| s.contains("r.priority < ?")).count()
+}
+
+/// A resend sends nothing else, so the windows of unsent work behind it are
+/// not read, however full the first was.
+#[test]
+fn a_resend_sends_only_the_resent_tasks() {
+    let w = World::new("", "<resend_lost_results>1</resend_lost_results>");
+    w.app(1, "a", "");
+    w.version(1, 1, "a", 100, 1, "");
+    let template = documents(&w, "a");
+    bulk_insert(&w, &template, &Bulk::new(1, "j", 1));
+    let host = w.computer("a");
+    let out = w.rpc(&host, 3000);
+    assert_eq!(out.n_sent, 1);
+    // More than two windows of unsent work, and a client that lost its task.
+    bulk_insert(&w, &template, &Bulk::new(1, "more", 250));
+    let mut lost = host.clone();
+    lost.seqno = 3;
+    lost.top_extra = "<other_results>\n</other_results>\n".into();
+    let (out, sql) = w.rpc_recorded(&lost, 3100);
+    assert_eq!(out.n_resent, 1);
+    assert_eq!(out.n_sent, 0);
+    assert_eq!(next_windows(&sql), 0);
+    assert_eq!(w.unsent_of("a"), 250);
+}
+
+/// The ways a host stops getting work, each with more than a window of
+/// unsent work waiting: no further window is read, since no job could be
+/// taken from it.
+#[test]
+fn nothing_is_read_past_the_first_window_when_no_job_can_be_taken() {
+    // The daily limit is used up by the first window's jobs.
+    let w = World::new("", "<daily_result_quota>1</daily_result_quota>");
+    w.app(1, "a", "");
+    w.version(1, 1, "a", 100, 1, "");
+    let template = documents(&w, "a");
+    bulk_insert(&w, &template, &Bulk::new(1, "j", 450));
+    let host = w.computer("a");
+    let (out, sql) = w.rpc_recorded(&host, 3000);
+    // One job a day for each of the host's four CPUs.
+    assert_eq!(out.n_sent, 4);
+    assert_eq!(next_windows(&sql), 0);
+
+    // The limit on jobs in progress is reached.
+    let w = World::new("", "<max_wus_in_progress>1</max_wus_in_progress>");
+    w.app(1, "a", "");
+    w.version(1, 1, "a", 100, 1, "");
+    let template = documents(&w, "a");
+    bulk_insert(&w, &template, &Bulk::new(1, "j", 450));
+    let host = w.computer("a");
+    let (out, sql) = w.rpc_recorded(&host, 3000);
+    assert_eq!(out.n_sent, 4);
+    assert_eq!(next_windows(&sql), 0);
+
+    // No disk is left: every job fails the disk check, and none is looked for
+    // behind the first window.
+    let w = World::new("", "");
+    w.app(1, "a", "");
+    w.version(1, 1, "a", 100, 1, "");
+    let template = documents(&w, "a");
+    bulk_insert(&w, &template, &Bulk::new(1, "j", 450));
+    let mut host = w.computer("a");
+    host.host_extra = "<d_free>1000</d_free>\n".into();
+    let (out, sql) = w.rpc_recorded(&host, 3000);
+    assert_eq!(out.n_sent, 0);
+    assert!(has_message(&out, "more disk space"));
+    assert_eq!(next_windows(&sql), 0);
+
+    // The project sends no jobs, the request asks for none, and a client
+    // that is too old gets none: no candidate is read at all.
+    for (config, tweak) in [
+        ("<dont_send_jobs>1</dont_send_jobs>", 0),
+        ("", 1),
+        (
+            "<min_core_client_version>90000</min_core_client_version>",
+            2,
+        ),
+    ] {
+        let w = World::new("", config);
+        w.app(1, "a", "");
+        w.version(1, 1, "a", 100, 1, "");
+        let template = documents(&w, "a");
+        bulk_insert(&w, &template, &Bulk::new(1, "j", 450));
+        let mut host = w.computer("a");
+        host.client = (8, 0, 4);
+        if tweak == 1 {
+            host.top_extra = "<dont_send_work>1</dont_send_work>\n".into();
+        }
+        let (out, sql) = w.rpc_recorded(&host, 3000);
+        assert_eq!(out.n_sent, 0, "{config}");
+        assert!(
+            !sql.iter().any(|s| s.contains("r.server_state = 2")),
+            "{config}: unsent results were read"
+        );
+    }
+
+    // The control: with room, the windows are read (a host too small for the
+    // jobs in the first two windows gets the small ones behind them).
+    let w = World::new("", "");
+    w.app(1, "a", "");
+    w.version(1, 1, "a", 100, 1, "");
+    let template = documents(&w, "a");
+    bulk_insert(
+        &w,
+        &template,
+        &Bulk {
+            memory_bound: 1e12,
+            ..Bulk::new(1, "big", 150)
+        },
+    );
+    bulk_insert(&w, &template, &Bulk::new(1, "small", 5));
+    let host = w.computer("a");
+    let (out, sql) = w.rpc_recorded(&host, 3000);
+    assert_eq!(out.n_sent, 5);
+    assert!(next_windows(&sql) >= 1);
 }

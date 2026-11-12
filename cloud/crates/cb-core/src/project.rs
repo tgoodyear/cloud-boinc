@@ -220,12 +220,23 @@ fn scan_config(xml: &str) -> CoreResult<ConfigDoc> {
 }
 
 /// `xml` with the top-level tag of `<config>` set to `value`, or removed when
-/// `value` is `None`, and the value the tag had. The loader takes the last
-/// of a tag that is stated more than once (each reading replaces the one
-/// before), so setting changes that one and leaves the others, and removing
-/// takes all of them out. Nothing else in the document changes. The edit is
-/// read back with the loader's own tokenizer, and refused unless the tag has
-/// the value asked for (or is gone) and every other element is as it was.
+/// `value` is `None`, and the value the tag had (its last occurrence's).
+///
+/// For an option the loader reads, the edit is of the setting, not of one
+/// element: every occurrence of the tag, and of the tags that set the same
+/// thing (`Config::option_group`), is taken out, and the tag is stated once, at
+/// the place of its last occurrence. The loader takes the last of a repeated
+/// tag for most options, but a flag that accumulates (`no_web_account_creation`
+/// is on if any element says so) or that is combined with another spelling
+/// would otherwise keep the old value. A tag the loader does not read is
+/// changed in its last occurrence only (a stock `config.xml` repeats some
+/// such tags, `ban_os` for one), and removal takes all of that tag.
+///
+/// The edit is read back with the loader's own tokenizer and refused unless
+/// the tag has the value asked for (or is gone), every other element is as it
+/// was, and what the loader makes of the result is what it makes of the
+/// option stated alone: each setting a lone `<tag>value</tag>` changes has the
+/// same value in the edited document.
 pub fn edit_config_tag(
     xml: &str,
     tag: &str,
@@ -257,8 +268,12 @@ pub fn edit_config_tag(
         Config::check_option(tag, v)?;
     }
     let doc = scan_config(xml)?;
-    let same: Vec<&ConfigElement> = doc.elements.iter().filter(|e| e.name == tag).collect();
-    let previous = same.last().and_then(|e| e.value.clone());
+    let group = Config::option_group(tag);
+    let names: Vec<&str> = group.clone().unwrap_or_else(|| vec![tag]);
+    let in_group = |e: &&ConfigElement| names.contains(&e.name.as_str());
+    let occurrences: Vec<&ConfigElement> = doc.elements.iter().filter(in_group).collect();
+    let own: Vec<&&ConfigElement> = occurrences.iter().filter(|e| e.name == tag).collect();
+    let previous = own.last().and_then(|e| e.value.clone());
     let element = value.map(|v| format!("<{tag}>{}</{tag}>", cb_proto::xml::xml_escape(v)));
     // Leave the line a removed element was on without a blank one.
     let widen = |s: &ConfigElement| {
@@ -270,14 +285,33 @@ pub fn edit_config_tag(
             _ => (s.start, s.end),
         }
     };
-    let mut out = String::with_capacity(xml.len() + 64);
-    let mut cursor = 0;
-    match (&element, same.last()) {
-        (Some(e), Some(last)) => {
-            out.push_str(&xml[..last.start]);
-            out.push_str(e);
-            cursor = last.end;
+    // What to cut or put: (from, to, text).
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    // The element that stays, with the new text in it; none when the tag
+    // is not stated or the edit is a removal.
+    let anchor: Option<&ConfigElement> = match (&element, group.is_some()) {
+        (None, _) => None,
+        (Some(_), true) => own.last().map(|e| **e).or(occurrences.last().copied()),
+        (Some(_), false) => own.last().map(|e| **e),
+    };
+    // What is removed: the occurrences other than the anchor, of the whole
+    // group for an option and of the tag for any other.
+    let removed: Vec<&ConfigElement> = if group.is_some() {
+        occurrences.clone()
+    } else if element.is_none() {
+        own.iter().map(|e| **e).collect()
+    } else {
+        Vec::new()
+    };
+    for e in removed {
+        if anchor.is_some_and(|a| a.start == e.start) {
+            continue;
         }
+        let (from, to) = widen(e);
+        edits.push((from, to, String::new()));
+    }
+    match (&element, anchor) {
+        (Some(e), Some(a)) => edits.push((a.start, a.end, e.clone())),
         (Some(e), None) => {
             let close = doc.close;
             let line = xml[..close].rfind('\n').map_or(0, |i| i + 1);
@@ -293,22 +327,20 @@ pub fn edit_config_tag(
                     })
                     .filter(|i| i.trim().is_empty() && !i.is_empty())
                     .unwrap_or("    ");
-                out.push_str(&xml[..line]);
-                out.push_str(&format!("{indent}{e}\n"));
-                cursor = line;
+                edits.push((line, line, format!("{indent}{e}\n")));
             } else {
-                out.push_str(&xml[..close]);
-                out.push_str(e);
-                cursor = close;
+                edits.push((close, close, e.clone()));
             }
         }
-        (None, _) => {
-            for s in &same {
-                let (from, to) = widen(s);
-                out.push_str(&xml[cursor..from]);
-                cursor = to;
-            }
-        }
+        (None, _) => {}
+    }
+    edits.sort_by_key(|e| e.0);
+    let mut out = String::with_capacity(xml.len() + 64);
+    let mut cursor = 0;
+    for (from, to, text) in &edits {
+        out.push_str(&xml[cursor..*from]);
+        out.push_str(text);
+        cursor = *to;
     }
     out.push_str(&xml[cursor..]);
 
@@ -317,13 +349,19 @@ pub fn edit_config_tag(
     let others = |d: &ConfigDoc| -> Vec<(String, Option<String>)> {
         d.elements
             .iter()
-            .filter(|e| e.name != tag)
+            .filter(|e| !names.contains(&e.name.as_str()))
             .map(|e| (e.name.clone(), e.value.clone()))
             .collect()
     };
-    let mine: Vec<&ConfigElement> = after.elements.iter().filter(|e| e.name == tag).collect();
+    let mine: Vec<&ConfigElement> = after.elements.iter().filter(in_group).collect();
     let ok = match value {
-        Some(v) => mine.last().is_some_and(|e| e.value.as_deref() == Some(v)),
+        Some(v) if group.is_some() => {
+            mine.len() == 1 && mine[0].name == tag && mine[0].value.as_deref() == Some(v)
+        }
+        Some(v) => mine
+            .iter()
+            .rfind(|e| e.name == tag)
+            .is_some_and(|e| e.value.as_deref() == Some(v)),
         None => mine.is_empty(),
     };
     if !ok {
@@ -338,7 +376,46 @@ pub fn edit_config_tag(
             "config tag: the edit would change another option".into(),
         ));
     }
+    // The URLs are filled in from the master URL when the config is
+    // finished, so what one of them comes to depends on the others.
+    let derived = ["master_url", "download_url", "upload_url"].contains(&tag);
+    if let (Some(v), true, false) = (value, group.is_some(), derived) {
+        effective_value_holds(&out, tag, v)?;
+    }
     Ok((out, previous))
+}
+
+/// What the loader makes of `out` for an option just set: every setting that
+/// `<tag>value</tag>` alone changes holds the value it gets from that element.
+/// A setting some other element of the document still overrides is a setting
+/// the edit did not set; the edit is refused, naming the tags in the document
+/// that read the same.
+fn effective_value_holds(out: &str, tag: &str, value: &str) -> CoreResult<()> {
+    let lone = format!(
+        "<config><master_url>https://p.example/</master_url><{tag}>{}</{tag}></config>",
+        cb_proto::xml::xml_escape(value)
+    );
+    let base = "<config><master_url>https://p.example/</master_url></config>";
+    let (Ok(lone), Ok(base), Ok(got)) = (
+        Config::parse(&lone),
+        Config::parse(base),
+        Config::parse(out),
+    ) else {
+        // A document that does not parse is refused by the checks that follow.
+        return Ok(());
+    };
+    // The settings the element sets, and what they come to in the document.
+    let wanted = lone.changed_fields(&base);
+    let have = got.changed_fields(&base);
+    for (field, v) in wanted {
+        if !have.iter().any(|(f, x)| *f == field && *x == v) {
+            return Err(CoreError::Invalid(format!(
+                "config tag: <{tag}> is overridden by another element of the document \
+                 ({field} reads differently)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// What `change_config_tag` did.

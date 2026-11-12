@@ -1302,3 +1302,146 @@ fn a_set_is_visible_in_the_parsed_config_for_every_option() {
     }
     assert!(checked > 45);
 }
+
+// ---- Repeated and aliased options ---------------------------------------------
+
+fn web_disabled(xml: &str) -> bool {
+    Config::parse(xml).unwrap().disable_web_account_creation
+}
+
+#[test]
+fn a_flag_that_accumulates_is_cleared_in_every_spelling_and_occurrence() {
+    let base =
+        |body: &str| format!("<config><master_url>https://p.example/</master_url>{body}</config>");
+    // Two elements of one tag: the loader ORs them.
+    let xml = base("<no_web_account_creation>1</no_web_account_creation><long_name>x</long_name><no_web_account_creation>1</no_web_account_creation>");
+    assert!(web_disabled(&xml));
+    let (new, prev) = edit_config_tag(&xml, "no_web_account_creation", Some("0")).unwrap();
+    assert_eq!(prev.as_deref(), Some("1"));
+    assert!(!web_disabled(&new), "{new}");
+    assert_eq!(new.matches("no_web_account_creation").count(), 2, "{new}");
+    // The other spelling holds 1: it is part of the same setting.
+    let xml = base("<disable_web_account_creation>1</disable_web_account_creation><no_web_account_creation>0</no_web_account_creation>");
+    assert!(web_disabled(&xml));
+    let (new, _) = edit_config_tag(&xml, "no_web_account_creation", Some("0")).unwrap();
+    assert!(!web_disabled(&new), "{new}");
+    assert!(!new.contains("disable_web_account_creation"), "{new}");
+    // The same from the other spelling, and a set to 1 with the alias at 0.
+    let (new, _) = edit_config_tag(&xml, "disable_web_account_creation", Some("0")).unwrap();
+    assert!(!web_disabled(&new));
+    let xml = base("<disable_web_account_creation>0</disable_web_account_creation>");
+    let (new, _) = edit_config_tag(&xml, "no_web_account_creation", Some("1")).unwrap();
+    assert!(web_disabled(&new));
+    // Removed: every spelling and occurrence goes.
+    let xml = base("<no_web_account_creation>1</no_web_account_creation><disable_web_account_creation>1</disable_web_account_creation><no_web_account_creation>1</no_web_account_creation>");
+    let (new, _) = edit_config_tag(&xml, "disable_web_account_creation", None).unwrap();
+    assert!(!web_disabled(&new), "{new}");
+    assert!(!new.contains("web_account_creation"), "{new}");
+    // Sign-up: `disable_account_creation` closes it whatever `account_creation` says.
+    let xml = base("<account_creation>0</account_creation><disable_account_creation>1</disable_account_creation>");
+    assert!(!Config::parse(&xml).unwrap().account_creation);
+    let (new, _) = edit_config_tag(&xml, "account_creation", Some("1")).unwrap();
+    assert!(Config::parse(&new).unwrap().account_creation, "{new}");
+    // The grace period is one setting under two tags, the later one read wins.
+    let xml = base(
+        "<report_grace_period>10</report_grace_period><grace_period_hours>2</grace_period_hours>",
+    );
+    assert_eq!(Config::parse(&xml).unwrap().report_grace_period, 7200);
+    let (new, _) = edit_config_tag(&xml, "report_grace_period", Some("30")).unwrap();
+    assert_eq!(
+        Config::parse(&new).unwrap().report_grace_period,
+        30,
+        "{new}"
+    );
+}
+
+/// For every option, with up to three elements of it and of its aliases in the
+/// document, in any order and with values the loader reads and skips alike, a
+/// set leaves the loader holding what was asked for, as if the option had
+/// been stated alone, and an unset leaves it at the default.
+#[test]
+fn a_set_or_unset_holds_with_repeats_and_aliases_present() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let head = "<master_url>https://p.example/</master_url>";
+    let mut checked = 0;
+    for (tag, kind) in Config::option_kinds() {
+        if tag.starts_with("stock_") || ["master_url", "download_url", "upload_url"].contains(&tag)
+        {
+            continue;
+        }
+        let group = Config::option_group(tag).unwrap();
+        let (a, b) = samples(tag, kind);
+        let skipped = "1800s";
+        for round in 0..40 {
+            let mut body = String::new();
+            for _ in 0..next(4) {
+                let name = group[next(group.len())];
+                let v = [a, b, skipped][next(3)];
+                body.push_str(&format!("<{name}>{v}</{name}>"));
+            }
+            let doc = format!("<config>{head}{body}</config>");
+            let Ok(before) = Config::parse(&doc) else {
+                continue;
+            };
+            let _ = before;
+            let value = [a, b][next(2)];
+            // Set: the loader holds what a lone element would give it.
+            let (new, _) = edit_config_tag(&doc, tag, Some(value))
+                .unwrap_or_else(|e| panic!("{tag}={value} round {round}: {e}\n{doc}"));
+            let lone = format!("<config>{head}<{tag}>{value}</{tag}></config>");
+            assert_eq!(
+                Config::parse(&new).unwrap(),
+                Config::parse(&lone).unwrap(),
+                "{tag}={value}\n{doc}\n{new}"
+            );
+            // Unset: the default.
+            let (gone, _) = edit_config_tag(&doc, tag, None).unwrap();
+            assert_eq!(
+                Config::parse(&gone).unwrap(),
+                Config::parse(&format!("<config>{head}</config>")).unwrap(),
+                "unset {tag}\n{doc}\n{gone}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 1500, "{checked}");
+}
+
+/// The aliases are listed because options that write the same setting are
+/// found by a test, not by reading: two options whose lone elements change a
+/// setting in common are in one group.
+#[test]
+fn options_that_share_a_setting_are_in_one_group() {
+    let head = "<master_url>https://p.example/</master_url>";
+    let base = Config::parse(&format!("<config>{head}</config>")).unwrap();
+    let options: Vec<(&str, OptionKind)> = Config::option_kinds()
+        .filter(|(t, _)| !t.starts_with("stock_") && *t != "master_url")
+        .collect();
+    let lone = |tag: &str, v: &str| {
+        Config::parse(&format!("<config>{head}<{tag}>{v}</{tag}></config>"))
+            .unwrap()
+            .changed_fields(&base)
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect::<Vec<_>>()
+    };
+    for (i, (ta, ka)) in options.iter().enumerate() {
+        for (tb, kb) in &options[i + 1..] {
+            let (a1, a2) = samples(ta, *ka);
+            let (b1, b2) = samples(tb, *kb);
+            let fa: Vec<String> = [lone(ta, a1), lone(ta, a2)].concat();
+            let fb: Vec<String> = [lone(tb, b1), lone(tb, b2)].concat();
+            let shared = fa.iter().any(|f| fb.contains(f));
+            if shared {
+                let g = Config::option_group(ta).unwrap();
+                assert!(g.contains(tb), "{ta} and {tb} set the same thing");
+            }
+        }
+    }
+}

@@ -503,6 +503,18 @@ static OPTIONS: &[ConfigOption] = &[
     },
 ];
 
+/// Options that feed one setting, so that one spelling set to 0 while another
+/// holds 1 does not leave the setting on. `grace_period_hours` and
+/// `report_grace_period` write the same field (the later one read wins), the
+/// two spellings of the flag that closes sign-up on the web accumulate (any
+/// 1 closes it), and `account_creation` and `disable_account_creation` are
+/// combined when the config is finished (closed if either says so).
+static ALIAS_GROUPS: &[&[&str]] = &[
+    &["grace_period_hours", "report_grace_period"],
+    &["no_web_account_creation", "disable_web_account_creation"],
+    &["account_creation", "disable_account_creation"],
+];
+
 /// Reads the option the parser is at, the way the loader does.
 fn read_option(xp: &mut XmlParser<'_>, opt: &ConfigOption) -> Option<Parsed> {
     match opt.kind {
@@ -535,6 +547,47 @@ impl Config {
         };
         (opt.set)(&mut Parsing::default(), parsed)?;
         Ok(Some(opt.kind))
+    }
+
+    /// The tags that set the same thing as `tag`, `tag` included, when the
+    /// loader reads `tag`; `None` for a tag it does not read. An option with
+    /// no alias is a group of its own.
+    pub fn option_group(tag: &str) -> Option<Vec<&'static str>> {
+        let opt = OPTIONS.iter().find(|o| o.name == tag)?;
+        Some(
+            ALIAS_GROUPS
+                .iter()
+                .find(|g| g.contains(&tag))
+                .map_or_else(|| vec![opt.name], |g| g.to_vec()),
+        )
+    }
+
+    /// The settings of `self` that differ from `other`, by field name, with
+    /// the value each has in `self`. (From the derived `Debug` text, so it
+    /// follows the fields without a list of them.)
+    pub fn changed_fields(&self, other: &Config) -> Vec<(String, String)> {
+        fn fields(c: &Config) -> Vec<(String, String)> {
+            let text = format!("{c:#?}");
+            let mut out: Vec<(String, String)> = Vec::new();
+            for line in text.lines().skip(1) {
+                let top = line.starts_with("    ") && !line.starts_with("     ");
+                match (top, line.trim_start().split_once(": ")) {
+                    (true, Some((name, value))) => out.push((name.to_string(), value.to_string())),
+                    _ => {
+                        if let Some(last) = out.last_mut() {
+                            last.1.push('\n');
+                            last.1.push_str(line);
+                        }
+                    }
+                }
+            }
+            out
+        }
+        let theirs = fields(other);
+        fields(self)
+            .into_iter()
+            .filter(|f| !theirs.contains(f))
+            .collect()
     }
 
     /// The tags the loader reads, with how it reads them.
