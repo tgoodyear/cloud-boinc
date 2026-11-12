@@ -1,4 +1,4 @@
-//! Scheduler requests recorded from stock clients of several versions, replayed
+//! Scheduler requests recorded from stock clients of several versions and platforms, replayed
 //! against this server. The files are in `cloud/tests/client-corpus/` (see its
 //! README for how they were captured and scrubbed).
 //!
@@ -36,11 +36,12 @@ use futures_lite::future::block_on;
 use regex::Regex;
 use serde_json::Value;
 
+/// The platform of a client that `manifest.json` gives no platform for.
 const LINUX: &str = "x86_64-pc-linux-gnu";
 const AUTH: &str = "fixture-authenticator";
 const INPUT_TEMPLATE: &str = "<input_template>\n<workunit>\n<rsc_fpops_est>1e10</rsc_fpops_est>\n<rsc_memory_bound>1e8</rsc_memory_bound>\n<rsc_disk_bound>1e8</rsc_disk_bound>\n<delay_bound>3600</delay_bound>\n</workunit>\n</input_template>\n";
 const RESULT_TEMPLATE: &str = "<output_template>\n<file_info>\n    <name><OUTFILE_0/></name>\n    <generated_locally/>\n    <upload_when_present/>\n    <max_nbytes>5000000</max_nbytes>\n    <url><UPLOAD_URL/></url>\n</file_info>\n<result>\n    <file_ref>\n        <file_name><OUTFILE_0/></file_name>\n        <open_name>out</open_name>\n    </file_ref>\n</result>\n</output_template>\n";
-const APP_VERSION_XML: &str = "<app_version>\n    <app_name>upper2</app_name>\n    <version_num>101</version_num>\n    <file_ref>\n        <file_name>upper2_1.01_x86_64-pc-linux-gnu</file_name>\n        <main_program/>\n    </file_ref>\n</app_version>\n";
+const APP_VERSION_XML: &str = "<app_version>\n    <app_name>upper2</app_name>\n    <version_num>101</version_num>\n    <file_ref>\n        <file_name>upper2_1.01_fixture</file_name>\n        <main_program/>\n    </file_ref>\n</app_version>\n";
 
 /// The project directory of the fixtures.
 fn corpus_dir() -> PathBuf {
@@ -52,21 +53,42 @@ fn manifest() -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
-/// `(client version, scenario, file name relative to the corpus, text)`.
-fn fixtures() -> Vec<(String, String, String, String)> {
+/// One request of the corpus.
+struct Fixture {
+    /// The directory of the client's files: its version, and its platform when that is not
+    /// 64-bit Linux.
+    client: String,
+    version: String,
+    /// The platform the client names in `<platform_name>`.
+    platform: String,
+    /// The platform of the application version the replay serves it. Differs from `platform`
+    /// for a client that runs the version through an alternate platform.
+    version_platform: String,
+    scenario: String,
+    /// Relative to the corpus directory.
+    file: String,
+    text: String,
+}
+
+fn fixtures() -> Vec<Fixture> {
     let mut out = Vec::new();
     for client in manifest()["clients"].as_array().unwrap() {
         let version = client["version"].as_str().unwrap();
+        let platform = client["platform"].as_str().unwrap_or(LINUX);
+        let version_platform = client["version_platform"].as_str().unwrap_or(platform);
         for f in client["files"].as_array().unwrap() {
             let file = f["file"].as_str().unwrap();
             let text = std::fs::read_to_string(corpus_dir().join(file))
                 .unwrap_or_else(|e| panic!("{file}: {e}"));
-            out.push((
-                version.to_string(),
-                f["scenario"].as_str().unwrap().to_string(),
-                file.to_string(),
+            out.push(Fixture {
+                client: file.split('/').next().unwrap().to_string(),
+                version: version.to_string(),
+                platform: platform.to_string(),
+                version_platform: version_platform.to_string(),
+                scenario: f["scenario"].as_str().unwrap().to_string(),
+                file: file.to_string(),
                 text,
-            ));
+            });
         }
     }
     out
@@ -108,17 +130,23 @@ fn manifest_names_every_file() {
             .iter()
             .map(|f| f["scenario"].as_str().unwrap())
             .collect();
-        for needed in [
-            "first_contact",
-            "work_request",
-            "report",
-            "no_work",
-            "reattach",
-        ] {
+        // A client that was run for one thing only (the 32-bit client that gets its work
+        // through an alternate platform) lists the scenarios it has in "scenarios".
+        let needed: Vec<&str> = match client["scenarios"].as_array() {
+            Some(list) => list.iter().map(|v| v.as_str().unwrap()).collect(),
+            None => vec![
+                "first_contact",
+                "work_request",
+                "report",
+                "no_work",
+                "reattach",
+            ],
+        };
+        for needed in needed {
             assert!(
                 scenarios.contains(needed),
                 "client {} has no {needed} fixture",
-                client["version"]
+                client["files"][0]["file"]
             );
         }
     }
@@ -132,7 +160,7 @@ fn fixtures_are_scrubbed() {
     let ipv4 = Regex::new(r"(?:^|[^0-9.])((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?:[^0-9]|$)").unwrap();
     let mac = mac_regex();
     let email = Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}").unwrap();
-    for (_, _, file, text) in fixtures() {
+    for Fixture { file, text, .. } in fixtures() {
         assert!(
             !hex.is_match(&text),
             "{file}: a run of 32 or more hex digits"
@@ -208,6 +236,65 @@ fn scrub_script_removes_and_refuses_mac_addresses() {
     assert!(!output.exists());
     let checked = run(&["--check-only", "--input", i]).unwrap();
     assert!(!checked.status.success());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The script replaces the CPU model and features with a placeholder of the kind of platform
+/// the request names, so that a fixture keeps the shape the client sends, and the capture
+/// machine's time zone with UTC. The test skips when `python3` is not installed.
+#[test]
+fn scrub_script_keeps_the_shape_of_each_platform() {
+    use std::process::Command;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/scrub-sched-request.py");
+    let dir = std::env::temp_dir().join(format!("cb-corpus-scrub-cpu-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (input, output) = (dir.join("in.xml"), dir.join("out.xml"));
+    for (platform, model, features) in [
+        ("x86_64-pc-linux-gnu", "Fixture CPU @ 3.00GHz", " avx2"),
+        ("i686-pc-linux-gnu", "Fixture CPU @ 3.00GHz", " avx2"),
+        ("windows_x86_64", "Fixture CPU @ 3.00GHz", " avx2"),
+        (
+            "aarch64-unknown-linux-gnu",
+            "ARMv8 Processor rev 0 (v8l)",
+            " asimd ",
+        ),
+        (
+            "arm-unknown-linux-gnueabihf",
+            "ARMv8 Processor rev 0 (v8l)",
+            " neon ",
+        ),
+        ("arm64-apple-darwin", "Apple Fixture", " arm64 "),
+    ] {
+        std::fs::write(
+            &input,
+            format!("<scheduler_request>\n<platform_name>{platform}</platform_name>\n<host_info>\n<timezone>-18000</timezone>\n<p_model>Some Real CPU 9000</p_model>\n<p_features>made up features</p_features>\n</host_info>\n</scheduler_request>\n"),
+        )
+        .unwrap();
+        let done = Command::new("python3")
+            .arg("-I")
+            .arg(&script)
+            .args(["--input", input.to_str().unwrap()])
+            .args(["--output", output.to_str().unwrap()])
+            .output();
+        let Ok(done) = done else {
+            eprintln!("python3 is not installed; the scrub script was not run");
+            return;
+        };
+        assert!(
+            done.status.success(),
+            "{platform}: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        let scrubbed = std::fs::read_to_string(&output).unwrap();
+        assert!(scrubbed.contains("<timezone>0</timezone>"), "{scrubbed}");
+        assert!(
+            scrubbed.contains(&format!("<p_model>{model}")),
+            "{platform}: {scrubbed}"
+        );
+        assert!(scrubbed.contains(features), "{platform}: {scrubbed}");
+        assert!(!scrubbed.contains("Some Real CPU"), "{scrubbed}");
+        assert!(!scrubbed.contains("made up features"), "{scrubbed}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -287,9 +374,12 @@ fn parsed(xml: &str) -> Option<SchedulerRequest> {
 }
 
 /// Elements the parser reads as containers or as text it keeps, so that a leaf of them with
-/// nothing in it says nothing about whether they are read.
+/// nothing in it says nothing about whether they are read. A Windows client with no WSL
+/// distribution sends `<wsl>` with nothing in it; `WSL_DISTROS::parse` in `lib/wslinfo.cpp` and
+/// `crates/cb-proto/src/sched_request.rs` read the `<distro>` elements inside it.
 const CONTAINERS: &[&str] = &[
     "scheduler_request/app_versions",
+    "scheduler_request/host_info/wsl",
     "scheduler_request/other_results",
 ];
 
@@ -383,7 +473,15 @@ const PREFS_PREFIX: &str = "scheduler_request/working_global_preferences/";
 
 #[test]
 fn every_fixture_parses() {
-    for (version, scenario, file, text) in fixtures() {
+    for Fixture {
+        version,
+        platform,
+        scenario,
+        file,
+        text,
+        ..
+    } in fixtures()
+    {
         let r = parse(&text).unwrap_or_else(|e| panic!("{file}: {e}"));
         let v: Vec<i32> = version.split('.').map(|n| n.parse().unwrap()).collect();
         assert_eq!(
@@ -396,7 +494,7 @@ fn every_fixture_parses() {
             "{file}: the version in the request is not the client's"
         );
         assert_eq!(r.authenticator, AUTH, "{file}");
-        assert_eq!(r.platform_name, LINUX, "{file}");
+        assert_eq!(r.platform_name, platform, "{file}");
         assert!(!r.host_info.host_cpid.is_empty(), "{file}");
         if scenario == "first_contact" {
             assert_eq!(r.hostid, 0, "{file}");
@@ -414,10 +512,10 @@ fn unread_elements_are_the_documented_ones() {
     // Path -> clients that send it.
     let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut prefs_read = BTreeSet::new();
-    for (version, _, _, text) in fixtures() {
+    for Fixture { client, text, .. } in fixtures() {
         let (unread, prefs) = unread_in(&text);
         for path in unread {
-            seen.entry(path).or_default().insert(version.clone());
+            seen.entry(path).or_default().insert(client.clone());
         }
         prefs_read.extend(prefs);
     }
@@ -477,7 +575,9 @@ struct World {
 const T0: i64 = 1_700_000_000;
 
 impl World {
-    fn new() -> World {
+    /// A project with the platforms the request names (its own, then its alternates, as the
+    /// client lists them), and one version of the app for `version_platform`.
+    fn new(req: &SchedulerRequest, version_platform: &str) -> World {
         let db = SqliteDb::with_schema().unwrap();
         let mut config =
             Config::parse("<config><master_url>https://project.example/</master_url></config>")
@@ -485,13 +585,28 @@ impl World {
         config.long_name = "Fixture project".into();
         config.daily_result_quota = 1000;
         config.version_select_random_factor = 0.0;
-        block_on(db.batch(vec![
-            stmt!("INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (1, 0, ?, 'Linux')", LINUX),
-            stmt!("INSERT INTO app (id, create_time, name, user_friendly_name, validator) VALUES (1, 0, 'upper2', 'Upper-case test app', 'trivial')"),
-            stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (7, 0, 1, 101, 1, ?)", APP_VERSION_XML),
-            stmt!("INSERT INTO user (id, create_time, email_addr, name, authenticator, cross_project_id) VALUES (1, 0, 'tester@example.org', 'tester', ?, 'fixture-cross-project-id')", AUTH),
-        ]))
-        .unwrap();
+        let mut names: Vec<&str> = vec![req.platform_name.as_str()];
+        names.extend(req.alt_platforms.iter().map(String::as_str));
+        if !names.contains(&version_platform) {
+            names.push(version_platform);
+        }
+        let mut platform_id = 0;
+        let mut batch = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            if *name == version_platform {
+                platform_id = i as i64 + 1;
+            }
+            batch.push(stmt!(
+                "INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (?, 0, ?, ?)",
+                i as i64 + 1,
+                *name,
+                *name
+            ));
+        }
+        batch.push(stmt!("INSERT INTO app (id, create_time, name, user_friendly_name, validator) VALUES (1, 0, 'upper2', 'Upper-case test app', 'trivial')"));
+        batch.push(stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (7, 0, 1, 101, ?, ?)", platform_id, APP_VERSION_XML));
+        batch.push(stmt!("INSERT INTO user (id, create_time, email_addr, name, authenticator, cross_project_id) VALUES (1, 0, 'tester@example.org', 'tester', ?, 'fixture-cross-project-id')", AUTH));
+        block_on(db.batch(batch)).unwrap();
         World {
             db,
             config,
@@ -654,9 +769,10 @@ fn well_formed(xml: &str) -> Result<(), String> {
     }
 }
 
-fn replay(scenario: &str, file: &str, text: &str) {
+fn replay(f: &Fixture) {
+    let (scenario, file, text) = (f.scenario.as_str(), f.file.as_str(), f.text.as_str());
     let req = parse(text).unwrap();
-    let w = World::new();
+    let w = World::new(&req, &f.version_platform);
 
     // The host the client had before this request: made by the same client's first contact.
     let mut text = text.to_string();
@@ -729,7 +845,7 @@ fn replay(scenario: &str, file: &str, text: &str) {
         assert!(xml.contains("<app_name>upper2</app_name>"), "{file}");
         assert!(xml.contains("<version_num>101</version_num>"), "{file}");
         assert!(
-            xml.contains(&format!("<platform>{LINUX}</platform>")),
+            xml.contains(&format!("<platform>{}</platform>", f.version_platform)),
             "{file}"
         );
     } else {
@@ -751,7 +867,7 @@ fn replay(scenario: &str, file: &str, text: &str) {
 fn every_fixture_replays_through_handle_request() {
     let all = fixtures();
     assert!(all.len() >= 30, "only {} fixtures", all.len());
-    for (_, scenario, file, text) in all {
-        replay(&scenario, &file, &text);
+    for f in &all {
+        replay(f);
     }
 }

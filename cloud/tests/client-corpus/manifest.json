@@ -251,6 +251,251 @@
           "scenario": "work_request"
         }
       ]
+    },
+    {
+      "version": "8.2.11",
+      "platform": "arm64-apple-darwin",
+      "binary": "the stock macOS client 8.2.11 (arm64-apple-darwin) from the BOINC Mac installer, run on an Apple-silicon Mac as a second client instance: a copy of the binary in a scratch directory, its own data directory and GUI RPC port, --allow_multiple_clients and -insecure",
+      "files": [
+        {
+          "file": "8.2.11-arm64-apple-darwin/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.2.11-arm64-apple-darwin/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.0.4",
+      "platform": "i686-pc-linux-gnu",
+      "binary": "Debian 13 (trixie) package boinc-client 8.0.4+dfsg-1 for i386, installed with apt in an i386 container on an x86-64 Linux machine and run under setarch i686, so that uname -m says i686 as it does on a 32-bit kernel (the client's check for a 64-bit kernel is uname -m)",
+      "files": [
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.0.4-i686-pc-linux-gnu/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.0.4",
+      "platform": "aarch64-unknown-linux-gnu",
+      "binary": "Debian 13 (trixie) package boinc-client 8.0.4+dfsg-1 for arm64, installed with apt in an arm64 container on an x86-64 Linux machine and run under qemu-user 10.0 (binfmt_misc, fix-binary flag); the CPU, its features and /proc/cpuinfo are qemu's",
+      "files": [
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.0.4-aarch64-unknown-linux-gnu/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.0.4",
+      "platform": "arm-unknown-linux-gnueabihf",
+      "binary": "Debian 13 (trixie) package boinc-client 8.0.4+dfsg-1 for armhf, installed with apt in an armhf (linux/arm/v7) container on an x86-64 Linux machine and run under qemu-user 10.0 (binfmt_misc, fix-binary flag); the CPU, its features and /proc/cpuinfo are qemu's",
+      "files": [
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.0.4-arm-unknown-linux-gnueabihf/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.2.15",
+      "platform": "windows_x86_64",
+      "binary": "Windows client binary under Wine, not a Windows host: boinc.exe of the official 8.2.15 Windows x86-64 installer (GitHub release client_release/8.2/8.2.15, boinc_8.2.15_windows_x86_64.exe), taken out of the installer with 7z without running it, and run with Wine 10.0 (Debian 13 package) in an amd64 container on an x86-64 Linux machine",
+      "files": [
+        {
+          "file": "8.2.15-windows_x86_64-wine/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/03-report-one-task-two-held.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/04-report-two-tasks.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/06-work-request-after-restart.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/07-report-after-restart.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/08-reattach-first-contact.request.xml",
+          "scenario": "reattach"
+        },
+        {
+          "file": "8.2.15-windows_x86_64-wine/09-reattach-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        }
+      ]
+    },
+    {
+      "version": "8.0.4",
+      "platform": "x86_64-pc-linux-gnu",
+      "version_platform": "i686-pc-linux-gnu",
+      "scenarios": [
+        "first_contact",
+        "work_request",
+        "report",
+        "no_work"
+      ],
+      "binary": "Debian 13 (trixie) package boinc-client 8.0.4+dfsg-1 for i386, installed with apt in an i386 container on an x86-64 Linux machine and run as it is, on a 64-bit kernel: the client names x86_64-pc-linux-gnu first and lists i686-pc-linux-gnu as an alternate platform (client/cs_platforms.cpp, detect_platforms). The project had an app version for i686-pc-linux-gnu only",
+      "files": [
+        {
+          "file": "8.0.4-i386-on-64-bit-kernel/01-first-contact.request.xml",
+          "scenario": "first_contact"
+        },
+        {
+          "file": "8.0.4-i386-on-64-bit-kernel/02-work-request-task-held.request.xml",
+          "scenario": "work_request"
+        },
+        {
+          "file": "8.0.4-i386-on-64-bit-kernel/03-report-one-task.request.xml",
+          "scenario": "report"
+        },
+        {
+          "file": "8.0.4-i386-on-64-bit-kernel/05-no-work-nothing-to-report.request.xml",
+          "scenario": "no_work"
+        }
+      ]
     }
   ]
 }

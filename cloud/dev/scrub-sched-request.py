@@ -8,7 +8,9 @@ The client writes its latest request to `sched_request_<project>.xml` in its dat
 file holds the account key, the host's cross-project ID and CPID, its domain name and address, the
 kernel and CPU model, and the project's URL and code-signing key. `--input` is such a file;
 `--output` gets the same document with those values replaced by fixed placeholders. Element names,
-numbers, counts, task names and timing are left as they were.
+numbers, counts, task names and timing are left as they were. The CPU model and feature list are
+replaced by a placeholder of the same kind as the request's platform (x86, 64-bit ARM, 32-bit ARM,
+Apple silicon), so that a fixture keeps the shape the client sends.
 
 After scrubbing, the output is checked, and nothing is written if a check fails:
 
@@ -43,6 +45,8 @@ TEXT_ELEMENTS = {
     "p_model": "Fixture CPU @ 3.00GHz",
     "p_features": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt avx avx2",
     "product_name": "fixture-product",
+    # The offset of the capture machine's time zone from UTC, in seconds.
+    "timezone": "0",
     "serialnum": "fixture-serial",
     "md5_cksum": "fixture-md5",
     # `HOST_INFO::write` in lib/hostinfo.cpp (the client has no `mac_addr`).
@@ -55,6 +59,28 @@ TEXT_ELEMENTS = {
     "project_name": "fixture-project",
     "client_brand": "fixture-brand",
 }
+
+# `p_model` and `p_features` by the kind of platform (`HOST_INFO::write` in lib/hostinfo.cpp; the
+# client fills them from /proc/cpuinfo, `sysctl` or the registry). The values name no real CPU:
+# the ARM ones are what qemu-user's emulated CPU reports, the Apple one an M1's generic list.
+CPU_PLACEHOLDERS = [
+    # (a word of `<platform_name>`, p_model, p_features)
+    (
+        "apple-darwin",
+        "Apple Fixture",
+        "amx_version_1 arm64 armv8_1_atomics armv8_2_fhm armv8_2_sha3 armv8_2_sha512 armv8_crc32 floatingpoint neon neon_fp16 neon_hpfp ucnormal_mem",
+    ),
+    (
+        "aarch64",
+        "ARMv8 Processor rev 0 (v8l) [Impl 0x00 Arch 8 Variant 0x0 Part 0x051 Rev 0]",
+        "fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svef32mm svef64mm svebf16 i8mm bf16 rng bti mte mte3 sme smei16i64 smef64f64 smei8i32 smef16f32 smeb16f32 smef32f32 smefa64 mops hbc",
+    ),
+    (
+        "arm-unknown",
+        "ARMv8 Processor rev 0 (v8l) [Impl 0x41 Arch 8 Variant 0x1 Part 0xd07 Rev 0]",
+        "swp half thumb fast_mult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae fphp asimdhp asimddp asimdfhm asimdbf16 i8mm aes pmull sha1 sha2 crc32 sb ssbs",
+    ),
+]
 
 # Elements that name a device or a distribution, replaced only inside the block that holds them,
 # because `name` means something else elsewhere in a request (task, file and platform names).
@@ -96,10 +122,22 @@ def scrub_block(text, block, elements):
     return re.sub(r"(?s)<%s>.*?</%s>" % (block, block), inside, text)
 
 
+def cpu_placeholders(text):
+    """The `p_model` and `p_features` placeholders for the platform the request names."""
+    m = re.search(r"<platform_name>([^<]*)</platform_name>", text)
+    platform = m.group(1) if m else ""
+    for word, model, features in CPU_PLACEHOLDERS:
+        if word in platform:
+            return model, features
+    return TEXT_ELEMENTS["p_model"], TEXT_ELEMENTS["p_features"]
+
+
 def scrub(text, project_url):
+    model, features = cpu_placeholders(text)
     for block, elements in BLOCK_ELEMENTS.items():
         text = scrub_block(text, block, elements)
     for tag, value in TEXT_ELEMENTS.items():
+        value = {"p_model": model, "p_features": features}.get(tag, value)
         # `[^<]+` leaves an empty element empty.
         text = re.sub(
             r"(<%s>)[^<]+(</%s>)" % (tag, tag),
