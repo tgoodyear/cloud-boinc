@@ -67,7 +67,8 @@ form .scroll{border:0;border-radius:0;background:none}
 form tr>th,form tr>td,form tr:nth-child(even)>td{background:none;border-bottom:0;padding:.4rem .5rem .4rem 0;white-space:normal}
 form td strong{color:var(--err)}
 form th[colspan]{padding-top:1.25rem;border-bottom:1px solid var(--line);font-size:1.05rem}
-input[type=text],input[type=email],input[type=password],input[type=url],input[type=number],select{display:block;width:100%;max-width:100%;min-height:44px;margin-top:.25rem;padding:.5rem .65rem;font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--ctl);border-radius:.5rem}
+input[type=text],input[type=email],input[type=password],input[type=url],input[type=number],select,textarea{display:block;width:100%;max-width:100%;min-height:44px;margin-top:.25rem;padding:.5rem .65rem;font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--ctl);border-radius:.5rem}
+textarea{min-height:8rem;resize:vertical;line-height:1.45}
 td>input[size="8"]{display:inline-block;width:7rem}
 select[id^=pref_]{display:inline-block;width:auto;margin:.25rem 0}
 input[type=checkbox]{width:1.35rem;height:1.35rem;margin:.6rem .5rem .6rem 0;vertical-align:middle;accent-color:var(--accent)}

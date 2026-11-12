@@ -276,6 +276,23 @@ struct Candidate {
     wu: Workunit,
 }
 
+/// A row of `user` with the name of the account's team, from the join of the
+/// first read (`team_name` is null when `teamid` is 0, or the team is gone).
+#[derive(Debug, Deserialize)]
+struct UserRow {
+    #[serde(flatten)]
+    user: User,
+    #[serde(default)]
+    team_name: Option<String>,
+}
+
+/// Selects an account and its team's name: the join looks the team up by its
+/// ID, which an account with no team (`teamid` 0) does not have, so the team
+/// costs that read nothing. Upstream reads the team in `handle_request`
+/// (`team.lookup_id`) and writes it in `SCHEDULER_REPLY::write`.
+const USER_WITH_TEAM: &str =
+    "SELECT u.*, t.name AS team_name FROM user u LEFT JOIN team t ON t.id = u.teamid";
+
 #[derive(Debug, Deserialize)]
 struct WuIdRow {
     workunitid: i64,
@@ -1152,17 +1169,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // Batch 1: who is asking.
     let weak_id = weak_auth_user_id(&req.authenticator);
     let mut reads = vec![stmt!(
-        "SELECT * FROM user WHERE authenticator = ?",
+        format!("{USER_WITH_TEAM} WHERE u.authenticator = ?"),
         req.authenticator.as_str()
     )];
     reads.push(stmt!("SELECT * FROM host WHERE id = ?", req.hostid.max(0)));
     if let Some(id) = weak_id {
-        reads.push(stmt!("SELECT * FROM user WHERE id = ?", id as i64));
+        reads.push(stmt!(format!("{USER_WITH_TEAM} WHERE u.id = ?"), id as i64));
     }
     let mut rows = ctx.db.batch(reads).await?.into_iter();
-    let by_auth: Option<User> = rows.next().unwrap_or_default().first()?;
+    let by_auth: Option<UserRow> = rows.next().unwrap_or_default().first()?;
     let mut host_row: Option<Host> = rows.next().unwrap_or_default().first()?;
-    let by_weak: Option<User> = match rows.next() {
+    let by_weak: Option<UserRow> = match rows.next() {
         Some(r) => r.first()?,
         None => None,
     };
@@ -1171,15 +1188,15 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         (None, Some(u)) => {
             let ok = check_weak_auth(
                 &req.authenticator,
-                u.id as u64,
-                &u.authenticator,
-                &u.passwd_hash,
+                u.user.id as u64,
+                &u.user.authenticator,
+                &u.user.passwd_hash,
             );
             (ok.then_some(u), true)
         }
         (None, None) => (None, false),
     };
-    let Some(user) = user.filter(|u| u.blocked == 0) else {
+    let Some(UserRow { user, team_name }) = user.filter(|u| u.user.blocked == 0) else {
         out.reply.nucleus_only = true;
         refuse(
             &mut out,
@@ -1389,6 +1406,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         expavg_credit: host.expavg_credit,
         venue: host.venue.clone(),
         create_time: host.create_time,
+    };
+    // `<teamid>` and `<team_name>`, as `SCHEDULER_REPLY::write` does when the
+    // account has a team; a team that is gone is written as no team.
+    out.reply.team = match team_name {
+        Some(name) if user.teamid > 0 => Some((user.teamid as u64, name)),
+        _ => None,
     };
     out.reply.user = ReplyUser {
         id: user.id as u64,

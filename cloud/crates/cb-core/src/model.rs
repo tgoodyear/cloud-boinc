@@ -92,6 +92,31 @@ pub struct User {
     pub valid_results: i64,
 }
 
+/// A row of `team` (`migrations/0009_teams.sql`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Team {
+    pub id: i64,
+    pub create_time: i64,
+    /// The founder; 0 when that account was deleted.
+    pub userid: i64,
+    pub name: String,
+    pub url: String,
+    /// An index of `teams::TEAM_TYPES`.
+    #[serde(rename = "type")]
+    pub team_type: i64,
+    pub description: String,
+    pub nusers: i64,
+    pub country: String,
+    pub total_credit: f64,
+    pub expavg_credit: f64,
+    pub expavg_time: f64,
+    pub joinable: i64,
+    pub recent_key: f64,
+    /// The founder's name, when the query joins `user` for it.
+    pub founder_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Host {
