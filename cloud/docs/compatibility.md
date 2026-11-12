@@ -163,7 +163,7 @@ What keeps working: a client's scheduler URL; the download URLs of app versions 
 it already has, with or without the hash directory; the upload URL of tasks it has not finished,
 including `<get_file_size>`, an upload and a resumed upload; the project's pages and web RPCs
 under `/<short>/` (including `get_project_config.php`, account pages, the account manager RPCs,
-sign-in cookies, which are set for the path the visitor signed in under) and at the root; the
+sign-in cookies, which are set for the path the visitor signed in under and cleared for it and the paths above it at logout) and at the root; the
 download, upload and scheduler URLs inside imported `app_version.xml_doc`, `workunit.xml_doc` and
 `result.xml_doc_in`, unchanged. The file deletion step recognizes the stock download URL as the
 project's own. The master page lists the stock scheduler URL by default

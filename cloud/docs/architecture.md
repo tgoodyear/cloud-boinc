@@ -1038,11 +1038,12 @@ Decisions:
   `MASTER_FETCH_PERIOD` in `client/scheduler_op.cpp`) and then replaces its scheduler URLs with
   the page's (`update_urls`). Advertising the stock URL means that refresh keeps the URL the
   client already had, and new work looks like the old. `<stock_advertise>0</stock_advertise>`
-  advertises the native URLs (`<master_url>sched`, `/download/`, `/upload/`) while the stock
-  paths keep answering; the way to move a project to the native layout once the old work is
-  gone. If the native download URL happens to be the stock one (master URL `/<short>/` and
-  `download_url` left at its default), it is the stock one and gets the hash directory,
-  because that is the only path under it that is served.
+  advertises the native URLs while the stock paths keep answering; the way to move a project
+  to the native layout once the old work is gone. The native paths (`/sched`, `/download/`,
+  `/upload/file_upload_handler`) are at the root of the master URL's host, because that is where
+  the Workers' routes are, so with a stock layout they are built from the origin and not from the
+  master URL's directory (`/<short>/`). A `download_url` set to the stock download URL gets the hash
+  directory, because that is the only path under it that is served.
 - **Stored XML.** `app_version.xml_doc`, `workunit.xml_doc` and `result.xml_doc_in` imported from
   a stock server carry the stock URLs, and serving the stock paths is what keeps them working;
   nothing is rewritten. The places that read a file URL were checked: the file deletion step
@@ -1055,11 +1056,15 @@ Decisions:
 - **Pages.** `route_web` takes `<page prefix>/<page>` to the same handlers as `/<page>`; both
   answer, so a master URL of the host root or of `/<short>/` works. `/<short>` without the slash
   is redirected to `/<short>/` (301), as a web server does for a directory. The pages' links are
-  relative (`home.php`), so they stay under the prefix a visitor came in on. Redirects and the
+  relative (`home.php`), so they stay under the prefix a visitor came in on. A path below
+  `/download/` with a further `/` is not a native file name, so a stock download prefix of
+  `/download` is still reached (`route_files`). Redirects and the
   login cookie follow the request: `SiteCtx::base` is the master URL for a request at the root,
   and the prefix on the master URL's host for a request under it, so a sign-in under
   `/<short>/` redirects there and the cookie's `Path` is `/<short>/`; at the root it is the
-  master URL's path as before. Text that leaves the site (email links, the weak-key instructions)
+  master URL's path as before. A logout clears the cookie for that path and for every directory above it
+  (`SitePage::clear_login`), because a cookie set at the root of the host is sent to the pages under
+  the prefix too. Text that leaves the site (email links, the weak-key instructions)
   keeps naming the master URL, which is what clients attach to. The static pages (master
   page, `get_project_config.php`) are cached per URL.
 
