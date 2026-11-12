@@ -1,13 +1,12 @@
 //! The job pipeline: a consumer of the `transitions` queue, a cron sweep
 //! for workunits whose `transition_time` has passed, and a second cron
-//! that purges finished workunits.
+//! that purges finished workunits, carries on account deletions and runs the
+//! rollup behind the dashboards.
 
 use std::collections::BTreeSet;
 
+use cb_core::cron::run_cron;
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
-use cb_core::purge::{purge_pass, MAX_PURGE_BATCH};
-use cb_core::site_delete::delete_account_steps;
-use cb_core::stats::{deletion_room, rollup_budget, rollup_pass};
 use cb_core::status::record_sweep;
 use cb_core::CoreResult;
 use cb_worker::{db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Files, BUCKET};
@@ -23,9 +22,6 @@ const SWEEP_LIMIT: i64 = 500;
 /// trigger runs the sweep. The purge has an invocation of its own so that
 /// its queries do not come out of the sweep's allowance.
 const PURGE_CRON: &str = "*/5 * * * *";
-/// Purge passes in one run; a pass costs three database round trips and
-/// holds at most `cb_core::purge::MAX_PURGE_BYTES` of rows.
-const PURGE_PASSES: usize = 8;
 
 struct Runner {
     db: cb_worker::D1Db,
@@ -124,88 +120,46 @@ async fn sweep(env: Env) -> Result<()> {
     Ok(())
 }
 
-/// Statements one run of the purge cron spends on account deletions at most. The
-/// invocation may run 50 queries on the Free plan; the purge's own passes cost
-/// up to 24 and the rollup needs `MIN_BUDGET`, so the deletions get what is
-/// left of that (see `deletions`).
-const DELETION_STATEMENTS: usize = 22;
-
-/// Continues the account deletions that the site started (see
-/// `cb_core::site_delete`); every pass is bounded, so a large account is
-/// removed over several runs.
-async fn deletions(db: &cb_worker::D1Db) -> Result<()> {
-    // What the purge and the settings load have used is already counted on
-    // this handle; the rollup after this is kept a share of the 50.
-    let room = deletion_room(db.statements() as usize, DELETION_STATEMENTS);
-    let report = delete_account_steps(db, now(), room)
+/// The purge trigger's work: the purge, the account deletions the site queued
+/// and the rollup behind the dashboards, sharing the 50 queries of an
+/// invocation on the Free plan (`cb_core::cron`).
+async fn purge_cron(env: &Env) -> Result<()> {
+    let db = db(env)?;
+    let project = project(&db).await.map_err(cb_worker::core_err)?;
+    // What the settings load sent (nothing when this isolate has them).
+    let used = db.statements() as usize;
+    let files = R2Files(env.bucket(BUCKET)?);
+    let report = run_cron(&db, &files, &project.config, now(), used)
         .await
         .map_err(cb_worker::core_err)?;
-    if report.finished > 0 || report.pending > 0 {
+    if report.purge.workunits > 0 {
         console_log!(
-            "account deletions: {} finished, {} pending",
-            report.finished,
-            report.pending
+            "purge: {} workunits, {} results in {} passes",
+            report.purge.workunits,
+            report.purge.results,
+            report.purge_passes
         );
     }
-    Ok(())
-}
-
-async fn purge(env: &Env, db: &cb_worker::D1Db) -> Result<()> {
-    let project = project(db).await.map_err(cb_worker::core_err)?;
-    if project.config.purge_days <= 0.0 {
-        return Ok(());
+    if report.deletions.finished > 0 || report.deletions.pending > 0 {
+        console_log!(
+            "account deletions: {} finished, {} pending",
+            report.deletions.finished,
+            report.deletions.pending
+        );
     }
-    let files = R2Files(env.bucket(BUCKET)?);
-    let (mut workunits, mut results) = (0, 0);
-    for _ in 0..PURGE_PASSES {
-        let report = purge_pass(db, &files, &project.config, now(), MAX_PURGE_BATCH)
-            .await
-            .map_err(cb_worker::core_err)?;
-        workunits += report.workunits;
-        results += report.results;
-        if report.archive.is_none() {
-            break;
-        }
+    if report.rollup.skipped_for_budget {
+        console_log!("rollup: skipped for budget");
     }
-    if workunits > 0 {
-        console_log!("purge: {workunits} workunits, {results} results");
-    }
-    Ok(())
-}
-
-/// The counts behind the jobs overview and the charts (`cb_core::stats`).
-/// Runs in the purge trigger's invocation, every five minutes, after the
-/// purge, so that its queries do not come out of the sweep's allowance.
-async fn rollup(db: &cb_worker::D1Db) -> Result<()> {
-    let project = project(db).await.map_err(cb_worker::core_err)?;
-    let now = now();
-    // Purged workunits take their tasks with them, so a period that ended
-    // before the purge horizon cannot be counted from what is left.
-    let not_before = if project.config.purge_days > 0.0 {
-        now - (project.config.purge_days * 86_400.0) as i64
-    } else {
-        0
-    };
-    // The Free plan allows 50 queries an invocation, and the purge and the
-    // settings load before this have used some of them. What is not done now is
-    // done by the next pass.
-    let budget = rollup_budget(db.statements() as usize);
-    let report = rollup_pass(db, now, not_before, budget)
-        .await
-        .map_err(cb_worker::core_err)?;
-    if report.skipped_for_budget {
-        console_log!("rollup: skipped, {budget} queries left");
-    }
-    if report.ran {
+    if report.rollup.ran {
         console_log!(
             "rollup: {} periods ({} postponed), {} apps, stmts={} trips={} read={} written={}",
-            report.recounted.len(),
-            report.postponed,
-            report.apps,
+            report.rollup.recounted.len(),
+            report.rollup.postponed,
+            report.rollup.apps,
             db.statements(),
             db.round_trips(),
             db.rows_read(),
-            cb_db::Db::rows_written(db),
+            cb_db::Db::rows_written(&db),
         );
     }
     Ok(())
@@ -214,22 +168,8 @@ async fn rollup(db: &cb_worker::D1Db) -> Result<()> {
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if event.cron() == PURGE_CRON {
-        // One handle for both, so the rollup knows what the purge used.
-        let db = match db(&env) {
-            Ok(db) => db,
-            Err(e) => {
-                console_error!("database: {e}");
-                return;
-            }
-        };
-        if let Err(e) = purge(&env, &db).await {
-            console_error!("purge: {e}");
-        }
-        if let Err(e) = deletions(&db).await {
-            console_error!("account deletions: {e}");
-        }
-        if let Err(e) = rollup(&db).await {
-            console_error!("rollup: {e}");
+        if let Err(e) = purge_cron(&env).await {
+            console_error!("purge cron: {e}");
         }
     } else if let Err(e) = sweep(env).await {
         console_error!("sweep: {e}");

@@ -1191,7 +1191,7 @@ fn a_queue_past_the_cap_is_a_lower_bound_and_names_what_it_did_not_count() {
     assert_eq!((f(2).unsent, f(2).unsent_capped), (40_000, true));
     assert_eq!(o.unsent_from, 2);
     assert_eq!((f(0).unsent, f(0).unsent_capped), (UNSENT_COUNT_CAP, true));
-    assert!(o.unsent_is_lower_bound(3) && !o.unsent_is_lower_bound(1));
+    assert!(f(3).unsent_capped && !f(1).unsent_capped);
     let page = get(&db, &project, "/work.php", &query(&[]));
     assert!(page.contains(">60,000<"));
     assert!(page.contains(">40,000+<"));
@@ -1616,5 +1616,162 @@ fn a_pass_sends_what_statements_for_says_whatever_the_applications() {
         let n = statements_of(&spy);
         assert!(n <= budget, "budget {budget}: {n}");
         assert!(n <= statements_for(r.recounted.len()), "budget {budget}");
+    }
+}
+
+fn add_apps(db: &SqliteDb, upto: i64) {
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 3 UNION ALL SELECT i + 1 FROM c WHERE i < ?) \
+         INSERT INTO app (id, create_time, name, user_friendly_name) \
+         SELECT i, 1, 'a' || i, 'App ' || i FROM c",
+        upto
+    )))
+    .unwrap();
+}
+
+#[test]
+fn the_row_of_the_other_applications_shows_a_capped_queue_as_at_least() {
+    let (db, _) = setup();
+    add_apps(&db, 20);
+    let project = block_on(Project::load(&db)).unwrap();
+    // An application that is not tracked (19) has a queue past the cap.
+    bulk_unsent(&db, 1_000_000, 100_050, 19);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    let other = o.apps.iter().find(|a| a.id == -1).unwrap();
+    assert!(other.unsent_capped, "{other:?}");
+    let page = get(&db, &project, "/work.php", &query(&[]));
+    assert!(page.contains("Other applications"));
+    // The row of the rest and the total both say "at least"; the tracked
+    // applications, which were counted in full before the cap, do not.
+    assert_eq!(
+        page.matches("data-label=\"To send\">100,000+<").count(),
+        2,
+        "{page}"
+    );
+    assert!(page.contains("data-label=\"To send\">0<"));
+}
+
+#[test]
+fn applications_that_are_grouped_have_no_rows_of_their_own() {
+    let (db, _) = setup();
+    add_apps(&db, 25);
+    let project = block_on(Project::load(&db)).unwrap();
+    // Tasks in progress for a tracked and for a grouped application.
+    add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+    add_host(&db, 1, 1, 1.0, 1);
+    for id in 0..10 {
+        insert_result(&db, 100 + id, 22, 4, 0, 0, 0, 1, 1);
+    }
+    insert_result(&db, 200, 3, 4, 0, 0, 0, 1, 1);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let page = get(&db, &project, "/work.php", &query(&[]));
+    // Application 22 is in the row of the rest, with its ten tasks; it has no
+    // row of its own with zeros.
+    assert!(!page.contains("App 22"), "{page}");
+    assert!(!page.contains("App 25"));
+    assert!(page.contains("App 3"));
+    let rest = page.find("Other applications").unwrap();
+    let row = &page[rest..rest + 600];
+    assert!(row.contains("data-label=\"In progress\">10<"), "{row}");
+    // The tracked applications are the first 18 by id.
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    assert_eq!(o.tracked, (1..=18).collect::<Vec<i64>>());
+}
+
+/// A small deterministic generator for the property test.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) % n
+    }
+}
+
+/// For every counted period, the rows of the applications and of the rest add up
+/// to the project's row, for the four counts a recount makes, and the sums of
+/// the overview add up to its total (timeouts included).
+fn assert_rows_add_up(db: &SqliteDb) {
+    for col in ["returned_ok", "valid", "invalid", "failed"] {
+        let rows = block_on(db.run(Stmt::new(format!(
+            "SELECT bucket, sum(CASE WHEN appid = 0 THEN {col} ELSE 0 END) AS project, \
+             sum(CASE WHEN appid <> 0 THEN {col} ELSE 0 END) AS apps \
+             FROM stats_bucket GROUP BY bucket"
+        ))))
+        .unwrap();
+        for r in rows.rows {
+            assert_eq!(r["project"], r["apps"], "{col} in {r:?}");
+        }
+    }
+    let o = block_on(cb_core::stats::load_overview(db))
+        .unwrap()
+        .unwrap();
+    let total = o.apps.iter().find(|a| a.id == 0).unwrap();
+    let apps = o.apps.iter().filter(|a| a.id != 0);
+    assert_eq!(total.ok_7d, apps.clone().map(|a| a.ok_7d).sum::<i64>());
+    assert_eq!(total.err_7d, apps.clone().map(|a| a.err_7d).sum::<i64>());
+    assert_eq!(total.ok_24h, apps.map(|a| a.ok_24h).sum::<i64>());
+}
+
+#[test]
+fn per_application_rows_and_the_rest_always_add_up_to_the_project() {
+    for seed in 1..=6u64 {
+        let (db, _) = setup();
+        add_apps(&db, 30);
+        add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+        add_host(&db, 1, 1, 1.0, 1);
+        let mut rng = Lcg(seed);
+        let mut apps = 30;
+        let mut next_result = 1;
+        let mut t = NOW;
+        for step in 0..60 {
+            match rng.next(5) {
+                // A new application.
+                0 if apps < 45 => {
+                    apps += 1;
+                    block_on(db.run(stmt!(
+                        "INSERT INTO app (id, create_time, name, user_friendly_name) VALUES (?, 1, ?, ?)",
+                        apps,
+                        format!("a{apps}"),
+                        format!("App {apps}")
+                    )))
+                    .unwrap();
+                }
+                // Deprecate or bring one back.
+                1 => {
+                    block_on(db.run(stmt!(
+                        "UPDATE app SET deprecated = 1 - deprecated WHERE id = ?",
+                        1 + rng.next(apps as u64) as i64
+                    )))
+                    .unwrap();
+                }
+                // Tasks come back, in a recent period, from any application;
+                // some of them fail, some are not judged.
+                _ => {
+                    for _ in 0..(1 + rng.next(4)) {
+                        let app = 1 + rng.next(apps as u64) as i64;
+                        let (outcome, state) =
+                            [(1, 1), (1, 2), (1, 0), (3, 2)][rng.next(4) as usize];
+                        let at = t - rng.next(6 * 10_800) as i64;
+                        insert_result(&db, next_result, app, 5, outcome, state, at, 1, 1);
+                        next_result += 1;
+                    }
+                }
+            }
+            // A pass, some of them an hour or more later so that settled
+            // periods are counted again.
+            t += 300 + rng.next(3) as i64 * 3_000;
+            block_on(rollup_pass(&db, t, 0, 20 + rng.next(30) as usize)).unwrap();
+            assert_rows_add_up(&db);
+            let _ = step;
+        }
     }
 }

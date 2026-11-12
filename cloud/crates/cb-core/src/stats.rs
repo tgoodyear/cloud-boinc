@@ -79,7 +79,10 @@ pub const UNSENT_COUNT_CAP: i64 = 100_000;
 pub const MAX_INFLIGHT_ROWS: i64 = 4000;
 /// Rows of one multi-row upsert (ten values a row; D1 allows 100 values).
 const PERIOD_ROWS_PER_STMT: usize = 10;
-/// Applications the rollup follows one by one, the live ones first, by id. The
+/// Applications the rollup follows one by one: the first ones by id,
+/// deprecated or not, so that the set does not change when an application is
+/// deprecated or brought back, and periods counted at different times group
+/// their tasks the same way. The
 /// tasks of every other application are counted together as [`OTHER_APP`], so
 /// the rows and statements of a pass do not grow with the number of
 /// applications.
@@ -90,32 +93,13 @@ pub const OTHER_APP: i64 = -1;
 /// each period costs; see [`statements_for`].
 const FIXED_STATEMENTS: usize = 3 + 6 + 3 + 3;
 const PERIOD_STATEMENTS: usize = 3;
-/// Queries a Worker invocation may make on the Free plan.
-pub const FREE_PLAN_QUERIES: usize = 50;
 /// The least budget a pass can work with: its fixed statements and one period (the open one).
 pub const MIN_BUDGET: usize = FIXED_STATEMENTS + PERIOD_STATEMENTS;
-/// Statements kept back for what the cron does after the rollup and for slack.
-const BUDGET_MARGIN: usize = 2;
 const SNAPSHOT_VERSION: u32 = 2;
 
 const SNAP_OVERVIEW: &str = "overview";
 const SNAP_INFLIGHT: &str = "inflight";
 const SNAP_RUN: &str = "rollup_run";
-
-/// What a cron invocation that has sent `used` statements may still spend on
-/// the account deletions (at most `wanted`): what is left of the Free plan's 50
-/// once the rollup has its [`MIN_BUDGET`] and the margin.
-pub fn deletion_room(used: usize, wanted: usize) -> usize {
-    FREE_PLAN_QUERIES
-        .saturating_sub(used)
-        .saturating_sub(MIN_BUDGET + BUDGET_MARGIN)
-        .min(wanted)
-}
-
-/// What the rollup may spend when the invocation has sent `used` statements.
-pub fn rollup_budget(used: usize) -> usize {
-    FREE_PLAN_QUERIES.saturating_sub(used + BUDGET_MARGIN)
-}
 
 /// Start of the period holding `t`.
 pub fn bucket_start(t: i64) -> i64 {
@@ -164,6 +148,10 @@ pub struct Overview {
     /// it and of every later one are lower bounds.
     #[serde(default)]
     pub unsent_from: i64,
+    /// The applications that have rows of their own; the tasks of every other
+    /// one are in the row of [`OTHER_APP`].
+    #[serde(default)]
+    pub tracked: Vec<i64>,
     /// Periods the 24-hour and 7-day sums cover, and how many they would
     /// cover if every period had been counted. The sums are lower bounds
     /// while the first is below the second.
@@ -185,11 +173,6 @@ impl Overview {
 
     pub fn week_complete(&self) -> bool {
         self.periods_7d >= self.expected_7d
-    }
-
-    /// Whether the queue length of application `id` is a lower bound.
-    pub fn unsent_is_lower_bound(&self, id: i64) -> bool {
-        self.unsent_from > 0 && (id == 0 || id >= self.unsent_from)
     }
 }
 
@@ -405,10 +388,7 @@ pub async fn rollup_pass(
     let mut out = db
         .batch(vec![
             stmt!("SELECT at FROM stats_snapshot WHERE name = ?", SNAP_RUN),
-            stmt!(
-                "SELECT id FROM app ORDER BY deprecated, id LIMIT ?",
-                TRACKED_APPS
-            ),
+            stmt!("SELECT id FROM app ORDER BY id LIMIT ?", TRACKED_APPS),
             stmt!(
                 "SELECT bucket, computed_at, pending FROM stats_bucket \
                  WHERE appid = 0 AND bucket >= ? AND computed_at > 0",
@@ -618,6 +598,19 @@ pub async fn rollup_pass(
         total.wait_assimilate += n;
         figures.entry(id).or_insert_with(|| fig(id)).wait_assimilate += n;
     }
+    // Every tracked application has a row, with zeros when nothing is going on
+    // for it; the page shows these rows and no others (no application gets a
+    // row of zeros of its own invention).
+    for app in &tracked {
+        figures.entry(*app).or_insert_with(|| fig(*app));
+    }
+    // With applications left over, their row exists when the queue count may
+    // have missed some of them.
+    if unsent_from > 0 && tracked.len() == TRACKED_APPS {
+        figures.entry(OTHER_APP).or_insert_with(|| fig(OTHER_APP));
+    }
+    // The queue is a lower bound for the application the cap stopped in, every
+    // later one, and the row of the rest, which may hold later ones.
     for f in figures.values_mut() {
         f.unsent_capped = unsent_from > 0 && (f.id == OTHER_APP || f.id >= unsent_from);
     }
@@ -704,6 +697,7 @@ pub async fn rollup_pass(
         working_users: inflight.working_users,
         working_hosts: inflight.working_hosts,
         unsent_from,
+        tracked: tracked.iter().copied().collect(),
         periods_24h,
         // The targets are the whole windows, however much of them can still
         // be counted: a window part of which was purged stays marked short.
@@ -861,26 +855,6 @@ mod tests {
 
     fn counted(at: i64, pending: i64) -> Counted {
         Counted { at, pending }
-    }
-
-    #[test]
-    fn the_cron_shares_fifty_statements_between_purge_deletions_and_rollup() {
-        // The purge sends at most 24 and the settings load 2; account deletions
-        // want 22. Whatever the purge used, the three together stay within 50 and
-        // the rollup always gets its minimum.
-        for purge in 0..=26 {
-            let deletions = deletion_room(purge, 22);
-            let rollup = rollup_budget(purge + deletions);
-            assert!(rollup >= MIN_BUDGET, "purge {purge}: rollup {rollup}");
-            assert!(
-                purge + deletions + rollup + BUDGET_MARGIN <= FREE_PLAN_QUERIES,
-                "purge {purge}"
-            );
-        }
-        // An ordinary run: the deletions get all they want.
-        assert_eq!(deletion_room(5, 22), 22);
-        // A heavy purge leaves the deletions what is left, for the next run.
-        assert_eq!(deletion_room(26, 22), 4);
     }
 
     #[test]

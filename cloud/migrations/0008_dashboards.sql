@@ -62,7 +62,7 @@ CREATE INDEX IF NOT EXISTS wu_need_validate ON workunit (id) WHERE need_validate
 -- The rollup behind the history charts and the jobs overview: one row per
 -- three-hour period (`bucket` is its start, Unix seconds) and application, and
 -- `appid` 0 for the whole project and -1 for the applications that are not
--- tracked one by one (the first 18 live ones are). `returned_ok` counts tasks received with a
+-- tracked one by one (the first 18 by id are, deprecated or not, so that the set does not change). `returned_ok` counts tasks received with a
 -- success outcome, `valid` and `invalid` those of them the validator has judged,
 -- `failed` tasks received with any other outcome, `timed_out` tasks written off
 -- at their deadline (counted by the transition), `queued` the tasks ready to send

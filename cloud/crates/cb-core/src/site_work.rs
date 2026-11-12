@@ -119,10 +119,11 @@ fn at_least(n: i64, exact: bool) -> String {
     }
 }
 
-/// The queue length of an application (0 for the project): a lower bound when
-/// the count stopped at the cap before or inside it.
-fn unsent_text(o: &Overview, f: &AppFigures) -> String {
-    at_least(f.unsent, !o.unsent_is_lower_bound(f.id))
+/// The queue length of a row (an application, the rest of them, or the
+/// project): a lower bound when the row says the count stopped at the cap in
+/// or before it.
+fn unsent_text(f: &AppFigures) -> String {
+    at_least(f.unsent, !f.unsent_capped)
 }
 
 /// The note that says the 24-hour and 7-day figures do not cover every period
@@ -165,7 +166,7 @@ fn applications_card(project: &Project, o: &Overview, now: i64) -> String {
     let row = |name: String, f: &AppFigures| {
         vec![
             name,
-            unsent_text(o, f),
+            unsent_text(f),
             count(f.in_progress),
             count(f.wait_validate),
             count(f.wait_assimilate),
@@ -178,23 +179,22 @@ fn applications_card(project: &Project, o: &Overview, now: i64) -> String {
     let busy = |f: &AppFigures| {
         f.unsent + f.in_progress + f.wait_validate + f.wait_assimilate + f.ok_7d + f.err_7d > 0
     };
-    // Every application the snapshot has, and every live one of the catalog: a
-    // queue past the cap may leave an application out of the count.
-    let mut figures: BTreeMap<i64, AppFigures> = o
+    // The rows the snapshot has: the tracked applications, the rest of them,
+    // and no others. An application that is grouped in the rest has no row of
+    // its own here, and is not given one with zeros.
+    let figures: BTreeMap<i64, &AppFigures> = o
         .apps
         .iter()
         .filter(|f| f.id != 0)
-        .map(|f| (f.id, f.clone()))
+        .map(|f| (f.id, f))
         .collect();
-    for a in project.catalog.apps.iter().filter(|a| a.deprecated == 0) {
-        figures.entry(a.id).or_insert_with(|| AppFigures {
-            id: a.id,
-            ..Default::default()
-        });
-    }
     let mut rows = Vec::new();
     for f in figures.values() {
         if app_deprecated(project, f.id) && !busy(f) {
+            continue;
+        }
+        // The row of the rest is shown when there is something in it.
+        if f.id == crate::stats::OTHER_APP && !busy(f) && !f.unsent_capped {
             continue;
         }
         rows.push(row(html_escape(&app_name(project, f.id)), f));
@@ -332,7 +332,7 @@ pub async fn work(ctx: &SiteCtx<'_>, _q: &Params, feed: &FeedState) -> CoreResul
             if let Some(t) = o.apps.iter().find(|f| f.id == 0) {
                 let day = o.day_complete();
                 body.push_str(&stats(&[
-                    stat("Waiting to send", &unsent_text(o, t), ""),
+                    stat("Waiting to send", &unsent_text(t), ""),
                     stat("In progress", &count(t.in_progress), ""),
                     stat("Completed, 24 hours", &at_least(t.ok_24h, day), ""),
                     stat("Failed, 24 hours", &at_least(t.err_24h, day), ""),

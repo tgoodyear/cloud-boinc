@@ -10,6 +10,7 @@ pub mod avg;
 pub mod charts;
 pub mod config;
 pub mod countries;
+pub mod cron;
 pub mod feed;
 pub mod host_misc;
 pub mod hr;

@@ -921,7 +921,7 @@ fn summary_card(o: &crate::stats::Overview, now: i64) -> String {
     let mut items = Vec::new();
     if let Some(t) = total {
         let plus = |v: i64, exact: bool| if exact { n(v) } else { format!("{}+", n(v)) };
-        let waiting = plus(t.unsent, !o.unsent_is_lower_bound(0));
+        let waiting = plus(t.unsent, !t.unsent_capped);
         items.push(site_ui::stat("Waiting to send", &waiting, ""));
         items.push(site_ui::stat("In progress", &n(t.in_progress), ""));
         items.push(site_ui::stat(

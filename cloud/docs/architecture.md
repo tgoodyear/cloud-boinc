@@ -1399,7 +1399,7 @@ The pipeline Worker's five-minute cron (the one that runs the purge) calls `roll
 (`cloud/crates/cb-core/src/stats.rs`) after the purge, and it writes two small tables:
 
 - `stats_bucket`: a row per three-hour period (UTC) for the project (`appid` 0), each of the first
-  18 live applications and the rest together (`appid` -1): tasks returned with a success outcome,
+  18 applications by id and the rest together (`appid` -1): tasks returned with a success outcome,
   valid, invalid, failed (any other outcome), timed out, and, in the project row, the queue length
   at the last count (with a flag when the count stopped at its cap, kept after the period closes)
   and the accounts and computers that returned a task.
@@ -1435,10 +1435,29 @@ sums "+" and say so while the week is being filled in. The targets are always 8 
 part of which was purged (or never existed, on a new deployment with a short `purge_days`) stays
 marked as partial.
 
-**Statement budget.** A Worker invocation may make 50 queries on the Free plan, and the cron's
-purge and its account deletions share it: the cron runs the purge, then the deletions with what is
-left once the rollup has its minimum, then the rollup (`deletion_room` and `rollup_budget` in
-`stats.rs`, with a test over every purge cost). Every part of a pass has a count that does not depend
+**Statement budget.** A Worker invocation may make 50 queries on the Free plan, and the cron does
+three jobs in it, split in one place (`run_cron` and the three budget functions in
+`cloud/crates/cb-core/src/cron.rs`): the purge, #21's account deletions and the rollup. What is left
+after the settings load is divided before anything starts. The deletions are reserved what one step
+needs to make progress (14: the queue read and a step of up to 13), the rollup its minimum (18) and
+there is a margin of 2, so on a cold isolate with a four-statement settings load the purge may use
+12: one full pass, which sends seven statements (the candidates, the read of the rows, the four
+deletes of the commit; an empty pass sends one), and what it does not finish waits for the next run.
+The deletions then take what the purge left, at most 22 and never so much that the rollup has less
+than its minimum, and the rollup takes the rest. The statements are counted where they are sent
+(`Counting`), not assumed. `tests/cron.rs` runs a purge backlog of 600 workunits, a queued deletion
+of an account with 12,000 tasks and 450 computers, and the rollup, through a counting database for
+as many runs as it takes, with the settings load at 4 and 6, and checks that each run sends at most 50
+in all and that all three make progress in every run.
+
+| Share | Cold isolate (settings load 4) | After a full purge pass | Without a purge |
+| --- | --- | --- | --- |
+| Settings load | 4 | 4 | 4 |
+| Purge | up to 12 (one pass of 7) | 7 | 0 or 1 |
+| Account deletions | 14 to 22 | 19 | 22 |
+| Rollup | 18 or more | 18 or more | 18 to 24 |
+
+Every part of a pass has a count that does not depend
 on the data, so the bound is enforced by construction and not by trimming:
 
 | Step | Statements |
@@ -1452,7 +1471,8 @@ That is `FIXED + 3 * periods` (`statements_for` in `stats.rs`): 15 plus 3 a peri
 (`MIN_BUDGET`) for the open period alone, and a pass counts `(budget - 15) / 3` periods at most,
 the open one first, and leaves the rest for the next pass (`postponed` in its report); with less
 than `MIN_BUDGET` it does nothing. The count does not grow with the applications because the first
-18 live applications (`TRACKED_APPS`, by id) have rows of their own, and the tasks of all the
+18 applications by id (`TRACKED_APPS`; deprecated or not, so that deprecating one does not move the
+grouping of periods already counted) have rows of their own, and the tasks of all the
 others are counted together in a row with `appid` -1, shown as "Other applications"; the queue gauge
 is one row for the project. The tests build 400 applications with returns in the open period and
 tasks waiting, at the least budget, and check that exactly the budget is sent, that every budget from
