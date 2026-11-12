@@ -8,13 +8,15 @@ config:
 <dashboard_feed_url>https://example.org/boinc-dashboard.json</dashboard_feed_url>
 ```
 
-The address must be `https`, at most 300 characters, with no credentials in it. The config is
+The feed has to be on a hostname other than the project's own: a request from the Worker to a
+path on the hostname it is serving returns a 522 (it goes to the origin, not to the Workers on the
+route), and the panels show the note instead. The address must be `https`, at most 300 characters, with no credentials in it. The config is
 refused otherwise. Without the tag the page has no panels.
 
 ## How it is fetched
 
-The web Worker fetches the document when it builds `work.php`, which is at most about once a
-minute because the page is cached for that long. The request is a `GET` with a 3-second limit for
+The web Worker fetches the document when it builds `work.php`, which is about once a minute
+for each data center, because the page is cached for that long. The request is a `GET` with a 3-second limit for
 the whole exchange, redirects are not followed, a status other than 200 is a failure, and at most
 64 KB is read. The document is then checked against the schema below. If any of that fails, the
 panels are replaced by a note saying the project's figures are not available; the rest of the page

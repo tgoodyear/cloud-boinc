@@ -1186,8 +1186,8 @@ absolute numbers, so a pass that runs twice, or fails partway, leaves the same r
 length is counted from `res_unsent` up to 100,000 per application and shown as "100,000+" past that.
 Tasks in progress are counted from `res_host_inprog`, which now holds the application as well as the
 computer (`(hostid, appid) WHERE server_state = 4`), so those counts read the index alone. Waiting
-workunits use `wu_need_validate` and `wu_assim`. A pass is about 20 statements for a project with
-three applications, in three round trips, and writes about 10 rows. It skips itself if the last pass
+workunits use `wu_need_validate` and `wu_assim`. A pass is about 36 statements for a project with
+four applications, in four round trips, and writes about 17 rows (measured on dev). It skips itself if the last pass
 was under 240 seconds ago.
 
 Timed-out tasks are the one figure the pass cannot count, since a task that misses its deadline is
@@ -1196,14 +1196,14 @@ that commits the write-off (`timeout_statements`), under the same commit guard, 
 once. Timeouts are therefore counted from when this was installed.
 
 Counting from the cron and not on each event keeps the scheduler's hot path, and the write budget
-per job, unchanged, makes every figure repairable by the next pass, and makes the cost of a page
+per job, unchanged, makes the figures it counts repairable by the next pass, and makes the cost of a page
 independent of traffic and of the table size. The cost is that figures are up to five minutes old
 (the pages say how old), and the daily and weekly figures are in whole three-hour periods (the last
 8 and 56). A period with no row, or a queue length that was never counted, is unknown: the charts
 leave a gap and the table says "unknown", never 0.
 
 Rows read, for a project with 20 accounts, 20 computers and three applications: a leaderboard page
-is at most 100 rows (51 index entries and 51 rows, plus the owners for computers); `work.php` about
+is about 100 rows (51 index entries and 51 rows, plus up to 51 owners for computers); `work.php` about
 60 and `activity.php` about 2 plus the accounts on the page; the pass reads two rows for each task
 returned in the periods it recounts (a few thousand a day), plus the unsent and in-progress
 counts, which are the length of the queues they count. All of this only happens on a cache miss,

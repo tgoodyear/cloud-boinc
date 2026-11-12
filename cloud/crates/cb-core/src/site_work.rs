@@ -6,8 +6,9 @@
 //! to name the volunteers on the page, their accounts by ID.
 //!
 //! Privacy follows the stock site: a volunteer's name is public; a computer is
-//! listed under its owner only when the owner has `show_hosts` on, and its
-//! domain name and addresses are not read at all.
+//! listed under its owner when the owner has `show_hosts` on or the project has
+//! `host_owner_public` on (the default), and its domain name and addresses are
+//! not read at all.
 
 use std::collections::{BTreeMap, BTreeSet};
 

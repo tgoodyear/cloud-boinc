@@ -4,9 +4,10 @@
 //!
 //! Upstream's pages are `html/user/top_users.php` and `top_hosts.php`. Names,
 //! credit and the country of an account are public there and here. A computer
-//! is listed with its owner's name only when the owner has `show_hosts` on, and
-//! as "Anonymous" otherwise (`top_hosts.php` does the same). A computer's
-//! domain name and addresses are never selected.
+//! is listed with its owner's name when the owner has `show_hosts` on or the
+//! project has `host_owner_public` on (the default, unlike upstream), and as
+//! "Anonymous" otherwise (the stock rule). A computer's domain name and
+//! addresses are never selected.
 //!
 //! Each page reads the first rows of one partial index (`user_total_credit` and
 //! its siblings in `migrations/0008_dashboards.sql`): at most [`PAGE_SIZE`] + 1
