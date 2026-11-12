@@ -340,6 +340,16 @@ admission by editing workunit-ID and batch bounds on live plan classes; here tha
 API call that bumps the config version, and every isolate picks it up within its cache
 lifetime (30 seconds).
 
+A client states its GPU's peak speed and memory, so neither can be trusted to be a number.
+`COPROC::bad_gpu_peak_flops` replaces a figure that is zero, negative or above 1e15, and a `nan`
+passes that test (every comparison with NaN is false); `gpu_peak_flops` in
+`crates/cb-core/src/plan_class.rs` replaces it as well. A GPU memory figure that is not a finite
+positive number counts as unknown (0), and `HostUsage::sanitize` replaces a speed that still is
+not finite, from any plan class or from an anonymous-platform version, with `DEFAULT_FPOPS`
+(1e9), before the usage is used. The peak speed is stored as the result's `flops_estimate`, and
+the database keeps a NaN as 0, which would leave a result with no credit from its run time.
+Upstream has no such guard.
+
 ### Anonymous platform
 
 A client with an `app_info.xml` reports the platform name `anonymous` and lists the app versions it
@@ -361,7 +371,7 @@ ignored.
   the host's GPU of that type. The client's figures are bound by what the host reports
   (`anon_usage`): `avg_ncpus` by the host's CPU count, the GPU count by the number of GPUs of that type the host reports, and the GPU's peak
   speed is the host's figure with the plan class path's correction (`gpu_peak_flops`, 100 GFLOPS in
-  place of a figure that is zero, negative or above 1e15). The stated `flops` is not part of the
+  place of a figure that is zero, negative, above 1e15 or not a number). The stated `flops` is not part of the
   peak speed; it only sets the client's runtime estimate, and is kept between 1e6 and 1e17 so that
   the scale factor described under "Speed" stays between 1e-11 and 1e11. No plan class is
   evaluated: the client's plan class string is passed back as it came, and the plan class gates
@@ -625,11 +635,12 @@ disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receiv
   validation keeps reading MD5s from metadata. Pieces are only composed with that check on.
   The pieces are deleted afterwards.
 - `<get_file_size>` answers the size of the finished object, or else the pieces present
-  without a gap from offset 0, or 0 when pieces of more than one file are present. The tail
-  is never a piece, so that number is always below the size of the file that wrote the pieces.
-  A request whose data stops early keeps the pieces it finished; the bytes of the piece in
-  flight are lost and sent again. A dropped connection keeps pieces only with a zone rule; see
-  below.
+  without a gap from offset 0, or 0 when pieces of more than one file are present. Pieces stored
+  before the result's latest sending are not counted (see "A recomputed file under an old name"
+  below). The tail is never a piece, so that number is always below the size of the file that
+  wrote the pieces. A request whose data stops early keeps the pieces it finished; the bytes of
+  the piece in flight are lost and sent again. A dropped connection keeps pieces only with a zone
+  rule; see below.
 - A file of 8 MiB or less has no pieces: its upload is one head and one put, as before.
 
 Offsets follow `copy_socket_to_file` in `sched/file_upload_handler.cpp`. An offset beyond the
@@ -696,21 +707,54 @@ first attempt left pieces and the new output differs, three cases follow:
   transient error; the client asks again, hears 0 and sends the file from the start. The
   finished object is exactly the new file. Nothing from the old attempt can end up in it.
 - The new request has no valid MD5: the same, and the file is sent whole in one put.
-- The size query comes first and reports the old pieces, and the new file is no longer than
-  they are. The query carries only the name, so the server cannot know this, and the stock
-  client counts the upload as done without sending a request (`FILE_XFER_SET::poll`: a
-  reported size at least the file's size). This is the stock handler's behaviour too, with
-  the old bytes on disk as the answer, and there the stale file stays as the output. Here
-  nothing is stored under the finished name, so the pipeline rejects the result for its
-  missing output, whatever the validator (see "Validation"), and the work is issued again; a
-  wrong file is never served. Closing this fully needs the attempt to be known when the size query
-  arrives. A result's upload names cannot change per attempt (they are signed), and the
-  scheduler Worker has no bucket binding to clear the pieces when it resends a result. One way
-  is for the resend to set `sent_time` as the stock scheduler does and for the size query to
-  ignore pieces older than it; that is not built. The regression tests
-  (`a_recomputed_file_never_mixes_with_an_earlier_attempt` in `crates/cb-core/tests/upload.rs`)
-  pin both outcomes, and `a_result_without_its_finished_output_is_not_accepted_by_any_validator`
-  in `crates/cb-core/tests/pipeline.rs` drives the result through validation.
+- The size query comes first. It carries only the name, so it cannot know the length of the new
+  file, and the stock client counts the upload as done without sending a request when the
+  reported size is at least the file's size (`FILE_XFER_SET::poll`). With the old pieces as the
+  answer, a new file no longer than they are would never be sent, nothing would be stored under
+  the finished name, and the pipeline would reject the result for its missing output and issue
+  the work again (the stock handler has the same exposure, with the old bytes on disk as the
+  answer, and there the stale file stays as the output). The server tells the attempts apart
+  by time instead:
+  - The resend sets the result's `sent_time` to the time of the resend, as upstream's
+    `possibly_give_result_new_deadline` does (`resend_lost_work` in
+    `crates/cb-core/src/scheduler.rs`). The deadline rule is unchanged: it moves only when the
+    result is past it.
+  - `<get_file_size>` ignores pieces that R2 stored before the `sent_time` of the result the file
+    belongs to (`file_size`, `attempt_start` in `crates/cb-core/src/upload.rs`; the Worker
+    passes the pieces' `uploaded` times from the listing it already makes). The file's result
+    is found from its name: `new_result` names an output `<result name>_r<random>_<n>`, so the
+    result's name is what precedes the last `_r<digits>_` (`result_name_of`), and the
+    `result` table has a unique index on it. A name of another form, or no such result, means
+    no pieces are ignored, as before.
+  - The client then hears 0, sends the file from the start, and the finished object is exactly
+    the new file whatever its length. A genuine resume within one attempt is unaffected: its
+    pieces were stored after the task was sent.
+  - Cost: one indexed read of `result` per size query, made only when pieces exist for the
+    name (a query for a file with no pieces, or a finished file, reads nothing), and one more
+    column in the same `UPDATE` of a resent result, which upstream writes too. The upload
+    request itself does not read the database for this.
+  - Times: a piece counts as the current attempt's when it was stored in the second of the
+    `sent_time` or later. R2 and the scheduler Worker are on Cloudflare's clocks. A piece
+    wrongly taken for stale only costs its bytes sent again; the failure this closes is the
+    other way, which a margin would make more likely, so there is none.
+
+  Whether a client can recompute an output without a resend: in the stock client a result
+  moves from computing to `RESULT_FILES_UPLOADING` when the app exits
+  (`CLIENT_STATE::app_finished` in `client/cs_apps.cpp`) and no state leads back to computing.
+  An upload that fails permanently ends in `RESULT_UPLOAD_FAILED` and is reported as an error
+  (`CLIENT_STATE::report_result_error` in `client/client_state.cpp`). A client therefore runs a
+  task again only when the task is new to it: after a project reset or the loss of its data
+  directory, when the next request from that host no longer lists the task, which is the case
+  the resend handles. A project with `resend_lost_results` off lets such a result time out and
+  issues a new result with new names.
+  A client that recomputed without being sent the task again, which the stock client does not
+  do, would still meet the old behaviour: the first two cases above end in the new
+  file, the third in a rejected result and a reissue, never in a wrong file served. The tests
+  pin both (`a_recomputed_file_never_mixes_with_an_earlier_attempt`,
+  `a_resent_task_does_not_inherit_the_pieces_of_the_lost_one`,
+  `a_resumed_upload_of_the_same_attempt_keeps_its_pieces` in `crates/cb-core/tests/upload.rs`),
+  and `a_result_without_its_finished_output_is_not_accepted_by_any_validator` in
+  `crates/cb-core/tests/pipeline.rs` drives a result without its output through validation.
 
 Every request passes the same checks before any byte is stored, whatever its offset
 (`check_header`): the upload certificate, `max_nbytes`, the project's `max_upload_nbytes`, and
@@ -744,10 +788,10 @@ R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
 | Upload of a file of 8 MiB or less from offset 0 | 1 head, 1 put (unchanged) |
 | Upload of a larger file from offset 0, with n pieces | 1 head, 1 list, n + 1 puts, n gets, 1 delete |
 | Resumed upload | the same; pieces already held are not written again |
-| `<get_file_size>` | 1 head and 1 list, run together |
+| `<get_file_size>` | 1 head and 1 list, run together; with pieces present, 1 indexed read of `result` (`file_size` in `crates/cb-core/tests/upload.rs`: `a_size_query_reads_the_database_only_when_pieces_exist`) |
 
-No database query is added. The settings read on the upload path is unchanged. A retry of an
-upload for a stored file is one head, which now also reads the stored MD5.
+An upload request adds no database query, and the settings read on the upload path is unchanged.
+A retry of an upload for a stored file is one head, which now also reads the stored MD5.
 
 Validation adds R2 heads in the pipeline Worker: one per required output of each result that
 is validated, for the `trivial` validator too (`bitwise` and `webhook` already looked up every
@@ -1245,6 +1289,35 @@ trip on D1.
 | `jobs` | submit a batch of workunits in one call, query, cancel |
 | `assimilate`, `outputs` | list finished work, fetch output files, acknowledge |
 | `users`, `hosts` | create an account, block a user, set a host's daily result limit |
+
+`platforms` and `apps` do what upstream's `tools/xadd` does for the `<platform>` and `<app>`
+elements of `project.xml` (a PHP script that looks each name up and adds the row or updates it),
+one entry per call (`cboinc platform-put`, `app-put`); there is no loader for `project.xml`.
+Differences:
+
+- An existing platform changes only in the fields the request states (`put_platform` in
+  `crates/cb-core/src/admin.rs`). `xadd` updates the user-friendly name and never touches
+  `deprecated`; with whole-row replacement here, `platform-put` (which sends no `deprecated`
+  unless given `--deprecated true|false`) would bring a deprecated platform back, and a request
+  without a user-friendly name would replace it with the platform's name. A new platform with
+  no user-friendly name is called by its name (`xadd` stores an empty string). The reply says
+  what happened as `xadd` prints it: `added`, `updated` or `unchanged`
+  (`{"id": n, "action": "added"}`). A platform is deprecated with
+  `cboinc platform-put --name <name> --deprecated true`; the scheduler skips deprecated
+  platforms as upstream's `sched/sched_shmem.cpp` does.
+- Names are matched exactly. `xadd`'s lookup goes through MySQL's collation and ignores case, so
+  `Windows_x86_64` would update `windows_x86_64` there and is another platform here. The
+  scheduler matches a client's platform name exactly too.
+- Names are limited to 254 letters, digits, `.`, `_` and `-` (`xadd` puts the text of
+  `project.xml` into SQL as it is), which covers every name in upstream's `tools/project.xml`.
+- A name has one row, by a unique index and one upsert; upstream's `platform` table has no
+  unique key on the name, and `xadd` relies on looking first.
+- `put_app` replaces the whole app row: a field the request leaves out goes back to its default,
+  including `min_version`, `beta`, `weight` and `deprecated`, and `cboinc app-put` sends only
+  the name, user-friendly name, validator, its URLs and `target_nresults`. `xadd` updates only
+  the user-friendly name or `min_version` of an existing app (one of them per run: its
+  `else if` skips `min_version` when the name also changed) and never changes the other
+  fields. This is not changed: an app is put with every field it should have, through the API.
 
 Job submission takes many workunits per request and writes them in batched statements, since
 the reference pipeline submits in chunks of hundreds. `POST /admin/v1/jobs` takes

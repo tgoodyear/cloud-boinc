@@ -676,7 +676,7 @@ fn anon_usage(
     } else {
         p_fpops
     };
-    HostUsage {
+    let mut hu = HostUsage {
         proc_type: cav.proc_type,
         gpu_usage,
         gpu_ram: 0.0,
@@ -685,7 +685,9 @@ fn anon_usage(
         projected_flops: stated.clamp(MIN_ANON_FLOPS, MAX_ANON_FLOPS),
         peak_flops,
         cmdline: String::new(),
-    }
+    };
+    hu.sanitize();
+    hu
 }
 
 /// The speed to use for a version from the client's `app_info.xml`, and the
@@ -1863,12 +1865,18 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         // peak speed. On the anonymous platform the client's versions can
         // have changed since, and the statistics and limits follow the
         // result's row. One statement with the deadline's.
+        //
+        // The result's `sent_time` is the time of this sending, as
+        // `possibly_give_result_new_deadline` in `sched/sched_resend.cpp`
+        // sets it. The upload size query reads it to tell the pieces of a
+        // file the lost attempt left from those of the attempt that runs
+        // now (`file_size` in `crates/cb-core/src/upload.rs`).
         let rerecord = version.anon
             && (ip.app_version_id != version.result_av_id
                 || ip.flops_estimate != version.hu.peak_flops);
-        if new_deadline || rerecord {
-            let mut sql = String::from("UPDATE result SET ");
-            let mut params: Vec<cb_db::Value> = Vec::new();
+        {
+            let mut sql = String::from("UPDATE result SET sent_time = ?, ");
+            let mut params: Vec<cb_db::Value> = vec![now.into()];
             if new_deadline {
                 sql.push_str("report_deadline = ?, ");
                 params.push(deadline.into());

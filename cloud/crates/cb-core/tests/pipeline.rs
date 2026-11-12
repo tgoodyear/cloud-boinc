@@ -489,7 +489,10 @@ fn missing_output_is_a_validate_error() {
 /// attempt are held under the output's name, the recomputed file is
 /// shorter, the size query answers at least its size, the client sends no
 /// data and reports success (`upload_when_present` outputs are counted
-/// done), and no object exists under `upload/` (see the upload tests).
+/// done), and no object exists under `upload/` (see the upload tests). A
+/// resend of the task now ends the stale pieces' effect on the size query;
+/// this stays as the check behind it for a client that recomputes without
+/// being sent the task again.
 #[test]
 fn a_result_without_its_finished_output_is_not_accepted_by_any_validator() {
     for validator in ["trivial", "bitwise"] {

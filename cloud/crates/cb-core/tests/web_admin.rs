@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use cb_core::admin::{
     add_app_version, job_status, list_catalog, put_app, put_platform, set_app_version_deprecated,
-    NewApp, NewAppVersion, NewPlatform, VersionFile,
+    NewApp, NewAppVersion, NewPlatform, PutAction, VersionFile,
 };
 use cb_core::model::User;
 use cb_core::project::{
@@ -202,8 +202,8 @@ fn a_registered_version_is_sent_to_a_client() {
         user_friendly_name: "Linux x86-64 <glibc & musl>".into(),
         ..Default::default()
     };
-    let pid = block_on(put_platform(&w.db, 1, &platform)).unwrap();
-    assert_eq!(block_on(put_platform(&w.db, 2, &platform)).unwrap(), pid);
+    let pid = block_on(put_platform(&w.db, 1, &platform)).unwrap().id;
+    assert_eq!(block_on(put_platform(&w.db, 2, &platform)).unwrap().id, pid);
     let app = NewApp {
         name: "worker".into(),
         user_friendly_name: "Worker".into(),
@@ -503,4 +503,140 @@ fn assigned_jobs_are_submitted_with_their_assignment() {
         3
     );
     assert_eq!(count("SELECT count(*) AS n FROM result"), 3);
+}
+
+/// What `tools/xadd` does for a `<platform>` of `project.xml`, and where
+/// `put_platform` differs on purpose.
+#[test]
+fn put_platform_follows_xadd() {
+    let w = World::new();
+    let put = |now: i64, name: &str, friendly: &str, deprecated: Option<bool>| {
+        block_on(put_platform(
+            &w.db,
+            now,
+            &NewPlatform {
+                name: name.into(),
+                user_friendly_name: friendly.into(),
+                deprecated,
+            },
+        ))
+        .unwrap()
+    };
+    let row = |name: &str| -> (i64, String, i64, i64) {
+        let r = block_on(w.db.run(stmt!(
+            "SELECT id, user_friendly_name, deprecated, create_time FROM platform WHERE name = ?",
+            name
+        )))
+        .unwrap()
+        .rows
+        .remove(0);
+        (
+            r["id"].as_i64().unwrap(),
+            r["user_friendly_name"].as_str().unwrap().to_string(),
+            r["deprecated"].as_i64().unwrap(),
+            r["create_time"].as_i64().unwrap(),
+        )
+    };
+
+    // A new platform is added with its user-friendly name and the time.
+    let added = put(100, "windows_x86_64", "Windows on x86_64", None);
+    assert_eq!(added.action, PutAction::Added);
+    assert_eq!(
+        row("windows_x86_64"),
+        (added.id, "Windows on x86_64".into(), 0, 100)
+    );
+
+    // The same entry again is "already in DB": nothing changes, not even
+    // the creation time.
+    let again = put(200, "windows_x86_64", "Windows on x86_64", None);
+    assert_eq!((again.id, again.action), (added.id, PutAction::Unchanged));
+    assert_eq!(row("windows_x86_64").3, 100);
+
+    // A different user-friendly name updates it and nothing else.
+    let renamed = put(300, "windows_x86_64", "Microsoft Windows, 64 bit", None);
+    assert_eq!((renamed.id, renamed.action), (added.id, PutAction::Updated));
+    assert_eq!(
+        row("windows_x86_64"),
+        (added.id, "Microsoft Windows, 64 bit".into(), 0, 100)
+    );
+
+    // Differences from xadd. A platform an operator deprecated stays
+    // deprecated when the entry is put again without saying so, and keeps
+    // its user-friendly name when the entry has none; xadd does not touch
+    // `deprecated` either, and would blank the name.
+    let dep = put(400, "windows_x86_64", "", Some(true));
+    assert_eq!((dep.id, dep.action), (added.id, PutAction::Updated));
+    assert_eq!(
+        row("windows_x86_64"),
+        (added.id, "Microsoft Windows, 64 bit".into(), 1, 100)
+    );
+    let kept = put(500, "windows_x86_64", "", None);
+    assert_eq!(kept.action, PutAction::Unchanged);
+    let kept = put(500, "windows_x86_64", "Microsoft Windows, 64 bit", None);
+    assert_eq!(kept.action, PutAction::Unchanged);
+    assert_eq!(
+        row("windows_x86_64"),
+        (added.id, "Microsoft Windows, 64 bit".into(), 1, 100)
+    );
+    // A request that says so brings it back.
+    let back = put(600, "windows_x86_64", "", Some(false));
+    assert_eq!((back.id, back.action), (added.id, PutAction::Updated));
+    assert_eq!(row("windows_x86_64").2, 0);
+
+    // A new platform with no user-friendly name is called by its name
+    // (xadd stores an empty string), and can be added deprecated.
+    let bare = put(700, "arm-unknown-linux-gnueabihf", "", Some(true));
+    assert_eq!(bare.action, PutAction::Added);
+    assert_eq!(
+        row("arm-unknown-linux-gnueabihf"),
+        (bare.id, "arm-unknown-linux-gnueabihf".into(), 1, 700)
+    );
+    assert_ne!(bare.id, added.id);
+
+    // A name is matched exactly (MySQL's collation makes xadd's lookup
+    // ignore case), so a name in another case is another platform; never two
+    // rows for one name.
+    let upper = put(800, "Windows_x86_64", "Windows, capitalised", None);
+    assert_eq!(upper.action, PutAction::Added);
+    assert_ne!(upper.id, added.id);
+    let count: i64 = block_on(w.db.run(stmt!(
+        "SELECT count(*) AS n FROM platform WHERE lower(name) = 'windows_x86_64'"
+    )))
+    .unwrap()
+    .scalar_i64()
+    .unwrap();
+    assert_eq!(count, 2);
+
+    // Names that cannot be platform names are refused (xadd would put them
+    // into SQL as they are).
+    for bad in [
+        "",
+        "x'; DROP TABLE platform; --",
+        "a b",
+        "a/b",
+        &"x".repeat(255),
+    ] {
+        assert!(
+            block_on(put_platform(
+                &w.db,
+                900,
+                &NewPlatform {
+                    name: bad.into(),
+                    ..Default::default()
+                }
+            ))
+            .is_err(),
+            "{bad:?}"
+        );
+    }
+    // The names in upstream's `tools/project.xml` are fine, the dotted
+    // Solaris one included.
+    for ok in [
+        "windows_intelx86",
+        "x86_64-pc-linux-gnu",
+        "sparc-sun-solaris2.7",
+        "anonymous",
+    ] {
+        assert_ne!(put(1000, ok, ok, None).id, 0, "{ok}");
+    }
 }

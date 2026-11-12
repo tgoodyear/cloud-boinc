@@ -165,7 +165,10 @@ async fn upload(req: Request, env: Env) -> Result<Response> {
             if !is_flat_name(&file_name) {
                 return refuse(UploadError::permanent("invalid filename"));
             }
-            match upload::file_size(&store, &file_name, PIECE_BYTES).await {
+            // The database is read only when pieces of the file exist, to
+            // tell the pieces of this attempt from an earlier one's.
+            let db = db(&env)?;
+            match upload::file_size(&store, &db, &file_name, PIECE_BYTES).await {
                 Ok(size) => xml(reply_file_size(size)),
                 Err(e) => {
                     console_error!("file size {file_name}: {e}");

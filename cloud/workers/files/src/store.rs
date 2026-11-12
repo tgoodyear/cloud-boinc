@@ -127,6 +127,7 @@ impl UploadStore for R2Uploads {
                         md5,
                         start,
                         size: o.size(),
+                        uploaded: (o.uploaded().as_millis() / 1000) as i64,
                     });
                 }
             }

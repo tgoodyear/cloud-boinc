@@ -499,6 +499,11 @@ fn lost_results_are_resent() {
         w.results(wu)[0].server_state,
         RESULT_SERVER_STATE_IN_PROGRESS
     );
+    // The resend is a new sending, as upstream's `resend_lost_work` records
+    // it: the upload size query takes the pieces of the lost attempt for
+    // stale by this time. The deadline is the one it had.
+    assert_eq!(w.results(wu)[0].sent_time, 2100);
+    assert_eq!(w.results(wu)[0].report_deadline, 5600);
 
     // The client holds it: nothing to resend.
     req.seqno = 4;

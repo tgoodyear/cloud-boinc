@@ -1164,6 +1164,37 @@ fn what_the_client_states_cannot_inflate_the_speed_a_result_is_credited_for() {
 }
 
 #[test]
+fn a_gpu_that_reports_no_number_for_its_speed_gets_the_default() {
+    // `nan` passes a test written as `x <= 0 || x > max`; the speed stored
+    // for the result would be NaN, which the database keeps as zero, and a
+    // result with no speed earns no credit from its run time. `inf` and a
+    // negative figure were already replaced.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0] {
+        let w = World::new();
+        w.submit("j1", 1000);
+        let mut req =
+            Req::anon(0).versions(vec![Cav::new("a", 100).gpu("NVIDIA", 1.0).flops(1e11)]);
+        req.cpu_secs = 0.0;
+        req.gpu = Some((1000.0, bad));
+        assert_eq!(w.rpc(&req, 2000).n_sent, 1, "{bad}");
+        let sent = first_sent(&w);
+        assert_eq!(sent.flops_estimate, 2e9 + 100e9, "{bad}");
+    }
+
+    // The same for the host's benchmark, and for one so large that the
+    // product with the CPU count overflows.
+    for bad in ["nan", "inf", "1e308"] {
+        let w = World::new();
+        w.submit("j1", 1000);
+        let mut req = Req::anon(0).versions(vec![Cav::new("a", 100).ncpus(4.0)]);
+        req.fpops = bad.into();
+        assert_eq!(w.rpc(&req, 2000).n_sent, 1, "{bad}");
+        let est = first_sent(&w).flops_estimate;
+        assert!(est.is_finite() && est > 0.0, "{bad}: {est}");
+    }
+}
+
+#[test]
 fn the_sizes_sent_stay_positive_and_finite_for_any_stated_speed() {
     // Stated speeds from absurdly small to absurdly large, with elapsed-time
     // history from absurdly fast to absurdly slow.

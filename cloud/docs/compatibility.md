@@ -61,7 +61,13 @@ They write every reply to a directory, run the oracle on it and compare what the
 what the server meant. The expected values come from fixture constants and from the structures the
 server builds its replies from, not from the oracle or from a recorded file. Any mismatch fails
 the test, and so does any message the client logs as an error or any element it does not
-recognise, unless the test names it and says why.
+recognise, unless the test names it and says why. An element a parser skips is visible in two
+places: the client's message log (`[unparsed_xml]`) and standard error, where
+`XML_PARSER::skip_unexpected` in `lib/parse.cpp` writes "Unrecognized XML tag" for the parsers
+that cannot log (`GLOBAL_PREFS::parse_day` returns success after calling it). The harness reads
+both, and `Expect::quiet` applies one allowlist to both
+(`an_unknown_element_inside_day_prefs_is_caught` in
+`cloud/crates/cb-core/tests/parser_oracle/scheduler.rs`).
 
 Replies and fields covered:
 
