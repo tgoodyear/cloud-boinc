@@ -716,7 +716,7 @@ first attempt left pieces and the new output differs, three cases follow:
   answer, and there the stale file stays as the output). The server tells the attempts apart
   by time instead:
   - The resend records the time under each upload name of the result, in the table
-    `upload_epoch` (`name` primary key, `result_id`, `since`; `migrations/0004_upload_epoch.sql`),
+    `upload_epoch` (`name` primary key, `result_id`, `since`; `migrations/0005_upload_epoch.sql`),
     in the same batch as the resend's `UPDATE` (`resend_lost_work` in
     `crates/cb-core/src/scheduler.rs`). It also sets the result's `sent_time` to the time of the
     resend, as upstream's `possibly_give_result_new_deadline` does, so turnaround is measured
