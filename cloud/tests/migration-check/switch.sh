@@ -1,12 +1,12 @@
 #!/bin/sh
 # The switch: the stock server is stopped and cloud-boinc answers at the same URLs.
-#   switch.sh --work DIR --clients FILE --tags "TAG ..." [--copy-jobs PATTERN]...
+#   switch.sh --work DIR --clients FILE --tags "TAG ..." [--copy-jobs PREFIX]...
 #             [--skip-host ID]... [--carry-uploads] [--config-set TAG=VALUE]... [--cboinc FILE]
 #             [--port N]
 # 1. every client in --tags is let to run its long tasks (release-tasks.sh is not called
 #    here; the clients are expected to be in the state drive-client.sh leaves them in);
 # 2. the stock rows are copied (dump-rows.sh), with the jobs whose workunit names match
-#    each --copy-jobs pattern (SQL LIKE) and without the hosts given by --skip-host, and a dump
+#    each --copy-jobs prefix and without the hosts given by --skip-host, and a dump
 #    of the whole stock database is kept in DIR/stock-final.sql;
 # 3. the stock server is stopped, cloud-boinc is started on --port (default 80), given the
 #    stock project's settings, keys and files and then the rows (cloud-load.sh);
@@ -18,7 +18,7 @@ work="" clients="" tags="" port=80 likes="" load="" cboinc=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --work) work="$2" ;; --clients) clients="$2" ;; --tags) tags="$2" ;; --port) port="$2" ;;
-        --copy-jobs) likes="$likes --wu-like $2" ;;
+        --copy-jobs) likes="$likes --wu-prefix $2" ;;
         --skip-host) likes="$likes --skip-host $2" ;;
         --config-set) load="$load --config-set $2" ;;
         --cboinc) cboinc="$2" ;;

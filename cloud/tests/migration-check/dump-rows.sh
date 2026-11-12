@@ -1,7 +1,7 @@
 #!/bin/sh
 # Copies the stock project's rows into DIR/rows.sql (see copy_rows.py), from inside the
 # running stock container.
-#   dump-rows.sh --work DIR [--wu-like PATTERN]... [--skip-host ID]...
+#   dump-rows.sh --work DIR [--wu-prefix PREFIX]... [--skip-host ID]...
 # Uses DIR/cloud-state/pepper (made if it is missing; cloud-up.sh uses the same one), so
 # that an account with the old form of password hash gets the form cloud-boinc stores.
 usage() { sed -n '2,/^usage()/p' "$0" | sed '$d' >&2; exit 2; }
@@ -10,7 +10,7 @@ work="" likes=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --work) work="$2" ;;
-        --wu-like) likes="$likes --wu-like $2" ;;
+        --wu-prefix) likes="$likes --wu-prefix $2" ;;
         --skip-host) likes="$likes --skip-host $2" ;;
         *) usage ;;
     esac

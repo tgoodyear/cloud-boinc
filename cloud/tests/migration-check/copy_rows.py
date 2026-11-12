@@ -11,11 +11,12 @@ columns only cloud-boinc has take their defaults. What it carried and what it
 made up is printed, one line per table, with the counts.
 
     copy_rows.py --db NAME --socket PATH --migrations DIR --project-dir DIR
-                 --out FILE [--pepper-file FILE] [--wu-like PATTERN]... [--skip-host ID]...
+                 --out FILE [--pepper-file FILE] [--wu-prefix PREFIX]... [--skip-host ID]...
 
 Tables: platform, app, app_version, user, host and host_app_version always;
-workunit and result only for the workunits whose name matches a --wu-like
-pattern (SQL LIKE; give it more than once for several), with every result of
+workunit and result only for the workunits whose name starts with a --wu-prefix
+(compared as text, not as a LIKE pattern, so `_` and `%` mean themselves; give it more than
+once for several), with every result of
 those workunits. Without the option no job rows are copied. A host given with
 --skip-host (more than once for several) is left out of host and host_app_version, to
 see what happens to a computer whose row did not come across. The conversions:
@@ -55,7 +56,7 @@ ap.add_argument("--migrations", required=True)
 ap.add_argument("--project-dir", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--pepper-file")
-ap.add_argument("--wu-like", action="append", default=[])
+ap.add_argument("--wu-prefix", action="append", default=[])
 ap.add_argument("--skip-host", action="append", default=[], type=int)
 args = ap.parse_args()
 
@@ -102,9 +103,9 @@ def lit(v):
 
 
 TABLES = ["platform", "app", "app_version", "user", "host", "host_app_version"]
-if args.wu_like:
+if args.wu_prefix:
     TABLES += ["workunit", "result"]
-wu_where = " OR ".join("name LIKE %s" for _ in args.wu_like)
+wu_where = " OR ".join("BINARY LEFT(name, %d) = BINARY %%s" % len(p) for p in args.wu_prefix)
 
 out = open(args.out, "w")
 report = []
@@ -118,10 +119,10 @@ for table in TABLES:
         made_up = [c for c in made_up if c != "result_template"]
     select = "SELECT %s FROM `%s`" % (", ".join("`%s`" % c for c in cols), table)
     if table == "workunit":
-        cur.execute(select + " WHERE " + wu_where, args.wu_like)
+        cur.execute(select + " WHERE " + wu_where, args.wu_prefix)
     elif table == "result":
         cur.execute(select + " WHERE workunitid IN (SELECT id FROM workunit WHERE %s)" % wu_where,
-                    args.wu_like)
+                    args.wu_prefix)
     elif table == "host" and args.skip_host:
         cur.execute(select + " WHERE id NOT IN (%s)" % ",".join(["%s"] * len(args.skip_host)),
                     args.skip_host)

@@ -74,9 +74,9 @@ if has switch; then
     for t in $tags; do
         load_client "$t"
         case "$C_MODE" in
-            copied) args="$args --copy-jobs ${t}_%" ;;
+            copied) args="$args --copy-jobs ${t}_" ;;
             nohost)
-                args="$args --copy-jobs ${t}_%"
+                args="$args --copy-jobs ${t}_"
                 id="$(stock_sql "SELECT id FROM host WHERE domain_name = 'cb-mig-$t'" | tail -1)" ||
                     die "reading the host ID of $t failed"
                 case "$id" in ''|*[!0-9]*) die "no host ID for $t in the stock database ($id)" ;; esac
