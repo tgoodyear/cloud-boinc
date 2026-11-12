@@ -1,0 +1,66 @@
+//! Command line behaviour that needs no database.
+
+use std::process::Command;
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_cb-import"))
+}
+
+#[test]
+fn load_sql_never_deletes_a_file_it_did_not_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let sql = dir.path().join("sql");
+    std::fs::create_dir(&sql).unwrap();
+    let existing = dir.path().join("existing.sqlite");
+    std::fs::write(&existing, "precious").unwrap();
+    let out = bin()
+        .args(["load-sql", "--sql-dir"])
+        .arg(&sql)
+        .arg("--target-sqlite")
+        .arg(&existing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "precious");
+
+    // A load that fails removes the file it made.
+    std::fs::write(
+        sql.join("0001_x.sql"),
+        "INSERT INTO no_such_table VALUES (1);\n",
+    )
+    .unwrap();
+    let fresh = dir.path().join("fresh.sqlite");
+    let out = bin()
+        .args(["load-sql", "--sql-dir"])
+        .arg(&sql)
+        .arg("--target-sqlite")
+        .arg(&fresh)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(!fresh.exists());
+}
+
+#[test]
+fn a_misspelt_tls_setting_is_a_usage_error_that_does_not_echo_the_dsn() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = dir.path().join("dsn");
+    std::fs::write(
+        &dsn,
+        "mysql://sentinel_user:sentinel-password@127.0.0.1:1/db?tls=requred\n",
+    )
+    .unwrap();
+    let out = bin()
+        .args(["import", "--source-dsn-file"])
+        .arg(&dsn)
+        .arg("--rows-only")
+        .arg("--target-sqlite")
+        .arg(dir.path().join("o.sqlite"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("tls="), "{err}");
+    assert!(!err.contains("sentinel") && !err.contains("requred"));
+    assert!(!dir.path().join("o.sqlite").exists());
+}

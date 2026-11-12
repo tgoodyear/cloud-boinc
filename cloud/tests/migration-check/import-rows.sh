@@ -36,15 +36,23 @@ rm -rf "$WORK/import-sql" "$WORK/import-work"
 mkdir -p "$WORK/import-work"
 pw="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
 (umask 077; echo "mysql://cbimp_ro:$pw@127.0.0.1:$port/$PROJECT" > "$WORK/import-work/dsn")
+fwdpid=""
 cleanup() {
+    [ -z "$fwdpid" ] || podman exec "$STOCK_NAME" kill "$fwdpid" > /dev/null 2>&1 || true
     stock_sql "DROP USER IF EXISTS 'cbimp_ro'@'localhost'" > /dev/null 2>&1 || true
     rm -f "$WORK/import-work/dsn" "$mig/fwd.py"
 }
 trap cleanup EXIT
 stock_sql "CREATE USER IF NOT EXISTS 'cbimp_ro'@'localhost' IDENTIFIED BY '$pw'; GRANT SELECT ON $PROJECT.* TO 'cbimp_ro'@'localhost'"
-podman exec -d "$STOCK_NAME" python3 -I /state/migrate/fwd.py --listen-port "$port" \
-    --socket /run/mysqld/mysqld.sock --seconds 600
-/bin/sleep 2
+# Started inside the container, detached; its PID there is kept so cleanup can stop it.
+fwdpid="$(podman exec "$STOCK_NAME" sh -c 'python3 -I /state/migrate/fwd.py --listen-port "$1" --socket /run/mysqld/mysqld.sock --seconds 600 > /dev/null 2>&1 & echo $!' sh "$port")"
+case "$fwdpid" in ''|*[!0-9]*) fwdpid=""; die "the forwarder did not start" ;; esac
+i=0
+until python3 -I -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 2).close()' "$port" 2> /dev/null; do
+    i=$((i + 1))
+    [ "$i" -le 20 ] || die "nothing listens on port $port after starting the forwarder"
+    /bin/sleep 1
+done
 proj="$WORK/stock-state/project"
 log "import"
 "$importer" config --config "$proj/config.xml" > "$WORK/import-config-set.txt"

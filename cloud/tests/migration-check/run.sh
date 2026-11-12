@@ -89,10 +89,10 @@ if has switch; then
         esac
     done
     # The importer's manifest names the files to copy, uploads included.
-    [ -z "$importer" ] || { uploads=""; args="--importer $importer"; }
+    [ -z "$importer" ] || { uploads=""; args=""; }
     # shellcheck disable=SC2086
     sh "$HERE/switch.sh" --work "$WORK" --clients "$CLIENTS" --tags "$tags" --cboinc "$cboinc" \
-        $uploads $args $cfg || die "switch.sh failed"
+        $uploads $args $cfg ${importer:+--importer "$importer"} || die "switch.sh failed"
 fi
 if has observe; then
     sh "$HERE/observe.sh" --work "$WORK" --clients "$CLIENTS" --tags "$tags" --cboinc "$cboinc" \

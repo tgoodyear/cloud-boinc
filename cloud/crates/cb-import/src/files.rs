@@ -137,6 +137,9 @@ pub struct FileCollector {
     uploads: BTreeMap<String, Upload>,
     /// File names whose documents disagree about size or MD5.
     pub conflicts: Vec<String>,
+    /// Names refused because they are not flat file names (a path, `..`, an
+    /// absolute path). Document text is client-supplied and may hold anything.
+    pub refused_names: u64,
 }
 
 impl FileCollector {
@@ -159,6 +162,7 @@ impl FileCollector {
             downloads: BTreeMap::new(),
             uploads: BTreeMap::new(),
             conflicts: Vec::new(),
+            refused_names: 0,
         }
     }
 
@@ -172,8 +176,19 @@ impl FileCollector {
         }
     }
 
+    /// Checked with the rule the server applies to a name it stores (`is_flat_name`), before
+    /// any name is looked up on disk or written to the manifest.
+    fn name_ok(&mut self, name: &str) -> bool {
+        if cb_core::upload::is_flat_name(name) {
+            true
+        } else {
+            self.refused_names += 1;
+            false
+        }
+    }
+
     fn add_download(&mut self, f: &DocFile, create_time: i64, force_keep: bool) {
-        if f.is_output || !self.is_staged(f) {
+        if f.is_output || !self.is_staged(f) || !self.name_ok(&f.name) {
             return;
         }
         let keep = force_keep || f.no_delete;
@@ -243,6 +258,9 @@ impl FileCollector {
             if !f.is_output && f.url.is_some() && f.md5.is_none() {
                 continue;
             }
+            if !self.name_ok(&f.name) {
+                continue;
+            }
             let e = self.uploads.entry(f.name.clone()).or_insert(Upload {
                 nbytes: f.nbytes,
                 md5: f.md5.clone(),
@@ -307,7 +325,7 @@ impl FileCollector {
     /// Writes the manifest: one line for each file to copy, `stock path
     /// (relative to the project directory)`, `bucket key`, `bytes`, `md5`,
     /// separated by tabs. Reads each file that is on disk to get its MD5.
-    pub fn write_manifest(&self, out: &Path, summary: &mut Summary) -> Result<()> {
+    pub fn write_manifest(&self, out: &Path, list: usize, summary: &mut Summary) -> Result<()> {
         let f = std::fs::File::create(out)
             .map_err(|_| ImportError::usage("cannot create the --files-manifest file"))?;
         let mut w = std::io::BufWriter::new(f);
@@ -378,48 +396,46 @@ impl FileCollector {
         summary.count("manifest download files", n_down);
         summary.count("manifest upload files", n_up);
         summary.count("manifest bytes", bytes);
+        // Names are listed only when asked for (`--list-missing N`).
+        let names = |v: &[String]| -> String {
+            if list == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; first {}: {}",
+                    list.min(v.len()),
+                    v.iter().take(list).cloned().collect::<Vec<_>>().join(", ")
+                )
+            }
+        };
         if !missing.is_empty() {
             summary.warn(format!(
-                "{} files named by the imported documents are not in the stock directories ({} of them uploads of received results); first: {}",
+                "{} files named by the imported documents are not in the stock directories ({} download files, {} uploads of received results){}",
                 missing.len(),
+                missing.len() as u64 - missing_uploads,
                 missing_uploads,
-                missing.iter().take(20).cloned().collect::<Vec<_>>().join(", ")
+                names(&missing)
             ));
         }
         if !bad_md5.is_empty() {
             summary.warn(format!(
-                "{} files have an MD5 that differs from the document's: {}",
+                "{} files have an MD5 that differs from the document's{}",
                 bad_md5.len(),
-                bad_md5
-                    .iter()
-                    .take(20)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names(&bad_md5)
             ));
         }
         if !bad_size.is_empty() {
             summary.warn(format!(
-                "{} files have a size that differs from the document's: {}",
+                "{} files have a size that differs from the document's{}",
                 bad_size.len(),
-                bad_size
-                    .iter()
-                    .take(20)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names(&bad_size)
             ));
         }
         if !self.conflicts.is_empty() {
             summary.warn(format!(
-                "{} files are described with different sizes or MD5s by different documents: {}",
+                "{} files are described with different sizes or MD5s by different documents{}",
                 self.conflicts.len(),
-                self.conflicts
-                    .iter()
-                    .take(20)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names(&self.conflicts)
             ));
         }
         let _ = show_ids;

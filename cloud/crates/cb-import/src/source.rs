@@ -161,9 +161,31 @@ pub fn parse_dsn(dsn: &str) -> Result<(Opts, Option<SslOpts>)> {
     let mut ca: Option<String> = None;
     let mut rest: Vec<&str> = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
-        match pair.split_once('=') {
-            Some(("tls", v)) => tls = matches!(v, "required" | "true" | "1"),
-            Some(("tls_ca_file", v)) => ca = Some(v.to_string()),
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let lower = key.to_ascii_lowercase();
+        match lower.as_str() {
+            "tls" => match value {
+                "required" | "true" | "1" => tls = true,
+                "false" | "0" | "disabled" => tls = false,
+                // A misspelt value must not turn TLS off without saying so.
+                _ => {
+                    return Err(ImportError::usage(
+                        "the source DSN has a tls= value that is not required, true, 1, false, 0 or disabled",
+                    ))
+                }
+            },
+            "tls_ca_file" => ca = Some(value.to_string()),
+            // The crate's own SSL parameters would be ignored by it, or conflict with ours.
+            k if k.starts_with("tls")
+                || k.starts_with("ssl")
+                || k == "require_ssl"
+                || k == "verify_ca"
+                || k == "verify_identity" =>
+            {
+                return Err(ImportError::usage(
+                    "the source DSN has a TLS parameter the importer does not know; use tls=required and tls_ca_file=PATH",
+                ))
+            }
             _ => rest.push(pair),
         }
     }
@@ -326,6 +348,17 @@ mod tests {
             parse_dsn("mysql://u:p@localhost/db?socket=/run/mysqld/mysqld.sock").unwrap();
         assert!(ssl.is_none());
         assert_eq!(o.get_socket(), Some("/run/mysqld/mysqld.sock"));
+        // Unknown or misspelt TLS settings fail closed.
+        for bad in [
+            "mysql://u:p@h/db?tls=requred",
+            "mysql://u:p@h/db?tls_ca=/x",
+            "mysql://u:p@h/db?ssl-mode=required",
+            "mysql://u:p@h/db?require_ssl=true",
+            "mysql://u:p@h/db?TLS=required&tls_verify=no",
+        ] {
+            assert!(parse_dsn(bad).is_err(), "{bad}");
+        }
+        assert!(parse_dsn("mysql://u:p@h/db?tls=false").unwrap().1.is_none());
         // A bad URL is a usage error that does not repeat it.
         let e = parse_dsn("not a url with sentinel-password").unwrap_err();
         assert!(!e.message.contains("sentinel"));

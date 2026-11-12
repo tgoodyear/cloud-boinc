@@ -44,6 +44,12 @@ pub struct Options {
     pub code_sign_public_key: Option<String>,
     pub skip_valid_counts: bool,
     pub files_manifest: Option<PathBuf>,
+    /// Rows only: no project directory is needed. A result template that cannot be
+    /// read is counted and stored empty, and no manifest is written. The output is
+    /// not loadable for a real move.
+    pub rows_only: bool,
+    /// How many file names a warning lists (0: counts only).
+    pub list_missing: usize,
     /// Unix time, for `Finished::Recent`.
     pub now: i64,
 }
@@ -63,6 +69,8 @@ impl Default for Options {
             code_sign_public_key: None,
             skip_valid_counts: false,
             files_manifest: None,
+            rows_only: false,
+            list_missing: 0,
             now: 0,
         }
     }
@@ -99,6 +107,9 @@ pub struct Preflight {
     pub src_cols: HashMap<String, Vec<SrcCol>>,
     /// Workunits that are open, sorted. Empty for `Finished::All`.
     pub wu_ids: Vec<u64>,
+    /// Workunits the pipeline still has work on: unsent, inactive or in-progress results,
+    /// results awaiting validation, `need_validate` set, or not yet assimilated.
+    pub open_ids: HashSet<u64>,
     pub open_unsent_or_in_progress: u64,
     pub open_awaiting_validation: u64,
     pub open_awaiting_assimilation: u64,
@@ -243,6 +254,9 @@ pub fn preflight(src: &mut Source, opts: &Options, summary: &mut Summary) -> Res
                 // `update_versions` writes no `<md5_cksum>` for an application file; it is
                 // the MD5 of the file in the download directory.
                 let md5 = f.md5.clone().or_else(|| {
+                    if !cb_core::upload::is_flat_name(&f.name) {
+                        return None;
+                    }
                     let dir = opts
                         .download_dir
                         .clone()
@@ -296,7 +310,7 @@ pub fn preflight(src: &mut Source, opts: &Options, summary: &mut Summary) -> Res
     }
 
     // Which workunits are carried.
-    if opts.finished != Finished::All {
+    {
         let mut open: BTreeSet<u64> = BTreeSet::new();
         // Results not yet sent, or in progress, or inactive.
         let a = id_list(
@@ -324,6 +338,11 @@ pub fn preflight(src: &mut Source, opts: &Options, summary: &mut Summary) -> Res
         let before = open.len();
         open.extend(c);
         pre.open_awaiting_assimilation = (open.len() - before) as u64;
+        // These are swept soon after the load (see `Ctx::workunit`).
+        pre.open_ids = open.iter().copied().collect();
+    }
+    if opts.finished != Finished::All {
+        let mut open: BTreeSet<u64> = pre.open_ids.iter().copied().collect();
         if opts.finished == Finished::Recent {
             let since = opts.now - opts.finished_days as i64 * 86400;
             let d = id_list(
@@ -442,6 +461,9 @@ impl TableMapper {
 pub struct Ctx {
     pub pepper: Option<Vec<u8>>,
     pub project_dir: Option<PathBuf>,
+    pub rows_only: bool,
+    pub open_ids: HashSet<u64>,
+    pub now: i64,
     pub allow_size_class: bool,
     pub allow_fileset_id: bool,
     pub validators: BTreeMap<String, String>,
@@ -473,6 +495,9 @@ impl Ctx {
         Ctx {
             pepper: opts.pepper.clone(),
             project_dir: opts.project_dir.clone(),
+            rows_only: opts.rows_only,
+            open_ids: pre.open_ids.clone(),
+            now: opts.now,
             allow_size_class: opts.allow_size_class,
             allow_fileset_id: opts.allow_fileset_id,
             validators: opts
@@ -493,17 +518,28 @@ impl Ctx {
         if let Some(t) = self.templates.get(file) {
             return Ok(t.clone());
         }
-        let Some(dir) = &self.project_dir else {
-            return Err(ImportError::usage(
-                "workunits are imported and --project-dir is not given; the result template files are read from it",
-            ));
+        let text = match &self.project_dir {
+            Some(dir) => std::fs::read_to_string(dir.join(file)).ok(),
+            None => None,
         };
-        let path = dir.join(file);
-        let text = std::fs::read_to_string(&path).map_err(|_| {
-            ImportError::refused(format!(
-                "cannot read the result template file {file} (under --project-dir) that workunits name"
-            ))
-        })?;
+        let Some(text) = text else {
+            if self.rows_only {
+                self.summary.count(
+                    "workunits whose result template could not be read (stored empty)",
+                    1,
+                );
+                return Ok(String::new());
+            }
+            return Err(if self.project_dir.is_none() {
+                ImportError::usage(
+                    "workunits are imported and --project-dir is not given; the result template files are read from it (--rows-only skips them for a rehearsal)",
+                )
+            } else {
+                ImportError::refused(format!(
+                    "cannot read the result template file {file} (under --project-dir) that workunits name"
+                ))
+            });
+        };
         self.templates.insert(file.to_string(), text.clone());
         Ok(text)
     }
@@ -663,6 +699,19 @@ impl Ctx {
         }
         if row.int("fileset_id").unwrap_or(0) != 0 {
             self.fileset_wus.push(id as u64);
+        }
+        // The stock transitioner's schedule does not carry over, and loading SQL
+        // enqueues nothing: the sweep takes workunits with `transition_time`
+        // before now. A workunit the pipeline still has work on is made due now, and
+        // its first transition recomputes the real time (`due_workunits` and
+        // `transitioner_pass` in cb-core). Finished workunits keep theirs.
+        if self.open_ids.contains(&(id as u64)) {
+            let t = get(info, vals, "transition_time").as_i64().unwrap_or(0);
+            if t > self.now {
+                set(info, vals, "transition_time", Value::Int(self.now));
+                self.summary
+                    .count("open workunits made due for the sweep (transition_time set to the import time)", 1);
+            }
         }
         let file = row.text("result_template_file").unwrap_or_default();
         let text = self.template(&file)?;
@@ -866,9 +915,18 @@ pub fn run(
         dropped: vec![],
     });
 
-    if let Some(path) = &opts.files_manifest {
+    if let Some(f) = &ctx.files {
+        let n = f.refused_names;
+        if n > 0 {
+            ctx.summary.count(
+                "file names refused (not a flat file name; no file was looked up for them)",
+                n,
+            );
+        }
+    }
+    if let (Some(path), false) = (&opts.files_manifest, opts.rows_only) {
         if let Some(f) = ctx.files.take() {
-            f.write_manifest(path, &mut ctx.summary)?;
+            f.write_manifest(path, opts.list_missing, &mut ctx.summary)?;
             ctx.files = Some(f);
         }
     }
@@ -911,6 +969,9 @@ fn check_unsupported(ctx: &Ctx, _opts: &Options) -> Result<()> {
 }
 
 fn notes(ctx: &mut Ctx, opts: &Options, pre: &Preflight) {
+    if opts.rows_only {
+        ctx.summary.warn("ROWS ONLY: no files manifest was written, and result templates that could not be read are stored empty. This output is for a rehearsal of the row mapping and is NOT loadable for a real move");
+    }
     let wu = ctx
         .summary
         .tables

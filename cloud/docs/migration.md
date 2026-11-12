@@ -38,7 +38,7 @@ cb-import import --source-dsn-file FILE (--target-sqlite FILE | --target-sql-dir
                  [--finished leave|all|recent] [--finished-days N]
                  [--allow-size-class] [--allow-fileset-id]
                  [--download-dir DIR] [--upload-dir DIR] [--max-file-bytes N]
-                 [--skip-valid-counts]
+                 [--skip-valid-counts] [--rows-only] [--list-missing N] [--verify-sample N]
 cb-import verify --source-dsn-file FILE --target-sqlite FILE [--sample N] [the scope flags of import]
 cb-import config --config FILE
 cb-import load-sql --sql-dir DIR --target-sqlite FILE
@@ -49,7 +49,7 @@ a directory that already holds `.sql` files, and when an import fails it removes
 
 | Flag | Meaning |
 |------|---------|
-| `--source-dsn-file` | A file with one line, `mysql://user:password@host:port/database`. The DSN is never a command line argument and is never printed. Parameters at the end of the URL: `?tls=required` turns TLS on (the server's certificate is verified), `tls_ca_file=/path/ca.pem` names the CA file for a private CA, and `socket=/path` connects through a Unix socket. TLS is built in (rustls); it was not exercised against a TLS server in the tests. |
+| `--source-dsn-file` | A file with one line, `mysql://user:password@host:port/database`. The DSN is never a command line argument and is never printed. Parameters at the end of the URL: `?tls=required` turns TLS on (the server's certificate is verified), `tls_ca_file=/path/ca.pem` names the CA file for a private CA, and `socket=/path` connects through a Unix socket. TLS is built in (rustls); it was not exercised against a TLS server in the tests. A `tls=` value other than `required`, `true`, `1`, `false`, `0` or `disabled`, or any other `tls*`, `ssl*`, `require_ssl`, `verify_ca` or `verify_identity` parameter, is a usage error, so a misspelling cannot turn TLS off. |
 | `--target-sqlite` | A new SQLite file with the schema of `cloud/migrations`. |
 | `--target-sql-dir` | A directory for `NNNN_<table>.sql` files, one INSERT per line. |
 | `--project-dir` | The stock project directory. Needed when workunits are imported: each workunit's `result_template_file` is read from it. Also where the `download/` and `upload/` trees are looked for (`--download-dir` and `--upload-dir` override). |
@@ -58,6 +58,9 @@ a directory that already holds `.sql` files, and when an import fails it removes
 | `--code-sign-public-key` | Checks every signature in `app_version.xml_doc` against this key before anything is written. A mismatch fails the run. |
 | `--finished` | What to do with finished workunits. `leave` (the default), `all`, or `recent` with `--finished-days`. |
 | `--allow-size-class`, `--allow-fileset-id` | See "Jobs". |
+| `--rows-only` | A rehearsal from the database alone, with no project directory (see "Rows only" below). Result templates that cannot be read are stored empty and counted, no manifest is written, and the summary says plainly that the output is not loadable for a real move. Cannot be combined with `--files-manifest`. |
+| `--list-missing N` | List up to N file names in the warnings about files that are missing or whose size or MD5 differs. The default is 0: the warnings give counts by kind (download files, uploads) and no names. |
+| `--verify-sample N` | `import` only. After the import, in the same read transaction, compare N rows per table with what was written (see "Verify"). |
 | `--skip-valid-counts` | Do not scan `result` for the count of valid tasks per account and computer. |
 | `--max-file-bytes` | Size at which a `.sql` file is closed (default 64 MiB). |
 
@@ -172,8 +175,11 @@ stops the import the same way.
 
 ### Password hashes (D23, D24)
 
-The stock `passwd_hash` is the client's `md5(password + lower-case address)` (32 hex digits, the old
-form), or PHP `password_hash()` of that (`$2y$...`, `$argon2id$...`). This server verifies only
+A current stock site stores PHP `password_hash()` of the client's `md5(password + lower-case address)`
+(`$2y$...` or `$argon2id$...`) for every account created or signed in since the site began to rehash
+(`do_passwd_rehash` in `html/inc/user_util.inc`), so expect most or all accounts to be in this form. In a
+rehearsal against a copy of a real project's database every account was. The old form, the bare MD5 (32 hex
+digits), remains only for accounts that have not signed in since. This server verifies only
 `HMAC-SHA-256(PASSWD_PEPPER, md5)` (`verify_peppered_passwd_hash` in `cloud/crates/cb-crypto/src/account.rs`).
 The weak account key is `md5(authenticator + stored passwd_hash)` (`weak_auth`), so it stays valid only
 while the stored string is the one the stock server had.
@@ -182,8 +188,8 @@ The tool carries what it can verify and otherwise leaves the value alone:
 
 | Stored value | Without `--passwd-pepper-file` | With it |
 |--------------|-------------------------------|---------|
+| PHP `password_hash()` (the common case) | carried unchanged | carried unchanged. It cannot be converted: the tool has only the hash of the MD5, not the MD5. The password does not work here (D23); the weak key stays valid. The pepper file changes nothing for these accounts |
 | 32 hex digits | carried unchanged; the password does not work here, the weak key stays valid | replaced by the HMAC; the password works, the weak key changes (D24) |
-| PHP `password_hash()` | carried unchanged | carried unchanged. It cannot be converted: the tool has only the hash of the MD5, not the MD5. The password does not work here (D23); the weak key stays valid |
 | empty | carried | carried |
 | anything else | carried unchanged | carried unchanged |
 
@@ -233,6 +239,14 @@ lookup of a client's computer by ID and the reset detection by `rpc_seqno` see w
   `--allow-size-class` or `--allow-fileset-id` the workunit is imported without the value: the work is
   sent to any host, which can be wrong for a project that chose size classes to keep slow hosts off long jobs.
 - Stock `result.server_state`, `outcome`, `client_state` and `validate_state` are copied as they are.
+- `workunit.transition_time` of an open workunit is set to the time of the import when the stock value is later.
+  The stock transitioner's schedule does not carry over, loading `.sql` files enqueues nothing, and the pipeline's
+  sweep takes only workunits whose `transition_time` has passed (`due_workunits` in `cloud/crates/cb-core/src/pipeline.rs`),
+  so a workunit parked at the maximum (for example one with `need_validate` set) would never be looked at. "Open"
+  here is the definition under "Which rows are carried": unsent, inactive or in-progress results, results
+  awaiting validation, `need_validate` set, or not yet assimilated. The first transition of each recomputes the real
+  time (deadlines, safety net). Finished workunits, carried only for the highest IDs or by `--finished`, keep the stock
+  value. The summary counts the workunits changed.
 
 ### `job_file`
 
@@ -269,6 +283,10 @@ project directory, the bucket key, the size and the MD5 of the file as it is on 
   (`server_state` 5, `outcome` 1, `file_delete_state` not 2), and files a task in progress has already
   uploaded (D22).
 
+A file name that is not a flat name (an absolute path, a `/`, `..`: the rule of `is_flat_name` in
+`cloud/crates/cb-core/src/upload.rs`) is refused before any file is looked up, whether or not a directory is given, and is not written to
+the manifest or `job_file`; the summary counts them. Output file names in `xml_doc_out` come from clients.
+
 The summary warns about files that the documents name and the directory does not have, and about files
 whose size or MD5 differs from the document (the importer does not touch the file). A result in progress whose
 output is not uploaded yet is not a warning.
@@ -300,6 +318,14 @@ every such column of the synthetic database. The `.sql` and SQLite files hold th
 
 ## Verify
 
+A separate `verify` run compares the source as it is when `verify` reads it. That agrees with the import only on
+a source that is not changing: a stopped project, or a replica whose replication is stopped. On a live source
+the counters, timestamps and row counts drift between the two runs and `verify` reports differences that are not
+errors. To compare against the exact data that was imported, use `import --verify-sample N`: after the last
+row is written, and before the read transaction ends, it compares `N` rows per table (and the counts) in the
+same consistent snapshot, and exits with status 6 on a difference. With `--target-sql-dir` it loads the
+files into a temporary SQLite file for the comparison and deletes it.
+
 ```
 cb-import verify --source-dsn-file dsn --target-sqlite imported.sqlite --sample 1000 [scope flags]
 ```
@@ -307,7 +333,7 @@ cb-import verify --source-dsn-file dsn --target-sqlite imported.sqlite --sample 
 For each table it prints the number of rows the import maps from the source and the number in the target,
 and compares a sample field by field: the first row and every row whose key is a multiple of
 `target rows / N`, found in the target by primary key. It checks that the `id_floor` rows are at or above the
-highest imported IDs, that `team.nusers` equals the member count, and, with `--code-sign-public-key`, that a
+highest imported IDs, that a table the source does not have has no rows in the target, that `team.nusers` equals the member count, and, with `--code-sign-public-key`, that a
 `code_sign_public_key` row of the target (when it has one) is that key. A difference is reported as a table
 and column with the number of sampled rows; the exit status is 6.
 
@@ -334,23 +360,92 @@ written (`--skip-valid-counts` leaves it out).
 The tool reads one table at a time in primary key order and writes with one transaction for every 20,000 rows
 on the SQLite side. Memory use is limited to the items listed under "What is read".
 
+## Rows only
+
+`import --rows-only` needs the database and nothing else: a replica is often reachable when the project
+directory is not. It reads every row and applies the mapping, so the summary, the counts, the password kinds,
+the collisions and the sizes of the output are real. What is missing is whatever comes from the project
+directory: each workunit's `result_template` is stored empty (the summary counts the workunits), no manifest is
+written, no application file is read for the signature check, and a `job_file` row whose document has no size or MD5
+is left out (counted). The summary ends with a warning that the output is not loadable for a real move. Use it
+to rehearse the mapping and to size the output; run again with `--project-dir` for the output that is loaded.
+
 ## Rehearsal procedure
 
+What a run needs besides database access:
+
+- The stock project directory (`--project-dir`): the result template files that workunits name, and the
+  `download/` and `upload/` trees for the manifest, the file sizes and MD5s, and the signature check. Without it,
+  use `--rows-only`.
+- The stock `config.xml` (`--config`): `uldl_dir_fanout` for the paths of the manifest, the master URL's host to tell
+  staged files from other URLs, and the validator daemons. Without `--config`, every app gets the `trivial`
+  validator and the summary counts them, and every `<file_info>` in a document counts as staged.
+- A database account with SELECT on the project database. An account with more privileges (a backup account) also
+  works on a read-only replica; the tool never uses them, and the test account has SELECT only.
+- Do not use `information_schema` row estimates as a check. For InnoDB they are estimates; in one rehearsal they
+  were 15 to 45 percent below the real counts. The summary and `verify` count rows.
+
+Steps:
+
 1. On a copy of the stock database that nothing writes to (a restored backup or a replica), create an
-   account with SELECT on the project database and put its DSN in a file readable only by you.
+   account as above and put its DSN in a file readable only by you.
 2. Run `cb-import config --config config.xml` and read the lines.
-3. Run `cb-import import` with `--target-sqlite` and `--files-manifest`, and the flags the real run will use
-   (`--code-sign-public-key`, `--finished`, with or without `--passwd-pepper-file`). Read the summary:
-   counts of rows per table, the password kinds, `accounts whose team is not in the team table`, the files
-   the manifest found missing. Resolve any refusal on the stock side.
-4. Run `cb-import verify` with the same flags. It must print `verify: ok`.
-5. Run `import` again with `--target-sql-dir`, then `load-sql` into a scratch SQLite file and `verify`
-   that file. This checks the files that will be loaded into D1, including the split rows.
-6. Load the `.sql` files into the dev D1 (`wrangler d1 execute <db> --remote --file <file>`, one at a
+3. Run `cb-import import` with `--target-sqlite`, `--files-manifest`, `--verify-sample 1000` and the flags the real
+   run will use (`--code-sign-public-key`, `--finished`, with or without `--passwd-pepper-file`). Read the
+   summary: counts of rows per table, the password kinds, `accounts whose team is not in the team table`, the
+   files the manifest found missing (add `--list-missing 20` for names). Resolve any refusal on the stock
+   side. The verify at the end of the run compares against the same snapshot, so it holds on a live replica.
+4. Run `import` again with `--target-sql-dir` and `--verify-sample 1000`, which loads the files into a
+   temporary SQLite file and compares. This checks the files that will be loaded into D1, including the split rows.
+5. Load the `.sql` files into the dev D1 (`wrangler d1 execute <db> --remote --file <file>`, one at a
    time, in name order), copy the files of the manifest to the dev bucket, and compare the row counts of D1
    with the summary. Record the time and the database size.
-7. Start a stock client against the dev deployment as in `tests/migration-check/README.md` and
+6. Start a stock client against the dev deployment as in `tests/migration-check/README.md` and
    check that it keeps its host ID and reports a task.
+
+A separate `cb-import verify` is for a source that is not changing; see "Verify".
+
+### One data point
+
+A rehearsal against a copy of a real small project's database on a read-only replica, project name withheld:
+about 50,000 workunits and 80,000 results.
+
+| Run | Rows carried | Time | Output |
+|-----|--------------|------|--------|
+| `--finished leave` (open work only) | about 680 workunits and 1,540 results | 1 second | 11 MB SQLite file; 11 `.sql` files, 17 MB in all, longest statement about 58 kB |
+| `--finished all` | all of them, with 139,000 `job_file` rows | 15 seconds | 675 MB SQLite file |
+
+The read transaction was open for about 1 second and about 15 seconds in the two runs, and the replica's lag stayed 0.
+Every account had a PHP `password_hash` value.
+
+### What drives the size
+
+The full-history file is about 5 kB for each workunit or result row. To see where the bytes go, a synthetic
+database with the same row counts (50,000 workunits, 80,000 results, 140,000 `job_file` rows) and document
+sizes typical of a stock project (workunit `xml_doc` 1.3 kB, `result_template` 1.1 kB, result `xml_doc_in` 2.3 kB,
+`xml_doc_out` 0.9 kB, `stderr_out` 1.8 kB) came to 667 MB, close to the real file; the sizes are assumptions chosen to
+match, not measurements of that project. `dbstat` on it (`tests/size.rs`, an ignored test: `cargo test -p cb-import
+--test size -- --ignored --nocapture`):
+
+| Part | Bytes | Share |
+|------|-------|-------|
+| `result` table | 437 MB | 66% |
+| `workunit` table | 205 MB | 31% |
+| `job_file` table | 14 MB | 2% |
+| all indexes | about 10 MB | under 2% |
+
+The text columns are almost all of it. In `result`, `xml_doc_in`, `xml_doc_out` and `stderr_out` are about 5 kB of the
+row; in `workunit`, `xml_doc` and `result_template` are 2.4 kB of the row, and the template text is the same in
+every workunit of an app, because this schema stores the text in each row (stock stores a file name). A
+workunit row of 2.5 kB also takes a whole 4 kB page, so the table is 205 MB for 127 MB of data. The indexes of
+`cloud/migrations` are small by comparison. The importer adds nothing of its own: it writes the columns the
+schema has, with documents unchanged.
+
+D1 bills storage by database size, so size follows the number of rows carried, at about 5 kB each. `--finished leave`
+carries the open work and the highest IDs, about 2,200 rows in the rehearsal above, and
+`--finished all` carries the whole history and so the whole 5 kB for every workunit and result. `--finished recent` is
+in between. A project that wants the history without the size can keep it on the stock server (`leave`), and the
+purge on this server removes finished rows when `purge_days` is set, whichever was chosen.
 
 ## What was run
 

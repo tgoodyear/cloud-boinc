@@ -336,6 +336,15 @@ pub fn load_sql_dir(dir: &Path, target: &Path) -> Result<HashMap<String, u64>> {
             "the --target-sqlite file exists; give a path that does not",
         ));
     }
+    // The file is this call's own from here: a failure removes it, and nothing else does.
+    let r = load_sql_dir_into(dir, target);
+    if r.is_err() {
+        let _ = std::fs::remove_file(target);
+    }
+    r
+}
+
+fn load_sql_dir_into(dir: &Path, target: &Path) -> Result<HashMap<String, u64>> {
     let conn = Connection::open(target)?;
     conn.execute_batch(
         "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA locking_mode = EXCLUSIVE;",

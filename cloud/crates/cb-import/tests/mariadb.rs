@@ -1250,6 +1250,12 @@ fn manifest_reports_missing_and_changed_files() {
     std::fs::write(&i, "changed!").unwrap();
     let mut o = fx.options();
     o.files_manifest = Some(fx.dir.path().join("m.tsv"));
+    // By default the warnings give counts by kind and no file names.
+    let (summary, _, _) = fx.import_sqlite(&o, "plain.sqlite").unwrap();
+    let w = summary.warnings.join("\n");
+    assert!(w.contains("1 files named by the imported documents are not in the stock directories (0 download files, 1 uploads"), "{w}");
+    assert!(!w.contains("wu3_r5_0") && !w.contains("wu2_in"), "{w}");
+    o.list_missing = 5;
     let (summary, _, _) = fx.import_sqlite(&o, "o.sqlite").unwrap();
     let w = summary.warnings.join("\n");
     assert!(
@@ -1332,4 +1338,190 @@ fn stderr_with_invalid_utf8_is_carried_with_replacement_characters() {
         summary.counters["result.stderr_out values with invalid UTF-8 (bytes replaced)"],
         1
     );
+}
+
+#[test]
+fn rows_only_needs_no_project_directory() {
+    let fx = fx!("rowsonly");
+    let mut o = fx.options();
+    o.project_dir = None;
+    // Without the flag the import refuses and says how to rehearse.
+    let e = fx.import_sqlite(&o, "no.sqlite").unwrap_err();
+    assert_eq!(e.kind, Kind::Usage);
+    assert!(e.message.contains("--rows-only"));
+    o.rows_only = true;
+    let (summary, path, _) = fx.import_sqlite(&o, "rows.sqlite").unwrap();
+    let t = Connection::open(path).unwrap();
+    assert_eq!(q_i(&t, "SELECT count(*) FROM workunit"), 4);
+    assert_eq!(
+        q_s(&t, "SELECT result_template FROM workunit WHERE id = 2"),
+        ""
+    );
+    assert_eq!(
+        summary.counters["workunits whose result template could not be read (stored empty)"],
+        4
+    );
+    let w = summary.warnings.join("\n");
+    assert!(w.contains("ROWS ONLY") && w.contains("NOT loadable"), "{w}");
+    assert!(summary.render().contains("ROWS ONLY"));
+    // No file lists without a project tree: the manifest is not written.
+    assert!(!w.contains("not in the stock directories"), "{w}");
+    for s in SENTINELS {
+        assert!(!summary.render().contains(s));
+    }
+}
+
+#[test]
+fn verify_in_the_import_snapshot_ignores_changes_made_after_it_started() {
+    let mut fx = fx!("snapshot");
+    let opts = fx.options();
+    let path = fx.dir.path().join("snap.sqlite");
+    let mut src = Source::connect(&fx.dsn_file).unwrap();
+    let mut summary = Summary::default();
+    let pre = preflight(&mut src, &opts, &mut summary).unwrap();
+    let mem = Connection::open_in_memory().unwrap();
+    apply_migrations(&mem).unwrap();
+    let tables = all_tables(&mem).unwrap();
+    let mut sink = SqliteSink::create(&path).unwrap();
+    run(&mut src, &mut sink, &opts, &pre, &tables, &mut summary).unwrap();
+    drop(sink);
+    // The source drifts while the transaction is open.
+    fx.admin
+        .query_drop("UPDATE host SET rpc_seqno = rpc_seqno + 9, total_credit = 1 WHERE id = 1")
+        .unwrap();
+    fx.admin
+        .query_drop("UPDATE user SET total_credit = 5 WHERE id = 1")
+        .unwrap();
+    let r = verify(&mut src, &path, &opts, 1000, &mut summary).unwrap();
+    assert!(r.ok(), "{}", r.render());
+    // A new session sees the drift.
+    let mut fresh = Source::connect(&fx.dsn_file).unwrap();
+    let r = verify(&mut fresh, &path, &opts, 1000, &mut summary).unwrap();
+    assert!(!r.ok());
+    assert!(r.render().contains("host.rpc_seqno"));
+}
+
+#[test]
+fn the_command_line_runs_import_with_verify_sample() {
+    let fx = fx!("cli");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cb-import"))
+        .args(["import", "--source-dsn-file"])
+        .arg(&fx.dsn_file)
+        .arg("--rows-only")
+        .arg("--target-sqlite")
+        .arg(fx.dir.path().join("cli.sqlite"))
+        .args(["--verify-sample", "100"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("verify inside the import's snapshot") && text.contains("verify: ok"));
+    for s in SENTINELS {
+        assert!(!text.contains(s));
+    }
+    // With a manifest requested and --rows-only: a usage error, exit 2.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cb-import"))
+        .args(["import", "--source-dsn-file"])
+        .arg(&fx.dsn_file)
+        .args(["--rows-only", "--files-manifest"])
+        .arg(fx.dir.path().join("m.tsv"))
+        .arg("--target-sqlite")
+        .arg(fx.dir.path().join("cli2.sqlite"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn names_that_are_paths_are_refused_before_any_file_is_looked_up() {
+    let mut fx = fx!("names");
+    // Result 3 is in progress; the client-supplied document names files outside the upload directory.
+    let doc = "<file_info>\n<name>../../outside</name>\n<nbytes>3</nbytes>\n<md5_cksum>d41d8cd98f00b204e9800998ecf8427e</md5_cksum>\n</file_info>\n<file_info>\n<name>/etc/hostname</name>\n<nbytes>3</nbytes>\n<md5_cksum>d41d8cd98f00b204e9800998ecf8427e</md5_cksum>\n</file_info>\n<file_info>\n<name>a/b</name>\n<nbytes>3</nbytes>\n<md5_cksum>d41d8cd98f00b204e9800998ecf8427e</md5_cksum>\n</file_info>\n";
+    fx.admin
+        .exec_drop("UPDATE result SET xml_doc_out = ? WHERE id = 3", (doc,))
+        .unwrap();
+    // A file the doc's `..` would reach, if it were followed.
+    std::fs::write(fx.project.join("outside"), "x").unwrap();
+    let mut o = fx.options();
+    let manifest = fx.dir.path().join("m.tsv");
+    o.files_manifest = Some(manifest.clone());
+    let (summary, _, _) = fx.import_sqlite(&o, "o.sqlite").unwrap();
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(
+        !text.contains("outside") && !text.contains("hostname") && !text.contains("a/b"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 4);
+    assert_eq!(
+        summary.counters
+            ["file names refused (not a flat file name; no file was looked up for them)"],
+        3
+    );
+    let out = summary.render();
+    assert!(!out.contains("outside") && !out.contains("hostname"));
+    // Also with no directories at all (rows only).
+    o.files_manifest = None;
+    o.project_dir = None;
+    o.rows_only = true;
+    let (summary, _, _) = fx.import_sqlite(&o, "o2.sqlite").unwrap();
+    assert_eq!(
+        summary.counters
+            ["file names refused (not a flat file name; no file was looked up for them)"],
+        3
+    );
+}
+
+#[test]
+fn open_workunits_are_made_due_for_the_sweep() {
+    let fx = fx!("due");
+    let o = fx.options();
+    let (summary, path, _) = fx.import_sqlite(&o, "o.sqlite").unwrap();
+    let t = Connection::open(path).unwrap();
+    // wu2 (unsent and in progress) and wu3 (awaiting validation, need_validate) were parked at INT_MAX.
+    assert_eq!(
+        q_i(&t, "SELECT transition_time FROM workunit WHERE id = 2"),
+        1_800_000_000
+    );
+    assert_eq!(
+        q_i(&t, "SELECT transition_time FROM workunit WHERE id = 3"),
+        1_800_000_000
+    );
+    // Finished workunits kept only for the highest IDs keep the stock value.
+    assert_eq!(
+        q_i(&t, "SELECT transition_time FROM workunit WHERE id = 4"),
+        2_147_483_647
+    );
+    assert_eq!(
+        q_i(&t, "SELECT transition_time FROM workunit WHERE id = 10"),
+        2_147_483_647
+    );
+    assert_eq!(
+        summary.counters
+            ["open workunits made due for the sweep (transition_time set to the import time)"],
+        2
+    );
+}
+
+#[test]
+fn verify_checks_tables_the_source_does_not_have() {
+    let mut fx = fx!("absent");
+    let o = fx.options();
+    let (_, path, _) = fx.import_sqlite(&o, "o.sqlite").unwrap();
+    assert_eq!(
+        q_i(
+            &Connection::open(&path).unwrap(),
+            "SELECT count(*) FROM batch"
+        ),
+        1
+    );
+    fx.admin.query_drop("DROP TABLE batch").unwrap();
+    let mut src = Source::connect(&fx.dsn_file).unwrap();
+    let mut s = Summary::default();
+    let r = verify(&mut src, &path, &o, 1000, &mut s).unwrap();
+    assert!(!r.ok(), "{}", r.render());
+    assert_eq!(r.counts["batch"], (0, 1));
 }

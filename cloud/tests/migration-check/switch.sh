@@ -16,7 +16,7 @@
 #    the clients' network is turned on again.
 usage() { sed -n '2,/^usage()/p' "$0" | sed '$d' >&2; exit 2; }
 set -eu
-work="" clients="" tags="" port=80 likes="" load="" cboinc="" importer="" finished=leave
+work="" clients="" tags="" port=80 likes="" load="" cboinc="" importer="" manifest="" finished=leave
 while [ $# -gt 0 ]; do
     case "$1" in
         --work) work="$2" ;; --clients) clients="$2" ;; --tags) tags="$2" ;; --port) port="$2" ;;
@@ -38,7 +38,7 @@ WORK="$work" CLIENTS="$clients"
 log "copy the stock rows"
 if [ -n "$importer" ]; then
     sh "$HERE/import-rows.sh" --work "$WORK" --importer "$importer" --finished "$finished"
-    load="$load --manifest $WORK/import-manifest.tsv"
+    manifest="$WORK/import-manifest.tsv"
 else
     # shellcheck disable=SC2086
     sh "$HERE/dump-rows.sh" --work "$WORK" $likes
@@ -55,7 +55,7 @@ sh "$HERE/../differential/stock.sh" --action stop --name "$STOCK_NAME"
 offline() { log "$1; the clients' network stays off and the stock server is stopped"; exit 1; }
 sh "$HERE/cloud-up.sh" --work "$WORK" --port "$port" || offline "cloud-boinc did not start"
 # shellcheck disable=SC2086
-sh "$HERE/cloud-load.sh" --work "$WORK" --port "$port" $load ${cboinc:+--cboinc "$cboinc"} ||
+sh "$HERE/cloud-load.sh" --work "$WORK" --port "$port" $load ${manifest:+--manifest "$manifest"} ${cboinc:+--cboinc "$cboinc"} ||
     offline "loading the stock project's settings, files and rows failed"
 
 log "clients on again"

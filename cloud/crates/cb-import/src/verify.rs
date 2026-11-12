@@ -238,6 +238,13 @@ pub fn verify(
     };
     run(src, &mut sink, &vopts, &pre, &tables, summary)?;
     let mut report = sink.report;
+    // A table the source does not have is imported as empty: the target must hold no rows of it.
+    for t in crate::schema::TABLES.iter().filter(|t| **t != "job_file") {
+        if pre.src_cols.get(*t).is_some_and(|c| c.is_empty()) {
+            let n: i64 = conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))?;
+            report.counts.insert(t.to_string(), (0, n as u64));
+        }
+    }
     if let Some(text) = &opts.code_sign_public_key {
         let stored: Option<String> = conn
             .query_row(

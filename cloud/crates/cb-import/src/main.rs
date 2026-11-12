@@ -65,6 +65,15 @@ struct Common {
     /// Check that the code-signing public key verifies the app version signatures.
     #[arg(long)]
     code_sign_public_key: Option<PathBuf>,
+    /// A rehearsal from the database alone: result templates that cannot be read
+    /// are stored empty and counted, no manifest is written, and the summary says
+    /// the output is not loadable for a real move.
+    #[arg(long)]
+    rows_only: bool,
+    /// List up to N file names in the warnings about missing or changed files
+    /// (default 0: counts only).
+    #[arg(long, default_value_t = 0)]
+    list_missing: usize,
     /// Do not count valid results per account and computer (saves a scan of `result`).
     #[arg(long)]
     skip_valid_counts: bool,
@@ -88,6 +97,11 @@ enum Command {
         /// Write the list of files to copy to the bucket.
         #[arg(long)]
         files_manifest: Option<PathBuf>,
+        /// After the import, still inside the same read transaction (the same snapshot),
+        /// compare this many rows per table with what was written. A separate `verify`
+        /// run later only agrees on a source that is not changing.
+        #[arg(long)]
+        verify_sample: Option<u64>,
     },
     /// Compares the source with a target SQLite file.
     Verify {
@@ -151,8 +165,14 @@ fn options(c: &Common, manifest: Option<PathBuf>) -> Result<Options, ImportError
         },
         skip_valid_counts: c.skip_valid_counts,
         files_manifest: manifest,
+        rows_only: c.rows_only,
+        list_missing: c.list_missing,
         now,
     })
+}
+
+fn opts_rows_only_manifest(c: &Common, m: &Option<PathBuf>) -> bool {
+    c.rows_only && m.is_some()
 }
 
 fn go() -> Result<i32, ImportError> {
@@ -169,17 +189,10 @@ fn go() -> Result<i32, ImportError> {
             sql_dir,
             target_sqlite,
         } => {
-            let r = load_sql_dir(&sql_dir, &target_sqlite);
-            match r {
-                Ok(files) => {
-                    println!("applied {} files", files.len());
-                    Ok(0)
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&target_sqlite);
-                    Err(e)
-                }
-            }
+            // `load_sql_dir` removes the file only when it created it.
+            let files = load_sql_dir(&sql_dir, &target_sqlite)?;
+            println!("applied {} files", files.len());
+            Ok(0)
         }
         Command::Import {
             common,
@@ -187,7 +200,13 @@ fn go() -> Result<i32, ImportError> {
             target_sql_dir,
             max_file_bytes,
             files_manifest,
+            verify_sample,
         } => {
+            if opts_rows_only_manifest(&common, &files_manifest) {
+                return Err(ImportError::usage(
+                    "--rows-only writes no manifest; drop --files-manifest",
+                ));
+            }
             if target_sqlite.is_some() == target_sql_dir.is_some() {
                 return Err(ImportError::usage(
                     "give exactly one of --target-sqlite and --target-sql-dir",
@@ -225,7 +244,33 @@ fn go() -> Result<i32, ImportError> {
             };
             result?;
             print!("{}", summary.render());
-            Ok(0)
+            let Some(n) = verify_sample else {
+                return Ok(0);
+            };
+            // Same session, same snapshot: the source cannot have drifted.
+            let (sqlite, temp) = match &target_sqlite {
+                Some(p) => (p.clone(), false),
+                None => {
+                    let p = std::env::temp_dir()
+                        .join(format!("cb-import-verify-{}.sqlite", std::process::id()));
+                    let _ = std::fs::remove_file(&p);
+                    load_sql_dir(target_sql_dir.as_ref().unwrap(), &p)?;
+                    (p, true)
+                }
+            };
+            let mut vsum = Summary::default();
+            let report = verify(&mut src, &sqlite, &opts, n, &mut vsum);
+            if temp {
+                let _ = std::fs::remove_file(&sqlite);
+            }
+            let report = report?;
+            println!("verify inside the import's snapshot:");
+            print!("{}", report.render());
+            Ok(if report.ok() {
+                0
+            } else {
+                ImportError::new(Kind::Mismatch, "").exit_code()
+            })
         }
         Command::Verify {
             common,
