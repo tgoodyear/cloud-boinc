@@ -357,6 +357,60 @@ pub fn next_team_id_sql() -> String {
         .to_string()
 }
 
+/// The statement that credits a team (`grant_credit` in `sched/credit.cpp`,
+/// the team part): `total_credit` grows by `credit`, and the recent average is
+/// brought up to date by `update_average` (`cloud/crates/cb-core/src/avg.rs`)
+/// computed in the statement from the stored row, not in the caller from a copy
+/// read earlier. Two transitions that credit members of one team at the same
+/// time each see the other's sample, so neither is lost; `recent_key` follows
+/// (`recent_key` in `avg.rs`). `now` is the time of the grant and `sent_time`
+/// the start of the work, which only a team with no average yet uses. It needs
+/// `UPDATE ... FROM` and the math functions `exp` and `ln`, which D1's SQLite has.
+pub fn team_grant_statement(team_id: i64, now: f64, sent_time: f64, credit: f64) -> Stmt {
+    use crate::avg::CREDIT_HALF_LIFE as HL;
+    use std::f64::consts::LN_2;
+    let mut params: Vec<cb_db::Value> = Vec::new();
+    let mut p = |v: f64| params.push(v.into());
+    // The average the row has after the sample, from `t`, the stored row.
+    let weight = format!("exp(-max(? - t.expavg_time, 0.0) * {LN_2:e} / {HL:e})");
+    let mut avg = String::from("CASE WHEN t.expavg_time != 0 THEN t.expavg_credit * ");
+    avg.push_str(&weight);
+    p(now);
+    avg.push_str(" + CASE WHEN (1.0 - ");
+    avg.push_str(&weight);
+    p(now);
+    avg.push_str(") > 1e-6 THEN (1.0 - ");
+    avg.push_str(&weight);
+    p(now);
+    avg.push_str(") * (? / (max(? - t.expavg_time, 0.0) / 86400.0)) ELSE ");
+    p(credit);
+    p(now);
+    avg.push_str(&format!("{:e} * ? END ", LN_2 * 86400.0 / HL));
+    p(credit);
+    avg.push_str("WHEN ? != 0 THEN CASE WHEN ? - ? > 0 THEN ? / ((? - ?) / 86400.0) ELSE 0.0 END ");
+    p(credit);
+    p(now);
+    p(sent_time);
+    p(credit);
+    p(now);
+    p(sent_time);
+    avg.push_str("ELSE t.expavg_credit END");
+    let mut head: Vec<cb_db::Value> = vec![credit.into(), now.into(), now.into()];
+    head.extend(params);
+    head.push(team_id.into());
+    head.push(team_id.into());
+    Stmt {
+        sql: format!(
+            "UPDATE team SET total_credit = total_credit + ?, expavg_credit = c.avg, \
+             expavg_time = ?, \
+             recent_key = CASE WHEN c.avg > 0 THEN ln(c.avg) + ? * {:e} ELSE -1e9 END \
+             FROM (SELECT {avg} AS avg FROM team t WHERE t.id = ?) AS c WHERE team.id = ?",
+            LN_2 / HL
+        ),
+        params: head,
+    }
+}
+
 /// The statement that makes a team (`make_team` in `html/inc/team.inc`) and
 /// the one that puts the founder in it (`user_join_team`). They run in one
 /// batch. The team is made only when the account is still the one read, in no

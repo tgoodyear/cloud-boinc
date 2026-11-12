@@ -1704,8 +1704,10 @@ pub async fn team_founder_transfer_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePag
         "<p>This team has no founder. As a member you may become its founder.</p>\n\
          <form method=\"post\" action=\"team_founder_transfer_action.php\">\n{}\
          <input type=\"hidden\" name=\"action\" value=\"initiate_transfer\">\n\
+         <input type=\"hidden\" name=\"teamid\" value=\"{}\">\n\
          <p><input type=\"submit\" value=\"Become the founder\"></p>\n</form>\n",
-        token_fields(&user, ctx.now)
+        token_fields(&user, ctx.now),
+        team.id
     );
     Ok(page(ctx, &title, &b))
 }
@@ -1732,6 +1734,9 @@ pub async fn team_founder_transfer_action(ctx: &SiteCtx<'_>, q: &Params) -> Core
             "Foundership requests are not supported on this site.",
         ));
     }
+    // The team the form showed. The statement takes it only if the account is
+    // still a member of that team, as the quit action does for its target.
+    let team_id = int_param(q, "teamid").unwrap_or(0);
     let done = ctx
         .db
         .run(stmt!(
@@ -1739,10 +1744,10 @@ pub async fn team_founder_transfer_action(ctx: &SiteCtx<'_>, q: &Params) -> Core
              AND EXISTS (SELECT 1 FROM user WHERE id = ? AND teamid = ? AND authenticator = ? \
              AND blocked = 0) RETURNING id",
             user.id,
-            user.teamid,
-            user.teamid,
+            team_id,
+            team_id,
             user.id,
-            user.teamid,
+            team_id,
             user.authenticator.as_str()
         ))
         .await?;

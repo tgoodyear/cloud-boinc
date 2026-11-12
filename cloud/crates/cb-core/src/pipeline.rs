@@ -1028,13 +1028,11 @@ struct CreditRow {
     expavg_credit: f64,
     expavg_time: f64,
     avg_turnaround: f64,
-    /// An account's team (0 for none) and, from the join in the same read, the
-    /// team's average: `team_id` is null when the account has no team or
-    /// the team is gone.
+    /// An account's team (0 for none) and, from the join in the same read,
+    /// whether the team exists: `team_id` is null when the account has no team
+    /// or the team is gone.
     teamid: i64,
     team_id: Option<i64>,
-    team_expavg_credit: f64,
-    team_expavg_time: f64,
 }
 
 fn guard_sql(wu_id: i64, token: i64) -> (&'static str, [Value; 2]) {
@@ -1062,8 +1060,9 @@ fn guarded(mut s: Stmt, wu_id: i64, token: i64) -> Stmt {
 ///
 /// Counters are written relative to the stored value. The averages are
 /// written as computed from the values read here; two transitions crediting
-/// one host at the same instant can lose one sample of an average, never
-/// credit.
+/// one host (or one account) at the same instant can lose one sample of an
+/// average, never credit. A team's is computed in its statement from the stored
+/// row and loses none.
 async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Vec<Stmt>> {
     if st.events.is_empty() {
         return Ok(Vec::new());
@@ -1108,9 +1107,7 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         // which finds nothing for an account with no team (`teamid` 0), so a
         // grant to an account without a team reads and writes nothing more.
         reads.push(Stmt::new(format!(
-            "SELECT u.id, u.expavg_credit, u.expavg_time, u.teamid, t.id AS team_id, \
-             coalesce(t.expavg_credit, 0) AS team_expavg_credit, \
-             coalesce(t.expavg_time, 0) AS team_expavg_time \
+            "SELECT u.id, u.expavg_credit, u.expavg_time, u.teamid, t.id AS team_id \
              FROM user u LEFT JOIN team t ON t.id = u.teamid WHERE u.id IN ({})",
             id_list(&user_ids)
         )));
@@ -1158,21 +1155,13 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         );
     }
 
-    // The teams of the accounts credited, by team ID: the average as it is
-    // brought up to date by each grant, as `grant_credit` in `sched/credit.cpp`
-    // does for `team.expavg_credit` after the user's.
-    let mut teams: BTreeMap<i64, CreditRow> = BTreeMap::new();
-    for u in users.values() {
-        if let Some(team_id) = u.team_id.filter(|_| u.teamid > 0) {
-            teams.entry(team_id).or_insert(CreditRow {
-                id: team_id,
-                expavg_credit: u.team_expavg_credit,
-                expavg_time: u.team_expavg_time,
-                ..Default::default()
-            });
-        }
-    }
-    let mut team_credit: BTreeMap<i64, f64> = BTreeMap::new();
+    // Credit for the teams of the accounts credited: `(team, credit, sent time)`
+    // for each grant. The team's average is not worked out here from a row read
+    // earlier: the statement does it from the stored row (`team_grant_statement`),
+    // so concurrent transitions for members of one team lose no sample. The
+    // account's and the computer's averages below are still written from the
+    // values read here.
+    let mut team_grants: Vec<(i64, f64, f64)> = Vec::new();
     let mut host_credit: BTreeMap<i64, f64> = BTreeMap::new();
     let mut user_credit: BTreeMap<i64, f64> = BTreeMap::new();
     // Valid tasks, for the leaderboards' "jobs completed".
@@ -1251,20 +1240,8 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
                     );
                     *user_credit.entry(*user_id).or_default() += credit;
                     *user_valid.entry(*user_id).or_default() += 1;
-                    if let Some(t) = u
-                        .team_id
-                        .filter(|_| u.teamid > 0)
-                        .and_then(|id| teams.get_mut(&id))
-                    {
-                        update_average(
-                            now,
-                            *sent_time,
-                            *credit,
-                            CREDIT_HALF_LIFE,
-                            &mut t.expavg_credit,
-                            &mut t.expavg_time,
-                        );
-                        *team_credit.entry(t.id).or_default() += credit;
+                    if let Some(team_id) = u.team_id.filter(|_| u.teamid > 0) {
+                        team_grants.push((team_id, *credit, *sent_time));
                     }
                 }
                 if let Some(h) = havs.get_mut(&(*host_id, *gavid)) {
@@ -1322,20 +1299,12 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
             token,
         ));
     }
-    // The team, when an account credited has one: one statement for each team,
-    // in the same batch.
-    for (id, credit) in &team_credit {
-        let t = &teams[id];
+    // The team, when an account credited has one: one statement for each grant,
+    // in the same batch, that adds the credit and updates the average from the
+    // stored row.
+    for (team_id, credit, sent_time) in &team_grants {
         out.push(guarded(
-            stmt!(
-                "UPDATE team SET total_credit = total_credit + ?, expavg_credit = ?, \
-                 expavg_time = ?, recent_key = ? WHERE id = ?",
-                *credit,
-                t.expavg_credit,
-                t.expavg_time,
-                crate::avg::recent_key(t.expavg_credit, t.expavg_time),
-                *id
-            ),
+            crate::teams::team_grant_statement(*team_id, now, *sent_time, *credit),
             wu_id,
             token,
         ));

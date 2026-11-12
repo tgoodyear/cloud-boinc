@@ -2066,3 +2066,74 @@ fn top_teams_past_its_limit_is_an_error_not_the_first_page() {
     assert_eq!(key("2000"), key("100000"));
     assert_eq!(key("7"), key("0"));
 }
+
+#[test]
+fn taking_a_founderless_team_names_the_team_the_form_showed() {
+    let w = World::new();
+    let ada = w.account("Ada");
+    let bob = w.account("Bob");
+    let cy = w.account("Cy");
+    let a = w.create(&ada, "Alpha", &[("joinable", "on")]);
+    let b = w.create(&cy, "Beta", &[("joinable", "on")]);
+    w.join(&bob, a);
+    w.sql("UPDATE team SET userid = 0");
+    let form = w.get("/team_founder_transfer_form.php", Some(&bob), &[]);
+    assert!(
+        form.body
+            .contains(&format!("name=\"teamid\" value=\"{a}\"")),
+        "{}",
+        form.body
+    );
+    // Bob joins Beta, which has no founder either, then submits the old form.
+    w.sql(&format!(
+        "UPDATE user SET teamid = {b} WHERE id = {}",
+        bob.id
+    ));
+    let (page, _) = w.submit(&form, "/team_founder_transfer_action.php", &bob, &[]);
+    assert_eq!(page.status, 409, "{}", page.body);
+    assert_eq!(w.n("SELECT count(*) FROM team WHERE userid = 0"), 2);
+    // A form for the team he is in works; one naming no team does not.
+    let form = w.get("/team_founder_transfer_form.php", Some(&bob), &[]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_founder_transfer_action.php",
+        &bob,
+        &[("teamid", "")],
+    );
+    assert_eq!(page.status, 409);
+    let (page, _) = w.submit(&form, "/team_founder_transfer_action.php", &bob, &[]);
+    assert_eq!(page.status, 303);
+    assert_eq!(
+        w.n(&format!("SELECT userid FROM team WHERE id = {b}")),
+        bob.id
+    );
+    assert_eq!(w.n(&format!("SELECT userid FROM team WHERE id = {a}")), 0);
+}
+
+#[test]
+fn an_account_inserted_with_a_team_counts_as_a_member() {
+    let w = World::new();
+    let ada = w.account("Ada");
+    let t = w.create(&ada, "Alpha", &[]);
+    assert_eq!(w.n("SELECT nusers FROM team WHERE id = 1"), 1);
+    // Rows loaded by SQL: two with the team, one with none, one with a team that is not there.
+    w.sql(
+        "INSERT INTO user (id, create_time, email_addr, authenticator, teamid) VALUES \
+         (50, 1, 'a@x.example', 'k50', 1), (51, 1, 'b@x.example', 'k51', 1), \
+         (52, 1, 'c@x.example', 'k52', 0), (53, 1, 'd@x.example', 'k53', 99)",
+    );
+    assert_eq!(w.n(&format!("SELECT nusers FROM team WHERE id = {t}")), 3);
+    // Deleting one takes one away, not one of the others.
+    w.sql("DELETE FROM user WHERE id = 50");
+    assert_eq!(w.n("SELECT nusers FROM team WHERE id = 1"), 2);
+    let counted = "SELECT count(*) FROM user WHERE teamid = 1";
+    assert_eq!(w.n(counted), 2);
+    // A sign-up (team 0) fires nothing.
+    let before = w.n("SELECT nusers FROM team WHERE id = 1");
+    w.account("Dee");
+    assert_eq!(w.n("SELECT nusers FROM team WHERE id = 1"), before);
+    // The recount the docs give for a bulk load.
+    w.sql("UPDATE team SET nusers = 40");
+    w.sql("UPDATE team SET nusers = (SELECT count(*) FROM user WHERE teamid = team.id AND teamid > 0)");
+    assert_eq!(w.n("SELECT nusers FROM team WHERE id = 1"), 2);
+}

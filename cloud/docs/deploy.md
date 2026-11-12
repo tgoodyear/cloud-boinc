@@ -431,7 +431,7 @@ deployed before the migration fails every request with `no such table: team`; th
 grant reads `team` the same way, and the web Worker's team pages, `am_get_info.php` and the
 account page read it. The migration only adds objects: the `team` table, its unique and
 sort indexes, the partial index `user_team` on `user` (empty at first, since no account has a team
-until someone joins one), the `team_id_floor` trigger, and the two triggers on `user` that keep
+until someone joins one), the `team_id_floor` trigger, and the three triggers on `user` (update, insert, delete) that keep
 `team.nusers` right. Each trigger is one statement whose body contains `;`: where a tool splits on
 `;`, run the file with `wrangler d1 execute --file`. The statements are written with `IF NOT EXISTS`,
 so running the file again is harmless. Roll back the Workers, not the migration.
@@ -448,7 +448,9 @@ Set one with `cboinc config-set --tag disable_teams --value 1`, like the other o
 credit its members earn while they are members, from the first grant after this build is deployed;
 nothing is added for credit earned before, or when an account joins. A project moving from a stock server
 that wants its teams has to insert the `team` rows itself (see "Teams" in
-[architecture.md](architecture.md)), with `nusers` set to the count of accounts with that `teamid`.
+[architecture.md](architecture.md)), and load the accounts after them. The `user` insert trigger counts every account loaded with a team, so
+load the team rows with `nusers` 0, or load everything and recount at the end with
+`UPDATE team SET nusers = (SELECT count(*) FROM user WHERE teamid = team.id AND teamid > 0)`.
 A credit grant to an account with a team writes one more row and two index entries (the team's);
 one to an account with no team writes nothing more.
 

@@ -1794,9 +1794,13 @@ collation does for upstream. Team IDs are not given out twice (`next_team_id_sql
 account moved from a stock server can; the last is a `max` over the partial index `user_team`). The columns upstream has for what is not built (`name_html`,
 `seti_id`, `ping_user`, `ping_time`, `mod_time`) are not there.
 
-`team.nusers` is kept exactly. Two triggers on `user` (`user_team_changed`, `user_team_deleted`)
-add and take away one when `teamid` changes, whatever statement changes it: a member joining or
-quitting, the founder removing a member, an account deletion, an operator's `UPDATE`. Upstream
+`team.nusers` is kept exactly. Three triggers on `user` (`user_team_changed`, `user_team_inserted`, `user_team_deleted`)
+add and take away one when `teamid` changes, an account is inserted with a team or an account with a team
+is deleted, whatever statement does it: a member joining or quitting, the founder removing a member, an
+account deletion, an operator's `UPDATE`, rows loaded by SQL. A bulk load of teams and accounts (an import
+from a stock server) must not count twice: load the `team` rows with `nusers` 0 before the accounts, or
+load everything and then recount with `UPDATE team SET nusers = (SELECT count(*) FROM user WHERE teamid =
+team.id AND teamid > 0)`. A sign-up inserts `teamid` 0 and fires nothing. Upstream
 keeps the column "temp" and recounts it daily in `update_stats` (`get_team_totals`); no such job is
 needed here. The other half of `update_stats` for teams, the decay of an idle average, is not needed
 either: pages show the average decayed to now (`decayed` in `avg.rs`) and order by `recent_key`, as
@@ -1898,8 +1902,16 @@ user's team (`team.total_credit`, `expavg_credit`, `expavg_time`), each with `up
 `host_statements` in `cloud/crates/cb-core/src/pipeline.rs` does the same: the read of the users in the
 transition's batch now joins `team` on `user.teamid`, which costs no statement and finds nothing for an
 account with no team, and each team credited gets one `UPDATE team SET total_credit = total_credit + ?,
-expavg_credit = ?, expavg_time = ?, recent_key = ?` in the batch that writes the host and user, guarded by the
-workunit's commit token like the others. Two accounts of one team in one transition make one update. The whole transition of a quorum-1 job
+expavg_credit = c.avg, expavg_time = ?, recent_key = ? FROM (...) AS c` in the batch that writes the host and user,
+guarded by the workunit's commit token like the others. The statement computes the average itself from the
+stored row (`team_grant_statement` in `teams.rs`: `update_average` and `recent_key` in SQL, with `exp` and
+`ln` and `UPDATE ... FROM`, which D1's SQLite has; a test compares it with `avg.rs`), not the caller from a
+copy read earlier, so two transitions that credit members of one team at the same time lose no sample of the
+average. The commit token guards one workunit only, so an average written from a copy would let one transition
+overwrite the other's sample, and the average of an account and of a computer (`host_statements`) still is
+written that way: this is stricter than upstream, whose `grant_credit` reads the team, runs `update_average` in
+the validator and writes the result back, a read-modify-write that two validators of different applications can
+interleave. There is one statement for each grant, so two members' results validated in one transition make two. The whole transition of a quorum-1 job
 that earns credit sends 11 statements for an account with no team (reads and writes, in the test's fixture) and 12 for one with a team, in the same
 round trips. A grant
 costs the statements it did, and for an account with a team one more, which writes the team row and its

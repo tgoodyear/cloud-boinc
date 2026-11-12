@@ -61,6 +61,16 @@ BEGIN
     UPDATE team SET nusers = max(nusers - 1, 0) WHERE id = old.teamid AND old.teamid > 0;
     UPDATE team SET nusers = nusers + 1 WHERE id = new.teamid AND new.teamid > 0;
 END;
+-- An account inserted with a team (rows loaded by SQL from another server) counts
+-- as a member, so deleting it later does not take one from the others. Sign-up
+-- inserts `teamid` 0 and never fires it. A bulk load that fills `team` first must
+-- load the team rows with `nusers` 0, or recount at the end:
+--   UPDATE team SET nusers = (SELECT count(*) FROM user WHERE teamid = team.id AND teamid > 0);
+CREATE TRIGGER IF NOT EXISTS user_team_inserted AFTER INSERT ON user
+WHEN new.teamid > 0
+BEGIN
+    UPDATE team SET nusers = nusers + 1 WHERE id = new.teamid;
+END;
 CREATE TRIGGER IF NOT EXISTS user_team_deleted AFTER DELETE ON user
 WHEN old.teamid > 0
 BEGIN

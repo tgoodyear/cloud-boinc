@@ -31,6 +31,15 @@ impl SqliteDb {
             |ctx| Ok(ctx.get::<f64>(0)?.ln()),
         )
         .map_err(err)?;
+        // `exp` is what `cb_core::teams::team_grant_statement` uses.
+        conn.create_scalar_function(
+            "exp",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(ctx.get::<f64>(0)?.exp()),
+        )
+        .map_err(err)?;
         Ok(SqliteDb {
             conn: RefCell::new(conn),
             written: Cell::new(0),
