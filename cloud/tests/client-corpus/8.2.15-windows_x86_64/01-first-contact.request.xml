@@ -1,0 +1,125 @@
+<scheduler_request>
+    <authenticator>fixture-authenticator</authenticator>
+    <hostid>0</hostid>
+    <rpc_seqno>0</rpc_seqno>
+    <core_client_major_version>8</core_client_major_version>
+    <core_client_minor_version>2</core_client_minor_version>
+    <core_client_release>15</core_client_release>
+    <resource_share_fraction>1.000000</resource_share_fraction>
+    <rrs_fraction>1.000000</rrs_fraction>
+    <prrs_fraction>1.000000</prrs_fraction>
+    <duration_correction_factor>1.000000</duration_correction_factor>
+    <allow_multiple_clients>0</allow_multiple_clients>
+    <sandbox>0</sandbox>
+    <dont_send_work>0</dont_send_work>
+    <work_req_seconds>1.000000</work_req_seconds>
+    <cpu_req_secs>1.000000</cpu_req_secs>
+    <cpu_req_instances>0.000000</cpu_req_instances>
+    <estimated_delay>0.000000</estimated_delay>
+    <client_cap_plan_class>1</client_cap_plan_class>
+    <platform_name>windows_x86_64</platform_name>
+    <alt_platform>
+        <name>windows_intelx86</name>
+    </alt_platform>
+<working_global_preferences>
+<global_preferences>
+   <source_project></source_project>
+   <mod_time>0.000000</mod_time>
+   <battery_charge_min_pct>90.000000</battery_charge_min_pct>
+   <battery_max_temperature>40.000000</battery_max_temperature>
+   <run_on_batteries>0</run_on_batteries>
+   <run_if_user_active>1</run_if_user_active>
+   <run_gpu_if_user_active>0</run_gpu_if_user_active>
+   <suspend_if_no_recent_input>0.000000</suspend_if_no_recent_input>
+   <suspend_cpu_usage>0.000000</suspend_cpu_usage>
+   <start_hour>0.000000</start_hour>
+   <end_hour>0.000000</end_hour>
+   <net_start_hour>0.000000</net_start_hour>
+   <net_end_hour>0.000000</net_end_hour>
+   <leave_apps_in_memory>0</leave_apps_in_memory>
+   <confirm_before_connecting>1</confirm_before_connecting>
+   <hangup_if_dialed>0</hangup_if_dialed>
+   <dont_verify_images>0</dont_verify_images>
+   <work_buf_min_days>0.100000</work_buf_min_days>
+   <work_buf_additional_days>0.500000</work_buf_additional_days>
+   <max_ncpus_pct>0.000000</max_ncpus_pct>
+   <niu_max_ncpus_pct>0.000000</niu_max_ncpus_pct>
+   <niu_cpu_usage_limit>100.000000</niu_cpu_usage_limit>
+   <niu_suspend_cpu_usage>0.000000</niu_suspend_cpu_usage>
+   <cpu_scheduling_period_minutes>60.000000</cpu_scheduling_period_minutes>
+   <disk_interval>60.000000</disk_interval>
+   <disk_max_used_gb>0.000000</disk_max_used_gb>
+   <disk_max_used_pct>90.000000</disk_max_used_pct>
+   <disk_min_free_gb>0.100000</disk_min_free_gb>
+   <vm_max_used_pct>100.000000</vm_max_used_pct>
+   <ram_max_used_busy_pct>50.000000</ram_max_used_busy_pct>
+   <ram_max_used_idle_pct>90.000000</ram_max_used_idle_pct>
+   <idle_time_to_run>3.000000</idle_time_to_run>
+   <max_bytes_sec_up>0.000000</max_bytes_sec_up>
+   <max_bytes_sec_down>0.000000</max_bytes_sec_down>
+   <cpu_usage_limit>100.000000</cpu_usage_limit>
+   <daily_xfer_limit_mb>0.000000</daily_xfer_limit_mb>
+   <daily_xfer_period_days>0</daily_xfer_period_days>
+   <override_file_present>1</override_file_present>
+   <network_wifi_only>0</network_wifi_only>
+</global_preferences>
+</working_global_preferences>
+<time_stats>
+    <on_frac>1.000000</on_frac>
+    <connected_frac>1.000000</connected_frac>
+    <cpu_and_network_available_frac>0.999965</cpu_and_network_available_frac>
+    <active_frac>0.999965</active_frac>
+    <gpu_active_frac>0.999965</gpu_active_frac>
+    <client_start_time>1794477274.074490</client_start_time>
+    <total_start_time>1794477274.927073</total_start_time>
+    <total_duration>202.639256</total_duration>
+    <total_active_duration>172.244709</total_active_duration>
+    <total_gpu_active_duration>172.244709</total_gpu_active_duration>
+    <now>1794477485.947149</now>
+    <previous_uptime>0.000000</previous_uptime>
+    <session_active_duration>172.244709</session_active_duration>
+    <session_gpu_active_duration>172.244709</session_gpu_active_duration>
+</time_stats>
+<net_stats>
+    <bwup>0.000000</bwup>
+    <avg_up>0.000000</avg_up>
+    <avg_time_up>0.000000</avg_time_up>
+    <bwdown>12969230.769234</bwdown>
+    <avg_down>1120487710194.183838</avg_down>
+    <avg_time_down>1794477480.305386</avg_time_down>
+</net_stats>
+<host_info>
+    <timezone>0</timezone>
+    <domain_name>fixture-host</domain_name>
+    <ip_addr>192.0.2.1</ip_addr>
+    <host_cpid>fixture-host-cpid</host_cpid>
+    <p_ncpus>4</p_ncpus>
+    <p_vendor>GenuineIntel</p_vendor>
+    <p_model>Fixture CPU @ 3.00GHz</p_model>
+    <p_features>fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc rep_good nopl pni ssse3 cx16 sse4_1 sse4_2 popcnt avx avx2</p_features>
+    <p_fpops>6184256812.793249</p_fpops>
+    <p_iops>9807141218.858955</p_iops>
+    <p_membw>250000000.000000</p_membw>
+    <p_calculated>1794477306.337042</p_calculated>
+    <p_vm_extensions_disabled>0</p_vm_extensions_disabled>
+    <m_nbytes>8519069696.000000</m_nbytes>
+    <m_cache>4194304.000000</m_cache>
+    <m_swap>10532335616.000000</m_swap>
+    <d_total>45969571840.000000</d_total>
+    <d_free>19403898880.000000</d_free>
+    <os_name>Microsoft Windows 11</os_name>
+    <os_version>x64 Edition, (10.00.26300.00)</os_version>
+    <n_usable_coprocs>0</n_usable_coprocs>
+    <wsl>
+    </wsl>
+</host_info>
+    <disk_usage>
+        <d_boinc_used_total>82593.000000</d_boinc_used_total>
+        <d_boinc_used_project>0.000000</d_boinc_used_project>
+        <d_project_share>21226268019.659996</d_project_share>
+    </disk_usage>
+<app_versions>
+</app_versions>
+<other_results>
+</other_results>
+</scheduler_request>
