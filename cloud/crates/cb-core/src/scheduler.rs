@@ -66,6 +66,12 @@ const NPROC: usize = 5;
 const MAX_IN_LIST: usize = 90;
 /// Most results sent in one reply, whatever the configuration says.
 const MAX_SEND: usize = 100;
+/// The message that says the request's host ID names no host (`authenticate_user` in
+/// `sched/handle_request.cpp`).
+pub const HOST_NOT_FOUND: &str = "Can't find host record";
+/// Most links of a merged ("zombie") host's chain followed, as
+/// `authenticate_user` in `sched/handle_request.cpp` does.
+const MAX_ZOMBIE_HOPS: usize = 10;
 /// Most lost results looked at in one request.
 const MAX_LOST: usize = 50;
 /// Most assigned jobs looked at, and so sent, in one request.
@@ -1172,7 +1178,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     }
     let mut rows = ctx.db.batch(reads).await?.into_iter();
     let by_auth: Option<UserRow> = rows.next().unwrap_or_default().first()?;
-    let host_row: Option<Host> = rows.next().unwrap_or_default().first()?;
+    let mut host_row: Option<Host> = rows.next().unwrap_or_default().first()?;
     let by_weak: Option<UserRow> = match rows.next() {
         Some(r) => r.first()?,
         None => None,
@@ -1203,20 +1209,71 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     };
     out.user_id = user.id;
 
-    // The host: the one named, if it is this user's and the request is not
-    // from an older copy of its state; else one that looks like this
-    // computer; else a new one.
+    // A host merged into another through the web is a "zombie": no user, and
+    // the ID of the host it became in `rpc_seqno`. `authenticate_user` follows
+    // the links, ten at most; a chain that breaks is a host ID that does not
+    // exist. The extra reads happen only for a merged host (`userid` 0), so an
+    // ordinary request makes none.
+    let mut hops = 0;
+    while let Some(z) = host_row.as_ref().filter(|h| h.userid == 0) {
+        hops += 1;
+        host_row = if hops > MAX_ZOMBIE_HOPS {
+            None
+        } else {
+            ctx.db
+                .run(stmt!("SELECT * FROM host WHERE id = ?", z.rpc_seqno))
+                .await?
+                .first()?
+        };
+    }
+    // Weak authenticators are accepted for the host's own account only;
+    // for the account of another host `authenticate_user` looks the string up
+    // as a key and finds none.
+    if weak_auth && host_row.as_ref().is_some_and(|h| h.userid != user.id) {
+        out.reply.nucleus_only = true;
+        refuse(
+            &mut out,
+            "Invalid or missing account key.  To fix, remove and add this project.",
+            "notice",
+            DELAY_MISSING_KEY,
+            "bad authenticator",
+        );
+        return Ok(out);
+    }
+    if host_row.is_none() && req.hostid > 0 {
+        out.reply
+            .messages
+            .push(UserMessage::new(HOST_NOT_FOUND, "low"));
+    }
+
+    // The host, as `authenticate_user` in `sched/handle_request.cpp` finds it:
+    // - The host ID names a host of this account, and the request is not from
+    //   an older copy of its state (`rpc_seqno` not below the stored one): that
+    //   host.
+    // - No host ID, or one that names no host: the account's newest host with
+    //   the request's host CPID (`find_host_by_cpid`), unless it is obviously
+    //   another computer, then `find_host_by_other`, then a new host.
+    // - A host ID of another account, or an `rpc_seqno` below the stored one (a
+    //   copied state file): the CPID lookup is skipped (`didnt_find_host`),
+    //   `find_host_by_other` runs, then a new host.
+    // A host found by a lookup, or made, is stored with `rpc_seqno` 0, which is
+    // what the client starts from when a reply gives it a new host ID.
     let request_cpid = if req.host_info.host_cpid.is_empty() {
         String::new()
     } else {
         host_cpid(&req.host_info.host_cpid, &user.email_addr)
     };
+    // True when the request's host ID did not resolve to a row (none sent, no such host, or a
+    // broken merge chain). It is false for another account's host and for a stale `rpc_seqno`:
+    // those rows exist, so `authenticate_user` skips the CPID lookup for them.
+    let host_row_missing = host_row.is_none();
     let mut host = host_row
         .filter(|h| h.userid == user.id && i64::from(req.rpc_seqno) >= h.rpc_seqno && h.id > 0);
+    let named_host = host.is_some();
     let mut results_detached = false;
     if host.is_none() {
         let mut lookups = Vec::new();
-        if !request_cpid.is_empty() {
+        if host_row_missing && !request_cpid.is_empty() {
             lookups.push(stmt!(
                 "SELECT * FROM host WHERE userid = ? AND host_cpid = ? ORDER BY id DESC LIMIT 1",
                 user.id,
@@ -1252,6 +1309,11 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     break;
                 }
                 host = r.first()?;
+                if host.is_some() && i >= n_cpid {
+                    // `find_host_by_other` is only run for a client that is not one of
+                    // several; its jobs are written off when it lists none.
+                    results_detached = req.other_results.is_empty();
+                }
                 if host.is_some() && i < n_cpid {
                     // A host with the same CPID that is obviously another computer is not
                     // this one (`obviously_different` in `sched/handle_request.cpp`); the
@@ -1333,11 +1395,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         return Ok(out);
     }
 
-    out.reply.hostid = if host.id != req.hostid {
-        host.id as u64
-    } else {
-        0
-    };
+    // The reply names the host when it is not the one the request named: a new
+    // or looked-up host (`got_host` in `authenticate_user`, even when the lookup
+    // finds the host the request named), or the host a merged one became. The
+    // client then takes the ID and starts its `rpc_seqno` again.
+    let reply_names_host = !named_host || host.id != req.hostid;
+    out.reply.hostid = if reply_names_host { host.id as u64 } else { 0 };
     out.reply.host = ReplyHost {
         total_credit: host.total_credit,
         expavg_credit: host.expavg_credit,
@@ -1959,7 +2022,14 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
          d_boinc_used_total = ?, d_boinc_used_project = ?, d_boinc_max = ?, n_bwup = ?, \
          n_bwdown = ?, host_cpid = ?, external_ip_addr = ?, product_name = ?, p_ngpus = ?, \
          p_gpu_fpops = ?, misc = ? WHERE id = ?",
-        i64::from(req.rpc_seqno),
+        // Whenever the reply names the host the client starts from 0 again, so
+        // that is what is stored. Stock stores the request's value for a merged
+        // host's destination (D20 in compatibility.md).
+        if reply_names_host {
+            0
+        } else {
+            i64::from(req.rpc_seqno)
+        },
         now,
         hi.timezone,
         truncate(&hi.domain_name, 254),
