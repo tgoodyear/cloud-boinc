@@ -970,6 +970,17 @@ fn shuffle_within_priority(c: &mut [Candidate], random: &dyn Fn() -> u32) {
     }
 }
 
+/// Whether any result is unsent, whatever its app or platform: upstream's
+/// feeder cache not being empty. The literal state lets SQLite use the
+/// partial index `res_unsent`, which holds only unsent results, and read one
+/// entry.
+pub const UNSENT_EXISTS: &str = "SELECT 1 AS n FROM result WHERE server_state = 2 LIMIT 1";
+const _: () = assert!(RESULT_SERVER_STATE_UNSENT == 2);
+
+async fn unsent_work_exists(db: &dyn Db) -> CoreResult<bool> {
+    Ok(!db.run(Stmt::new(UNSENT_EXISTS)).await?.rows.is_empty())
+}
+
 /// Handle one scheduler request. `body` is the request XML.
 pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedOutcome> {
     let config = ctx.config;
@@ -2346,7 +2357,6 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // version, by whether the job needs a 64-bit version.
     let mut no_usable: HashSet<(i64, bool)> = HashSet::new();
     let mut sent_wus: HashSet<i64> = outgoing.iter().map(|o| o.wu.id).collect();
-    let n_candidates = merged.len() + assigned_rows.len();
     let mut n_new = 0;
     let mut n_assigned = 0;
     let mut excluded: HashSet<i64> = HashSet::new();
@@ -2825,14 +2835,27 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // `process_request` says only that, whether or not it resent lost tasks;
     // "No tasks sent" is for when the cache holds jobs and none suits the host.
     // With assignment enabled, upstream does not look at the cache.
-    let no_jobs_cache = !config.dont_send_jobs
+    //
+    // Upstream's cache holds unsent results of any app and platform
+    // (`SCHED_SHMEM::no_work`), so the host's own candidates are not what to
+    // ask: a host with a version of app A, when only app B has unsent tasks,
+    // finds a cache that is not empty. One probe asks the project, and runs
+    // only when a message depends on it: not when the host has candidates
+    // (the cache then holds jobs), nor on a request that was sent work.
+    let no_jobs_base = !config.dont_send_jobs
         && !config.enable_assignment
         && !req.dont_send_work
         && !versions.is_empty()
         && send
-        && !had_candidates
         && apps_with_work.is_empty()
         && !skipped.hr_class;
+    let says_something =
+        resent_lost || (work_requested && out.n_sent == 0 && key_ok && !too_recent);
+    let no_jobs_cache = if no_jobs_base && says_something && !had_candidates {
+        !unsent_work_exists(ctx.db).await?
+    } else {
+        false
+    };
     if resent_lost && no_jobs_cache {
         out.reply
             .messages
@@ -2865,7 +2888,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 .any(|r| !r.rows.is_empty());
         }
         // Jobs committed to other classes are jobs in upstream's cache.
-        if !(no_jobs_cache && !committed_elsewhere) {
+        let no_jobs = no_jobs_cache && !committed_elsewhere;
+        if !no_jobs {
             out.reply
                 .messages
                 .push(UserMessage::new("No tasks sent", "low"));
@@ -2880,7 +2904,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if plan_messages.is_empty() && !anonymous {
                 why.push("No app version is available for this computer".into());
             }
-        } else if send && n_candidates == 0 && apps_with_work.is_empty() && !committed_elsewhere {
+        } else if no_jobs {
             // Not when the search never ran: a client on the anonymous
             // platform with no version for a resource it asks work for is
             // told only "No tasks sent", as upstream's `work_needed` stops

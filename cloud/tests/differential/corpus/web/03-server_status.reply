@@ -33,7 +33,7 @@
     </daemon>
 </daemon_status>
 <database_file_states>
-   <results_ready_to_send>3</results_ready_to_send>
+   <results_ready_to_send>4</results_ready_to_send>
    <results_in_progress>1</results_in_progress>
    <workunits_waiting_for_validation>0</workunits_waiting_for_validation>
    <workunits_waiting_for_assimilation>0</workunits_waiting_for_assimilation>
@@ -53,6 +53,12 @@
    <name>upper</name>
    <unsent>3</unsent>
    <in_progress>1</in_progress>
+</app>
+<app>
+   <id>2</id>
+   <name>other</name>
+   <unsent>1</unsent>
+   <in_progress>0</in_progress>
 </app>
 </tasks_by_app>
 </database_file_states>

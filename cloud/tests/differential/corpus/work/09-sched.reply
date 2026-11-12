@@ -3,7 +3,7 @@
 <dont_use_dcf/>
 <master_url>http://project.test/diff/</master_url>
 <request_delay>7.000000</request_delay>
-<message priority="low">Project has no tasks available</message>
+<message priority="low">No tasks sent</message>
 <project_name>Differential test project</project_name>
 <userid>1</userid>
 <user_name>Test User</user_name>
@@ -17,7 +17,7 @@
 <host_total_credit>0.000000</host_total_credit>
 <host_expavg_credit>0.000000</host_expavg_credit>
 <host_venue></host_venue>
-<host_create_time>1794447877</host_create_time>
+<host_create_time>1794450917</host_create_time>
 <team_name></team_name>
 <result_ack>
     <name>diff_0004_0</name>
@@ -48,7 +48,7 @@
 </gui_urls>
 <rss_feeds>
     <rss_feed>
-        <url>http://project.test/diff/notices.php?userid=1&auth=1_8bef73d56db2cbe5bd75e0277750c2e4</url>
+        <url>http://project.test/diff/notices.php?userid=1&auth=1_7dc0481c8ffb0ddcf092f0292adf9a12</url>
         <poll_interval>86400</poll_interval>
     </rss_feed>
 </rss_feeds>

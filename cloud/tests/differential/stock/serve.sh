@@ -24,6 +24,9 @@ export STATE="$state" PORT="$port" PUBLIC_PORT="$public_port"
 id boincadm >/dev/null 2>&1 || useradd --create-home --uid 1000 boincadm
 trap 'stop_all' TERM INT
 chown boincadm:boincadm "$STATE"
+# stock.sh makes a default state directory with mktemp, mode 0700. MariaDB runs
+# as another user, and needs to pass through it to its own directory inside.
+chmod 0711 "$STATE"
 start_mariadb
 if [ ! -f "$STATE/project-ready" ]; then
     setup_project

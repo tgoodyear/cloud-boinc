@@ -7,6 +7,10 @@
       "user_friendly_name": "Linux running on an AMD x86_64 or Intel EM64T CPU"
     },
     {
+      "name": "windows_x86_64",
+      "user_friendly_name": "Microsoft Windows running on an AMD x86_64 or Intel EM64T CPU"
+    },
+    {
       "name": "anonymous",
       "user_friendly_name": "anonymous"
     }
@@ -15,6 +19,10 @@
     {
       "name": "upper",
       "user_friendly_name": "Upper-case test app"
+    },
+    {
+      "name": "other",
+      "user_friendly_name": "Windows-only test app"
     }
   ],
   "app_versions": [
@@ -25,6 +33,17 @@
       "files": [
         {
           "name": "upper_1.00_x86_64-pc-linux-gnu",
+          "main_program": true
+        }
+      ]
+    },
+    {
+      "app": "other",
+      "platform": "windows_x86_64",
+      "version_num": 100,
+      "files": [
+        {
+          "name": "other_1.00_windows_x86_64.exe",
           "main_program": true
         }
       ]
@@ -77,6 +96,11 @@
     {
       "name": "diff_0004",
       "app": "upper",
+      "input": "diff_in.txt"
+    },
+    {
+      "name": "other_0001",
+      "app": "other",
       "input": "diff_in.txt"
     }
   ]

@@ -297,8 +297,8 @@ What is left after these rules is a finding and fails the test (`compare.rs`):
   (it signs a name with a random part). The test checks every upload certificate in both replies
   against the upload public key, so that two certificates for different names are not taken as
   equal merely because both are long.
-- Transforms (`TRANSFORMS`): the layout of `download/` (see D1) and the number of seconds a host
-  must wait (see D11).
+- Transforms (`TRANSFORMS`): the layout of `download/` (see D1), the number of seconds a host
+  must wait (see D11), and the translation markers in messages (see D13).
 - Intended differences (`INTENDED`), below. An entry names the step it applies to and the
   element, so it cannot cover a difference elsewhere.
 
@@ -340,6 +340,8 @@ echo, the user, host and credit fields, and the `<gui_urls>` and `<rss_feeds>` l
 | D9 | Weak account key (`<weak_auth>` in `am_get_info.php`) | `userid_` and an MD5 that includes the stored password hash | The same form, with the hash this server stores (HMAC with the pepper) | Weak keys made by the stock server stop working after a move. The account key and the password keep working. |
 | D10 | Upload certificates of output files, and the random part of their names | Signed with the upload key | Signed with the same key, over another name | Both verify against the upload public key. |
 | D11 | "Not sending work. Last request too recent. Please wait N seconds." | N counts from the fraction of a second the last request came in | N counts from the stored time of the last request, in whole seconds, so it can be one more | Stock subtracts that stored time from the current time with its fraction (`handle_request.cpp`). |
+| D12 | "Project has no tasks available" and "No tasks sent" | Decided from the feeder's cache in shared memory: a window of `shmem_work_items` unsent results (100 unless set), refilled every few seconds, of any app and platform (`SCHED_SHMEM::no_work` in `sched/sched_shmem.cpp`). The window can be empty for a moment while unsent work exists. Empty: only "Project has no tasks available". Not empty: "No tasks sent" and the reasons. | One probe for an unsent result of any app or platform (`UNSENT_EXISTS` in `cloud/crates/cb-core/src/scheduler.rs`): `SELECT 1 FROM result WHERE server_state = 2 LIMIT 1`, which reads one entry of the partial index `res_unsent`. It runs only when the reply would carry one of the two messages: a work request that was sent nothing, or one that resent lost tasks. It does not run for a host that has candidates, or for a request that was sent work. | There is no cache to lag behind the database, so this server never says "no tasks" while unsent work exists, which the stock server can. A project whose feeder is slow sees "No tasks sent" here where stock says "Project has no tasks available". Log text only. |
+| D13 | Messages the stock scheduler marks for translation: 15 of them in `sched/handle_request.cpp`, `sched/sched_send.cpp` and `sched/sched_version.cpp`, among them "Invalid or missing account key", "Your BOINC client software is too old" and "Your app_info.xml file doesn't have a usable version of" | Written as `_("text")`; for the app_info message only the first part is marked: `_("Your app_info.xml file doesn't have a usable version of") App A.` (`#define _(x)` in `lib/sched_msgs.h`) | Plain text, without the marker | The client removes the marker before it shows the message (`strip_translation` in `lib/str_util.cpp`, called from `client/client_msgs.cpp`), so an English client shows the same text. The marker exists so that a message can be found and translated; whether a localized Manager translates these messages by it was not checked, and without the marker it could not. Recorded for the app_info message (scenarios `anon`); the other 14 follow from the macro. Not fixed. |
 
 ### Differences found, and what was done
 
@@ -367,9 +369,14 @@ test covers each fix, because the stored stock replies carry the right values.
    lost tasks were resent; stock writes it only when it would otherwise send work.
 7. With no jobs to send, this server wrote "No tasks sent" and then "Project has no tasks
    available". Stock writes only the second when its cache is empty, and "No tasks sent" and the
-   reasons only when the cache holds jobs that do not suit the host.
+   reasons only when the cache holds jobs, of any app, that do not suit the host. The first
+   fix looked at the host's own candidates, which are only the apps it has a version of; it
+   now asks the project (D12). The fixture has a second app, with a version for Windows only, and
+   one job of it, so that the Linux host of the corpus always sees unsent work it cannot run:
+   the ordinary request and the request that resends lost tasks both cover it, in `work`,
+   `anon`, `lost` and `quick`, with replies recorded from the stock server.
 
-Not fixed, and recorded above: D2 (no project web pages), D5, D6 (pieces), D7.
+Not fixed, and recorded above: D2 (no project web pages), D5, D6 (pieces), D7, D12, D13.
 
 ### What the stock tree gets wrong
 

@@ -104,6 +104,16 @@ pub const TRANSFORMS: &[(&str, &str, &str, &str)] = &[
         "wait [0-9]+ seconds",
         "wait N seconds",
     ),
+    (
+        // The stock scheduler marks some messages for translation, as
+        // `_("text")`, which the client removes before it shows them
+        // (`strip_translation` in `lib/str_util.cpp`). This server sends the
+        // plain text. See D13.
+        "translation-markers",
+        "scheduler_reply/message",
+        "_\\(\"|\"\\)",
+        "",
+    ),
 ];
 
 pub const INTENDED: &[Intended] = &[
