@@ -46,6 +46,8 @@ struct Req {
     reports: Vec<(String, i32, i32)>,
     /// Names of the results the client holds; `None` leaves the list out.
     other: Option<Vec<String>>,
+    /// Added at the top level of the request, after everything else.
+    extra: String,
 }
 
 impl Req {
@@ -61,6 +63,7 @@ impl Req {
             domain: "box".into(),
             reports: Vec::new(),
             other: None,
+            extra: String::new(),
         }
     }
 
@@ -92,6 +95,7 @@ impl Req {
             }
             s.push_str("</other_results>\n");
         }
+        s.push_str(&self.extra);
         s.push_str("</scheduler_request>\n");
         s
     }
@@ -1263,4 +1267,98 @@ fn a_new_computer_never_gets_the_id_of_one_that_was_deleted() {
         fourth > third && third > second,
         "{second} {third} {fourth}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Computing preferences: which copy the client ends up with.
+
+/// What the site's computing-preferences form writes for `max_ncpus_pct` at
+/// `now`, over the document `stored` (`PrefsForm::write`, which the form uses).
+fn saved_prefs(stored: &str, max_ncpus_pct: &str, now: i64) -> String {
+    use cb_core::prefs::{PrefsForm, Subset};
+    let form = PrefsForm::new(Subset::Global, &cb_core::project::Project::default());
+    let mut prefs = form.parse(stored);
+    let mut fields = form.form_values(&prefs.main);
+    fields.insert("max_ncpus_pct".into(), max_ncpus_pct.into());
+    prefs.main = form.parse_form(&prefs.main, &fields).unwrap();
+    form.write(&prefs, now)
+}
+
+fn mod_time_of(xml: &str) -> i64 {
+    cb_proto::sched_request::GlobalPrefs::parse(xml, "").mod_time as i64
+}
+
+fn store_prefs(w: &World, xml: &str) {
+    block_on(w.db.run(stmt!("UPDATE user SET global_prefs = ? WHERE id = 1", xml))).unwrap();
+}
+
+fn stored_prefs(w: &World) -> String {
+    block_on(query_one::<cb_core::model::User>(
+        &w.db,
+        stmt!("SELECT * FROM user WHERE id = 1"),
+    ))
+    .unwrap()
+    .unwrap()
+    .global_prefs
+}
+
+/// A request from a client that holds `copy` as the preferences it got from
+/// the web site (and as its working copy), with the hash of user 1's address
+/// or of another account's.
+fn holding_prefs(copy: &str, same_account: bool) -> Req {
+    let hash = if same_account {
+        cb_crypto::email_hash("u@example.com")
+    } else {
+        "00".into()
+    };
+    let mut req = Req::new(0);
+    req.work_secs = 0.0;
+    req.extra = format!(
+        "{copy}<working_global_preferences>\n{copy}</working_global_preferences>\n\
+         <global_prefs_source_email_hash>{hash}</global_prefs_source_email_hash>\n"
+    );
+    req
+}
+
+#[test]
+fn a_client_that_has_the_first_of_two_saves_in_one_second_gets_the_second() {
+    let w = World::new();
+    let first = saved_prefs("", "50", 1000);
+    store_prefs(&w, &first);
+    let second = saved_prefs(&first, "60", 1000);
+    // Same second, so a later time is what tells the two apart.
+    assert_eq!(mod_time_of(&first), 1000);
+    assert_eq!(mod_time_of(&second), 1001);
+    store_prefs(&w, &second);
+
+    let out = w.rpc(&holding_prefs(&first, true), 2000);
+    assert_eq!(
+        out.reply.user.global_prefs.as_deref(),
+        Some(second.as_str())
+    );
+    assert_eq!(stored_prefs(&w), second);
+    // A client that already has the second is not sent it again.
+    let out = w.rpc(&holding_prefs(&second, true), 2000);
+    assert_eq!(out.reply.user.global_prefs, None);
+}
+
+#[test]
+fn preferences_a_client_holds_with_a_later_time_still_win() {
+    let w = World::new();
+    let first = saved_prefs("", "50", 1000);
+    let second = saved_prefs(&first, "60", 1000);
+    store_prefs(&w, &second);
+    // The client's copy, from another project, is newer than the account's:
+    // it is stored, and nothing is sent back.
+    let newer = saved_prefs(&second, "70", 1500);
+    assert_eq!(mod_time_of(&newer), 1500);
+    let out = w.rpc(&holding_prefs(&newer, true), 2000);
+    assert_eq!(out.reply.user.global_prefs, None);
+    assert_eq!(mod_time_of(&stored_prefs(&w)), 1500);
+    assert!(stored_prefs(&w).contains("<max_ncpus_pct>70</max_ncpus_pct>"));
+    // From another account's copy it is neither stored nor sent back.
+    store_prefs(&w, &second);
+    let out = w.rpc(&holding_prefs(&newer, false), 2000);
+    assert_eq!(out.reply.user.global_prefs, None);
+    assert_eq!(stored_prefs(&w), second);
 }

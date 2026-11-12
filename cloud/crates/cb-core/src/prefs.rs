@@ -5,7 +5,9 @@
 //!
 //! The XML is what the scheduler sends to clients: global preferences go out
 //! when their `<mod_time>` is newer than the client's copy, so every save
-//! sets it to the current time; project preferences go out in every reply.
+//! sets it to the current time, or one second past the time it replaces if
+//! that is later (`PrefsForm::write`); project preferences go out in every
+//! reply.
 //! Both may carry `<venue name="...">` sections, which a client with that
 //! venue uses in place of the main set (`extract_venue`).
 //!

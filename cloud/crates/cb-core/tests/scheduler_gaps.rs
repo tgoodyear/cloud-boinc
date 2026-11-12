@@ -328,10 +328,14 @@ impl World {
     }
 
     fn rpc(&self, req: &Req, now: i64) -> SchedOutcome {
+        self.rpc_xml(&req.xml(), now)
+    }
+
+    fn rpc_xml(&self, xml: &str, now: i64) -> SchedOutcome {
         let catalog = block_on(Catalog::load(&self.db)).unwrap();
         let random = || self.rand();
         let ctx = self.ctx(&self.db, &catalog, &random, now);
-        block_on(handle_request(&ctx, &req.xml())).unwrap()
+        block_on(handle_request(&ctx, xml)).unwrap()
     }
 
     /// A request, with the SQL it sent.
@@ -876,6 +880,232 @@ fn an_apple_gpu_host_gets_a_metal_version_and_the_gpu_is_recorded() {
             "driver_version": "3",
             "opencl_version": "102"
         })
+    );
+}
+
+// ---- Computers --------------------------------------------------------------
+
+/// A client that knows its host ID is 0 after a detach and attach finds its host by the account
+/// and the host CPID. When the CPID is new, `find_host_by_other` in `sched/handle_request.cpp`
+/// looks for the account's host with the same name, address, OS name, CPU model and memory,
+/// unless the client says it was started with `--allow_multiple_clients`: then each instance is
+/// a host of its own, and its CPID differs from the others' by design (it is made from the
+/// data directory).
+#[test]
+fn clients_that_share_a_computer_get_a_host_each_only_when_they_say_so() {
+    let w = World::new("", "");
+    let mut a = w.computer("a");
+    // The first request had no address; stock searches only when it has one.
+    a.host_extra = "<ip_addr>198.51.100.7</ip_addr>\n".into();
+    a.work_secs = 0.0;
+    a.seqno = 2;
+    assert_eq!(w.rpc(&a, 1500).host_id, a.hostid);
+    let another = |cpid: &str, multiple: bool, now: i64| -> i64 {
+        let mut b = a.clone();
+        b.hostid = 0;
+        b.seqno = 0;
+        if multiple {
+            b.top_extra = "<allow_multiple_clients>1</allow_multiple_clients>\n".into();
+        }
+        let xml = b.xml().replace(
+            "<host_cpid>a</host_cpid>",
+            &format!("<host_cpid>{cpid}</host_cpid>"),
+        );
+        w.rpc_xml(&xml, now).host_id
+    };
+    // A client with a new CPID on a computer that looks like a known one is that computer.
+    assert_eq!(another("b", false, 2000), a.hostid);
+    // One of several clients on the computer is not.
+    let second = another("c", true, 2100);
+    assert_ne!(second, a.hostid);
+    assert!(second > 0);
+    // A client that sends no address is not searched for.
+    let mut no_ip = a.clone();
+    no_ip.hostid = 0;
+    no_ip.seqno = 0;
+    no_ip.host_extra = String::new();
+    let xml = no_ip
+        .xml()
+        .replace("<host_cpid>a</host_cpid>", "<host_cpid>d</host_cpid>");
+    let third = w.rpc_xml(&xml, 2200).host_id;
+    assert!(third != a.hostid && third != second, "{third}");
+}
+
+/// A host with the client's CPID is the client's host unless it is obviously another computer
+/// (`obviously_different` in `sched/handle_request.cpp`: processor count, vendor and model, OS
+/// name and version). A CPID is made from the MAC address and the data directory, so a cloned
+/// disk image or virtual machine gives two computers the same one.
+#[test]
+fn a_host_with_the_clients_cpid_that_is_another_computer_is_not_reused() {
+    let w = World::new("", "");
+    let a = w.computer("a");
+    let again = |model: &str, ncpus: i32, now: i64| -> i64 {
+        let mut b = a.clone();
+        b.hostid = 0;
+        b.seqno = 0;
+        b.model = model.into();
+        b.ncpus = ncpus;
+        w.rpc(&b, now).host_id
+    };
+    // The same computer that lost its host ID.
+    assert_eq!(again(&a.model, a.ncpus, 2000), a.hostid);
+    // The same CPID on another CPU, or with another number of them.
+    let arm = again("ARMv8 Processor", a.ncpus, 2100);
+    assert!(arm > 0 && arm != a.hostid);
+    let more = again(&a.model, a.ncpus * 2, 2200);
+    assert!(more > 0 && more != a.hostid && more != arm);
+}
+
+// ---- Alternate platforms ---------------------------------------------------
+
+const I686: &str = "i686-pc-linux-gnu";
+const ALT_I686: &str = "<alt_platform>\n<name>i686-pc-linux-gnu</name>\n</alt_platform>\n";
+const ALT_X86_64: &str = "<alt_platform>\n<name>x86_64-pc-linux-gnu</name>\n</alt_platform>\n";
+
+/// An app `a` and the platforms Linux x86-64 (1), Windows (2) and Linux i686 (3). The version
+/// numbers 11 (i686) and 12 (x86-64) are added by each test.
+fn platforms_world(config: &str) -> World {
+    let w = World::new("", config);
+    w.sql("INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (3, 0, 'i686-pc-linux-gnu', 'Linux i686'), (4, 0, 'windows_intelx86', 'Windows 32-bit')");
+    w.app(1, "a", "");
+    w
+}
+
+fn platform_of(out: &SchedOutcome) -> Vec<&str> {
+    out.reply
+        .app_versions
+        .iter()
+        .map(|v| v.platform.as_str())
+        .collect()
+}
+
+/// `process_request` in `sched/handle_request.cpp` adds each alternate platform the project has
+/// to the client's list, and `get_app_version` scans the whole list.
+#[test]
+fn a_client_gets_a_version_for_an_alternate_platform_when_its_primary_has_none() {
+    let w = platforms_world("");
+    w.version(11, 1, "a", 100, 3, "");
+    w.unpinned("a", "j1");
+    w.unpinned("a", "j2");
+    // No alternate: the client's platform has no version.
+    let plain = w.computer("a");
+    assert_eq!(w.rpc(&plain, 2000).n_sent, 0);
+    // The same kind of client, saying it can run i686 too.
+    let mut both = w.computer("b");
+    both.top_extra = ALT_I686.into();
+    both.seqno = 3;
+    let out = w.rpc(&both, 2100);
+    assert_eq!(out.n_sent, 2);
+    assert_eq!(platform_of(&out), [I686]);
+    assert_eq!(w.result_named("j1_0").app_version_id, 11);
+    // An alternate the project does not have changes nothing.
+    let mut unknown = w.computer("c");
+    unknown.top_extra = "<alt_platform>\n<name>sparc-sun-solaris</name>\n</alt_platform>\n".into();
+    unknown.seqno = 3;
+    assert_eq!(w.rpc(&unknown, 2200).n_sent, 0);
+}
+
+/// Of versions with the same speed, `get_app_version` keeps the first it meets, which is the one
+/// for the client's primary platform; `config.version_select_random_factor` is 0 here.
+#[test]
+fn of_two_equal_versions_the_primary_platform_wins() {
+    let w = platforms_world("");
+    // The i686 version is the older row, so that catalog order would pick it.
+    w.version(11, 1, "a", 100, 3, "");
+    w.version(12, 1, "a", 100, 1, "");
+    w.unpinned("a", "j1");
+    let mut on64 = w.computer("a");
+    on64.top_extra = ALT_I686.into();
+    let out = w.rpc(&on64, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(platform_of(&out), [LINUX]);
+    w.unpinned("a", "j2");
+    let mut on32 = w.computer("b");
+    on32.platform = I686.into();
+    on32.top_extra = ALT_X86_64.into();
+    on32.seqno = 3;
+    let out = w.rpc(&on32, 2100);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(platform_of(&out), [I686]);
+}
+
+/// A version that is faster by the record of the app's other results wins whatever its platform
+/// is, unless `prefer_primary_platform` is set, when the scan stops at the first platform that
+/// has a usable version.
+#[test]
+fn prefer_primary_platform_stops_at_the_first_platform_with_a_version() {
+    for (config, expect) in [
+        ("", I686),
+        (
+            "<prefer_primary_platform>1</prefer_primary_platform>",
+            LINUX,
+        ),
+    ] {
+        let w = platforms_world(config);
+        // The i686 version has done twice the work per unit of peak speed.
+        w.version_with(11, 1, "a", 100, 3, "", "pfc_n = 1000, pfc_avg = 0.5");
+        w.version_with(12, 1, "a", 100, 1, "", "pfc_n = 1000, pfc_avg = 1.0");
+        w.unpinned("a", "j1");
+        let mut c = w.computer("a");
+        c.top_extra = ALT_I686.into();
+        let out = w.rpc(&c, 2000);
+        assert_eq!(out.n_sent, 1, "{config}");
+        assert_eq!(platform_of(&out), [expect], "{config}");
+    }
+}
+
+/// A job whose memory bound is more than a 32-bit app can address is sent only with a version for
+/// a platform with "64" in its name (`get_app_version`, `is_64b_platform`). The limit is
+/// 3 GiB for a Linux client and 2 GiB for a Windows client
+/// (`max_32b_address_space`).
+#[test]
+fn a_job_too_big_for_a_32_bit_app_goes_only_with_a_64_bit_version() {
+    let big = |gib: f64| JobSpec {
+        rsc_memory_bound: Some(gib * 1024.0 * 1024.0 * 1024.0),
+        ..Default::default()
+    };
+    let w = platforms_world("");
+    // The 32-bit versions are the faster, so that nothing but the rule keeps them out.
+    w.version_with(11, 1, "a", 100, 3, "", "pfc_n = 1000, pfc_avg = 0.5");
+    w.version_with(12, 1, "a", 100, 1, "", "pfc_n = 1000, pfc_avg = 1.0");
+    w.job("a", "small", 1000, big(0.1));
+    w.job("a", "mid", 1000, big(2.5));
+    w.job("a", "huge", 1000, big(3.5));
+    let mut c = w.computer("a");
+    c.top_extra = ALT_I686.into();
+    c.ram = 16e9;
+    let out = w.rpc(&c, 2000);
+    let mut got: Vec<(String, String)> = sent_names(&out)
+        .into_iter()
+        .zip(out.reply.results.iter())
+        .map(|(n, r)| (wu_of(&n), r.platform.clone()))
+        .collect();
+    got.sort();
+    // Up to 3 GiB, the faster 32-bit version is used; above it only the 64-bit one.
+    assert_eq!(
+        got,
+        [
+            ("huge".to_string(), LINUX.to_string()),
+            ("mid".to_string(), I686.to_string()),
+            ("small".to_string(), I686.to_string()),
+        ]
+    );
+
+    // A client whose only platform is 32-bit gets nothing for the big one.
+    let w = platforms_world("");
+    w.version(11, 1, "a", 100, 3, "");
+    w.job("a", "huge", 1000, big(3.5));
+    w.job("a", "mid", 1000, big(2.5));
+    let mut c = w.computer("a");
+    c.platform = I686.into();
+    c.ram = 16e9;
+    let out = w.rpc(&c, 2000);
+    assert_eq!(
+        sent_names(&out)
+            .iter()
+            .map(|n| wu_of(n))
+            .collect::<Vec<_>>(),
+        ["mid"]
     );
 }
 
