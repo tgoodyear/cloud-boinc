@@ -801,7 +801,7 @@ pub async fn show_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let mut b = String::from("<table>\n");
     row2(
         &mut b,
-        &format!("{} member since", project.config.long_name),
+        &format!("{} member since", html_escape(&project.config.long_name)),
         &date_str(user.create_time),
     );
     if project.config.user_country {

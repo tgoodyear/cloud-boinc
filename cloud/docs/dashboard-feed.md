@@ -77,10 +77,10 @@ length refuses the whole document.
 | `kind` | string | no | `line` (default), `bars` or `area` |
 | `start` | integer | yes | Unix time of the first value |
 | `interval_secs` | integer | yes | Time between values, 60 seconds to 31 days |
-| `values` | array | yes | 1 to 200 numbers; null leaves a gap and is shown as "unknown" |
+| `values` | array | yes | 1 to 200 numbers, not negative (the charts draw from zero; use a figure for a signed value); null leaves a gap and is shown as "unknown" |
 
 Texts may not contain control characters. `updated` and `start` must be after September 2001, and
-a series must end no later than a day after the time the page is built. A `series` is shown with a
+the last value of a series (`start` plus `interval_secs` for each value after the first) must be no later than a day after the time the page is built. A `series` is shown with a
 table of its values, for screen readers and for reading off the numbers.
 
 A figure whose value is unknown is shown as "unknown", never as 0; send 0 when the value is 0.

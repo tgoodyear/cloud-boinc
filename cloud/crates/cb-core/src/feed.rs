@@ -281,9 +281,13 @@ pub fn parse_feed(body: &str, now: i64) -> Result<Feed, FeedError> {
             if !(MIN_INTERVAL..=MAX_INTERVAL).contains(&r.interval_secs) {
                 return bad("interval_secs is out of range");
             }
-            if r.start < MIN_TIME
-                || r.start + r.interval_secs * r.values.len() as i64 > now + FUTURE_SLACK
-            {
+            // The time of the last value, by checked arithmetic: `start` comes
+            // from outside.
+            let last = r
+                .interval_secs
+                .checked_mul(r.values.len() as i64 - 1)
+                .and_then(|d| r.start.checked_add(d));
+            if r.start < MIN_TIME || !last.is_some_and(|t| t <= now + FUTURE_SLACK) {
                 return bad("a series does not end in the past");
             }
             if r.values
@@ -292,6 +296,11 @@ pub fn parse_feed(body: &str, now: i64) -> Result<Feed, FeedError> {
                 .any(|v| !v.is_finite() || v.abs() > MAX_ABS_VALUE)
             {
                 return bad("a series value is out of range");
+            }
+            // The charts draw from zero upward; a negative value would be drawn
+            // as something else than the table says.
+            if r.values.iter().flatten().any(|v| *v < 0.0) {
+                return bad("a series value is negative");
             }
             let kind = match r.kind.as_deref() {
                 None | Some("line") => Kind::Lines,
@@ -591,6 +600,19 @@ mod tests {
             NOW - 3 * 86_400
         ));
         assert!(render_feed(&slow, NOW).contains("badge ok"));
+    }
+
+    #[test]
+    fn a_single_sample_may_have_a_long_interval() {
+        // The last (only) sample is at `start`; one interval beyond it does not count.
+        let start = NOW - 86_400;
+        assert!(parse_feed(
+            &format!(
+                r#"{{"schema":1,"sections":[{{"title":"T","series":[{{"title":"S","start":{start},"interval_secs":2678400,"values":[3]}}]}}]}}"#
+            ),
+            NOW
+        )
+        .is_ok());
     }
 
     #[test]

@@ -69,6 +69,17 @@ impl Sort {
         }
     }
 
+    /// The indexed column the sort uses. "Recent average" is ordered by
+    /// `recent_key`, which compares averages as they stand now (see
+    /// `migrations/0008_dashboards.sql`), not by the stored average.
+    fn column(self) -> &'static str {
+        match self {
+            Sort::TotalCredit => "total_credit",
+            Sort::Recent => "recent_key",
+            Sort::Jobs => "valid_results",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Sort::TotalCredit => "Total credit",
@@ -140,9 +151,10 @@ impl StackCol {
 /// A table that becomes one block per row, label over value, under 40rem (the
 /// `table.stack` rules in `site.css`). The header row is in `<thead>`, hidden
 /// from sight there, and each cell carries its column label as `data-label`.
-/// It is in the scroll box of the site kit. Cells are HTML.
+/// `web::page` puts it in the scroll box of the site kit, as every table. Cells
+/// are HTML.
 pub(crate) fn stack_table(cols: &[StackCol], rows: &[Vec<String>]) -> String {
-    let mut o = String::from("<div class=\"scroll\"><table class=\"stack\">\n<thead><tr>");
+    let mut o = String::from("<table class=\"stack\">\n<thead><tr>");
     for c in cols {
         o.push_str(&format!(
             "<th{}>{}</th>",
@@ -167,7 +179,7 @@ pub(crate) fn stack_table(cols: &[StackCol], rows: &[Vec<String>]) -> String {
         }
         o.push_str("</tr>\n");
     }
-    o.push_str("</tbody></table></div>\n");
+    o.push_str("</tbody></table>\n");
     o
 }
 
@@ -231,15 +243,6 @@ fn name_or_anonymous(name: &str) -> String {
     }
 }
 
-/// Orders the rows of a page by the average as it stands now, when that is
-/// the sort: a stored average is only brought up to date when its owner earns
-/// credit, so the index order can differ a little from the decayed one.
-fn by_recent_now<T>(rows: &mut [T], sort: Sort, key: impl Fn(&T) -> f64) {
-    if sort == Sort::Recent {
-        rows.sort_by(|a, b| key(b).total_cmp(&key(a)));
-    }
-}
-
 const RECENT_NOTE: &str = "Recent average credit is credit per day, and halves every week an \
      account or computer earns nothing. Jobs completed counts tasks that passed validation.";
 
@@ -258,18 +261,17 @@ pub async fn top_users(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
                 "SELECT id, name, country, total_credit, expavg_credit, expavg_time, valid_results \
                  FROM user WHERE total_credit > 0 AND blocked = 0 \
                  ORDER BY {} DESC, id LIMIT ? OFFSET ?",
-                sort.key()
+                sort.column()
             ),
             params: vec![((PAGE_SIZE + 1) as i64).into(), (offset as i64).into()],
         })
         .await?
         .decode()?;
-    let has_next = rows.len() > PAGE_SIZE;
+    let has_next = rows.len() > PAGE_SIZE && page < MAX_PAGE;
     let mut rows = rows;
     rows.truncate(PAGE_SIZE);
     let now = ctx.now as f64;
     let recent = |u: &User| decayed(u.expavg_credit, u.expavg_time, now);
-    by_recent_now(&mut rows, sort, recent);
 
     let show_country = project.config.user_country;
     let mut cols = vec![
@@ -368,16 +370,16 @@ pub async fn top_hosts(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let sort = Sort::parse(str_param(q, "sort"));
     let page = page_param(q);
     let offset = (page - 1) * PAGE_SIZE;
-    let key = sort.key();
+    let key = sort.column();
     let rows: Vec<HostRow> = ctx
         .db
         .run(Stmt {
             sql: format!(
                 "SELECT h.id, h.userid, h.total_credit, h.expavg_credit, h.expavg_time, \
-                 h.valid_results, h.p_vendor, h.p_model, h.p_ncpus, h.os_name, h.os_version, \
+                 h.valid_results, h.recent_key, h.p_vendor, h.p_model, h.p_ncpus, h.os_name, h.os_version, \
                  h.serialnum, u.name AS owner_name, u.show_hosts AS owner_show_hosts \
                  FROM (SELECT id, userid, total_credit, expavg_credit, expavg_time, valid_results, \
-                       p_vendor, p_model, p_ncpus, os_name, os_version, serialnum FROM host \
+                       recent_key, p_vendor, p_model, p_ncpus, os_name, os_version, serialnum FROM host \
                        WHERE total_credit > 0 ORDER BY {key} DESC, id LIMIT ? OFFSET ?) h \
                  LEFT JOIN user u ON u.id = h.userid ORDER BY h.{key} DESC, h.id"
             ),
@@ -385,12 +387,11 @@ pub async fn top_hosts(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         })
         .await?
         .decode()?;
-    let has_next = rows.len() > PAGE_SIZE;
+    let has_next = rows.len() > PAGE_SIZE && page < MAX_PAGE;
     let mut rows = rows;
     rows.truncate(PAGE_SIZE);
     let now = ctx.now as f64;
     let recent = |r: &HostRow| decayed(r.expavg_credit, r.expavg_time, now);
-    by_recent_now(&mut rows, sort, recent);
 
     let public = project.config.host_owner_public;
     let cols = [

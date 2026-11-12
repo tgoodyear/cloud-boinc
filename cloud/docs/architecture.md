@@ -1249,22 +1249,28 @@ only, as upstream, and a computer is identified publicly by its ID and its CPU, 
 and GPU.
 
 **Leaderboard indexes.** `migrations/0008_dashboards.sql` adds three partial indexes each to `user`
-and `host`: `total_credit DESC`, `expavg_credit DESC` and `valid_results DESC`, all
+and `host`: `total_credit DESC`, `recent_key DESC` and `valid_results DESC`, all
 `WHERE total_credit > 0`. A page runs one statement of `ORDER BY <column> DESC, id LIMIT 51 OFFSET n`
 whose `WHERE` repeats the index condition, so it reads at most 51 index entries and their rows
-plus, for computers, 51 owner rows; the deepest page allowed reads about 2,000 index entries to
-skip to its offset. The tests run `EXPLAIN QUERY PLAN` on every statement of these pages and fail on
-a full scan of a large table, on a missing index and on a sort outside the index. The price is
-writes: a task that earns credit changes `total_credit`, `expavg_credit` and `valid_results` of an
-account and of a computer, which updates three index entries for each, six more index writes per
-valid task than before. At the design's 25 rows per job that is a quarter more; on the Paid plan it
-is negligible, on the Free plan it lowers the jobs a day that fit in 100,000 writes. A project that
-cannot spend them can drop the `valid_results` indexes and the sort that uses them.
+plus, for computers, 51 owner rows; the deepest page allowed (40) reads about 2,000 index entries to
+skip to its offset, and has no "Next" link. The tests run `EXPLAIN QUERY PLAN` on every statement of
+these pages and fail on a full scan of a large table, on a missing index and on a sort outside the
+index. The price is writes: a task that earns credit changes `total_credit`, `recent_key` and
+`valid_results` of an account and of a computer, which updates three index entries for each, six
+more index writes per valid task than before. At the design's 25 rows per job that is a quarter
+more; on the Paid plan it is negligible, on the Free plan it lowers the jobs a day that fit in
+100,000 writes. A project that cannot spend them can drop the `valid_results` indexes and the sort
+that uses them.
 
-The stored recent average is brought up to date only when its owner earns credit (as upstream
-leaves it to `update_stats`). The pages show it decayed to now (`decayed` in `avg.rs`) and order the
-rows of a page by that, so an idle account's figure is not shown stale; across pages the order is the
-stored one, which differs only for accounts whose averages have decayed by different amounts.
+**Recent average.** The stored `expavg_credit` is brought up to date only when its owner earns credit
+(upstream leaves the decay to the `update_stats` daemon), so ordering by it would rank an idle
+account above an active one. The pages order by `recent_key = ln(expavg_credit) + expavg_time * ln 2
+/ half life` (`recent_key` in `avg.rs`), which the pipeline writes in the statement that writes
+`expavg_credit`. An average that halves every half life is multiplied by the same factor at every
+time, so the keys of two rows compare as their averages do at any common time, and the order is
+right across pages without decaying each row in the query. The pages show the average decayed to
+now (`decayed` in `avg.rs`). The migration fills the key with `ln`, which D1's SQLite has; the
+native test database registers the same function.
 
 `valid_results` is added to in the statement that grants the credit (`host_statements` in
 `cloud/crates/cb-core/src/pipeline.rs`), so it counts each valid result once, with the credit, under
@@ -1285,18 +1291,43 @@ The pipeline Worker's five-minute cron (the one that runs the purge) calls `roll
   `inflight` has tasks in progress by computer and application. `rollup_run` is the time of the
   last pass.
 
-A pass recounts the open period, and each closed period once within ten minutes of its end and once an hour after (so
-that late validations count), and up to six periods that have no row (a new deployment's week is
-filled in a few passes; periods before the purge horizon are not counted, because what is left of
-them is only part of what happened). The counts come from the partial index `res_received`
-(tasks by time received): about two reads per task returned in the period (one scan, grouped by application, outcome, validation state, account and computer, from which the accounts and computers are counted). The recount writes
-absolute numbers, so a pass that runs twice, or fails partway, leaves the same rows. The queue
-length is counted from `res_unsent` up to 100,000 per application and shown as "100,000+" past that.
-Tasks in progress are counted from `res_host_inprog`, which now holds the application as well as the
-computer (`(hostid, appid) WHERE server_state = 4`), so those counts read the index alone. Waiting
-workunits use `wu_need_validate` and `wu_assim`. A pass is about 36 statements for a project with
-four applications, in four round trips, and writes about 17 rows (measured on dev). It skips itself if the last pass
-was under 240 seconds ago.
+A pass recounts the open period; each closed period once within ten minutes of its end, and
+then hourly for as long as tasks returned in it still wait for validation (`pending`), because a
+validation moves a task from one count to another; and up to six periods that have no row (a new
+deployment's week is filled in a few passes). A period that starts before the purge horizon is
+never counted or recounted, since what is left of it is only part of what happened: it stays unknown,
+or keeps the count it had. The counts come from the partial index `res_received` (tasks by time
+received): about two reads per task returned in the period (one scan, grouped by application,
+outcome, validation state, account and computer, from which the accounts and computers are
+counted). The recount writes absolute numbers, so a pass that runs twice, or fails partway, leaves
+the same rows, and an application that had a row for the period and has no task in it now is
+written as zero (its timeouts and queue length are left alone).
+
+The queue length is one statement: `res_unsent` read in application order up to 100,000 tasks in
+all. Past that the count stops inside one application's queue; that application and every later
+one are lower bounds (`unsent_from` in the overview), and the page shows them as "40,000+" (an
+application it never reached as "0+"). Tasks in progress are counted from `res_host_inprog`, which
+now holds the application as well as the computer (`(hostid, appid) WHERE server_state = 4`), so
+those counts read the index alone, and the accounts and computers holding tasks are counted
+separately over all of them, so they stay exact when the list of groups the activity page keeps
+(4,000) is cut off; the tasks in progress that page shows are then marked as at least. Waiting
+workunits use `wu_need_validate` and `wu_assim`. The sums of the last day and week cover only the
+periods that have been counted; the overview says how many of how many, and the pages mark the
+sums "+" and say so while the week is being filled in (or part of it has been purged).
+
+**Statement budget.** A Worker invocation may make 50 queries on the Free plan, and the cron's
+purge shares it. `rollup_pass` is given a budget (50 minus what the invocation has used, less a
+margin), counts as many of the due periods as fit, newest first, and leaves the rest for the next
+pass (`postponed` in its report); with less than `MIN_BUDGET` (18) it does nothing. Its fixed
+statements are 14 (two reads, six counts, the queue gauges, the retention delete, the sums, three
+snapshot writes) and each period costs a read and one write for every ten applications that have
+tasks in it. The tests build the worst case (40 applications with tasks in every period of the
+week) and check that the statements sent stay within the budget and that no statement binds more
+than 100 values. Dev: about 36 statements, four round trips, about 17 rows written.
+
+A row in `stats_bucket` with `computed_at` 0 (made by a timeout before its period was counted) is
+not a counted period: the pages show the period as unknown and the sums leave it out until a pass
+counts it.
 
 Timed-out tasks are the one figure the pass cannot count, since a task that misses its deadline is
 never returned and has no `received_time`. The transition that writes it off counts it in the batch
@@ -1304,7 +1335,7 @@ that commits the write-off (`timeout_statements`), under the same commit guard, 
 once. Timeouts are therefore counted from when this was installed.
 
 Counting from the cron and not on each event keeps the scheduler's hot path, and the write budget
-per job, unchanged, makes the figures it counts repairable by the next pass, and makes the cost of a page
+per job, unchanged, makes the figures a pass counts repairable by the next one, and makes the cost of a page
 independent of traffic and of the table size. The cost is that figures are up to five minutes old
 (the pages say how old), and the daily and weekly figures are in whole three-hour periods (the last
 8 and 56). A period with no row, or a queue length that was never counted, is unknown: the charts

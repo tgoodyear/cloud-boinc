@@ -5,18 +5,24 @@
 use std::cell::RefCell;
 
 use async_trait::async_trait;
+use cb_core::avg::recent_key;
 use cb_core::feed::parse_feed;
 use cb_core::project::{put_setting, Project, SETTING_CONFIG};
 use cb_core::site::{site_page, Params, SiteCtx, SITE_PATHS};
 use cb_core::site_boards::{public_cache_key, MAX_PAGE, PAGE_SIZE, PUBLIC_PATHS};
 use cb_core::site_work::{activity, work, FeedState};
-use cb_core::stats::{rollup_pass, BUCKET_SECS, MIN_INTERVAL_SECS};
+use cb_core::stats::{
+    load_inflight, load_work, rollup_pass, BUCKET_SECS, MIN_BUDGET, MIN_INTERVAL_SECS,
+    UNSENT_COUNT_CAP,
+};
 use cb_db::{stmt, Db, DbResult, Rows, Stmt};
 use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
 
 const CONFIG: &str = "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<user_country>1</user_country>\n</config>\n";
 const NOW: i64 = 2_000_000_000;
+/// Statements a pass may use: what the Free plan leaves after a purge.
+const BUDGET: usize = 40;
 /// Start of the three-hour period NOW is in.
 const CUR: i64 = NOW - NOW % BUCKET_SECS;
 
@@ -53,8 +59,8 @@ fn add_user(
 ) {
     block_on(db.run(stmt!(
         "INSERT INTO user (id, create_time, email_addr, name, authenticator, country, total_credit, \
-         expavg_credit, expavg_time, valid_results, show_hosts, blocked) \
-         VALUES (?, 1, ?, ?, ?, 'US', ?, ?, ?, ?, ?, ?)",
+         expavg_credit, expavg_time, valid_results, show_hosts, blocked, recent_key) \
+         VALUES (?, 1, ?, ?, ?, 'US', ?, ?, ?, ?, ?, ?, ?)",
         id,
         format!("secret{id}@example.com"),
         name,
@@ -64,7 +70,8 @@ fn add_user(
         NOW as f64,
         valid,
         show_hosts,
-        blocked
+        blocked,
+        recent_key(recent, NOW as f64)
     )))
     .unwrap();
 }
@@ -73,15 +80,16 @@ fn add_host(db: &SqliteDb, id: i64, userid: i64, credit: f64, valid: i64) {
     block_on(db.run(stmt!(
         "INSERT INTO host (id, create_time, userid, total_credit, expavg_credit, expavg_time, valid_results, \
          domain_name, last_ip_addr, external_ip_addr, p_vendor, p_model, p_ncpus, os_name, os_version, \
-         serialnum, rpc_time) VALUES (?, 1, ?, ?, ?, ?, ?, 'secret-pc.lan', '10.9.8.7', '203.0.113.9', \
-         'GenuineIntel', 'Core <i7>', 8, 'Linux', '6.1', '[BOINC|8.0.4][CUDA|1|8192MB]', ?)",
+         serialnum, rpc_time, recent_key) VALUES (?, 1, ?, ?, ?, ?, ?, 'secret-pc.lan', '10.9.8.7', '203.0.113.9', \
+         'GenuineIntel', 'Core <i7>', 8, 'Linux', '6.1', '[BOINC|8.0.4][CUDA|1|8192MB]', ?, ?)",
         id,
         userid,
         credit,
         credit / 10.0,
         NOW as f64,
         valid,
-        NOW - 120
+        NOW - 120,
+        recent_key(credit / 10.0, NOW as f64)
     )))
     .unwrap();
 }
@@ -265,26 +273,51 @@ fn top_users_pages_are_bounded() {
 }
 
 #[test]
-fn a_stale_average_is_shown_as_it_stands_now() {
+fn recent_average_orders_as_the_averages_stand_now() {
     let (db, project) = setup();
-    add_user(&db, 1, "Active", 100.0, 10.0, 1, 0, 0);
-    add_user(&db, 2, "Idle", 200.0, 100.0, 1, 0, 0);
-    // The idle account's average was last updated two weeks ago.
-    block_on(db.run(stmt!(
-        "UPDATE user SET expavg_time = ? WHERE id = 2",
-        (NOW - 14 * 86400) as f64
-    )))
-    .unwrap();
+    // Fifty idle accounts whose stored average is high but decayed to almost
+    // nothing, and one active account with a modest average: the active one
+    // ranks first, on the first page, whatever the stored averages say.
+    for i in 1..=50 {
+        add_user(&db, i, &format!("Idle{i}"), 500.0, 100.0, 1, 0, 0);
+        let time = (NOW - 12 * 7 * 86400) as f64;
+        block_on(db.run(stmt!(
+            "UPDATE user SET expavg_time = ?, recent_key = ? WHERE id = ?",
+            time,
+            recent_key(100.0, time),
+            i
+        )))
+        .unwrap();
+    }
+    add_user(&db, 99, "Active", 20.0, 10.0, 1, 0, 0);
     let page = get(
         &db,
         &project,
         "/top_users.php",
         &query(&[("sort", "expavg_credit")]),
     );
-    // 100 halved twice is 25, which is more than 10: Idle stays first, with
-    // the decayed figure.
-    assert!(page.contains(">25.00<"), "{page}");
-    assert!(page.find("Idle").unwrap() < page.find("Active").unwrap());
+    let (active, idle) = (page.find("Active").unwrap(), page.find("Idle").unwrap());
+    assert!(active < idle, "{page}");
+    assert!(page.contains("<td class=\"num\" data-label=\"Rank\">1</td><td class=\"who\" data-label=\"User\"><a href=\"show_user.php?userid=99\">Active"));
+    // The displayed figure is the decayed one: 100 halved twelve times.
+    assert!(page.contains(">0.02<"), "{page}");
+    // The same for computers.
+    add_user(&db, 200, "Owner", 1.0, 1.0, 1, 1, 0);
+    add_host(&db, 1, 200, 5000.0, 1);
+    add_host(&db, 2, 200, 40.0, 1);
+    block_on(db.run(stmt!(
+        "UPDATE host SET expavg_time = ?, recent_key = ? WHERE id = 1",
+        (NOW - 20 * 7 * 86400) as f64,
+        recent_key(500.0, (NOW - 20 * 7 * 86400) as f64)
+    )))
+    .unwrap();
+    let page = get(
+        &db,
+        &project,
+        "/top_hosts.php",
+        &query(&[("sort", "expavg_credit")]),
+    );
+    assert!(page.find("hostid=2\">#2<").unwrap() < page.find("hostid=1\">#1<").unwrap());
 }
 
 #[test]
@@ -367,10 +400,10 @@ fn leaderboard_queries_read_indexes() {
     let lines = plans(&spy).join("\n");
     for index in [
         "user_total_credit",
-        "user_expavg_credit",
+        "user_recent_key",
         "user_valid_results",
         "host_total_credit",
-        "host_expavg_credit",
+        "host_recent_key",
         "host_valid_results",
     ] {
         assert!(lines.contains(index), "{index} is not used:\n{lines}");
@@ -490,7 +523,7 @@ fn figure(db: &SqliteDb, sql: &str) -> i64 {
 fn the_rollup_counts_periods_and_snapshots() {
     let (db, project) = setup();
     busy(&db);
-    let report = block_on(rollup_pass(&db, NOW, 0)).unwrap();
+    let report = block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
     assert!(report.ran);
     assert_eq!(report.recounted[0], CUR);
     assert_eq!(report.recounted[1], CUR - BUCKET_SECS);
@@ -543,11 +576,11 @@ fn the_rollup_counts_periods_and_snapshots() {
     assert!(history[55].is_some() && history[0].is_none());
 
     // Not again within the interval.
-    let again = block_on(rollup_pass(&db, NOW + MIN_INTERVAL_SECS - 1, 0)).unwrap();
+    let again = block_on(rollup_pass(&db, NOW + MIN_INTERVAL_SECS - 1, 0, BUDGET)).unwrap();
     assert!(!again.ran);
     // Repeating it leaves the same rows.
     let before = dump(&db);
-    let again = block_on(rollup_pass(&db, NOW + MIN_INTERVAL_SECS + 10, 0)).unwrap();
+    let again = block_on(rollup_pass(&db, NOW + MIN_INTERVAL_SECS + 10, 0, BUDGET)).unwrap();
     assert!(again.ran);
     // The same rows, plus the older periods the second pass backfilled.
     let after = dump(&db);
@@ -560,7 +593,13 @@ fn the_rollup_counts_periods_and_snapshots() {
     let app1 = o.apps.iter().find(|a| a.id == 1).unwrap();
     assert_eq!((app1.ok_24h, app1.ok_7d), (3, 4));
     let before = after;
-    let again = block_on(rollup_pass(&db, NOW + 2 * MIN_INTERVAL_SECS + 20, 0)).unwrap();
+    let again = block_on(rollup_pass(
+        &db,
+        NOW + 2 * MIN_INTERVAL_SECS + 20,
+        0,
+        BUDGET,
+    ))
+    .unwrap();
     assert!(again.ran);
     // Rows already counted do not change when counted again.
     let now_rows = dump(&db);
@@ -569,9 +608,9 @@ fn the_rollup_counts_periods_and_snapshots() {
     // After the period closes it is counted once more, once an hour has
     // passed, and then left alone.
     let late = CUR + BUCKET_SECS + 4000;
-    let r = block_on(rollup_pass(&db, late, 0)).unwrap();
+    let r = block_on(rollup_pass(&db, late, 0, BUDGET)).unwrap();
     assert!(r.recounted.contains(&CUR));
-    let r = block_on(rollup_pass(&db, late + 300, 0)).unwrap();
+    let r = block_on(rollup_pass(&db, late + 300, 0, BUDGET)).unwrap();
     assert!(!r.recounted.contains(&CUR));
     assert_eq!(cur("returned_ok", 0), 2);
     let _ = project;
@@ -581,7 +620,7 @@ fn the_rollup_counts_periods_and_snapshots() {
 fn the_rollup_leaves_out_periods_before_the_purge_horizon() {
     let (db, _) = setup();
     busy(&db);
-    let r = block_on(rollup_pass(&db, NOW, CUR - BUCKET_SECS)).unwrap();
+    let r = block_on(rollup_pass(&db, NOW, CUR - BUCKET_SECS, BUDGET)).unwrap();
     assert_eq!(r.recounted, vec![CUR, CUR - BUCKET_SECS]);
     assert_eq!(
         figure(&db, "SELECT count(*) FROM stats_bucket WHERE appid = 0"),
@@ -597,7 +636,7 @@ fn rollup_queries_read_indexes_and_stay_bounded() {
         inner: &db,
         log: RefCell::new(Vec::new()),
     };
-    block_on(rollup_pass(&spy, NOW, 0)).unwrap();
+    block_on(rollup_pass(&spy, NOW, 0, BUDGET)).unwrap();
     let lines = plans(&spy).join("\n");
     for index in [
         "res_received",
@@ -622,7 +661,7 @@ fn work_page_shows_counts_charts_and_unknowns() {
     let before = get(&db, &project, "/work.php", &query(&[]));
     assert!(before.contains("The counts are not available yet"));
     busy(&db);
-    block_on(rollup_pass(&db, NOW, 0)).unwrap();
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
     let page = get(&db, &project, "/work.php", &query(&[]));
     assert!(page.contains("Worker &lt;one&gt;"));
     assert!(!page.contains("Worker <one>"));
@@ -675,7 +714,7 @@ fn activity_names_computers_only_for_owners_who_show_them() {
     busy(&db);
     add_user(&db, 3, "Gone", 1.0, 1.0, 1, 1, 1);
     insert_result(&db, 30, 1, 4, 0, 0, 0, 3, 3);
-    block_on(rollup_pass(&db, NOW, 0)).unwrap();
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
     let page = block_on(activity(&ctx(&db, &project, NOW), &query(&[])))
         .unwrap()
         .body;
@@ -695,7 +734,7 @@ fn activity_names_computers_only_for_owners_who_show_them() {
     // By default Bob's computer is listed too.
     let (db3, project3) = setup();
     busy(&db3);
-    block_on(rollup_pass(&db3, NOW, 0)).unwrap();
+    block_on(rollup_pass(&db3, NOW, 0, BUDGET)).unwrap();
     let page = block_on(activity(&ctx(&db3, &project3, NOW), &query(&[])))
         .unwrap()
         .body;
@@ -703,7 +742,7 @@ fn activity_names_computers_only_for_owners_who_show_them() {
     assert!(!page.contains("secret-pc.lan") && !page.contains("10.9.8.7"));
     // And a project with nothing in progress says so.
     let (db2, project2) = setup();
-    block_on(rollup_pass(&db2, NOW, 0)).unwrap();
+    block_on(rollup_pass(&db2, NOW, 0, BUDGET)).unwrap();
     let page = block_on(activity(&ctx(&db2, &project2, NOW), &query(&[])))
         .unwrap()
         .body;
@@ -714,7 +753,7 @@ fn activity_names_computers_only_for_owners_who_show_them() {
 fn activity_reads_one_snapshot_and_looks_accounts_up_by_id() {
     let (db, project) = setup();
     busy(&db);
-    block_on(rollup_pass(&db, NOW, 0)).unwrap();
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
     let spy = Spy {
         inner: &db,
         log: RefCell::new(Vec::new()),
@@ -773,7 +812,7 @@ fn the_pages_answer_under_a_stock_page_prefix_and_link_relatively() {
     assert_eq!(stock.page_prefix, "/testproj");
     let (db, project) = setup();
     busy(&db);
-    block_on(rollup_pass(&db, NOW, 0)).unwrap();
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
     for path in PUBLIC_PATHS {
         // The web Worker routes the prefixed path to the page, which is
         // named at the root, and the cache key is the root's.
@@ -810,4 +849,455 @@ fn feed_url_is_checked_when_the_config_is_stored() {
             "{url}"
         );
     }
+}
+
+/// Whether every element that has a closing tag is closed, in order. Void
+/// elements and self-closed ones (SVG shapes) are not tracked.
+fn balanced(html: &str) -> Result<(), String> {
+    const VOID: [&str; 6] = ["meta", "link", "br", "input", "img", "hr"];
+    let mut stack: Vec<String> = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        rest = &rest[i + 1..];
+        if rest.starts_with("!--") {
+            rest = &rest[rest.find("-->").map_or(rest.len(), |j| j + 3)..];
+            continue;
+        }
+        if rest.starts_with('!') || rest.starts_with('?') {
+            continue;
+        }
+        let end = rest.find('>').ok_or("unterminated tag")?;
+        let tag = &rest[..end];
+        rest = &rest[end + 1..];
+        let closing = tag.starts_with('/');
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect();
+        if tag.ends_with('/') || VOID.contains(&name.as_str()) {
+            continue;
+        }
+        if closing {
+            match stack.pop() {
+                Some(open) if open == name => {}
+                other => return Err(format!("</{name}> closes {other:?}")),
+            }
+        } else {
+            stack.push(name.clone());
+            // Text of these is not markup.
+            if name == "style" {
+                rest = &rest[rest.find("</style>").ok_or("open style")?..];
+            }
+        }
+    }
+    if stack.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("unclosed {stack:?}"))
+    }
+}
+
+#[test]
+fn every_dashboard_page_has_balanced_markup() {
+    use cb_core::web::master_page_with;
+    let (db, project) = setup();
+    busy(&db);
+    add_user(&db, 7, "Showy", 5.0, 1.0, 1, 1, 0);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let feed = parse_feed(
+        &format!(
+            r#"{{"schema":1,"updated":{},"sections":[{{"title":"A","figures":[{{"label":"L","value":1}}],
+            "series":[{{"title":"S","start":{},"interval_secs":86400,"values":[1,null,3]}}]}}]}}"#,
+            NOW - 5,
+            NOW - 4 * 86400
+        ),
+        NOW,
+    )
+    .unwrap();
+    let overview = block_on(cb_core::stats::load_overview(&db)).unwrap();
+    let mut pages = vec![
+        (
+            "work",
+            block_on(work(
+                &ctx(&db, &project, NOW),
+                &query(&[]),
+                &FeedState::Ready(feed),
+            ))
+            .unwrap()
+            .body,
+        ),
+        (
+            "work without feed",
+            get(&db, &project, "/work.php", &query(&[])),
+        ),
+        ("activity", get(&db, &project, "/activity.php", &query(&[]))),
+        ("home", master_page_with(&project, overview.as_ref())),
+    ];
+    for sort in ["total_credit", "expavg_credit", "valid_results"] {
+        for path in ["/top_users.php", "/top_hosts.php"] {
+            pages.push((path, get(&db, &project, path, &query(&[("sort", sort)]))));
+        }
+    }
+    // And the empty states.
+    let (db2, project2) = setup();
+    for path in [
+        "/top_users.php",
+        "/top_hosts.php",
+        "/work.php",
+        "/activity.php",
+    ] {
+        pages.push((path, get(&db2, &project2, path, &query(&[]))));
+    }
+    for (name, html) in &pages {
+        balanced(html).unwrap_or_else(|e| panic!("{name}: {e}"));
+        // Every table of a dashboard page is in exactly one scroll box.
+        assert_eq!(
+            html.matches("<table").count(),
+            html.matches("<div class=\"scroll\"><table").count(),
+            "{name}"
+        );
+    }
+    // The checker itself.
+    assert!(balanced("<div><p></div>").is_err());
+    assert!(balanced("<div><svg><path d=\"\"/></svg></div>").is_ok());
+}
+
+#[test]
+fn a_period_with_tasks_waiting_for_validation_is_recounted() {
+    let (db, _) = setup();
+    add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+    add_host(&db, 1, 1, 1.0, 1);
+    let prev = CUR - BUCKET_SECS;
+    // Returned in the previous period, not yet judged.
+    insert_result(&db, 1, 1, 5, 1, 0, prev + 500, 1, 1);
+    // Counted twice at the start (for the backfill, then the early recount),
+    // then the period is closed and settled.
+    let mut t = NOW;
+    for _ in 0..3 {
+        block_on(rollup_pass(&db, t, 0, BUDGET)).unwrap();
+        t += 600;
+    }
+    let pending = figure(
+        &db,
+        &format!("SELECT pending FROM stats_bucket WHERE appid = 0 AND bucket = {prev}"),
+    );
+    assert_eq!(pending, 1);
+    // A day later the validator calls it invalid (it waited for a partner).
+    block_on(db.run(stmt!("UPDATE result SET validate_state = 2 WHERE id = 1"))).unwrap();
+    let day_later = NOW + 86_400;
+    let r = block_on(rollup_pass(&db, day_later, 0, BUDGET)).unwrap();
+    assert!(r.recounted.contains(&prev), "{:?}", r.recounted);
+    let row = |col: &str| {
+        figure(
+            &db,
+            &format!("SELECT {col} FROM stats_bucket WHERE appid = 0 AND bucket = {prev}"),
+        )
+    };
+    assert_eq!((row("invalid"), row("pending")), (1, 0));
+    // Nothing waits now: it is final and is not counted again.
+    let r = block_on(rollup_pass(&db, day_later + 7200, 0, BUDGET)).unwrap();
+    assert!(!r.recounted.contains(&prev));
+}
+
+#[test]
+fn a_period_that_straddles_the_purge_horizon_is_left_unknown() {
+    let (db, _) = setup();
+    busy(&db);
+    let horizon = CUR - BUCKET_SECS + 100;
+    let r = block_on(rollup_pass(&db, NOW, horizon, BUDGET)).unwrap();
+    assert_eq!(r.recounted, vec![CUR]);
+    let (overview, history) = block_on(load_work(&db, NOW)).unwrap();
+    assert!(history[54].is_none() && history[55].is_some());
+    let o = overview.unwrap();
+    // Only the open period can be counted, so the sums say they are partial.
+    assert_eq!((o.expected_24h, o.periods_24h), (1, 1));
+    assert!(o.day_complete());
+}
+
+#[test]
+fn an_application_with_no_tasks_left_in_a_recount_is_zeroed() {
+    let (db, _) = setup();
+    let (s, o, v) = (5, 1, 1);
+    insert_result(&db, 1, 1, s, o, v, CUR + 10, 1, 1);
+    insert_result(&db, 2, 2, s, o, v, CUR + 20, 1, 1);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let get_n = |app: i64| {
+        figure(
+            &db,
+            &format!("SELECT returned_ok FROM stats_bucket WHERE appid = {app} AND bucket = {CUR}"),
+        )
+    };
+    assert_eq!((get_n(0), get_n(1), get_n(2)), (2, 1, 1));
+    // A purge takes app 2's task; the next count writes zero for it.
+    block_on(db.run(stmt!("DELETE FROM result WHERE id = 2"))).unwrap();
+    block_on(rollup_pass(&db, NOW + 300, 0, BUDGET)).unwrap();
+    assert_eq!((get_n(0), get_n(1), get_n(2)), (1, 1, 0));
+    // Its queue length and timeouts are not touched by a recount.
+    block_on(db.run(stmt!(
+        "UPDATE stats_bucket SET timed_out = 4 WHERE appid = 2 AND bucket = ?",
+        CUR
+    )))
+    .unwrap();
+    block_on(rollup_pass(&db, NOW + 600, 0, BUDGET)).unwrap();
+    assert_eq!(
+        figure(
+            &db,
+            &format!("SELECT timed_out FROM stats_bucket WHERE appid = 2 AND bucket = {CUR}")
+        ),
+        4
+    );
+}
+
+#[test]
+fn a_pass_stays_inside_its_statement_budget_and_carries_the_rest() {
+    // Many applications, and tasks in every period of the week.
+    let (db, _) = setup();
+    add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+    add_host(&db, 1, 1, 1.0, 1);
+    let mut id = 1;
+    for period in 0..56 {
+        for app in 1..=40 {
+            insert_result(&db, id, app, 5, 1, 1, CUR - period * BUCKET_SECS + 60, 1, 1);
+            id += 1;
+        }
+    }
+    for app in 1..=40 {
+        insert_result(&db, 100_000 + app, app, 2, 0, 0, 0, 0, 0);
+    }
+    for budget in [MIN_BUDGET, 25, BUDGET, 50] {
+        let spy = Spy {
+            inner: &db,
+            log: RefCell::new(Vec::new()),
+        };
+        let r = block_on(rollup_pass(&spy, NOW + budget as i64 * 1000, 0, budget)).unwrap();
+        let used = spy.log.borrow().len();
+        assert!(r.ran);
+        assert_eq!(used, r.statements, "budget {budget}");
+        assert!(used <= budget, "budget {budget}: {used} statements");
+        // No statement binds more than D1 allows.
+        assert!(spy.log.borrow().iter().all(|s| s.params.len() <= 100));
+    }
+    // Too little budget does nothing, and says so.
+    let r = block_on(rollup_pass(&db, NOW + 90_000, 0, MIN_BUDGET - 1)).unwrap();
+    assert!(r.skipped_for_budget && !r.ran);
+    // Passes at the smallest budget still count the whole week, a few periods
+    // each, newest first, and the open period every time.
+    let (db, _) = setup();
+    add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+    add_host(&db, 1, 1, 1.0, 1);
+    for period in 0..48 {
+        insert_result(
+            &db,
+            period + 1,
+            1,
+            5,
+            1,
+            1,
+            CUR - period * BUCKET_SECS + 60,
+            1,
+            1,
+        );
+    }
+    let mut t = NOW;
+    let mut first_counted = None;
+    for pass in 0..40 {
+        let r = block_on(rollup_pass(&db, t, 0, 20)).unwrap();
+        assert!(r.ran && r.statements <= 20, "pass {pass}: {}", r.statements);
+        assert_eq!(r.recounted[0], cb_core::stats::bucket_start(t));
+        first_counted.get_or_insert(r.recounted.len());
+        t += 300;
+    }
+    // Every period that has a task is counted, each with its one task.
+    let (_, history) = block_on(load_work(&db, t)).unwrap();
+    let counted = history
+        .iter()
+        .flatten()
+        .filter(|p| p.returned_ok == 1)
+        .count();
+    assert_eq!(counted, 48);
+}
+
+#[test]
+fn the_figures_say_so_while_the_week_is_still_being_counted() {
+    let (db, project) = setup();
+    busy(&db);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let page = get(&db, &project, "/work.php", &query(&[]));
+    assert!(page.contains("Counting is still catching up"), "{page}");
+    assert!(page.contains("3+"));
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    assert!(!o.week_complete() && !o.day_complete());
+    assert_eq!((o.periods_24h, o.expected_24h), (7, 8));
+    let mut t = NOW;
+    for _ in 0..12 {
+        t += 300;
+        block_on(rollup_pass(&db, t, 0, BUDGET)).unwrap();
+    }
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    assert!(o.week_complete());
+    let page = block_on(work(
+        &ctx(&db, &project, t),
+        &query(&[]),
+        &FeedState::NotConfigured,
+    ))
+    .unwrap()
+    .body;
+    assert!(!page.contains("Counting is still catching up"));
+}
+
+/// Inserts `n` rows into `result` with a recursive query: unsent tasks of
+/// `app`, or in progress on host `ids + i`.
+fn bulk_unsent(db: &SqliteDb, first_id: i64, n: i64, app: i64) {
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < ?) \
+         INSERT INTO result (id, create_time, workunitid, server_state, name, xml_doc_in, appid) \
+         SELECT ? + i, 1, 1, 2, 'u' || (? + i), '', ? FROM c",
+        n,
+        first_id,
+        first_id,
+        app
+    )))
+    .unwrap();
+}
+
+#[test]
+fn a_queue_past_the_cap_is_a_lower_bound_and_names_what_it_did_not_count() {
+    let (db, _) = setup();
+    block_on(db.run(stmt!("INSERT INTO app (id, create_time, name, user_friendly_name) VALUES (3, 1, 'third', 'Third')"))).unwrap();
+    let project = block_on(Project::load(&db)).unwrap();
+    bulk_unsent(&db, 1_000_000, 60_000, 1);
+    bulk_unsent(&db, 2_000_000, 40_100, 2);
+    bulk_unsent(&db, 3_000_000, 7, 3);
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    let f = |id: i64| {
+        o.apps
+            .iter()
+            .find(|a| a.id == id)
+            .cloned()
+            .unwrap_or_default()
+    };
+    // Application 1 is counted in full; 2 is cut at the cap; 3 was not reached.
+    assert_eq!((f(1).unsent, f(1).unsent_capped), (60_000, false));
+    assert_eq!((f(2).unsent, f(2).unsent_capped), (40_000, true));
+    assert_eq!(o.unsent_from, 2);
+    assert_eq!((f(0).unsent, f(0).unsent_capped), (UNSENT_COUNT_CAP, true));
+    assert!(o.unsent_is_lower_bound(3) && !o.unsent_is_lower_bound(1));
+    let page = get(&db, &project, "/work.php", &query(&[]));
+    assert!(page.contains(">60,000<"));
+    assert!(page.contains(">40,000+<"));
+    // The third application is in the table, as "0+": at least none.
+    assert!(page.contains("Third"));
+    assert!(page.contains(">0+<"));
+    assert!(page.contains(">100,000+<"));
+    // And the home page's headline says the same.
+    let home = cb_core::web::master_page_with(&project, Some(&o));
+    assert!(home.contains("100,000+"));
+}
+
+#[test]
+fn headline_counts_do_not_depend_on_the_rows_the_snapshot_keeps() {
+    let (db, project) = setup();
+    add_user(&db, 1, "A", 1.0, 1.0, 1, 0, 0);
+    add_user(&db, 2, "B", 1.0, 1.0, 1, 0, 0);
+    // 4,100 computers (half each of two accounts), one task in progress each.
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 4100) \
+         INSERT INTO host (id, create_time, userid, rpc_time) SELECT i, 1, 1 + i % 2, ? FROM c",
+        NOW - 60
+    )))
+    .unwrap();
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 4100) \
+         INSERT INTO result (id, create_time, workunitid, server_state, name, xml_doc_in, appid, hostid, userid) \
+         SELECT 10000 + i, 1, 1, 4, 'p' || i, '', 1, i, 1 + i % 2 FROM c"
+    )))
+    .unwrap();
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let snap = block_on(load_inflight(&db)).unwrap().unwrap();
+    assert!(snap.truncated);
+    assert_eq!(snap.rows.len(), 4000);
+    assert_eq!((snap.working_hosts, snap.working_users), (4100, 2));
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    assert_eq!((o.working_hosts, o.working_users), (4100, 2));
+    let page = block_on(activity(&ctx(&db, &project, NOW), &query(&[])))
+        .unwrap()
+        .body;
+    assert!(page.contains(">4,100<"));
+    // The tasks are summed from the rows kept, so they are a lower bound.
+    assert!(page.contains("4,000+"));
+    assert!(page.contains("not complete"));
+}
+
+#[test]
+fn a_row_a_timeout_made_is_not_a_counted_period_and_retention_still_runs() {
+    let (db, project) = setup();
+    // As `timeout_statements` leaves it: a timeout in the open period, before
+    // any pass has counted it; and a period long past the retention.
+    block_on(db.batch(vec![
+        stmt!("INSERT INTO stats_bucket (appid, bucket, timed_out) VALUES (0, ?, 3)", CUR),
+        stmt!("INSERT INTO stats_bucket (appid, bucket, timed_out) VALUES (1, ?, 3)", CUR),
+        stmt!("INSERT INTO stats_bucket (appid, bucket, returned_ok, computed_at) VALUES (0, ?, 9, 5)", CUR - 100 * BUCKET_SECS),
+    ]))
+    .unwrap();
+    let (_, history) = block_on(load_work(&db, NOW)).unwrap();
+    assert!(history[55].is_none(), "an uncounted period is unknown");
+    let page = get(&db, &project, "/work.php", &query(&[]));
+    assert!(!page.contains("data-label") || history[55].is_none());
+    block_on(rollup_pass(&db, NOW, 0, BUDGET)).unwrap();
+    let (_, history) = block_on(load_work(&db, NOW)).unwrap();
+    let p = history[55].clone().unwrap();
+    assert_eq!(p.timed_out, 3);
+    assert_eq!(
+        figure(
+            &db,
+            &format!(
+                "SELECT count(*) FROM stats_bucket WHERE bucket = {}",
+                CUR - 100 * BUCKET_SECS
+            )
+        ),
+        0,
+        "old rows are deleted"
+    );
+    // The timeout survives the recount, and is in the sums.
+    let o = block_on(cb_core::stats::load_overview(&db))
+        .unwrap()
+        .unwrap();
+    assert_eq!(o.apps.iter().find(|a| a.id == 0).unwrap().err_24h, 3);
+}
+
+#[test]
+fn the_last_leaderboard_page_has_no_next_link() {
+    let (db, project) = setup();
+    block_on(db.run(stmt!(
+        "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2100) \
+         INSERT INTO user (id, create_time, email_addr, name, authenticator, total_credit, recent_key) \
+         SELECT i, 1, 'e' || i, 'U' || i, 'a' || i, 5000 - i, 1.0 FROM c"
+    )))
+    .unwrap();
+    let last = get(
+        &db,
+        &project,
+        "/top_users.php",
+        &query(&[("page", &MAX_PAGE.to_string())]),
+    );
+    assert_eq!(rows_in(&last), PAGE_SIZE);
+    assert!(!last.contains("Next"));
+    assert!(last.contains("Previous"));
+    let before = get(
+        &db,
+        &project,
+        "/top_users.php",
+        &query(&[("page", &(MAX_PAGE - 1).to_string())]),
+    );
+    assert!(before.contains("Next"));
 }

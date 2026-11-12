@@ -5015,6 +5015,12 @@ fn a_project_name_with_markup_is_shown_as_text() {
     assert!(home.contains("<title>A &lt;b&gt;&amp;amp; Co</title>"));
     assert!(home.contains("<h1>A &lt;b&gt;&amp;amp; Co</h1>"));
     assert!(!home.contains("<b>"));
+    // The public page of an account has the name in a table label.
+    let user = w
+        .get("/show_user.php", None, &[("userid", &ada.id.to_string())])
+        .body;
+    assert!(user.contains("A &lt;b&gt;&amp;amp; Co member since"));
+    assert!(!user.contains("<b>"));
 }
 
 /// The outlined and danger buttons have to out-rank the primary

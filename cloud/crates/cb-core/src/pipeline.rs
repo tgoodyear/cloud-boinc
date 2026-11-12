@@ -1249,12 +1249,13 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         out.push(guarded(
             stmt!(
                 "UPDATE host SET total_credit = total_credit + ?, expavg_credit = ?, expavg_time = ?, \
-                 avg_turnaround = ?, valid_results = valid_results + ? WHERE id = ?",
+                 avg_turnaround = ?, valid_results = valid_results + ?, recent_key = ? WHERE id = ?",
                 *credit,
                 h.expavg_credit,
                 h.expavg_time,
                 h.avg_turnaround,
                 host_valid.get(id).copied().unwrap_or(0),
+                crate::avg::recent_key(h.expavg_credit, h.expavg_time),
                 *id
             ),
             wu_id,
@@ -1266,11 +1267,12 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
         out.push(guarded(
             stmt!(
                 "UPDATE user SET total_credit = total_credit + ?, expavg_credit = ?, expavg_time = ?, \
-                 valid_results = valid_results + ? WHERE id = ?",
+                 valid_results = valid_results + ?, recent_key = ? WHERE id = ?",
                 *credit,
                 u.expavg_credit,
                 u.expavg_time,
                 user_valid.get(id).copied().unwrap_or(0),
+                crate::avg::recent_key(u.expavg_credit, u.expavg_time),
                 *id
             ),
             wu_id,

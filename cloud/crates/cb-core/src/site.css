@@ -83,7 +83,7 @@ summary{cursor:pointer;min-height:44px;padding:.6rem 0;font-weight:600}
 .notice{color:var(--fg);background:var(--note-bg);border-color:var(--accent)}
 @media(min-width:40rem){.top{position:sticky;top:0;z-index:5}.top nav{flex:1;margin:0;padding:0}}
 @media(max-width:40rem){form table,form tbody,form tr,form th,form td{display:block}form tr{margin-bottom:.75rem}h1{font-size:1.5rem}.kv{grid-template-columns:1fr;gap:0}.kv dd{margin-bottom:.75rem}}
-.charts{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(22rem,1fr))}
+.charts{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(min(22rem,100%),1fr))}
 .charts>.card{margin:0}
 .chart{display:block;width:100%;max-width:36rem;height:auto}
 .chart text{font:12px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;fill:var(--muted)}

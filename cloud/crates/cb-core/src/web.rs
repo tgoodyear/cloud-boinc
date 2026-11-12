@@ -838,6 +838,10 @@ fn favicon_href() -> String {
 pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
     let body = body
         .replace("<table>", "<div class=\"scroll\"><table>")
+        .replace(
+            "<table class=\"stack\">",
+            "<div class=\"scroll\"><table class=\"stack\">",
+        )
         .replace("</table>", "</table></div>");
     let (header, main) = match body.strip_prefix("<header class=\"top\">") {
         Some(rest) => {
@@ -867,14 +871,15 @@ fn summary_card(o: &crate::stats::Overview) -> String {
     let total = o.apps.iter().find(|a| a.id == 0);
     let mut items = Vec::new();
     if let Some(t) = total {
-        let waiting = if t.unsent_capped {
-            format!("{}+", n(crate::stats::UNSENT_COUNT_CAP))
-        } else {
-            n(t.unsent)
-        };
+        let plus = |v: i64, exact: bool| if exact { n(v) } else { format!("{}+", n(v)) };
+        let waiting = plus(t.unsent, !o.unsent_is_lower_bound(0));
         items.push(site_ui::stat("Waiting to send", &waiting, ""));
         items.push(site_ui::stat("In progress", &n(t.in_progress), ""));
-        items.push(site_ui::stat("Completed, 24 hours", &n(t.ok_24h), ""));
+        items.push(site_ui::stat(
+            "Completed, 24 hours",
+            &plus(t.ok_24h, o.day_complete()),
+            "",
+        ));
     }
     items.push(site_ui::stat("Volunteers working", &n(o.working_users), ""));
     items.push(site_ui::stat("Computers working", &n(o.working_hosts), ""));

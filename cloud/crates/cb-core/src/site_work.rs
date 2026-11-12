@@ -24,7 +24,6 @@ use crate::site_boards::{shell, stack_table, StackCol};
 use crate::site_ui::{badge, card, card_accent, empty, notice, stat, stats, Tone};
 use crate::stats::{
     load_inflight, load_work, week_bounds, AppFigures, Inflight, Overview, Period, BUCKET_SECS,
-    UNSENT_COUNT_CAP,
 };
 use crate::web::html_escape;
 use crate::CoreResult;
@@ -95,12 +94,33 @@ fn count(n: i64) -> String {
     number_format(n as f64, 0)
 }
 
-fn unsent_text(f: &AppFigures) -> String {
-    if f.unsent_capped {
-        format!("{}+", count(UNSENT_COUNT_CAP))
+/// A count that is at least what is shown when `exact` is false: `1,234+`.
+fn at_least(n: i64, exact: bool) -> String {
+    if exact {
+        count(n)
     } else {
-        count(f.unsent)
+        format!("{}+", count(n))
     }
+}
+
+/// The queue length of an application (0 for the project): a lower bound when
+/// the count stopped at the cap before or inside it.
+fn unsent_text(o: &Overview, f: &AppFigures) -> String {
+    at_least(f.unsent, !o.unsent_is_lower_bound(f.id))
+}
+
+/// The note that says the 24-hour and 7-day figures do not cover every period
+/// yet, or none when they do.
+fn coverage_note(o: &Overview) -> String {
+    if o.day_complete() && o.week_complete() {
+        return String::new();
+    }
+    notice(&format!(
+        "Counting is still catching up, or part of the history was purged: the last 24 hours \
+         cover {} of {} three-hour periods and the last 7 days {} of {}. Figures marked + are \
+         at least that many.",
+        o.periods_24h, o.expected_24h, o.periods_7d, o.expected_7d
+    ))
 }
 
 /// A badge for how old a snapshot is.
@@ -125,24 +145,39 @@ fn applications_card(project: &Project, o: &Overview, now: i64) -> String {
         StackCol::num("Failed, 24 h"),
         StackCol::num("Failed, 7 d"),
     ];
+    let (day, week) = (o.day_complete(), o.week_complete());
     let row = |name: String, f: &AppFigures| {
         vec![
             name,
-            unsent_text(f),
+            unsent_text(o, f),
             count(f.in_progress),
             count(f.wait_validate),
             count(f.wait_assimilate),
-            count(f.ok_24h),
-            count(f.ok_7d),
-            count(f.err_24h),
-            count(f.err_7d),
+            at_least(f.ok_24h, day),
+            at_least(f.ok_7d, week),
+            at_least(f.err_24h, day),
+            at_least(f.err_7d, week),
         ]
     };
     let busy = |f: &AppFigures| {
         f.unsent + f.in_progress + f.wait_validate + f.wait_assimilate + f.ok_7d + f.err_7d > 0
     };
+    // Every application the snapshot has, and every live one of the catalog: a
+    // queue past the cap may leave an application out of the count.
+    let mut figures: BTreeMap<i64, AppFigures> = o
+        .apps
+        .iter()
+        .filter(|f| f.id != 0)
+        .map(|f| (f.id, f.clone()))
+        .collect();
+    for a in project.catalog.apps.iter().filter(|a| a.deprecated == 0) {
+        figures.entry(a.id).or_insert_with(|| AppFigures {
+            id: a.id,
+            ..Default::default()
+        });
+    }
     let mut rows = Vec::new();
-    for f in o.apps.iter().filter(|f| f.id != 0) {
+    for f in figures.values() {
         if app_deprecated(project, f.id) && !busy(f) {
             continue;
         }
@@ -160,8 +195,10 @@ fn applications_card(project: &Project, o: &Overview, now: i64) -> String {
          outcome; \"failed\" is tasks returned with an error, tasks that failed validation and \
          tasks that passed their deadline. A day is the last eight three-hour periods and a \
          week the last 56. Timeouts are counted from when this feature was installed. \
-         Waiting counts are cut off at 100,000 per application.</small></p>\n",
+         The queue is counted up to 100,000 tasks in all; past that a figure marked + is at \
+         least that many.</small></p>\n",
     );
+    body.push_str(&coverage_note(o));
     card("Applications", &body)
 }
 
@@ -267,11 +304,12 @@ pub async fn work(ctx: &SiteCtx<'_>, _q: &Params, feed: &FeedState) -> CoreResul
     match &overview {
         Some(o) => {
             if let Some(t) = o.apps.iter().find(|f| f.id == 0) {
+                let day = o.day_complete();
                 body.push_str(&stats(&[
-                    stat("Waiting to send", &unsent_text(t), ""),
+                    stat("Waiting to send", &unsent_text(o, t), ""),
                     stat("In progress", &count(t.in_progress), ""),
-                    stat("Completed, 24 hours", &count(t.ok_24h), ""),
-                    stat("Failed, 24 hours", &count(t.err_24h), ""),
+                    stat("Completed, 24 hours", &at_least(t.ok_24h, day), ""),
+                    stat("Failed, 24 hours", &at_least(t.err_24h, day), ""),
                 ]));
             }
             body.push_str(&applications_card(project, o, ctx.now));
@@ -434,19 +472,16 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
     let visible = |u: &i64| names.get(u).is_none_or(|p| p.blocked == 0);
 
     let in_progress: i64 = by_user.values().map(|v| v.total).sum();
-    let computers: usize = by_user.values().map(|v| v.computers.len()).sum();
     let mut body = String::new();
+    // The volunteers and computers are counted over every task in progress; the
+    // tasks are summed from the rows kept, so past the cap they are at least.
     body.push_str(&stats(&[
-        stat("Volunteers working", &count(by_user.len() as i64), ""),
-        stat("Computers working", &count(computers as i64), ""),
+        stat("Volunteers working", &count(snap.working_users), ""),
+        stat("Computers working", &count(snap.working_hosts), ""),
         stat(
             "Tasks in progress",
-            &count(in_progress),
-            if snap.truncated {
-                "largest groups only"
-            } else {
-                ""
-            },
+            &at_least(in_progress, !snap.truncated),
+            "",
         ),
     ]));
     if by_user.is_empty() {
@@ -511,6 +546,12 @@ pub async fn activity(ctx: &SiteCtx<'_>, _q: &Params) -> CoreResult<SitePage> {
         }
     );
     vol.push_str(&stack_table(&cols, &rows));
+    if snap.truncated {
+        vol.push_str(
+            "<p><small>There are more computers holding tasks than the page keeps; those with \
+             the most are listed, so the lists below are not complete.</small></p>\n",
+        );
+    }
     if order.len() > shown.len() {
         vol.push_str(&format!(
             "<p><small>The {} volunteers holding the most tasks are shown, of {}.</small></p>\n",

@@ -213,7 +213,7 @@ Workers that use it are deployed.
 
 `migrations/0008_dashboards.sql` must be applied before the pipeline or web Worker of this build
 is deployed: the pipeline writes `valid_results` and the rollup tables, and the web pages read
-them. It adds a column to `user` and `host` and counts the valid tasks still in the table into
+them. It adds `valid_results` and a sort key `recent_key` (filled with `ln`, which D1's SQLite has) to `user` and `host` and counts the valid tasks still in the table into
 it (one pass over the tasks of accounts and computers that have credit), builds six leaderboard
 indexes, replaces `res_host_inprog` with one that also holds the application, builds `res_received`
 and `wu_need_validate` unless the per-application server status migration already did, and creates

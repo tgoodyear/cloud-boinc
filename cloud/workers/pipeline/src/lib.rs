@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
 use cb_core::purge::{purge_pass, MAX_PURGE_BATCH};
-use cb_core::stats::rollup_pass;
+use cb_core::stats::{rollup_pass, FREE_PLAN_QUERIES};
 use cb_core::CoreResult;
 use cb_worker::{db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Files, BUCKET};
 use worker::{
@@ -118,16 +118,15 @@ async fn sweep(env: Env) -> Result<()> {
     Ok(())
 }
 
-async fn purge(env: Env) -> Result<()> {
-    let db = db(&env)?;
-    let project = project(&db).await.map_err(cb_worker::core_err)?;
+async fn purge(env: &Env, db: &cb_worker::D1Db) -> Result<()> {
+    let project = project(db).await.map_err(cb_worker::core_err)?;
     if project.config.purge_days <= 0.0 {
         return Ok(());
     }
     let files = R2Files(env.bucket(BUCKET)?);
     let (mut workunits, mut results) = (0, 0);
     for _ in 0..PURGE_PASSES {
-        let report = purge_pass(&db, &files, &project.config, now(), MAX_PURGE_BATCH)
+        let report = purge_pass(db, &files, &project.config, now(), MAX_PURGE_BATCH)
             .await
             .map_err(cb_worker::core_err)?;
         workunits += report.workunits;
@@ -145,9 +144,8 @@ async fn purge(env: Env) -> Result<()> {
 /// The counts behind the jobs overview and the charts (`cb_core::stats`).
 /// Runs in the purge trigger's invocation, every five minutes, after the
 /// purge, so that its queries do not come out of the sweep's allowance.
-async fn rollup(env: Env) -> Result<()> {
-    let db = db(&env)?;
-    let project = project(&db).await.map_err(cb_worker::core_err)?;
+async fn rollup(db: &cb_worker::D1Db) -> Result<()> {
+    let project = project(db).await.map_err(cb_worker::core_err)?;
     let now = now();
     // Purged workunits take their tasks with them, so a period that ended
     // before the purge horizon cannot be counted from what is left.
@@ -156,18 +154,26 @@ async fn rollup(env: Env) -> Result<()> {
     } else {
         0
     };
-    let report = rollup_pass(&db, now, not_before)
+    // The Free plan allows 50 queries an invocation, and the purge and the
+    // settings load before this have used some of them. What is not done now is
+    // done by the next pass.
+    let budget = FREE_PLAN_QUERIES.saturating_sub(db.statements() as usize + 2);
+    let report = rollup_pass(db, now, not_before, budget)
         .await
         .map_err(cb_worker::core_err)?;
+    if report.skipped_for_budget {
+        console_log!("rollup: skipped, {budget} queries left");
+    }
     if report.ran {
         console_log!(
-            "rollup: {} periods, {} apps, stmts={} trips={} read={} written={}",
+            "rollup: {} periods ({} postponed), {} apps, stmts={} trips={} read={} written={}",
             report.recounted.len(),
+            report.postponed,
             report.apps,
             db.statements(),
             db.round_trips(),
             db.rows_read(),
-            cb_db::Db::rows_written(&db),
+            cb_db::Db::rows_written(db),
         );
     }
     Ok(())
@@ -176,10 +182,18 @@ async fn rollup(env: Env) -> Result<()> {
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if event.cron() == PURGE_CRON {
-        if let Err(e) = purge(env.clone()).await {
+        // One handle for both, so the rollup knows what the purge used.
+        let db = match db(&env) {
+            Ok(db) => db,
+            Err(e) => {
+                console_error!("database: {e}");
+                return;
+            }
+        };
+        if let Err(e) = purge(&env, &db).await {
             console_error!("purge: {e}");
         }
-        if let Err(e) = rollup(env).await {
+        if let Err(e) = rollup(&db).await {
             console_error!("rollup: {e}");
         }
     } else if let Err(e) = sweep(env).await {
