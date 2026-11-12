@@ -630,6 +630,10 @@ fn unwanted_results_are_aborted() {
     let out = w.rpc(&req, 2100);
     assert_eq!(out.reply.result_aborts, vec!["j1_0", "gone_0"]);
     assert_eq!(out.reply.result_abort_if_not_starteds, vec!["j2_0"]);
+    // The volunteer is told about each abort, and about no other result.
+    assert!(has_message(&out, "Result j1_0 is no longer usable"));
+    assert!(has_message(&out, "Result gone_0 is no longer usable"));
+    assert!(!has_message(&out, "Result j2_0 is no longer usable"));
 }
 
 #[test]

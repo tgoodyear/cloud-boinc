@@ -1704,11 +1704,18 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             if reported.iter().any(|r| r.name == o.name) {
                 continue;
             }
+            // Each abort also tells the volunteer, as `send_result_abort` in
+            // `sched/handle_request.cpp` does.
+            let abort = |out: &mut SchedOutcome| {
+                out.reply.result_aborts.push(o.name.clone());
+                out.reply.messages.push(UserMessage::new(
+                    format!("Result {} is no longer usable", o.name),
+                    "low",
+                ));
+            };
             match other_rows.get(&o.name) {
-                None => out.reply.result_aborts.push(o.name.clone()),
-                Some(r) if r.error_mask & WU_ERROR_CANCELLED != 0 => {
-                    out.reply.result_aborts.push(o.name.clone())
-                }
+                None => abort(&mut out),
+                Some(r) if r.error_mask & WU_ERROR_CANCELLED != 0 => abort(&mut out),
                 Some(r)
                     if r.assimilate_state == ASSIMILATE_DONE
                         || (r.server_state == RESULT_SERVER_STATE_OVER

@@ -3,7 +3,7 @@
 #
 #   stock.sh --action build [--source DIR] [--image NAME] [--jobs N]
 #   stock.sh --action start [--image NAME] [--name NAME] [--port N] [--public-port N]
-#                           [--state DIR]
+#                           [--state DIR] [--project NAME] [--url-base URL] [--fixtures DIR]
 #   stock.sh --action reset [--name NAME]
 #   stock.sh --action stop  [--name NAME]
 #   stock.sh --action logs  [--name NAME]
@@ -18,6 +18,11 @@
 #         it is printed on stdout. Returns when the server answers.
 #         --public-port is the port the project's URLs name, when a proxy
 #         sits in front of the server (see record.sh); default --port.
+#         --project is the project's short name (default diff), --url-base the
+#         URL its master URL is built on (default http://127.0.0.1:<public
+#         port>/) and --fixtures a directory laid out like project/ (default
+#         project/ next to this script); the migration check
+#         (cloud/tests/migration-check) sets all three.
 # reset   Puts the project back into the starting state of fixtures/ and
 #         restarts the feeder, so the next replay begins from the same rows.
 # stop    Stops and removes the container.
@@ -27,7 +32,7 @@
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 action="" source="$here/../../.." image="cloud-boinc-stock" name="cloud-boinc-stock"
-port=18480 public_port="" state="" jobs=2
+port=18480 public_port="" state="" jobs=2 project=diff url_base="" fixtures="$here/project"
 while [ $# -gt 0 ]; do
     [ $# -ge 2 ] || { sed -n "2,30p" "$0" >&2; exit 2; }
     case "$1" in
@@ -37,6 +42,9 @@ while [ $# -gt 0 ]; do
         --name) name="$2" ;;
         --port) port="$2" ;;
         --public-port) public_port="$2" ;;
+        --project) project="$2" ;;
+        --url-base) url_base="$2" ;;
+        --fixtures) fixtures="$2" ;;
         --state) state="$2" ;;
         --jobs) jobs="$2" ;;
         *) sed -n "2,30p" "$0" >&2; exit 2 ;;
@@ -66,12 +74,17 @@ start)
     [ -n "$state" ] || state="$(mktemp -d "${TMPDIR:-/tmp}/cloud-boinc-stock.XXXXXX")"
     mkdir -p "$state"
     state="$(cd "$state" && pwd)"
+    # A source without a slash is a named volume to the container engine, so --fixtures is
+    # made absolute, as --state is.
+    [ -d "$fixtures" ] || { echo "stock.sh: --fixtures $fixtures is not a directory" >&2; exit 1; }
+    fixtures="$(cd "$fixtures" && pwd)"
     rm -f "$state/serving"
     "$engine" rm -f "$name" >/dev/null 2>&1 || true
     "$engine" run -d --name "$name" --network host \
-        -v "$state:/state" -v "$here/project:/fixtures:ro" \
+        -v "$state:/state" -v "$fixtures:/fixtures:ro" \
         -v "$here/stock:/opt/differential:ro" \
-        "$image" --port "$port" --public-port "${public_port:-$port}" >/dev/null
+        "$image" --port "$port" --public-port "${public_port:-$port}" \
+        --project "$project" ${url_base:+--url-base "$url_base"} >/dev/null
     i=0
     while [ ! -f "$state/serving" ]; do
         i=$((i + 1))
