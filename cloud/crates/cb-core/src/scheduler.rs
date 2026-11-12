@@ -2223,6 +2223,19 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // without a feeder" in `docs/architecture.md`. The IDs and numbers are
     // integers of the catalog and the plan class file. The client's own
     // versions are none: an app with a client version has no clause.
+    // The routing conditions one request may write into its statements, in
+    // bytes. Past it a gate leaves them out, and `admitted` alone enforces the
+    // rules, which can let a window of refused results through. A statement is
+    // limited to 100,000 bytes on D1.
+    let routing_sql_left = std::cell::Cell::new(40_000usize);
+    let routing_sql = |text: String| -> String {
+        if text.len() <= routing_sql_left.get() {
+            routing_sql_left.set(routing_sql_left.get() - text.len());
+            text
+        } else {
+            String::new()
+        }
+    };
     let version_gate = |app_id: i64, assigned: bool| -> String {
         let app_name = catalog.app(app_id).map_or("", |a| a.name.as_str());
         let hav = catalog
@@ -2233,7 +2246,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let Some(av) = v.av else {
                 // The client's own version takes any workunit of a plain
                 // app (`admitted` below), but not one a routing rule selects.
-                let refused = ctx.routing.sql_condition(app_name, assigned, None);
+                let refused = routing_sql(ctx.routing.sql_condition(app_name, assigned, None));
                 return if refused.is_empty() {
                     "1 = 1".to_string()
                 } else {
@@ -2269,7 +2282,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             };
             // A workunit a routing rule refuses this version for
             // (`RoutingRules::permits`, below in `admitted`).
-            let refused = ctx.routing.sql_condition(
+            let refused = routing_sql(ctx.routing.sql_condition(
                 app_name,
                 assigned,
                 Some(&VersionRef {
@@ -2277,7 +2290,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     plan_class: v.plan_class,
                     version_num: v.version_num,
                 }),
-            );
+            ));
             if !refused.is_empty() {
                 clause.push_str(" AND ");
                 clause.push_str(&refused);

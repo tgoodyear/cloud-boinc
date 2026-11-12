@@ -22,9 +22,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, CoreResult};
 
-/// The most rules, and the most entries in one rule's `allow` list.
-pub const MAX_RULES: usize = 256;
+/// The most rules, and the most entries in one rule's `allow` list. The rule
+/// limit keeps the text a rule adds to a query small (see `sql_condition`).
+pub const MAX_RULES: usize = 64;
 pub const MAX_ALLOW: usize = 256;
+/// The longest name pattern: D1 refuses a `GLOB` or `LIKE` pattern over 50 bytes.
+pub const MAX_PATTERN: usize = 50;
 
 /// One entry of a rule's `allow` list. Every field that is set must match.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -115,7 +118,7 @@ fn word(s: &str) -> bool {
 
 fn pattern_ok(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= 254
+        && s.len() <= MAX_PATTERN
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-*?".contains(c))
 }
@@ -138,7 +141,7 @@ impl RoutingRule {
         self.app == app
             && (!assigned || self.assigned)
             && self.name.as_deref().is_none_or(|p| glob_match(p, name))
-            && batch >= self.min_batch
+            && (self.min_batch == 0 || batch >= self.min_batch)
             && (self.max_batch == 0 || batch <= self.max_batch)
     }
 
@@ -198,7 +201,7 @@ impl RoutingRules {
             if r.name.as_deref().is_some_and(|p| !pattern_ok(p)) {
                 return Err(invalid(
                     i,
-                    "name may hold only letters, digits, . _ - and the wildcards * and ?",
+                    "name may hold only letters, digits, . _ - and the wildcards * and ?, up to 50 bytes",
                 ));
             }
             if r.min_batch < 0 || r.max_batch < 0 || (r.max_batch != 0 && r.min_batch > r.max_batch)
@@ -264,6 +267,12 @@ impl RoutingRules {
     /// The same decision as a condition on workunit rows `w`, to leave out of a
     /// query the rows that [`permits`](Self::permits) would refuse; empty when no
     /// rule of the app can refuse this version.
+    ///
+    /// One `CASE` that lists the app's rules in order, each `WHEN` selector once,
+    /// so the text is linear in the number of rules, and stops after the last rule
+    /// that refuses the version (the rules after it cannot change the outcome).
+    /// The first selector that holds decides, as in `permits`. With the limits on
+    /// rules and patterns one version adds at most a few kilobytes.
     pub fn sql_condition(
         &self,
         app: &str,
@@ -275,23 +284,19 @@ impl RoutingRules {
             .iter()
             .filter(|r| r.app == app && (!assigned || r.assigned))
             .collect();
-        let mut refused: Vec<String> = Vec::new();
-        for (i, r) in mine.iter().enumerate() {
-            if r.allows(version) {
-                continue;
-            }
-            let mut terms: Vec<String> = mine[..i]
-                .iter()
-                .map(|e| format!("NOT {}", e.sql_selects()))
-                .collect();
-            terms.push(r.sql_selects());
-            refused.push(format!("({})", terms.join(" AND ")));
+        let Some(last) = mine.iter().rposition(|r| !r.allows(version)) else {
+            return String::new();
+        };
+        let mut sql = String::from("CASE");
+        for r in &mine[..=last] {
+            sql.push_str(&format!(
+                " WHEN {} THEN {}",
+                r.sql_selects(),
+                u8::from(!r.allows(version))
+            ));
         }
-        if refused.is_empty() {
-            String::new()
-        } else {
-            format!("NOT ({})", refused.join(" OR "))
-        }
+        sql.push_str(" ELSE 0 END = 0");
+        sql
     }
 }
 
@@ -410,11 +415,14 @@ mod tests {
         let r = RoutingRules::parse(DOC).unwrap();
         let lin = v("x86_64-pc-linux-gnu", "", 3);
         let c = r.sql_condition("calib", false, Some(&lin));
-        // Rule 1 allows it; rule 2 does not (plan class), rule 3 does not (empty
-        // list), each only where no earlier rule selected the row.
-        assert!(c.contains("NOT (w.name GLOB 'calib_a_*')"), "{c}");
-        assert!(c.starts_with("NOT ("), "{c}");
-        assert!(c.contains("w.batch >= 10 AND w.batch <= 20"), "{c}");
+        // Rule 1 allows the version, rules 2 and 3 do not; the selectors come in
+        // rule order, once each.
+        assert_eq!(
+            c,
+            "CASE WHEN (w.name GLOB 'calib_a_*') THEN 0 \
+             WHEN (w.batch >= 10 AND w.batch <= 20) THEN 1 \
+             WHEN (w.name GLOB 'calib_*') THEN 1 ELSE 0 END = 0"
+        );
         // For assigned jobs only the rules that apply to them count.
         let c = r.sql_condition("calib", true, Some(&lin));
         assert!(!c.contains("w.batch"), "{c}");
@@ -424,10 +432,45 @@ mod tests {
         let only =
             RoutingRules::parse(r#"{"rules":[{"app":"a","allow":[{"platform":"p"}]}]}"#).unwrap();
         assert_eq!(only.sql_condition("a", false, Some(&v("p", "", 1))), "");
+        let refused = "CASE WHEN 1 = 1 THEN 1 ELSE 0 END = 0";
         assert_eq!(
             only.sql_condition("a", false, Some(&v("q", "", 1))),
-            "NOT ((1 = 1))"
+            refused
         );
-        assert_eq!(only.sql_condition("a", false, None), "NOT ((1 = 1))");
+        assert_eq!(only.sql_condition("a", false, None), refused);
+    }
+
+    #[test]
+    fn patterns_are_limited_to_what_d1_accepts() {
+        let ok = format!(r#"{{"rules":[{{"app":"a","name":"{}"}}]}}"#, "x".repeat(50));
+        assert!(RoutingRules::parse(&ok).is_ok());
+        let long = format!(r#"{{"rules":[{{"app":"a","name":"{}"}}]}}"#, "x".repeat(51));
+        assert!(RoutingRules::parse(&long).is_err());
+    }
+
+    #[test]
+    fn the_worst_accepted_rule_set_stays_small() {
+        // The most rules, each with the longest pattern and both batch bounds at
+        // their widest, none of which allows the version.
+        let rule = format!(
+            r#"{{"app":"a","name":"{}","min_batch":9223372036854775806,"max_batch":9223372036854775807,"allow":[]}}"#,
+            "x".repeat(50)
+        );
+        let rules = vec![rule; MAX_RULES].join(",");
+        let r = RoutingRules::parse(&format!(r#"{{"rules":[{rules}]}}"#)).unwrap();
+        let c = r.sql_condition("a", false, Some(&v("p", "", 1)));
+        assert!(c.len() < 12_000, "{} bytes", c.len());
+        // And one more rule is refused.
+        let rules = vec![r#"{"app":"a"}"#; MAX_RULES + 1].join(",");
+        assert!(RoutingRules::parse(&format!(r#"{{"rules":[{rules}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn a_zero_bound_is_no_bound_even_for_a_negative_batch() {
+        let r = RoutingRules::parse(r#"{"rules":[{"app":"a","allow":[]}]}"#).unwrap();
+        assert!(!r.permits("a", "n", -3, false, Some(&v("p", "", 1))));
+        let r = RoutingRules::parse(r#"{"rules":[{"app":"a","min_batch":2,"allow":[]}]}"#).unwrap();
+        assert!(r.permits("a", "n", -3, false, Some(&v("p", "", 1))));
+        assert!(!r.permits("a", "n", 2, false, Some(&v("p", "", 1))));
     }
 }

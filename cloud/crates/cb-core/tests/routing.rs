@@ -311,3 +311,15 @@ fn the_setting_is_checked_loaded_and_removed() {
     assert!(block_on(Project::load(&db)).unwrap().routing.is_empty());
     assert!(block_on(delete_setting(&db, SETTING_CONFIG)).is_err());
 }
+
+#[test]
+fn a_negative_batch_is_selected_like_any_other_when_no_minimum_is_set() {
+    let w = World::new(r#"{"rules":[{"app":"a","max_batch":9,"allow":[{"max_version":1}]}]}"#);
+    let host = w.host();
+    let wu = w.submit(&["neg_1"], -3, None)[0];
+    // The rule selects batch -3 (no minimum), allows no version the host has, so
+    // the workunit is not sent: the query and the loop agree.
+    let out = w.rpc(host, 2, None, 2000);
+    assert_eq!(out.n_sent, 0);
+    assert_eq!(sent_with(&w, wu), None);
+}

@@ -672,7 +672,7 @@ Where it applies, in `handle_request` in `crates/cb-core/src/scheduler.rs`:
 - Unsent results: the `admitted` test that picks a version for each candidate, next to the plan
   class windows. The candidate and assigned-job queries carry the same decision as a condition on
   the workunit (`RoutingRules::sql_condition`, a `GLOB` on `workunit.name` and bounds on
-  `workunit.batch`, written into the `version_gate` clause of each version), so a window of
+  `workunit.batch`, a minimum or maximum of 0 meaning no bound (also for a negative batch), written into the `version_gate` clause of each version), so a window of
   results no version of the host can take does not hide the ones it can (see "Dispatch without a
   feeder").
 - Lost results: a resend is skipped, and the result allowed to expire, when a rule refuses the
@@ -688,7 +688,7 @@ Cost. The rules are loaded with the other settings in the one query of `Project:
 for the 30-second cache lifetime, so there is no extra query. With no rule the setting is absent
 and the checks return at once; no SQL text changes. With rules, the candidate query text is longer
 and each candidate costs a few string comparisons; the number of statements and bound parameters
-is the same. A rule set is limited to 256 rules of 256 entries each.
+is the same. A rule set is limited to 64 rules of 256 entries each, and a name pattern to 50 bytes (D1 refuses a longer `GLOB` pattern). The condition for a version is one `CASE` that lists the app's rules in order, so its size is linear in the number of rules (at most a few kilobytes), and one request writes at most 40,000 bytes of routing conditions into its statements, against D1's limit of 100,000 bytes for one statement. Past that budget the queries leave the conditions out and only the dispatch loop enforces the rules, which can let a window of refused results through, as in a project without the conditions.
 
 Managed with `cboinc routing-show`, `routing-set --file F` and `routing-clear`
 (`GET`, `PUT` and `DELETE /admin/v1/routing`). `PUT` replaces the whole document after it has been
