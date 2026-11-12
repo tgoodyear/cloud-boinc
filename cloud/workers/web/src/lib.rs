@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use cb_core::mail::Mailer;
-use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS};
+use cb_core::site::{
+    auth_from_cookie, robots_txt, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS,
+};
 use cb_core::stock::{route_web, url_origin, WebRoute};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, html_cache_control, lookup_account,
@@ -47,12 +49,17 @@ fn cacheable_xml(body: String) -> Result<Response> {
 }
 
 /// A site page. These depend on the visitor's cookie, so no cache keeps them.
-fn site_response(page: SitePage) -> Result<Response> {
+fn site_response(page: SitePage, robots_tag: &str) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", page.content_type)?;
     headers.set("Cache-Control", &html_cache_control("private, no-store"))?;
     for (name, value) in SITE_HEADERS {
         headers.set(name, value)?;
+    }
+    // The project's `robots_tag` setting, for the account pages only: the
+    // master page and the RPCs are not sent through here.
+    if !robots_tag.is_empty() {
+        headers.set("X-Robots-Tag", robots_tag)?;
     }
     if let Some(location) = &page.location {
         headers.set("Location", location)?;
@@ -197,6 +204,13 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             }
             Ok(response)
         }
+        "/robots.txt" => Ok(Response::builder()
+            .with_header("Content-Type", "text/plain; charset=utf-8")?
+            .with_header(
+                "Cache-Control",
+                &format!("public, max-age={PAGE_CACHE_SECS}"),
+            )?
+            .fixed(robots_txt(project.config.stock.as_ref()).into_bytes())),
         "/server_status.php" => {
             let q = params(&mut req).await?;
             let now = now();
@@ -301,7 +315,7 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
                 mailer: mail.as_ref().map(|m| m as &dyn Mailer),
             };
             match site_page(&ctx, p, &q).await {
-                Ok(Some(page)) => site_response(page),
+                Ok(Some(page)) => site_response(page, &project.config.robots_tag),
                 Ok(None) => text(404, "not found\n"),
                 Err(e) => {
                     console_error!("{p}: {e}");

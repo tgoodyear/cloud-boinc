@@ -414,7 +414,8 @@ fn status_counts_come_from_a_snapshot_until_it_expires() {
     let before = db.statements();
     let cached = block_on(server_status(&db, 1000 + STATUS_COUNTS_TTL - 1)).unwrap();
     assert_eq!((cached.hosts, cached.hosts_with_recent_credit), (0, 0));
-    assert_eq!(db.statements() - before, 5);
+    // The snapshot and the pipeline's last sweep, one batch.
+    assert_eq!(db.statements() - before, 2);
 
     // Past the TTL: counts are recomputed and stored again.
     let fresh = block_on(server_status(&db, 1000 + STATUS_COUNTS_TTL)).unwrap();

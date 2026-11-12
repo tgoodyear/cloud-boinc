@@ -53,6 +53,22 @@ enum Command {
         #[command(flatten)]
         server: Server,
     },
+    /// Per-application work summary: unsent, in progress, received, validated
+    /// and failed in the last 24 hours, oldest unsent age, workunits waiting,
+    /// and whether the pipeline's cron is running.
+    Summary {
+        #[command(flatten)]
+        server: Server,
+        /// Largest age in seconds of the figures; 0 computes them again.
+        #[arg(long, default_value_t = 600)]
+        max_age: i64,
+        /// Only this application.
+        #[arg(long)]
+        app: Option<String>,
+        /// Exit with an error if the pipeline's cron has not run lately.
+        #[arg(long)]
+        check: bool,
+    },
     /// Platforms, apps and app versions.
     Catalog {
         #[command(flatten)]
@@ -496,6 +512,29 @@ fn run(cli: Cli) -> Res<()> {
             );
         }
         Command::Status { server } => show(&Client::new(&server)?.get("status")?),
+        Command::Summary {
+            server,
+            max_age,
+            app,
+            check,
+        } => {
+            let mut v = Client::new(&server)?.get(&format!("summary?max_age={max_age}"))?;
+            if let Some(name) = &app {
+                let apps = v["apps"].as_array().cloned().unwrap_or_default();
+                let kept: Vec<Value> = apps
+                    .into_iter()
+                    .filter(|a| a["name"].as_str() == Some(name.as_str()))
+                    .collect();
+                if kept.is_empty() {
+                    return Err(format!("no application named {name}"));
+                }
+                v["apps"] = Value::Array(kept);
+            }
+            show(&v);
+            if check && v["pipeline"]["running"] != Value::Bool(true) {
+                return Err("the pipeline's cron has not run lately".into());
+            }
+        }
         Command::Catalog { server } => show(&Client::new(&server)?.get("catalog")?),
         Command::ConfigGet { server, name } => {
             let c = Client::new(&server)?;

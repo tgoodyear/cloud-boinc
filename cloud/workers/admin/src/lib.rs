@@ -7,6 +7,7 @@ use cb_core::admin::{
     NewPlatform, ResetTarget, ResetWhat,
 };
 use cb_core::project::{change_config_tag, get_setting, put_setting, SETTING_CONFIG};
+use cb_core::status::{operator_summary, STATUS_COUNTS_TTL};
 use cb_core::web::{make_user, server_status, NewAccount};
 use cb_core::work::{
     acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate,
@@ -266,6 +267,17 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
     let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
     match (&method, parts.as_slice()) {
         (Method::Get, ["status"]) => reply(server_status(&db, now()).await),
+        // The figures a monitor polls: per application, from a snapshot at
+        // most `max_age` seconds old (0 computes them again).
+        (Method::Get, ["summary"]) => {
+            let max_age = req
+                .url()?
+                .query_pairs()
+                .find(|(k, _)| k == "max_age")
+                .and_then(|(_, v)| v.parse::<i64>().ok())
+                .map_or(STATUS_COUNTS_TTL, |v| v.max(0));
+            reply(operator_summary(&db, now(), max_age).await)
+        }
 
         (Method::Get, ["config", name]) => match get_setting(&db, name).await {
             Ok(Some(v)) => text(200, &v),

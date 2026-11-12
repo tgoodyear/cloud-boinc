@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
 use cb_core::purge::{purge_pass, MAX_PURGE_BATCH};
+use cb_core::site_delete::delete_account_steps;
+use cb_core::status::record_sweep;
 use cb_core::CoreResult;
 use cb_worker::{db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Files, BUCKET};
 use worker::{
@@ -93,6 +95,10 @@ async fn queue(batch: MessageBatch<i64>, env: Env, _ctx: Context) -> Result<()> 
 
 async fn sweep(env: Env) -> Result<()> {
     let runner = Runner::new(&env).await?;
+    // The status pages report from this whether the pipeline runs.
+    if let Err(e) = record_sweep(&runner.db, now()).await {
+        console_error!("sweep time: {e}");
+    }
     let due = due_workunits(&runner.db, now(), SWEEP_LIMIT)
         .await
         .map_err(cb_worker::core_err)?;
@@ -117,7 +123,33 @@ async fn sweep(env: Env) -> Result<()> {
     Ok(())
 }
 
+/// Statements one run of the purge cron spends on account deletions. The
+/// purge's own passes cost up to 24 round trips of the 50 queries an
+/// invocation may run, so this leaves room for them.
+const DELETION_STATEMENTS: usize = 22;
+
+/// Continues the account deletions that the site started (see
+/// `cb_core::site_delete`); every pass is bounded, so a large account is
+/// removed over several runs.
+async fn deletions(env: &Env) -> Result<()> {
+    let db = db(env)?;
+    let report = delete_account_steps(&db, now(), DELETION_STATEMENTS)
+        .await
+        .map_err(cb_worker::core_err)?;
+    if report.finished > 0 || report.pending > 0 {
+        console_log!(
+            "account deletions: {} finished, {} pending",
+            report.finished,
+            report.pending
+        );
+    }
+    Ok(())
+}
+
 async fn purge(env: Env) -> Result<()> {
+    if let Err(e) = deletions(&env).await {
+        console_error!("account deletions: {e}");
+    }
     let db = db(&env)?;
     let project = project(&db).await.map_err(cb_worker::core_err)?;
     if project.config.purge_days <= 0.0 {
