@@ -388,6 +388,10 @@ pub struct XmlParser<'a> {
     tag: String,
     attrs: String,
     is_tag: bool,
+    /// Where the last token read by `get_tag` starts.
+    start: usize,
+    /// Whether the last token was a CDATA section.
+    cdata: bool,
 }
 
 impl<'a> XmlParser<'a> {
@@ -402,7 +406,22 @@ impl<'a> XmlParser<'a> {
             tag: String::new(),
             attrs: String::new(),
             is_tag: false,
+            start: 0,
+            cdata: false,
         }
+    }
+
+    /// Byte offset of the first byte of the token the last
+    /// [`get_tag`](Self::get_tag) read: the `<` of a tag, the first
+    /// non-space byte of text. The token ends at [`pos`](Self::pos).
+    pub fn token_start(&self) -> usize {
+        self.start
+    }
+
+    /// Whether the last token was the text of a CDATA section, which is not
+    /// unescaped.
+    pub fn is_cdata(&self) -> bool {
+        self.cdata
     }
 
     /// Byte offset of the next unread byte.
@@ -505,6 +524,7 @@ impl<'a> XmlParser<'a> {
     fn get_aux(&mut self) -> Option<(Scan, String, String)> {
         loop {
             let c = self.scan_nonws()?;
+            self.start = self.pos - 1;
             if c == b'<' {
                 match self.scan_tag()? {
                     RawTag::Comment => continue,
@@ -537,6 +557,7 @@ impl<'a> XmlParser<'a> {
             None => false,
             Some((kind, text, attrs)) => {
                 self.is_tag = matches!(kind, Scan::Tag);
+                self.cdata = matches!(kind, Scan::Cdata);
                 self.tag = text;
                 self.attrs = attrs;
                 true

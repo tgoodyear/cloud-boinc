@@ -123,7 +123,7 @@ impl World {
                     now,
                     &NewApp {
                         name: a["name"].as_str().unwrap().into(),
-                        user_friendly_name: a["user_friendly_name"].as_str().unwrap().into(),
+                        user_friendly_name: Some(a["user_friendly_name"].as_str().unwrap().into()),
                         ..Default::default()
                     },
                 )

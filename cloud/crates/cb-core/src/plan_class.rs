@@ -22,6 +22,14 @@
 //!   the volunteer. Nothing is recorded here.
 //! - Patterns are compiled by the `regex` crate, not as POSIX extended
 //!   regular expressions. The common syntax behaves the same.
+//! - `max_gpu_ram_mb` is not upstream: a class may bound the host's GPU RAM
+//!   from above as well as below.
+//! - `<gpu_type>apple</gpu_type>` and `apple_gpu` both select the host's Apple
+//!   GPU and make a version of the class an Apple GPU version. Upstream's host
+//!   check knows only `apple` and its processor type only `apple_gpu`, so a
+//!   class spelled `apple` runs as a CPU version there, and one spelled
+//!   `apple_gpu` finds the GPU as a generic coprocessor with no Metal check
+//!   and no RAM figure.
 //! - `host_summary_regex` is not in current upstream; it is matched against
 //!   the stored host summary the way older upstream versions did.
 
@@ -214,6 +222,9 @@ pub struct PlanClassSpec {
     // GPU apps
     pub cpu_frac: f64,
     pub min_gpu_ram_mb: f64,
+    /// Not upstream: the most GPU RAM a host may have for the class. Off
+    /// when 0, and for a GPU whose RAM is not known.
+    pub max_gpu_ram_mb: f64,
     pub gpu_ram_used_mb: f64,
     pub gpu_peak_flops_scale: f64,
     pub ngpus: f64,
@@ -301,6 +312,7 @@ impl Default for PlanClassSpec {
             max_batch: 0,
             cpu_frac: 0.1,
             min_gpu_ram_mb: 0.0,
+            max_gpu_ram_mb: 0.0,
             gpu_ram_used_mb: 0.0,
             gpu_peak_flops_scale: 1.0,
             ngpus: 1.0,
@@ -687,6 +699,7 @@ impl PlanClassSpec {
             // GPU info
             take!(xp.parse_double("cpu_frac") => pc.cpu_frac);
             take!(xp.parse_double("min_gpu_ram_mb") => pc.min_gpu_ram_mb);
+            take!(xp.parse_double("max_gpu_ram_mb") => pc.max_gpu_ram_mb);
             take!(xp.parse_double("gpu_ram_used_mb") => pc.gpu_ram_used_mb);
             take!(xp.parse_double("gpu_peak_flops_scale") => pc.gpu_peak_flops_scale);
             take!(xp.parse_double("ngpus") => pc.ngpus);
@@ -742,7 +755,6 @@ impl PlanClassSpec {
         )))
     }
 
-    /// Host-dependent checks only. None when the host cannot use the class.
     /// The processor type a version of this class uses, from the spelling
     /// of `gpu_type` as upstream; `PROC_TYPE_CPU` for anything else.
     pub fn proc_type(&self) -> i32 {
@@ -753,13 +765,14 @@ impl PlanClassSpec {
             PROC_TYPE_NVIDIA_GPU
         } else if gpu_type.starts_with("intel") {
             PROC_TYPE_INTEL_GPU
-        } else if gpu_type.starts_with("apple_gpu") {
+        } else if gpu_type == "apple" || gpu_type.starts_with("apple_gpu") {
             PROC_TYPE_APPLE_GPU
         } else {
             PROC_TYPE_CPU
         }
     }
 
+    /// Host-dependent checks only. None when the host cannot use the class.
     pub fn check(&self, host: &PlanHost<'_>) -> Option<HostUsage> {
         self.evaluate(host).ok()
     }
@@ -1242,7 +1255,7 @@ impl PlanClassSpec {
             }));
         }
 
-        if gpu_type == "apple" {
+        if gpu_type == "apple" || gpu_type.starts_with("apple_gpu") {
             let Some(cp) = coprocs.apple_gpu.as_ref().filter(|c| c.base.count != 0) else {
                 return reject("No Apple GPUs found");
             };
@@ -1347,6 +1360,16 @@ impl PlanClassSpec {
             ));
         }
 
+        // Not upstream. A GPU whose RAM is not known passes, as an unknown
+        // driver version does.
+        if self.max_gpu_ram_mb != 0.0 && gpu.ram > 0.0 && self.max_gpu_ram_mb * MEGA < gpu.ram {
+            return reject(format!(
+                "GPU RAM allowed max: {}, supplied: {}",
+                self.max_gpu_ram_mb * MEGA,
+                gpu.ram
+            ));
+        }
+
         // An unknown driver version (0) passes.
         let (min, max) = (
             i64::from(self.min_driver_version),
@@ -1414,7 +1437,7 @@ impl PlanClassSpec {
 
         // As upstream, the type is taken from the spelling of gpu_type. A
         // type that is none of these leaves a CPU app with the speed
-        // estimates above; "apple" is among them, only "apple_gpu" counts.
+        // estimates above. Unlike upstream, `apple` is an Apple GPU too.
         let proc_type = self.proc_type();
         if proc_type != PROC_TYPE_CPU {
             hu.proc_type = proc_type;
@@ -1626,6 +1649,42 @@ mod tests {
         <max_driver_version>50000</max_driver_version>
     </plan_class>
     <plan_class>
+        <name>cuda_small</name>
+        <gpu_type>nvidia</gpu_type>
+        <cuda/>
+        <max_gpu_ram_mb>4096</max_gpu_ram_mb>
+    </plan_class>
+    <plan_class>
+        <name>cuda_room</name>
+        <gpu_type>nvidia</gpu_type>
+        <cuda/>
+        <min_gpu_ram_mb>4096</min_gpu_ram_mb>
+        <max_gpu_ram_mb>8192</max_gpu_ram_mb>
+    </plan_class>
+    <plan_class>
+        <name>metal</name>
+        <gpu_type>apple_gpu</gpu_type>
+        <min_metal_support>3</min_metal_support>
+        <min_gpu_ram_mb>8192</min_gpu_ram_mb>
+        <gpu_ram_used_mb>2048</gpu_ram_used_mb>
+        <gpu_peak_flops_scale>.5</gpu_peak_flops_scale>
+        <cpu_frac>.05</cpu_frac>
+    </plan_class>
+    <plan_class>
+        <name>metal_new</name>
+        <gpu_type>apple</gpu_type>
+        <min_metal_support>9</min_metal_support>
+    </plan_class>
+    <plan_class>
+        <name>metal_old_spelling</name>
+        <gpu_type>apple</gpu_type>
+    </plan_class>
+    <plan_class>
+        <name>metal_max_ram</name>
+        <gpu_type>apple_gpu</gpu_type>
+        <max_gpu_ram_mb>4096</max_gpu_ram_mb>
+    </plan_class>
+    <plan_class>
         <name>opencl_nvidia</name>
         <gpu_type>nvidia</gpu_type>
         <opencl/>
@@ -1719,6 +1778,25 @@ mod tests {
     </plan_class>
 </plan_classes>
 "#;
+
+    /// What a current client reports for an Apple silicon GPU: 16 GiB of
+    /// unified memory, Metal 3.
+    const APPLE: &str = r#"<coproc_apple_gpu>
+   <count>1</count>
+   <model>Apple M2 Pro</model>
+   <available_ram>17179869184.000000</available_ram>
+   <have_metal>1</have_metal>
+   <have_opencl>1</have_opencl>
+   <ncores>19</ncores>
+   <metal_support>3</metal_support>
+   <peak_flops>6800000000000.000000</peak_flops>
+   <coproc_opencl>
+      <name>Apple M2 Pro</name>
+      <vendor>Apple</vendor>
+      <global_mem_size>17179869184</global_mem_size>
+      <opencl_device_version>OpenCL 1.2 </opencl_device_version>
+   </coproc_opencl>
+</coproc_apple_gpu>"#;
 
     const NVIDIA: &str = r#"<coproc_cuda>
    <count>1</count>
@@ -1835,6 +1913,44 @@ mod tests {
         cb_proto::sched_request::parse(&xml).unwrap()
     }
 
+    #[test]
+    fn apple_gpu_plan_classes() {
+        let s = specs();
+        let apple = linux_request(APPLE);
+        let host = plan_host(&apple);
+        // Spelled `apple_gpu`: the GPU's RAM (the client's `available_ram`)
+        // and Metal level are checked, and the version is an Apple GPU one.
+        let hu = s.check("metal", &host).unwrap();
+        assert_eq!(hu.proc_type, PROC_TYPE_APPLE_GPU);
+        assert_eq!(hu.gpu_usage, 1.0);
+        assert_eq!(hu.gpu_ram, 2048.0 * MEGA);
+        // The GPU's speed is scaled: 6.8 TFLOPS * .5 plus the CPU share.
+        assert!(
+            hu.peak_flops > 3.4e12 && hu.peak_flops < 3.5e12,
+            "{}",
+            hu.peak_flops
+        );
+        // Metal 3 is below the 9 asked for.
+        let err = s.evaluate("metal_new", &host).unwrap_err();
+        assert!(err.reason.contains("Metal support"), "{}", err.reason);
+        // `apple` is an Apple GPU version too, where upstream makes it a CPU one.
+        let hu = s.check("metal_old_spelling", &host).unwrap();
+        assert_eq!(hu.proc_type, PROC_TYPE_APPLE_GPU);
+        // 16 GiB is over the 4 GiB maximum.
+        assert!(s.check("metal_max_ram", &host).is_none());
+        // A host with no Apple GPU, or one with 4 GiB, does not match.
+        let nvidia = linux_request(NVIDIA);
+        assert!(s.check("metal", &plan_host(&nvidia)).is_none());
+        let small = linux_request(&APPLE.replace("17179869184.000000", "4294967296.000000"));
+        let err = s.evaluate("metal", &plan_host(&small)).unwrap_err();
+        assert!(
+            err.reason.contains("GPU RAM required min"),
+            "{}",
+            err.reason
+        );
+        assert!(s.check("metal_max_ram", &plan_host(&small)).is_some());
+    }
+
     fn plan_host(request: &SchedulerRequest) -> PlanHost<'_> {
         PlanHost {
             request,
@@ -1857,7 +1973,7 @@ mod tests {
     #[test]
     fn parses_a_spec_file() {
         let s = specs();
-        assert_eq!(s.classes.len(), 29);
+        assert_eq!(s.classes.len(), 35);
         let mt = s.find("mt").unwrap();
         assert_eq!(mt.min_ncpus, 2.0);
         assert_eq!(mt.max_threads, 8);
@@ -2113,6 +2229,14 @@ mod tests {
         assert!(err.reason.contains("driver version required min"));
         let err = s.evaluate("cuda_old_driver", &host).unwrap_err();
         assert!(err.reason.contains("driver version required max"));
+
+        // The host's GPU has 8 GiB. `max_gpu_ram_mb` is not upstream.
+        let err = s.evaluate("cuda_small", &host).unwrap_err();
+        assert!(err.reason.contains("GPU RAM allowed max"), "{}", err.reason);
+        assert!(s.check("cuda_room", &host).is_some());
+        // A GPU whose RAM is not known passes the maximum.
+        let unknown = linux_request(&NVIDIA.replace("totalGlobalMem", "x"));
+        assert!(s.check("cuda_small", &plan_host(&unknown)).is_some());
 
         // No such GPU.
         let err = s.evaluate("amd", &host).unwrap_err();

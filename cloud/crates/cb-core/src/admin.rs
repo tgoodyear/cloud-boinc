@@ -1,6 +1,8 @@
 //! Project administration: what upstream does with `xadd`, `update_versions`
 //! and the ops pages. Every function is one admin API operation.
 
+use std::collections::HashMap;
+
 use cb_crypto::{verify_md5, PublicKey};
 use cb_db::{query, query_one, stmt, Db, Stmt, Value};
 use cb_proto::upload::is_valid_filename;
@@ -10,6 +12,22 @@ use serde::{Deserialize, Serialize};
 use crate::hr::HR_NTYPES;
 use crate::model::{App, AppVersion, JobResult, Platform, Workunit};
 use crate::{Config, CoreError, CoreResult};
+
+/// Most names in one `IN (...)` list; D1 allows 100 bound parameters.
+const MAX_IN_LIST: usize = 90;
+/// Files to a statement of `add_app_version`, which sends them as one JSON
+/// value; at most 200 names of 255 bytes and their MD5s, under 60 KB.
+const JSON_CHUNK: usize = 200;
+/// Longest file name of an app version.
+const MAX_FILE_NAME: usize = 255;
+/// Most files in one app version. A statement covers 200 files, and a
+/// request may run about 50 statements on D1's free plan; 1000 files take 18
+/// (see `add_app_version`).
+pub const MAX_VERSION_FILES: usize = 1000;
+/// Longest description of an app version. D1 limits a row to 2 MB; the
+/// scheduler keeps every version's description in memory and sends it in
+/// replies.
+pub const MAX_VERSION_XML: usize = 1024 * 1024;
 
 fn invalid<T>(msg: impl Into<String>) -> CoreResult<T> {
     Err(CoreError::Invalid(msg.into()))
@@ -119,65 +137,52 @@ pub async fn put_platform(db: &dyn Db, now: i64, p: &NewPlatform) -> CoreResult<
     })
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// An app to create or change. A setting left out (`None`) keeps the stored
+/// value of an existing app, and takes the default for a new one.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct NewApp {
     pub name: String,
-    pub user_friendly_name: String,
-    pub weight: f64,
-    pub beta: bool,
+    /// New apps: the name.
+    pub user_friendly_name: Option<String>,
+    /// New apps: 1.
+    pub weight: Option<f64>,
+    pub beta: Option<bool>,
     /// Above 1 turns on adaptive replication for the app.
-    pub target_nresults: i32,
-    pub non_cpu_intensive: bool,
-    pub fraction_done_exact: bool,
-    pub min_version: i32,
-    pub deprecated: bool,
-    /// `trivial`, `bitwise` or `webhook`.
-    pub validator: String,
-    pub validator_url: String,
-    pub assimilate_url: String,
-    /// Homogeneous redundancy type: 0 for none, 1 fine, 2 coarse. Left as it
-    /// is when absent, unlike the other settings, which a put replaces: a put
-    /// that only changes a URL must not end a project's HR.
+    pub target_nresults: Option<i32>,
+    pub non_cpu_intensive: Option<bool>,
+    pub fraction_done_exact: Option<bool>,
+    pub min_version: Option<i32>,
+    pub deprecated: Option<bool>,
+    /// `trivial`, `bitwise` or `webhook`. New apps: `trivial`.
+    pub validator: Option<String>,
+    pub validator_url: Option<String>,
+    pub assimilate_url: Option<String>,
+    /// Homogeneous redundancy type: 0 for none, 1 fine, 2 coarse.
     pub homogeneous_redundancy: Option<i32>,
-    /// Send all results of a workunit with one app version. Left as it is
-    /// when absent.
+    /// Send all results of a workunit with one app version.
     pub homogeneous_app_version: Option<bool>,
 }
 
-impl Default for NewApp {
-    fn default() -> Self {
-        NewApp {
-            name: String::new(),
-            user_friendly_name: String::new(),
-            weight: 1.0,
-            beta: false,
-            target_nresults: 0,
-            non_cpu_intensive: false,
-            fraction_done_exact: false,
-            min_version: 0,
-            deprecated: false,
-            validator: "trivial".into(),
-            validator_url: String::new(),
-            assimilate_url: String::new(),
-            homogeneous_redundancy: None,
-            homogeneous_app_version: None,
-        }
-    }
-}
-
-/// Creates the app or updates the one with this name.
+/// Creates the app or updates the one with this name. The settings the call
+/// states are written; the others stay as they are. (`xadd` has no such
+/// call: it rewrites the app from `project.xml`.)
+///
+/// An update writes only the columns the call states, so a call that states
+/// one setting cannot undo another operator's change to another. The
+/// validator is the one setting that is checked against the rest of the row
+/// (a webhook needs a URL): the check runs on the row as it was read, and
+/// the update carries the values it read of the validator and URL it did not
+/// itself state, so it changes nothing if either has changed since. It reads
+/// again and checks again, up to five times, as `change_config_tag` does.
 pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
     if !is_name(&a.name) {
         return invalid("app: bad name");
     }
-    if !["trivial", "bitwise", "webhook"].contains(&a.validator.as_str()) {
-        return invalid("app: validator must be trivial, bitwise or webhook");
-    }
-    if a.validator == "webhook" && !a.validator_url.starts_with("https://") {
-        return invalid("app: the webhook validator needs an https validator_url");
-    }
-    if !a.assimilate_url.is_empty() && !a.assimilate_url.starts_with("https://") {
+    if a.assimilate_url
+        .as_ref()
+        .is_some_and(|u| !u.is_empty() && !u.starts_with("https://"))
+    {
         return invalid("app: assimilate_url must be https");
     }
     if let Some(t) = a.homogeneous_redundancy {
@@ -185,51 +190,136 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
             return invalid("app: homogeneous_redundancy must be 0 (none), 1 (fine) or 2 (coarse)");
         }
     }
-    let friendly = if a.user_friendly_name.is_empty() {
-        &a.name
-    } else {
-        &a.user_friendly_name
+    let friendly = a
+        .user_friendly_name
+        .as_deref()
+        .filter(|f| !f.is_empty())
+        .map(str::to_string);
+    let flag = |x: Option<bool>| x.map(i32::from);
+    // Column, value, for each setting the call states.
+    let mut stated: Vec<(&str, Value)> = Vec::new();
+    {
+        let mut add = |column: &'static str, v: Option<Value>| {
+            if let Some(v) = v {
+                stated.push((column, v));
+            }
+        };
+        add("user_friendly_name", friendly.clone().map(Value::from));
+        add("weight", a.weight.map(Value::from));
+        add("beta", flag(a.beta).map(Value::from));
+        add("target_nresults", a.target_nresults.map(Value::from));
+        add(
+            "non_cpu_intensive",
+            flag(a.non_cpu_intensive).map(Value::from),
+        );
+        add(
+            "fraction_done_exact",
+            flag(a.fraction_done_exact).map(Value::from),
+        );
+        add("min_version", a.min_version.map(Value::from));
+        add("deprecated", flag(a.deprecated).map(Value::from));
+        add("validator", a.validator.clone().map(Value::from));
+        add("validator_url", a.validator_url.clone().map(Value::from));
+        add("assimilate_url", a.assimilate_url.clone().map(Value::from));
+        add(
+            "homogeneous_redundancy",
+            a.homogeneous_redundancy.map(Value::from),
+        );
+        add(
+            "homogeneous_app_version",
+            flag(a.homogeneous_app_version).map(Value::from),
+        );
+    }
+    let check = |validator: &str, url: &str| -> CoreResult<()> {
+        if !["trivial", "bitwise", "webhook"].contains(&validator) {
+            return invalid("app: validator must be trivial, bitwise or webhook");
+        }
+        if validator == "webhook" && !url.starts_with("https://") {
+            return invalid("app: the webhook validator needs an https validator_url");
+        }
+        Ok(())
     };
-    // NULL keeps the stored value of an existing app, and is 0 for a new one.
-    let hr_type = a.homogeneous_redundancy.map_or(Value::Null, Value::from);
-    let hav = a
-        .homogeneous_app_version
-        .map_or(Value::Null, |b| Value::from(i32::from(b)));
-    let rows = db
-        .run(stmt!(
-            "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, target_nresults, \
-             non_cpu_intensive, fraction_done_exact, min_version, deprecated, validator, validator_url, \
-             assimilate_url, homogeneous_redundancy, homogeneous_app_version) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce(?, 0), coalesce(?, 0)) \
-             ON CONFLICT (name) DO UPDATE SET user_friendly_name = excluded.user_friendly_name, \
-             weight = excluded.weight, beta = excluded.beta, target_nresults = excluded.target_nresults, \
-             non_cpu_intensive = excluded.non_cpu_intensive, \
-             fraction_done_exact = excluded.fraction_done_exact, min_version = excluded.min_version, \
-             deprecated = excluded.deprecated, validator = excluded.validator, \
-             validator_url = excluded.validator_url, assimilate_url = excluded.assimilate_url, \
-             homogeneous_redundancy = coalesce(?, app.homogeneous_redundancy), \
-             homogeneous_app_version = coalesce(?, app.homogeneous_app_version) \
-             RETURNING id",
-            now,
-            a.name.as_str(),
-            friendly.as_str(),
-            a.weight,
-            a.beta,
-            a.target_nresults,
-            a.non_cpu_intensive,
-            a.fraction_done_exact,
-            a.min_version,
-            a.deprecated,
-            a.validator.as_str(),
-            a.validator_url.as_str(),
-            a.assimilate_url.as_str(),
-            hr_type.clone(),
-            hav.clone(),
-            hr_type,
-            hav
-        ))
+    for _ in 0..5 {
+        let existing: Option<App> = query_one(
+            db,
+            stmt!("SELECT * FROM app WHERE name = ?", a.name.as_str()),
+        )
         .await?;
-    Ok(rows.scalar_i64().unwrap_or(0))
+        let Some(e) = existing else {
+            // A new app: what is left out takes its default.
+            let validator = a.validator.clone().unwrap_or_else(|| "trivial".into());
+            let url = a.validator_url.clone().unwrap_or_default();
+            check(&validator, &url)?;
+            let rows = db
+                .run(stmt!(
+                    "INSERT INTO app (create_time, name, user_friendly_name, weight, beta, \
+                     target_nresults, non_cpu_intensive, fraction_done_exact, min_version, \
+                     deprecated, validator, validator_url, assimilate_url, \
+                     homogeneous_redundancy, homogeneous_app_version) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT (name) DO NOTHING RETURNING id",
+                    now,
+                    a.name.as_str(),
+                    friendly.clone().unwrap_or_else(|| a.name.clone()),
+                    a.weight.unwrap_or(1.0),
+                    flag(a.beta).unwrap_or(0),
+                    a.target_nresults.unwrap_or(0),
+                    flag(a.non_cpu_intensive).unwrap_or(0),
+                    flag(a.fraction_done_exact).unwrap_or(0),
+                    a.min_version.unwrap_or(0),
+                    flag(a.deprecated).unwrap_or(0),
+                    validator,
+                    url,
+                    a.assimilate_url.clone().unwrap_or_default(),
+                    a.homogeneous_redundancy.unwrap_or(0),
+                    flag(a.homogeneous_app_version).unwrap_or(0)
+                ))
+                .await?;
+            match rows.scalar_i64() {
+                Some(id) => return Ok(id),
+                // Created by another call meanwhile: read it and update.
+                None => continue,
+            }
+        };
+        if stated.is_empty() {
+            return Ok(e.id);
+        }
+        let mut sql = String::new();
+        let mut set: Vec<String> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        for (column, v) in &stated {
+            set.push(format!("{column} = ?"));
+            params.push(v.clone());
+        }
+        sql.push_str(&format!("UPDATE app SET {} WHERE id = ?", set.join(", ")));
+        params.push(e.id.into());
+        // The validator and URL are checked together, so the update holds
+        // the ones it did not state to what the check read.
+        if a.validator.is_some() || a.validator_url.is_some() {
+            let validator = a.validator.clone().unwrap_or_else(|| e.validator.clone());
+            let url = a
+                .validator_url
+                .clone()
+                .unwrap_or_else(|| e.validator_url.clone());
+            check(&validator, &url)?;
+            if a.validator.is_none() {
+                sql.push_str(" AND validator = ?");
+                params.push(e.validator.clone().into());
+            }
+            if a.validator_url.is_none() {
+                sql.push_str(" AND validator_url = ?");
+                params.push(e.validator_url.clone().into());
+            }
+        }
+        sql.push_str(" RETURNING id");
+        let rows = db.run(Stmt { sql, params }).await?;
+        if let Some(id) = rows.scalar_i64() {
+            return Ok(id);
+        }
+    }
+    Err(CoreError::Conflict(
+        "the app kept changing under the update; try again".into(),
+    ))
 }
 
 /// A file of an app version. The file itself is staged under `download/`
@@ -290,8 +380,10 @@ pub async fn add_app_version(
     if !v.plan_class.is_empty() && !is_name(&v.plan_class) {
         return invalid("app version: bad plan class name");
     }
-    if v.files.is_empty() || v.files.len() > 40 {
-        return invalid("app version: between 1 and 40 files");
+    if v.files.is_empty() || v.files.len() > MAX_VERSION_FILES {
+        return invalid(format!(
+            "app version: between 1 and {MAX_VERSION_FILES} files"
+        ));
     }
     if v.files.iter().filter(|f| f.main_program).count() != 1 {
         return invalid("app version: exactly one file must be the main program");
@@ -300,17 +392,25 @@ pub async fn add_app_version(
         stmt!("SELECT * FROM app WHERE name = ?", v.app.as_str()),
         stmt!("SELECT * FROM platform WHERE name = ?", v.platform.as_str()),
     ];
-    let mut files = Stmt::new(format!(
-        "SELECT name, nbytes, md5 FROM job_file WHERE name IN ({})",
-        vec!["?"; v.files.len()].join(", ")
-    ));
     for f in &v.files {
-        if !is_valid_filename(&f.name) || f.name.contains('/') || f.name.is_empty() {
+        if !is_valid_filename(&f.name)
+            || f.name.contains('/')
+            || f.name.is_empty()
+            || f.name.len() > MAX_FILE_NAME
+        {
             return invalid(format!("app version: bad file name {:?}", f.name));
         }
-        files = files.bind(f.name.as_str());
     }
-    lookups.push(files);
+    // The names go to each statement as one JSON array, so a statement binds
+    // one value however many files it covers (D1 allows 100), and joins
+    // `job_file` on its primary key, `name`.
+    let names: Vec<&str> = v.files.iter().map(|f| f.name.as_str()).collect();
+    for chunk in names.chunks(JSON_CHUNK) {
+        lookups.push(stmt!(
+            "SELECT f.name, f.nbytes, f.md5 FROM json_each(?) j JOIN job_file f ON f.name = j.value",
+            serde_json::to_string(chunk).unwrap_or_default()
+        ));
+    }
     let mut out = db.batch(lookups).await?.into_iter();
     let app: App = out
         .next()
@@ -322,11 +422,15 @@ pub async fn add_app_version(
         .unwrap_or_default()
         .first()?
         .ok_or_else(|| CoreError::NotFound(format!("platform {}", v.platform)))?;
-    let staged: Vec<StagedRow> = out.next().unwrap_or_default().decode()?;
+    let mut staged: Vec<StagedRow> = Vec::new();
+    for rows in out {
+        staged.extend(rows.decode::<StagedRow>()?);
+    }
+    let staged: HashMap<&str, &StagedRow> = staged.iter().map(|r| (r.name.as_str(), r)).collect();
 
     let mut xml = String::new();
     for f in &v.files {
-        let Some(s) = staged.iter().find(|s| s.name == f.name) else {
+        let Some(s) = staged.get(f.name.as_str()) else {
             return Err(CoreError::NotFound(format!(
                 "file {} is not staged",
                 f.name
@@ -399,6 +503,12 @@ pub async fn add_app_version(
         }
     }
     xml.push_str("</app_version>\n");
+    if xml.len() > MAX_VERSION_XML {
+        return invalid(format!(
+            "app version: its description is {} bytes, over the {MAX_VERSION_XML} a row holds",
+            xml.len()
+        ));
+    }
 
     let mut writes = vec![stmt!(
         "INSERT INTO app_version (create_time, appid, version_num, platformid, xml_doc, \
@@ -415,15 +525,81 @@ pub async fn add_app_version(
         v.beta
     )];
     // App files outlive the jobs that use them.
-    let mut keep = Stmt::new(format!(
-        "UPDATE job_file SET no_delete = 1 WHERE name IN ({})",
-        vec!["?"; v.files.len()].join(", ")
-    ));
-    for f in &v.files {
-        keep = keep.bind(f.name.as_str());
+    for chunk in names.chunks(JSON_CHUNK) {
+        writes.push(stmt!(
+            "UPDATE job_file SET no_delete = 1 WHERE name IN (SELECT value FROM json_each(?))",
+            serde_json::to_string(chunk).unwrap_or_default()
+        ));
     }
-    writes.push(keep);
-    let done = db.batch(writes).await?;
+    // The signatures were checked against the MD5s read above. A file staged
+    // again with other contents (`replace=1`) since would leave a version that
+    // describes the old one, so the batch checks every file still has the MD5
+    // that was read, and fails, writing nothing, if one does not. The check
+    // raises an error when the count is off: `abs` of the smallest integer
+    // overflows in SQLite. Each check is a join of a JSON object of
+    // name to MD5 with `job_file` on its primary key.
+    //
+    // Statements for a version of 1000 files (200 to a statement): 5 reads
+    // of the files and 2 of the app and platform, then one batch of 1 insert,
+    // 5 updates and 5 checks, 18 in all, and 5 more if a check fails. D1's
+    // free plan allows about 50 queries to a request.
+    let pairs: Vec<(&str, &str)> = {
+        let mut p: Vec<(&str, &str)> = v
+            .files
+            .iter()
+            .filter_map(|f| {
+                staged
+                    .get(f.name.as_str())
+                    .map(|s| (f.name.as_str(), s.md5.as_str()))
+            })
+            .collect();
+        p.sort_unstable();
+        p.dedup();
+        p
+    };
+    let check_of = |chunk: &[(&str, &str)]| -> String {
+        let map: serde_json::Map<String, serde_json::Value> = chunk
+            .iter()
+            .map(|(n, m)| (n.to_string(), serde_json::Value::from(*m)))
+            .collect();
+        serde_json::Value::Object(map).to_string()
+    };
+    for chunk in pairs.chunks(JSON_CHUNK) {
+        writes.push(stmt!(
+            "SELECT CASE WHEN (SELECT count(*) FROM json_each(?) j JOIN job_file f \
+             ON f.name = j.key AND f.md5 = j.value) = ? \
+             THEN 1 ELSE abs(-9223372036854775808) END AS ok",
+            check_of(chunk),
+            chunk.len() as i64
+        ));
+    }
+    let done = match db.batch(writes).await {
+        Ok(d) => d,
+        Err(e) => {
+            // Was it the check? Look at the files again.
+            let again: Vec<Stmt> = pairs
+                .chunks(JSON_CHUNK)
+                .map(|chunk| {
+                    stmt!(
+                        "SELECT count(*) AS n FROM json_each(?) j JOIN job_file f \
+                         ON f.name = j.key AND f.md5 = j.value",
+                        check_of(chunk)
+                    )
+                })
+                .collect();
+            let mut changed = false;
+            for (chunk, rows) in pairs.chunks(JSON_CHUNK).zip(db.batch(again).await?) {
+                changed |= rows.scalar_i64().unwrap_or(0) != chunk.len() as i64;
+            }
+            return Err(if changed {
+                CoreError::Conflict(
+                    "a staged file changed while the version was registered; try again".into(),
+                )
+            } else {
+                e.into()
+            });
+        }
+    };
     match done.first().and_then(|r| r.scalar_i64()) {
         Some(id) => Ok(id),
         None => Err(CoreError::Conflict(format!(
@@ -490,6 +666,8 @@ pub struct JobStatus {
     pub hr_class: i32,
     /// The app version it is committed to (homogeneous app version); 0 if none.
     pub app_version_id: i64,
+    /// The version number the workunit is pinned to; 0 if none.
+    pub app_version_num: i32,
     pub results: Vec<ResultStatus>,
 }
 
@@ -541,6 +719,7 @@ pub async fn job_status(db: &dyn Db, name: &str) -> CoreResult<Option<JobStatus>
         transition_time: wu.transition_time,
         hr_class: wu.hr_class,
         app_version_id: wu.app_version_id,
+        app_version_num: wu.app_version_num,
         results: results
             .into_iter()
             .map(|r| ResultStatus {
@@ -562,6 +741,86 @@ pub async fn job_status(db: &dyn Db, name: &str) -> CoreResult<Option<JobStatus>
             })
             .collect(),
     }))
+}
+
+/// Which workunits `reset_homogeneous` releases.
+#[derive(Debug, Clone)]
+pub enum ResetTarget {
+    /// Every workunit committed to this homogeneous redundancy class.
+    Class(i32),
+    /// These workunits, by name.
+    Names(Vec<String>),
+}
+
+/// What to release.
+#[derive(Debug, Clone, Copy)]
+pub struct ResetWhat {
+    /// The homogeneous redundancy class the workunit is committed to.
+    pub hr_class: bool,
+    /// The app version it is committed to (homogeneous app version).
+    pub app_version: bool,
+}
+
+/// Releases workunits from the class or app version their first sent result
+/// committed them to, so the next result may go to any host. For a class this
+/// is `html/ops/reset_hrclass.php`, which sets `hr_class` to 0 for every
+/// workunit in it; that page cannot release a single workunit or an app
+/// version, which this can. A result already sent stays where it is; only
+/// the choice for the results still to be sent changes. Returns the number of
+/// workunits changed.
+pub async fn reset_homogeneous(
+    db: &dyn Db,
+    target: &ResetTarget,
+    what: ResetWhat,
+    now: i64,
+) -> CoreResult<usize> {
+    if !what.hr_class && !what.app_version {
+        return invalid("reset: nothing to reset");
+    }
+    let mut set = String::from("mod_time = ?, rev = rev + 1");
+    let mut cond = Vec::new();
+    if what.hr_class {
+        set.push_str(", hr_class = 0");
+        cond.push("hr_class != 0");
+    }
+    if what.app_version {
+        set.push_str(", app_version_id = 0");
+        cond.push("app_version_id != 0");
+    }
+    // Only workunits that have something to release.
+    let committed = format!("({})", cond.join(" OR "));
+    let mut stmts = Vec::new();
+    match target {
+        ResetTarget::Class(class) => {
+            if *class <= 0 {
+                return invalid("reset: hr_class must be positive");
+            }
+            stmts.push(stmt!(
+                format!(
+                    "UPDATE workunit SET {set} WHERE hr_class = ? AND {committed} RETURNING id"
+                ),
+                now,
+                *class
+            ));
+        }
+        ResetTarget::Names(names) => {
+            for chunk in names.chunks(MAX_IN_LIST) {
+                let mut s = Stmt::new(format!(
+                    "UPDATE workunit SET {set} WHERE name IN ({}) AND {committed} RETURNING id",
+                    vec!["?"; chunk.len()].join(", ")
+                ))
+                .bind(now);
+                for n in chunk {
+                    s = s.bind(n.as_str());
+                }
+                stmts.push(s);
+            }
+        }
+    }
+    if stmts.is_empty() {
+        return Ok(0);
+    }
+    Ok(db.batch(stmts).await?.iter().map(|r| r.rows.len()).sum())
 }
 
 /// Blocks or unblocks an account; a blocked account's scheduler requests
