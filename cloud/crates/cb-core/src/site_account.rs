@@ -115,7 +115,7 @@ fn done(project: &Project, title: &str, msg: &str) -> SitePage {
         project,
         title,
         &format!(
-            "<p>{}</p>\n<p><a href=\"home.php\">Your account</a></p>\n",
+            "<p class=\"notice\">{}</p>\n<p><a href=\"home.php\">Your account</a></p>\n",
             html_escape(msg)
         ),
     )

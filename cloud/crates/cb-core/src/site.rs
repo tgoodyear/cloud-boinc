@@ -25,6 +25,7 @@ use crate::model::{Host, JobResult, User, Workunit};
 use crate::project::Project;
 use crate::site_account;
 use crate::site_email;
+use crate::site_ui::{self, site_header};
 use crate::web::{account_creation_refusal, html_escape, page, show_user_xml, weak_account_key};
 use crate::CoreResult;
 
@@ -388,12 +389,7 @@ fn host_link(hostid: i64) -> String {
 
 /// A page in the site layout: the given body under a short navigation bar.
 pub(crate) fn layout(project: &Project, title: &str, body: &str) -> String {
-    let nav = format!(
-        "<p><a href=\"./\">{}</a> &middot; <a href=\"home.php\">Your account</a> &middot; \
-         <a href=\"server_status.php\">Server status</a></p>\n<h1>{}</h1>\n",
-        html_escape(&project.config.long_name),
-        html_escape(title)
-    );
+    let nav = format!("{}<h1>{}</h1>\n", site_header(project), html_escape(title));
     page(title, "", &format!("{nav}{body}"))
 }
 
@@ -403,7 +399,7 @@ pub(crate) fn error_page(project: &Project, status: u16, msg: &str) -> SitePage 
         layout(
             project,
             "Unable to handle request",
-            &format!("<p>{}</p>\n", html_escape(msg)),
+            &format!("<p class=\"error\">{}</p>\n", html_escape(msg)),
         ),
     )
 }
@@ -628,73 +624,106 @@ pub async fn home(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     };
     let weak = weak_account_key(&user);
     let account_file = account_file_name(&project.config.master_url);
-    let mut b = String::from("<h2>Account information</h2>\n<table>\n");
-    row2(&mut b, "Name", &html_escape(&user.name));
+    let master = html_escape(&project.config.master_url);
+
+    // Attaching a computer. The keys are shown here as they were before; this
+    // only lays them out. The key never goes in a URL.
+    let attach = format!(
+        "<p>To attach a computer to this account, give the BOINC client the project URL and \
+         either your email address and password, or the account key.</p>\n\
+         {}<ol>\n\
+         <li>In the BOINC Manager choose Add project, enter the project URL, then your email \
+         address and password.</li>\n\
+         <li>Or on the command line: <code>boinccmd --project_attach {master} ACCOUNT_KEY</code>, \
+         with the account key above.</li>\n</ol>\n\
+         <details>\n<summary>Weak account key</summary>\n\
+         <p><code class=\"key\">{}</code></p>\n\
+         <p class=\"muted\">Attaches computers but cannot log in. To attach a computer without \
+         the BOINC Manager, put this in <code>{}</code> in its BOINC data directory:</p>\n\
+         <pre>{}</pre>\n</details>\n\
+         {}",
+        site_ui::kv(&[
+            ("Project URL", format!("<code class=\"key\">{master}</code>")),
+            (
+                "Account key",
+                format!("<code class=\"key\">{}</code>", html_escape(&user.authenticator))
+            ),
+        ]),
+        html_escape(&weak),
+        html_escape(&account_file),
+        html_escape(&format!(
+            "<account>\n    <master_url>{}</master_url>\n    <authenticator>{}</authenticator>\n</account>",
+            project.config.master_url, weak
+        )),
+        site_ui::actions(&[site_ui::button_link(
+            "Replace the account key",
+            "reset_account_key.php",
+            true
+        )]),
+    );
+
     let mut email_cell = html_escape(&user.email_addr);
     if ctx.mail().is_some() {
         email_cell.push_str(&site_email::verify_cell(&user, ctx.now));
     }
-    row2(&mut b, "Email address", &email_cell);
-    row2(
-        &mut b,
-        &format!("{} member since", html_escape(&project.config.long_name)),
-        &date_str(user.create_time),
-    );
-    row2(&mut b, "User ID", &user.id.to_string());
-    row2(
-        &mut b,
-        "Account key",
-        &format!("<code>{}</code>", html_escape(&user.authenticator)),
-    );
-    row2(
-        &mut b,
-        "Weak account key",
-        &format!(
-            "<code>{}</code><br><small>Attaches computers but cannot log in. To attach a \
-             computer without the BOINC Manager, put this in <code>{}</code> in its BOINC data \
-             directory:</small><pre>{}</pre>",
-            html_escape(&weak),
-            html_escape(&account_file),
-            html_escape(&format!(
-                "<account>\n    <master_url>{}</master_url>\n    <authenticator>{}</authenticator>\n</account>",
-                project.config.master_url, weak
-            ))
+    let info = site_ui::kv(&[
+        ("Name", html_escape(&user.name)),
+        ("Email address", email_cell),
+        (
+            &format!("{} member since", project.config.long_name),
+            date_str(user.create_time),
         ),
-    );
-    b.push_str("</table>\n<h2>Computing</h2>\n<table>\n");
-    row2(&mut b, "Total credit", &number_format(user.total_credit, 0));
-    row2(
-        &mut b,
-        "Recent average credit",
-        &number_format(user.expavg_credit, 2),
-    );
-    row2(
-        &mut b,
-        "Computers on this account",
-        "<a href=\"hosts_user.php\">View</a>",
-    );
-    row2(
-        &mut b,
-        "Tasks",
-        &format!("<a href=\"results.php?userid={}\">View</a>", user.id),
-    );
-    row2(
-        &mut b,
-        "Cross-project ID",
-        &user_cpid(&user.cross_project_id, &user.email_addr),
-    );
-    b.push_str(
-        "</table>\n<h2>Settings</h2>\n<ul>\n\
-         <li><a href=\"edit_user_info_form.php\">Account information</a></li>\n\
-         <li><a href=\"edit_email_form.php\">Email address</a></li>\n\
-         <li><a href=\"edit_passwd_form.php\">Password</a></li>\n\
-         <li><a href=\"reset_account_key.php\">Replace the account key</a></li>\n\
-         <li><a href=\"prefs.php?subset=global\">Computing preferences</a></li>\n\
-         <li><a href=\"prefs.php?subset=project\">Project preferences</a></li>\n</ul>\n\
-         <form method=\"post\" action=\"logout.php\">\n",
-    );
-    b.push_str(&site_account::token_fields(&user, ctx.now));
-    b.push_str("<p><input type=\"submit\" value=\"Log out\"></p>\n</form>\n");
+        ("User ID", user.id.to_string()),
+        (
+            "Cross-project ID",
+            user_cpid(&user.cross_project_id, &user.email_addr),
+        ),
+    ]);
+
+    let numbers = site_ui::stats(&[
+        site_ui::stat("Total credit", &number_format(user.total_credit, 0), ""),
+        site_ui::stat(
+            "Recent average credit",
+            &number_format(user.expavg_credit, 2),
+            "",
+        ),
+    ]);
+
+    let mut account_links: Vec<(&str, String)> = vec![
+        ("Account information", "edit_user_info_form.php".into()),
+        ("Email address", "edit_email_form.php".into()),
+        ("Password", "edit_passwd_form.php".into()),
+    ];
+    if ctx.mail().is_some() {
+        account_links.push((
+            "Forgot your password? Get a login link by email",
+            "get_passwd.php".into(),
+        ));
+        if user.email_validated == 0 {
+            account_links.push((
+                "Verify your email address",
+                "validate_email_addr.php".into(),
+            ));
+        }
+    }
+    let computing_links: Vec<(&str, String)> = vec![
+        ("Computers on this account", "hosts_user.php".into()),
+        ("Tasks", format!("results.php?userid={}", user.id)),
+        ("Computing preferences", "prefs.php?subset=global".into()),
+        ("Project preferences", "prefs.php?subset=project".into()),
+    ];
+    let mut logout = String::from("<form method=\"post\" action=\"logout.php\">\n");
+    logout.push_str(&site_account::token_fields(&user, ctx.now));
+    logout.push_str("<p><input type=\"submit\" value=\"Log out\"></p>\n</form>\n");
+
+    let mut b = numbers;
+    b.push_str(&site_ui::card_accent("Attach a computer", &attach));
+    b.push_str(&site_ui::grid(&[
+        site_ui::card("Account functions", &site_ui::link_list(&account_links)),
+        site_ui::card("Computing", &site_ui::link_list(&computing_links)),
+    ]));
+    b.push_str(&site_ui::card("Account information", &info));
+    b.push_str(&logout);
     Ok(SitePage::html(200, layout(project, "Your account", &b)))
 }
 
@@ -759,7 +788,7 @@ pub async fn show_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let mut b = String::from("<table>\n");
     row2(
         &mut b,
-        &format!("{} member since", html_escape(&project.config.long_name)),
+        &format!("{} member since", project.config.long_name),
         &date_str(user.create_time),
     );
     if project.config.user_country {
@@ -1513,13 +1542,13 @@ fn result_row(
     let reported = if r.received_time > 0 {
         time_str(r.received_time)
     } else if r.report_deadline > 0 {
-        let color = if r.report_deadline > now {
-            "#33cc33"
+        let class = if r.report_deadline > now {
+            "due"
         } else {
-            "#ff3333"
+            "overdue"
         };
         format!(
-            "<span style=\"color:{color}\">{}</span>",
+            "<span class=\"{class}\">{}</span>",
             time_str(r.report_deadline)
         )
     } else {

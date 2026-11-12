@@ -845,6 +845,31 @@ fn home_shows_the_account_to_its_holder_only() {
         .body
         .contains(&format!("results.php?userid={}", ada.id)));
     assert!(page.body.contains("account_p.example.xml"));
+
+    // The card for attaching a computer: the project URL, the key shown once
+    // as before, the weak key and the page that replaces the key. The key is
+    // never in a link.
+    let body = &page.body;
+    assert!(body.contains("<h2>Attach a computer</h2>"));
+    assert!(body.contains("<code class=\"key\">https://p.example/</code>"));
+    assert!(body.contains("boinccmd --project_attach https://p.example/ ACCOUNT_KEY"));
+    assert!(body.contains("href=\"reset_account_key.php\""));
+    assert_eq!(body.matches(ada.auth.as_str()).count(), 1);
+    assert!(!body.contains(&format!("={}", ada.auth)));
+    for link in [
+        "edit_user_info_form.php",
+        "edit_email_form.php",
+        "edit_passwd_form.php",
+        "hosts_user.php",
+        "prefs.php?subset=global",
+        "prefs.php?subset=project",
+    ] {
+        assert!(body.contains(&format!("href=\"{link}\"")), "{link}");
+    }
+    assert!(
+        !body.contains("get_passwd.php"),
+        "no mail, no recovery link"
+    );
 }
 
 #[test]
@@ -4518,4 +4543,106 @@ fn a_refused_request_leaves_the_tokens_of_the_change_that_won() {
         );
         assert!(w.mails().is_empty());
     }
+}
+
+/// Every HTML page of the site, logged in or not, comes out of the one
+/// shell: a document with the viewport meta, the inline stylesheet and no
+/// external request. Redirects have no body.
+#[test]
+fn every_site_page_goes_through_the_shell() {
+    let w = World::new();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let mut shell_pages = 0;
+    for path in cb_core::site::SITE_PATHS {
+        for auth in [None, Some(ada.auth.as_str())] {
+            for post in [false, true] {
+                let (page, _) = w.page(path, auth, post, &[]);
+                if page.content_type.starts_with("text/xml") || page.body.is_empty() {
+                    continue;
+                }
+                let body = &page.body;
+                assert!(
+                    body.starts_with("<!DOCTYPE html>\n<html lang=\"en\">"),
+                    "{path}"
+                );
+                assert!(
+                    body.contains(
+                        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                    ),
+                    "{path}"
+                );
+                assert!(body.contains("<style>:root{"), "{path}");
+                assert!(
+                    body.contains("<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg"),
+                    "{path}"
+                );
+                assert!(body.contains("<header class=\"top\">"), "{path}");
+                assert!(body.contains("<h1>"), "{path}");
+                for external in ["src=\"", "url(", "@import", "<link rel=\"stylesheet"] {
+                    assert!(!body.contains(external), "{path}: {external}");
+                }
+                shell_pages += 1;
+            }
+        }
+    }
+    assert!(shell_pages >= 40, "only {shell_pages} pages checked");
+}
+
+/// With email the account page links the recovery page and, until the
+/// address is verified, the verification page.
+#[test]
+fn the_account_page_links_the_email_functions() {
+    let w = World::with_mail();
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let body = w.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("href=\"get_passwd.php\""));
+    assert!(body.contains("href=\"validate_email_addr.php\""));
+    assert!(body.contains("(not verified)"));
+    w.sql("UPDATE user SET email_validated = 1");
+    let body = w.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("href=\"get_passwd.php\""));
+    assert!(!body.contains("href=\"validate_email_addr.php\""));
+    assert!(body.contains("(verified)"));
+}
+
+/// A project name with markup or a character reference is shown as the text
+/// it is, once escaped: in the header, the title, the account page and the
+/// label that carries it (`site_ui::kv` escapes labels itself).
+#[test]
+fn a_project_name_with_markup_is_shown_as_text() {
+    let config = CONFIG.replace(
+        "<long_name>Test Project</long_name>",
+        "<long_name>A &lt;b&gt;&amp;amp; Co</long_name>",
+    );
+    let w = World::with_config(&config);
+    let ada = w.account("ada@example.com", "secret", "Ada");
+    let body = w.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("A &lt;b&gt;&amp;amp; Co member since"));
+    assert!(body.contains("<a class=\"brand\" href=\"./\">A &lt;b&gt;&amp;amp; Co</a>"));
+    assert!(!body.contains("<b>"));
+    assert!(!body.contains("&amp;amp;amp;"));
+    let home = cb_core::web::master_page(&w.project);
+    assert!(home.contains("<title>A &lt;b&gt;&amp;amp; Co</title>"));
+    assert!(home.contains("<h1>A &lt;b&gt;&amp;amp; Co</h1>"));
+    assert!(!home.contains("<b>"));
+}
+
+/// The outlined and danger buttons have to out-rank the primary
+/// `input[type=submit]` rule, which has an element and an attribute: a bare
+/// `.secondary` loses to it. A browser check of computed styles is in the PR.
+#[test]
+fn secondary_and_danger_buttons_out_rank_the_primary_rule() {
+    let css = cb_core::web::SITE_CSS;
+    for selector in [
+        "input[type=submit].secondary",
+        "input[type=submit].danger",
+        ".button.secondary",
+        ".button.danger",
+    ] {
+        assert!(css.contains(selector), "{selector}");
+    }
+    let verify = World::with_mail();
+    let ada = verify.account("ada@example.com", "secret", "Ada");
+    let body = verify.get("/home.php", Some(&ada.auth), &[]).body;
+    assert!(body.contains("class=\"secondary\" value=\"Send verification email\""));
 }

@@ -14,8 +14,8 @@ use cb_core::project::{
 };
 use cb_core::scheduler::{handle_request, SchedCtx};
 use cb_core::web::{
-    create_account, lookup_account, master_page, project_config, server_status, server_status_xml,
-    NewAccount, STATUS_COUNTS_TTL,
+    create_account, lookup_account, master_page, project_config, server_status, server_status_page,
+    server_status_xml, NewAccount, STATUS_COUNTS_TTL,
 };
 use cb_core::work::{create_work, register_job_file, JobSpec, Submission};
 use cb_core::CoreError;
@@ -311,6 +311,22 @@ fn a_registered_version_is_sent_to_a_client() {
     assert!(page.contains("<link rel=\"boinc_scheduler\" href=\"https://p.example/sched\">"));
     assert!(page.contains("<scheduler>https://p.example/sched</scheduler>"));
     assert!(page.contains("1.02"));
+    let view = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+    assert!(page.contains(view) && page.contains("<header class=\"top\">"));
+    assert!(page.contains("<div class=\"scroll\"><table>"));
+    // The icon is a data URL without tag characters, so that a client reading
+    // the master page for its `<link>` elements sees one tag and no more.
+    let icon = page.split("<link rel=\"icon\" href=\"").nth(1).unwrap();
+    let href = icon.split('"').next().unwrap();
+    assert!(href.starts_with("data:image/svg+xml,%3Csvg"));
+    assert!(!href.contains(['<', '>', '#', '"']));
+    assert_eq!(
+        cb_core::web::html_cache_control("public, max-age=30"),
+        "public, max-age=30, no-transform"
+    );
+    assert!(
+        cb_core::web::FAVICON_SVG.starts_with("<svg ") && cb_core::web::FAVICON_SVG.len() < 400
+    );
 
     // A job, an account, and a client asking for work.
     let reply = w.create("ada@example.com", "secret", "Ada");
@@ -371,6 +387,10 @@ fn a_registered_version_is_sent_to_a_client() {
     assert_eq!(s.hosts, 1);
     assert_eq!(s.users_with_recent_credit, 0);
     assert_eq!(s.hosts_with_recent_credit, 0);
+    let status_page = server_status_page(&project, &s);
+    assert!(status_page.contains("<meta name=\"viewport\""));
+    assert!(status_page.contains("<header class=\"top\">"));
+    assert!(status_page.contains("<dl class=\"stats\">"));
     assert!(server_status_xml(&project, &s, 300)
         .contains("<results_in_progress>1</results_in_progress>"));
 
