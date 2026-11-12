@@ -1323,7 +1323,7 @@ statements are 14 (two reads, six counts, the queue gauges, the retention delete
 snapshot writes) and each period costs a read and one write for every ten applications that have
 tasks in it. The tests build the worst case (40 applications with tasks in every period of the
 week) and check that the statements sent stay within the budget and that no statement binds more
-than 100 values. Dev: about 36 statements, four round trips, about 17 rows written.
+than 100 values. Dev: 36 to 48 statements while the week was being filled in, 19 in steady state.
 
 A row in `stats_bucket` with `computed_at` 0 (made by a timeout before its period was counted) is
 not a counted period: the pages show the period as unknown and the sums leave it out until a pass
