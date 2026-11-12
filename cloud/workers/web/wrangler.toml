@@ -17,8 +17,15 @@ mode = "smart"
 pattern = "boinc-dev.usnewsmap.com/*"
 zone_name = "usnewsmap.com"
 
-# Stock server URL layout: the pages under `/example/` are covered by the route above.
-# A deployment whose route is narrower than `/*` adds this one, with its short name:
+# Stock server URL layout (docs/deploy.md, "Stock layout routes"): the pages under
+# `/example/` are covered by the route above, unless the short name begins with
+# `sched` or `upload` (for example `scheduler`): the native `/sched*` or `/upload*`
+# route then matches the pages' path as well, and these two, which are more specific,
+# are needed. The first is the prefix without its slash, which redirects to it.
+# [[routes]]
+# pattern = "boinc-dev.usnewsmap.com/example"
+# zone_name = "usnewsmap.com"
+#
 # [[routes]]
 # pattern = "boinc-dev.usnewsmap.com/example/*"
 # zone_name = "usnewsmap.com"

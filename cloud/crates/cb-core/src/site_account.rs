@@ -20,8 +20,8 @@ use crate::model::User;
 use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
 use crate::site::{
-    error_page, label_row, layout, local_url, login_cookie, row2, str_param,
-    to_login, user_by_auth, viewer, Params, SiteCtx, SitePage,
+    error_page, label_row, layout, local_url, login_cookie, row2, str_param, to_login,
+    user_by_auth, viewer, Params, SiteCtx, SitePage,
 };
 use crate::site_email::{self, EMAIL_CHANGE_WAIT_SECS};
 use crate::web::{

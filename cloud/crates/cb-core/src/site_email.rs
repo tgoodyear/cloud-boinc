@@ -16,8 +16,8 @@ use cb_db::{stmt, Stmt};
 use crate::mail::Mail;
 use crate::model::User;
 use crate::site::{
-    error_page, layout, login_cookie, str_param, time_str, to_login, viewer, Params,
-    SiteCtx, SitePage,
+    error_page, layout, login_cookie, str_param, time_str, to_login, viewer, Params, SiteCtx,
+    SitePage,
 };
 use crate::site_account::{token_fields, token_ok, TIMED_OUT};
 pub use crate::web::EMAIL_CHANGE_WAIT_SECS;

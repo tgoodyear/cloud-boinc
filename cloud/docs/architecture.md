@@ -1007,7 +1007,12 @@ of cgi, download and, optionally, pages must be given. `uldl_dir_fanout` is upst
 copied `config.xml` can bring it as it is. An empty or `/` page prefix means the pages are
 served at the root only. Prefixes are validated when the setting is stored (`put_setting` parses
 it): a path of letters, digits, `.`, `_`, `-` and `~`, no `..`, and not starting with a path
-the native layout uses (`admin`, `download`, `sched`, `upload`).
+the native layout uses (`admin`, `download`, `sched`, `upload`, as a whole first segment; the
+download prefix may start with any but `admin`). The page, cgi, upload and download prefixes must
+differ from one another, except that the cgi and upload prefixes may be one. Short names that
+merely begin with a native prefix (`scheduler`, `uploadtest`) are accepted; their pages need the
+web routes of `StockLayout::routes`, which `docs/deploy.md` lists, because the native `/sched*`
+and `/upload*` routes also match their path.
 
 Decisions:
 

@@ -120,15 +120,24 @@ ones. For the default layout:
 | `scheduler` | `<host>/example_cgi/cgi*` |
 | `files` | `<host>/example_cgi/file_upload_handler*` |
 | `files` | `<host>/example/download/*` |
-| `web` | `<host>/*`, which is already there; `<host>/example/*` if the route is narrower |
+| `web` | `<host>/example` and `<host>/example/*`; needed when the short name begins with `sched` or `upload`, and harmless otherwise |
 
-Cloudflare picks the most specific matching pattern for a request. That matters in two places.
+Cloudflare picks the most specific matching pattern for a request, and a longer literal part is
+more specific (an exact pattern beats a wildcard one of the same length). That matters in three
+places.
 The scheduler and the upload handler share the `example_cgi/` directory but are different
 Workers, so each pattern names its script and ends in `*` (so a request with a query string
 matches); a pattern for `example_cgi/*` would send both to one Worker. And the download
 directory of the default layout is under the pages' path, so `example/download/*` has to be a
 route of its own, or the web Worker's `/*` takes it and answers 404. The pattern with the
-longer literal part, `example/download/*`, wins over `/*`. If the stock project set its own
+longer literal part, `example/download/*`, wins over `/*`. The third: a short name that begins
+with `sched` or `upload`, such as `scheduler` or `uploadtest`, has its pages under a path that
+the native `/sched*` or `/upload*` route also matches, and that route would send the master
+page and every page to the scheduler or files Worker. The web routes `<host>/scheduler` (the
+prefix without its slash, which redirects to it) and `<host>/scheduler/*` are more specific and
+win; they are listed for every short name and are only required for these. Short names that
+only resemble the native `/download/` and `/admin/` routes (`downloads`, `admin2`) do not
+overlap them, since those patterns end in a slash. If the stock project set its own
 download or upload directory, the patterns follow the prefixes in the setting. The pieces in
 `wrangler.toml` are commented out in each Worker's file for a deployment to uncomment and
 adapt.
@@ -141,8 +150,17 @@ expression: (http.host eq "<hostname>" and (starts_with(http.request.uri.path, "
 ```
 
 The `*` in a route pattern matches any characters, so `example_cgi/cgi*` also reaches the
-scheduler Worker for `example_cgi/cgi-bin/...`; the Worker answers 404 for any path that is not
-exactly the scheduler's.
+scheduler Worker for `example_cgi/cgi-bin/...`, and `/sched*` reaches it for `/scheduler/...`;
+the Worker answers 404 for any path that is not exactly `/sched` or the stock scheduler path.
+
+The setting refuses prefixes that would need two routes with one pattern: the page, cgi, upload
+and download prefixes may not be equal to each other (the cgi and upload prefixes are one by
+default), a page, cgi or upload prefix may not start with `/admin`, `/download`, `/sched` or
+`/upload` as a whole segment, and the download prefix may not start with `/admin`. Prefixes
+nested inside one another are accepted, because the longer route wins. `StockLayout::routes` in
+`cloud/crates/cb-core/src/stock.rs` produces the stock routes, and its test and
+`cloud/dev/router/routes.test.mjs` check, for a table of short names, that every stock and native
+URL reaches the Worker meant for it.
 
 ## Secrets
 

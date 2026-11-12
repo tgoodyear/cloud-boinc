@@ -147,13 +147,25 @@ impl StockSpec {
                 "config: <uldl_dir_fanout> must not be negative".into(),
             ));
         }
-        for p in [&cgi_prefix, &upload_prefix] {
-            if *p == page_prefix || *p == download_prefix {
-                return Err(CoreError::Invalid(
-                    "config: the stock cgi and upload prefixes must differ from the page and \
-                     download prefixes"
-                        .into(),
-                ));
+        // Two groups of URLs on one prefix would need the same route
+        // pattern for different Workers, or let one Worker's route capture
+        // the other's paths. The cgi and upload prefixes may be one (the
+        // default); every other pair must differ. Nested prefixes are fine:
+        // the longer route is the more specific (see `StockLayout::routes`).
+        let named = [
+            ("stock_page_prefix", &page_prefix),
+            ("stock_cgi_prefix", &cgi_prefix),
+            ("stock_upload_prefix", &upload_prefix),
+            ("stock_download_prefix", &download_prefix),
+        ];
+        for (i, (tag_a, a)) in named.iter().enumerate() {
+            for (tag_b, b) in &named[i + 1..] {
+                let both_cgi = *tag_a == "stock_cgi_prefix" && *tag_b == "stock_upload_prefix";
+                if a == b && !a.is_empty() && !both_cgi {
+                    return Err(CoreError::Invalid(format!(
+                        "config: <{tag_a}> and <{tag_b}> are both {a}; they must differ"
+                    )));
+                }
             }
         }
         for (tag, p) in [
@@ -167,6 +179,20 @@ impl StockSpec {
                     "config: <{tag}> may not start with /{first}, which the native layout uses"
                 )));
             }
+        }
+        // `/admin/` belongs to the admin Worker, so nothing of the layout may be
+        // under it.
+        let first = download_prefix
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("");
+        if first == "admin" {
+            return Err(CoreError::Invalid(
+                "config: <stock_download_prefix> may not start with /admin, which the admin \
+                 API uses"
+                    .into(),
+            ));
         }
         Ok(Some(StockLayout {
             cgi_prefix,
@@ -335,10 +361,7 @@ pub fn route_files<'a>(path: &'a str, stock: Option<&StockLayout>) -> FilesRoute
     // A native name is flat. A longer path may be a stock download below a
     // stock download prefix that starts with `/download`, so it is left to
     // the stock routing below.
-    if let Some(name) = path
-        .strip_prefix("/download/")
-        .filter(|n| !n.contains('/'))
-    {
+    if let Some(name) = path.strip_prefix("/download/").filter(|n| !n.contains('/')) {
         return FilesRoute::Download(name);
     }
     if let Some(s) = stock {
@@ -352,9 +375,57 @@ pub fn route_files<'a>(path: &'a str, stock: Option<&StockLayout>) -> FilesRoute
     FilesRoute::NotFound
 }
 
-/// Whether the scheduler Worker answers a request path.
+/// Whether the scheduler Worker answers a request path: `/sched`, or the
+/// stock scheduler path. The route `/sched*` also delivers other paths that
+/// begin with those letters (a stock short name such as `scheduler`), which
+/// are not the scheduler's.
 pub fn route_scheduler(path: &str, stock: Option<&StockLayout>) -> bool {
-    path.starts_with("/sched") || stock.is_some_and(|s| s.is_scheduler_path(path))
+    path == "/sched" || stock.is_some_and(|s| s.is_scheduler_path(path))
+}
+
+/// The Worker a route sends to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTarget {
+    Scheduler,
+    Files,
+    Web,
+    Admin,
+}
+
+/// The native routes of a deployment (`wrangler.toml` of each Worker), as
+/// path patterns on the hostname. A trailing `*` matches any rest.
+pub const NATIVE_ROUTES: [(&str, RouteTarget); 5] = [
+    ("/sched*", RouteTarget::Scheduler),
+    ("/upload*", RouteTarget::Files),
+    ("/download/*", RouteTarget::Files),
+    ("/admin/*", RouteTarget::Admin),
+    ("/*", RouteTarget::Web),
+];
+
+impl StockLayout {
+    /// The routes a deployment adds for this layout, as path patterns, with
+    /// the Worker each goes to; `docs/deploy.md` lists them. Each is meant to
+    /// be more specific than the native route it overlaps: a short name that
+    /// begins with `sched` or `upload` has its pages under a path that the
+    /// native `/sched*` or `/upload*` also matches, so the pages need routes
+    /// of their own, and so does the page prefix without its slash, which is
+    /// redirected to it. Cloudflare sends a request to the route with the
+    /// most specific pattern, and a longer literal part is more specific.
+    pub fn routes(&self) -> Vec<(String, RouteTarget)> {
+        let mut routes = vec![
+            (format!("{}/cgi*", self.cgi_prefix), RouteTarget::Scheduler),
+            (
+                format!("{}/{UPLOAD_HANDLER}*", self.upload_prefix),
+                RouteTarget::Files,
+            ),
+            (format!("{}/*", self.download_prefix), RouteTarget::Files),
+        ];
+        if !self.page_prefix.is_empty() {
+            routes.push((self.page_prefix.clone(), RouteTarget::Web));
+            routes.push((format!("{}/*", self.page_prefix), RouteTarget::Web));
+        }
+        routes
+    }
 }
 
 /// How the web Worker treats a request path.
@@ -603,6 +674,183 @@ mod tests {
         assert!(with(&|s| s.page_prefix = Some("/download".into())).is_err());
         assert!(with(&|s| s.page_prefix = Some("/testproj_cgi".into())).is_err());
         assert!(spec("testproj").resolve(-1).is_err());
+    }
+
+    /// Every pair of prefixes the layout names: equal prefixes are refused,
+    /// except the cgi and upload prefixes, which are one by default; nested
+    /// ones are accepted because the longer route is the more specific.
+    #[test]
+    fn prefix_pairs_are_refused_or_routed() {
+        #[derive(Clone, Copy)]
+        enum P {
+            Page,
+            Cgi,
+            Upload,
+            Download,
+        }
+        let set = |s: &mut StockSpec, which: P, v: &str| match which {
+            P::Page => s.page_prefix = Some(v.into()),
+            P::Cgi => s.cgi_prefix = v.into(),
+            P::Upload => s.upload_prefix = v.into(),
+            P::Download => s.download_prefix = v.into(),
+        };
+        // (first prefix, second prefix, accepted when both are set to the same path)
+        let pairs = [
+            (P::Page, P::Cgi, false),
+            (P::Page, P::Upload, false),
+            (P::Page, P::Download, false),
+            (P::Cgi, P::Download, false),
+            (P::Upload, P::Download, false),
+            (P::Cgi, P::Upload, true),
+        ];
+        for (a, b, same_ok) in pairs {
+            let mut s = spec("testproj");
+            set(&mut s, a, "/shared");
+            set(&mut s, b, "/shared");
+            assert_eq!(s.resolve(0).is_ok(), same_ok);
+            // One nested in the other is accepted, either way round.
+            for (outer, inner) in [("/shared", "/shared/sub"), ("/shared/sub", "/shared")] {
+                let mut s = spec("testproj");
+                set(&mut s, a, outer);
+                set(&mut s, b, inner);
+                assert!(s.resolve(0).is_ok(), "{outer} and {inner}");
+            }
+        }
+        // The page prefix may be empty next to anything.
+        let mut s = spec("testproj");
+        s.page_prefix = Some(String::new());
+        s.download_prefix = "/shared".into();
+        assert!(s.resolve(0).is_ok());
+        // Nothing of the layout may sit under /admin/, and the native
+        // roots themselves are not page or cgi prefixes.
+        for (which, v, ok) in [
+            (P::Download, "/admin/files", false),
+            (P::Download, "/admin2", true),
+            (P::Download, "/download", true),
+            (P::Download, "/downloads", true),
+            (P::Page, "/admin", false),
+            (P::Page, "/admin2", true),
+            (P::Page, "/scheduler", true),
+            (P::Page, "/uploadtest", true),
+            (P::Page, "/sched", false),
+            (P::Page, "/upload", false),
+            (P::Cgi, "/upload", false),
+            (P::Upload, "/admin", false),
+        ] {
+            let mut s = spec("testproj");
+            set(&mut s, which, v);
+            assert_eq!(s.resolve(0).is_ok(), ok, "{v}");
+        }
+    }
+
+    /// A model of how Cloudflare picks a route: among the patterns that match
+    /// a path, the one with the longest literal part, and an exact pattern
+    /// before a wildcard one of the same length. `None` when the best two
+    /// patterns tie and name different Workers.
+    fn pick(routes: &[(String, RouteTarget)], path: &str) -> Option<RouteTarget> {
+        let mut best: Option<(usize, bool, RouteTarget)> = None;
+        let mut tie = false;
+        for (pattern, target) in routes {
+            let (literal, wildcard) = match pattern.strip_suffix('*') {
+                Some(l) => (l, true),
+                None => (pattern.as_str(), false),
+            };
+            let matches = if wildcard {
+                path.starts_with(literal)
+            } else {
+                path == literal
+            };
+            if !matches {
+                continue;
+            }
+            let key = (literal.len(), !wildcard);
+            match best {
+                Some((len, exact, t)) if (len, exact) == key => tie |= t != *target,
+                Some((len, exact, _)) if (len, exact) > key => {}
+                _ => {
+                    best = Some((key.0, key.1, *target));
+                    tie = false;
+                }
+            }
+        }
+        if tie {
+            None
+        } else {
+            best.map(|(_, _, t)| t)
+        }
+    }
+
+    /// Short names that begin with a native prefix, or are one without being
+    /// reserved, with the routes of the layout next to the native ones: every
+    /// stock URL and every native URL reaches the right Worker.
+    #[test]
+    fn stock_routes_beat_the_native_ones_they_overlap() {
+        use RouteTarget::*;
+        let shorts = [
+            "example",
+            "scheduler",
+            "sched_x",
+            "uploadtest",
+            "upload2",
+            "downloads",
+            "admin2",
+            "a",
+        ];
+        for short in shorts {
+            for (extra_download, fanout) in [(None, 16), (Some(format!("/{short}_files")), 0)] {
+                let mut sp = spec(short);
+                if let Some(d) = &extra_download {
+                    sp.download_prefix = d.clone();
+                }
+                let s = sp.resolve(fanout).unwrap().unwrap();
+                let mut routes: Vec<(String, RouteTarget)> = NATIVE_ROUTES
+                    .iter()
+                    .map(|(p, t)| (p.to_string(), *t))
+                    .collect();
+                routes.extend(s.routes());
+                let name = "wu_1_0";
+                let download = format!("{}/{}", s.download_prefix, download_tail(name, s.fanout));
+                let cases = [
+                    (s.scheduler_path(), Scheduler),
+                    (s.upload_path(), Files),
+                    (download, Files),
+                    (s.page_prefix.clone(), Web),
+                    (format!("{}/", s.page_prefix), Web),
+                    (format!("{}/home.php", s.page_prefix), Web),
+                    (format!("{}/get_project_config.php", s.page_prefix), Web),
+                    ("/sched".to_string(), Scheduler),
+                    ("/upload/file_upload_handler".to_string(), Files),
+                    ("/download/wu_1_0".to_string(), Files),
+                    ("/admin/v1/status".to_string(), Admin),
+                    ("/".to_string(), Web),
+                    ("/home.php".to_string(), Web),
+                    ("/get_project_config.php".to_string(), Web),
+                ];
+                for (path, want) in cases {
+                    assert_eq!(pick(&routes, &path), Some(want), "{short}: {path}");
+                }
+                // Without the layout's page routes the native ones capture
+                // the pages of a short name that begins with `sched` or
+                // `upload`, which is why they are listed.
+                let page = format!("{}/home.php", s.page_prefix);
+                let native: Vec<_> = NATIVE_ROUTES
+                    .iter()
+                    .map(|(p, t)| (p.to_string(), *t))
+                    .collect();
+                let captured = short.starts_with("sched") || short.starts_with("upload");
+                assert_eq!(pick(&native, &page) != Some(Web), captured, "{short}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_scheduler_worker_answers_only_its_own_paths() {
+        let s = layout(16);
+        // The route `/sched*` also delivers these; they are not scheduler requests.
+        for path in ["/scheduler/home.php", "/sched_x", "/schedule", "/sched/x"] {
+            assert!(!route_scheduler(path, Some(&s)), "{path}");
+        }
+        assert!(route_scheduler("/sched", None));
     }
 
     #[test]
