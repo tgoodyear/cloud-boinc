@@ -138,12 +138,12 @@ cloud/dev/scrub-sched-request.py --input RAW.xml --output cloud/tests/client-cor
 The script replaces the account key, the cross-project ID, the host CPID, the email hash, the
 domain name, the address, the time zone, the CPU model and features (by a placeholder of the kind
 of the request's platform: x86, 64-bit ARM, 32-bit ARM, Apple silicon), the kernel release, product and serial
-strings, absolute Windows paths (`C:\Users\...`, `C:\ProgramData\...`), the MAC address (`<mac_address>`), GPU and OpenCL device names and PCI numbers, WSL
+strings, absolute Windows paths (`C:\Users\...`, `C:\ProgramData\...`, to the end of the line, element text or double quote, because a profile name can hold spaces and apostrophes), the MAC address (`<mac_address>`), GPU and OpenCL device names and PCI numbers, WSL
 distribution names, user and team names, the client brand, output file checksums, paths, the
 project's URLs and the echoed code-signing key. It leaves element names, numbers, counts, task
 names and timing as they were. It then refuses to write the file if the result still has a run of
 32 or more hex digits, a MAC address (six hex pairs joined by colons or dashes) in any element, an
-IPv4 address outside the RFC 5737 ranges, a `\Users\` or `/Users/` path, or a word given with `--forbid`. Give it the capture
+IPv4 address outside the RFC 5737 ranges, a `\Users\` or `/Users/` path, or a word given with `--forbid` (or a part of it, three characters or more, split at spaces and apostrophes). Give it the capture
 machine's host name, and the name of any user or machine that is not in its list, with `--forbid`
 (it can be repeated).
 

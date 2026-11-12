@@ -17,7 +17,8 @@ After scrubbing, the output is checked, and nothing is written if a check fails:
   * no run of 32 or more hexadecimal digits (keys, CPIDs, MD5 sums);
   * no IPv4 address outside the documentation ranges of RFC 5737;
   * no MAC address (six hex pairs joined by colons or dashes), whatever element it is in;
-  * none of the words given with `--forbid` (for example the capture machine's host name), and none
+  * none of the words given with `--forbid` (for example the capture machine's host name; each part
+    of a name with spaces or apostrophes, three characters or more, too), and none
     of the built-in ones (`usnewsmap`, `/root/`, `/home/`, `\\Users\\`, `/Users/`).
 
 `--check-only` runs the checks on `--input` itself, without changing it, which is how the committed
@@ -110,6 +111,27 @@ IPV4 = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 BUILTIN_FORBIDDEN = ["usnewsmap", "/root/", "/home/", "\\users\\", "/users/"]
 
 
+# A Windows path under a profile or the data directory. A profile name can hold spaces and
+# apostrophes, so the path has no safe end inside a line: it runs to the end of the line, the end of
+# the element text (`<`), the end of the tag (`>`) or a double quote, which no Windows file name can
+# hold and which ends an attribute value. That can remove text after the path; leaving part of a
+# profile name is worse.
+WIN_PATH = re.compile(
+    r"(?P<quote>['\"]?)[A-Za-z]:\\(?:Users|ProgramData|Documents and Settings)\\[^<>\"\r\n]*",
+    re.IGNORECASE,
+)
+
+
+def win_path(m):
+    # `'C:\Users\O'Connor\x'`: a single quote may close the path or be part of a name.
+    if m.group("quote") == "'" and "'" in m.group(0)[1:]:
+        raise ValueError(
+            "cannot tell where the path ends in %r; remove it from the capture by hand"
+            % m.group(0)[:30]
+        )
+    return m.group("quote") + "C:\\ProgramData\\BOINC\\path"
+
+
 def scrub_block(text, block, elements):
     def inside(m):
         body = m.group(0)
@@ -153,11 +175,7 @@ def scrub(text, project_url):
     # Absolute paths a task's stderr may carry.
     text = re.sub(r"/(?:root|home|var/lib|opt|usr)/[^\s<\"']*", "/var/lib/boinc/path", text)
     # The same on Windows: a task's stderr may name a user's profile or the data directory.
-    text = re.sub(
-        r"[A-Za-z]:\\(?:Users|ProgramData|Documents and Settings)\\[^\s<\"']*",
-        lambda m: "C:\\ProgramData\\BOINC\\path",
-        text,
-    )
+    text = WIN_PATH.sub(win_path, text)
     # The code-signing key the client echoes back: key size, then hex lines, then a dot.
     text = re.sub(
         r"(<code_sign_key>\s*\n)\s*[0-9]+\s*\n(?:[0-9a-fA-F]+\s*\n)+(\.\s*\n</code_sign_key>)",
@@ -180,6 +198,12 @@ def check(text, forbid):
     for word in BUILTIN_FORBIDDEN + forbid:
         if word and word.lower() in text.lower():
             problems.append("forbidden text %r" % word)
+    # A forbidden name with spaces or apostrophes ("Jane Doe", "O'Connor") is also refused when a
+    # part of it is left: a path cut at a space leaves the rest of the name.
+    for word in forbid:
+        for part in re.split(r"[\s']+", word):
+            if len(part) >= 3 and part != word and part.lower() in text.lower():
+                problems.append("a part %r of the forbidden text %r" % (part, word))
     return problems
 
 
@@ -197,7 +221,11 @@ def main():
     with open(args.input, encoding="utf-8") as f:
         text = f.read()
     if not args.check_only:
-        text = scrub(text, args.project_url)
+        try:
+            text = scrub(text, args.project_url)
+        except ValueError as e:
+            print("%s: %s" % (args.input, e), file=sys.stderr)
+            return 1
     problems = check(text, args.forbid)
     if problems:
         for p in problems:

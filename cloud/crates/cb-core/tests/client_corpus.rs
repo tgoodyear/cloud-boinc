@@ -239,8 +239,10 @@ fn scrub_script_removes_and_refuses_mac_addresses() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A Windows task's stderr can name the user's profile or the data directory; the script
-/// replaces such paths, and refuses a file that still has a `\Users\` path.
+/// A Windows task's stderr can name the user's profile or the data directory. A profile name can
+/// hold spaces and apostrophes, so the script replaces the path to the end of the line, the end of
+/// the element text, or a double quote, refuses a path it cannot bound, and refuses a part of a
+/// forbidden name that is left behind.
 #[test]
 fn scrub_script_replaces_windows_paths() {
     use std::process::Command;
@@ -248,45 +250,114 @@ fn scrub_script_replaces_windows_paths() {
     let dir = std::env::temp_dir().join(format!("cb-corpus-scrub-win-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (input, output) = (dir.join("in.xml"), dir.join("out.xml"));
-    let run = |args: &[&str]| {
-        Command::new("python3")
-            .arg("-I")
-            .arg(&script)
-            .args(args)
-            .output()
+    // The scrubbed output, or the error text when the script refuses the file; None when
+    // python3 is not installed.
+    let run = |body: &str, forbid: &[&str]| -> Option<Result<String, String>> {
+        std::fs::write(
+            &input,
+            format!("<scheduler_request>\n{body}\n</scheduler_request>\n"),
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&output);
+        let mut cmd = Command::new("python3");
+        cmd.arg("-I").arg(&script);
+        cmd.args(["--input", input.to_str().unwrap()]);
+        cmd.args(["--output", output.to_str().unwrap()]);
+        for f in forbid {
+            cmd.args(["--forbid", f]);
+        }
+        let done = cmd.output().ok()?;
+        Some(if done.status.success() {
+            Ok(std::fs::read_to_string(&output).unwrap())
+        } else {
+            assert!(!output.exists(), "a refused file was written");
+            Err(String::from_utf8_lossy(&done.stderr).into_owned())
+        })
     };
-    std::fs::write(
-        &input,
-        "<scheduler_request>\n<result>\n<stderr_out>\n<stderr_txt>\ncan't open C:\\Users\\jsmith\\AppData\\x.txt and C:\\ProgramData\\BOINC\\slots\\0\\out\n</stderr_txt>\n</stderr_out>\n</result>\n</scheduler_request>\n",
-    )
-    .unwrap();
-    let (i, o) = (input.to_str().unwrap(), output.to_str().unwrap());
-    let Ok(done) = run(&["--input", i, "--output", o]) else {
+    let path = "C:\\ProgramData\\BOINC\\path";
+
+    // A profile name with a space, in element text: no part of the name is left.
+    let Some(r) = run(
+        "<stderr_txt>\ncan't open C:\\Users\\Jane Doe\\AppData\\x.txt\n</stderr_txt>",
+        &["Jane Doe"],
+    ) else {
         eprintln!("python3 is not installed; the scrub script was not run");
         return;
     };
+    let scrubbed = r.unwrap();
     assert!(
-        done.status.success(),
-        "{}",
-        String::from_utf8_lossy(&done.stderr)
-    );
-    let scrubbed = std::fs::read_to_string(&output).unwrap();
-    assert!(!scrubbed.contains("jsmith"), "{scrubbed}");
-    assert!(!scrubbed.contains("slots"), "{scrubbed}");
-    assert!(
-        scrubbed.contains("C:\\ProgramData\\BOINC\\path"),
+        !scrubbed.contains("Doe") && !scrubbed.contains("AppData"),
         "{scrubbed}"
     );
-    // A profile path in a form the replacement does not match is refused, not written.
-    std::fs::write(
-        &input,
-        "<scheduler_request>\n<x>d:/Users/jsmith/x</x>\n</scheduler_request>\n",
+    assert!(
+        scrubbed.contains(&format!("can't open {path}\n")),
+        "{scrubbed}"
+    );
+
+    // An apostrophe in the name.
+    let scrubbed = run(
+        "<stderr_txt>\nC:\\Users\\O'Connor\\AppData\\x.txt\n</stderr_txt>",
+        &["O'Connor"],
     )
+    .unwrap()
     .unwrap();
-    let _ = std::fs::remove_file(&output);
-    let refused = run(&["--input", i, "--output", o]).unwrap();
-    assert!(!refused.status.success());
-    assert!(!output.exists());
+    assert!(
+        !scrubbed.contains("Connor") && !scrubbed.contains("AppData"),
+        "{scrubbed}"
+    );
+
+    // A path in double quotes: the closing quote stays, the text after it is kept.
+    let scrubbed = run(
+        "<stderr_txt>\n\"C:\\Users\\Jane Doe\\x.txt\" failed\n</stderr_txt>",
+        &["Jane Doe"],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        scrubbed.contains(&format!("\"{path}\" failed")),
+        "{scrubbed}"
+    );
+    assert!(!scrubbed.contains("Doe"), "{scrubbed}");
+
+    // A path in an attribute value: the tag stays well formed.
+    let scrubbed = run(
+        "<file name=\"C:\\Users\\Jane Doe\\x.txt\" size=\"3\"/>",
+        &["Jane Doe"],
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        scrubbed.contains(&format!("<file name=\"{path}\" size=\"3\"/>")),
+        "{scrubbed}"
+    );
+
+    // The data directory with a space in a name, in lower case.
+    let scrubbed = run("<x>c:\\programdata\\My Co\\boinc\\slots</x>", &["My Co"])
+        .unwrap()
+        .unwrap();
+    assert!(scrubbed.contains(&format!("<x>{path}</x>")), "{scrubbed}");
+
+    // A single-quoted path with an apostrophe inside: the end is unknown, so the file is refused.
+    let refused = run("<x a='C:\\Users\\O'Connor\\x'/>", &[])
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        refused.contains("cannot tell where the path ends"),
+        "{refused}"
+    );
+
+    // A part of a forbidden name that is left anywhere is refused.
+    let refused = run("<x>Mr Doe</x>", &["Jane Doe"]).unwrap().unwrap_err();
+    assert!(
+        refused.contains("a part 'Doe' of the forbidden text 'Jane Doe'"),
+        "{refused}"
+    );
+    let refused = run("<x>Connor</x>", &["O'Connor"]).unwrap().unwrap_err();
+    assert!(refused.contains("'Connor'"), "{refused}");
+
+    // A profile path in a form the replacement does not match is refused, not written.
+    let refused = run("<x>d:/Users/jsmith/x</x>", &[]).unwrap().unwrap_err();
+    assert!(refused.contains("forbidden text"), "{refused}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
