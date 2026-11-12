@@ -1,0 +1,5 @@
+<data_server_reply>
+    <status>1</status>
+    <message>EOF on socket read : asked for 22, got 10
+</message>
+</data_server_reply>

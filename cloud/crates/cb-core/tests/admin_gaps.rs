@@ -471,11 +471,15 @@ fn flags_text_and_odd_layouts() {
         new,
         "<config><master_url>https://p.example/</master_url><dont_send_jobs/><!-- <ended>1</ended> --><ended>1</ended></config>"
     );
-    // A tag stated twice keeps the first and loses the rest; removal takes all.
+    // A tag stated twice: the loader takes the last, so that one is changed
+    // (and reported as the previous value); removal takes all of them out.
     let twice = "<config>\n  <a>1</a>\n  <ban_os>x</ban_os>\n  <ban_os>y</ban_os>\n</config>";
     let (new, prev) = edit_config_tag(twice, "ban_os", Some("z")).unwrap();
-    assert_eq!(prev.as_deref(), Some("x"));
-    assert_eq!(new, "<config>\n  <a>1</a>\n  <ban_os>z</ban_os>\n</config>");
+    assert_eq!(prev.as_deref(), Some("y"));
+    assert_eq!(
+        new,
+        "<config>\n  <a>1</a>\n  <ban_os>x</ban_os>\n  <ban_os>z</ban_os>\n</config>"
+    );
     let (new, _) = edit_config_tag(twice, "ban_os", None).unwrap();
     assert_eq!(new, "<config>\n  <a>1</a>\n</config>");
     // Text is escaped and read back as it was.
@@ -630,4 +634,480 @@ fn the_maintenance_options_are_read() {
     let d = Config::parse("<config><master_url>https://p.example/</master_url></config>").unwrap();
     assert_eq!(d.maintenance_delay, 3600.0);
     assert_eq!(d.min_core_client_version_announced, 0);
+}
+
+// ---- The config is found as the loader finds it ------------------------------
+
+/// The value `Config::parse` ends up with for `maintenance_delay`.
+fn delay(xml: &str) -> f64 {
+    Config::parse(xml).unwrap().maintenance_delay
+}
+
+#[test]
+fn the_active_config_is_edited_not_a_commented_one() {
+    let xml = "<!-- <config><maintenance_delay>5</maintenance_delay></config> -->\n<boinc>\n<config>\n    <master_url>https://p.example/</master_url>\n    <!-- <maintenance_delay>7</maintenance_delay> -->\n    <maintenance_delay>9</maintenance_delay>\n</config>\n</boinc>\n";
+    assert_eq!(delay(xml), 9.0);
+    let (new, prev) = edit_config_tag(xml, "maintenance_delay", Some("1800")).unwrap();
+    assert_eq!(prev.as_deref(), Some("9"));
+    assert_eq!(delay(&new), 1800.0);
+    // Both comments are as they were.
+    assert!(new.starts_with("<!-- <config><maintenance_delay>5</maintenance_delay></config> -->"));
+    assert!(new.contains("<!-- <maintenance_delay>7</maintenance_delay> -->"));
+    // A tag only a comment has is added, not "changed" in the comment.
+    let (new, prev) = edit_config_tag(xml, "ended", Some("1")).unwrap();
+    assert_eq!(prev, None);
+    assert!(Config::parse(&new).unwrap().ended);
+    let (new, prev) = edit_config_tag(xml, "maintenance_delay", None).unwrap();
+    assert_eq!(prev.as_deref(), Some("9"));
+    assert_eq!(delay(&new), 3600.0);
+    assert!(new.contains("<!-- <maintenance_delay>7</maintenance_delay> -->"));
+}
+
+#[test]
+fn the_loaders_spellings_of_the_config_element_are_accepted() {
+    for open in [
+        "<config >",
+        "<config\n>",
+        "<config attr=\"1\">",
+        "<config  \t>",
+    ] {
+        let xml = format!(
+            "<boinc>{open}<master_url>https://p.example/</master_url><maintenance_delay>9</maintenance_delay></config></boinc>"
+        );
+        assert_eq!(delay(&xml), 9.0, "{open}");
+        let (new, _) = edit_config_tag(&xml, "maintenance_delay", Some("77")).unwrap();
+        assert_eq!(delay(&new), 77.0, "{open}");
+        let (new, _) = edit_config_tag(&xml, "ended", Some("1")).unwrap();
+        assert!(Config::parse(&new).unwrap().ended, "{open}");
+    }
+}
+
+#[test]
+fn cdata_whitespace_attributes_and_nesting() {
+    // CDATA text is read as it is, not unescaped.
+    let xml = "<config><master_url>https://p.example/</master_url><long_name><![CDATA[A &amp; B]]></long_name><email_from_name>  spaced  </email_from_name><maintenance_delay a=\"x\">9</maintenance_delay><dont_send_jobs/><nested><x>1</x><x>2</x></nested></config>";
+    assert_eq!(Config::parse(xml).unwrap().long_name, "A &amp; B");
+    let (new, prev) = edit_config_tag(xml, "long_name", Some("C & D")).unwrap();
+    assert_eq!(prev.as_deref(), Some("A &amp; B"));
+    assert_eq!(Config::parse(&new).unwrap().long_name, "C & D");
+    // Attributes and surrounding space do not matter.
+    let (new, prev) = edit_config_tag(xml, "maintenance_delay", Some("5")).unwrap();
+    assert_eq!(prev.as_deref(), Some("9"));
+    assert_eq!(delay(&new), 5.0);
+    assert_eq!(Config::parse(&new).unwrap().email_from_name, "spaced");
+    // An element holding elements is replaced or removed whole.
+    let (new, prev) = edit_config_tag(xml, "nested", None).unwrap();
+    assert_eq!(prev, None);
+    assert!(!new.contains("nested"));
+    assert_eq!(Config::parse(&new).unwrap().long_name, "A &amp; B");
+    // A value the loader would not give back as it was is refused.
+    for bad in [" lead", "trail ", "a\u{1}b"] {
+        assert!(
+            edit_config_tag(xml, "long_name", Some(bad)).is_err(),
+            "{bad:?}"
+        );
+    }
+    // A document that is not closed is refused.
+    assert!(edit_config_tag("<config><a>1</a>", "a", Some("2")).is_err());
+    assert!(edit_config_tag("<config><a>1</config>", "b", Some("2")).is_err());
+}
+
+/// For documents built from the loader's awkward spellings, an edit that is
+/// accepted gives the value asked for, and no other option of the parsed
+/// config changes.
+#[test]
+fn set_then_parse_returns_the_value_and_changes_nothing_else() {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    let tags = [
+        (
+            "maintenance_delay",
+            "<maintenance_delay>%</maintenance_delay>",
+        ),
+        (
+            "email_max_per_day",
+            "<email_max_per_day>%</email_max_per_day>",
+        ),
+        ("long_name", "<long_name>%</long_name>"),
+        ("dont_send_jobs", "<dont_send_jobs>%</dont_send_jobs>"),
+        ("max_wus_to_send", "<max_wus_to_send>%</max_wus_to_send>"),
+    ];
+    let values = [
+        "0",
+        "1",
+        "20",
+        "7200",
+        "12.5",
+        "x y",
+        "<![CDATA[a&b]]>",
+        "a &amp; b",
+        "",
+    ];
+    let noise = [
+        "",
+        "\n    ",
+        "<!-- <maintenance_delay>1</maintenance_delay> -->",
+        "<!-- </config> -->",
+        "<unknown><maintenance_delay>3</maintenance_delay></unknown>",
+        "<db_passwd>secret</db_passwd>",
+        "text between",
+        "<ended/>",
+    ];
+    let opens = ["<config>", "<config >", "<config a=\"1\">", "<config\n>"];
+    let mut accepted = 0;
+    for round in 0..600 {
+        let mut doc = String::new();
+        if next(3) == 0 {
+            doc.push_str("<!-- <config><long_name>old</long_name></config> -->");
+        }
+        if next(2) == 0 {
+            doc.push_str("<boinc>");
+        }
+        doc.push_str(opens[next(opens.len())]);
+        doc.push_str("<master_url>https://p.example/</master_url>");
+        for _ in 0..next(7) {
+            doc.push_str(noise[next(noise.len())]);
+            let (_, pattern) = tags[next(tags.len())];
+            doc.push_str(&pattern.replace('%', values[next(values.len())]));
+        }
+        doc.push_str("</config>");
+        let Ok(before) = Config::parse(&doc) else {
+            continue;
+        };
+        let (tag, _) = tags[next(tags.len())];
+        let asked = ["0", "1", "42", "3600", "new name", "9.5"][next(6)];
+        let unset = next(4) == 0;
+        let result = edit_config_tag(&doc, tag, (!unset).then_some(asked));
+        let Ok((new, _)) = result else {
+            continue;
+        };
+        accepted += 1;
+        let after = Config::parse(&new).unwrap_or_else(|e| panic!("{round}: {e}\n{doc}\n{new}"));
+        // Everything but the option is as it was.
+        let mut expect = before.clone();
+        let mut got = after.clone();
+        match tag {
+            "maintenance_delay" => {
+                expect.maintenance_delay = 0.0;
+                got.maintenance_delay = 0.0
+            }
+            "email_max_per_day" => {
+                expect.email_max_per_day = 0;
+                got.email_max_per_day = 0
+            }
+            "long_name" => {
+                expect.long_name.clear();
+                got.long_name.clear()
+            }
+            "dont_send_jobs" => {
+                expect.dont_send_jobs = false;
+                got.dont_send_jobs = false
+            }
+            _ => {
+                expect.max_wus_to_send = 0;
+                got.max_wus_to_send = 0
+            }
+        }
+        assert_eq!(expect, got, "{round}: {tag}\n{doc}\n{new}");
+        // And the option itself.
+        if unset {
+            let d = Config::default();
+            match tag {
+                "maintenance_delay" => assert_eq!(after.maintenance_delay, d.maintenance_delay),
+                "email_max_per_day" => assert_eq!(after.email_max_per_day, d.email_max_per_day),
+                "long_name" => assert_eq!(after.long_name, d.long_name),
+                "dont_send_jobs" => assert!(!after.dont_send_jobs),
+                _ => assert_eq!(after.max_wus_to_send, d.max_wus_to_send),
+            }
+        } else {
+            // A value the option's type cannot hold (words for a number) is
+            // not read back by the loader: the edit then must have been
+            // refused, or the loader must see what was asked.
+            let typed = match tag {
+                "maintenance_delay" => asked
+                    .parse::<f64>()
+                    .ok()
+                    .map(|v| after.maintenance_delay == v),
+                "email_max_per_day" => asked
+                    .parse::<i32>()
+                    .ok()
+                    .map(|v| after.email_max_per_day == v),
+                "long_name" => Some(after.long_name == asked),
+                "dont_send_jobs" => asked
+                    .parse::<i32>()
+                    .ok()
+                    .map(|v| after.dont_send_jobs == (v != 0)),
+                _ => asked
+                    .parse::<i32>()
+                    .ok()
+                    .map(|v| after.max_wus_to_send == v),
+            };
+            if let Some(ok) = typed {
+                assert!(ok, "{round}: {tag}={asked}\n{doc}\n{new}");
+            }
+        }
+    }
+    assert!(accepted > 300, "only {accepted} edits accepted");
+}
+
+// ---- app-put races -----------------------------------------------------------
+
+/// A database that runs another call to `put_app` before the first write
+/// of this one that is an update of the app table.
+struct AppRace<'a> {
+    inner: &'a SqliteDb,
+    other: RefCell<Option<NewApp>>,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for AppRace<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if stmts.iter().any(|s| s.sql.starts_with("UPDATE app SET")) {
+            if let Some(a) = self.other.borrow_mut().take() {
+                block_on(put_app(self.inner, 150, &a)).unwrap();
+            }
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+fn webhook_app(db: &SqliteDb) {
+    block_on(put_app(
+        db,
+        100,
+        &NewApp {
+            name: "w".into(),
+            validator: Some("webhook".into()),
+            validator_url: Some("https://v.example/old".into()),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_weight_update_does_not_undo_a_validator_change_made_meanwhile() {
+    let db = world();
+    webhook_app(&db);
+    let raced = AppRace {
+        inner: &db,
+        other: RefCell::new(Some(NewApp {
+            name: "w".into(),
+            validator: Some("bitwise".into()),
+            validator_url: Some(String::new()),
+            ..Default::default()
+        })),
+    };
+    block_on(put_app(
+        &raced,
+        200,
+        &NewApp {
+            name: "w".into(),
+            weight: Some(4.0),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let a = app_named(&db, "w");
+    // Both survive.
+    assert_eq!(a.weight, 4.0);
+    assert_eq!(
+        (a.validator.as_str(), a.validator_url.as_str()),
+        ("bitwise", "")
+    );
+}
+
+#[test]
+fn a_url_update_checked_against_a_validator_that_then_changes_is_checked_again() {
+    let db = world();
+    webhook_app(&db);
+    // The call states a new URL for what it read as a webhook; another call
+    // makes the app bitwise first. The URL is written all the same (a
+    // bitwise app may carry one), the validator stays as the other call set it.
+    let raced = AppRace {
+        inner: &db,
+        other: RefCell::new(Some(NewApp {
+            name: "w".into(),
+            validator: Some("bitwise".into()),
+            ..Default::default()
+        })),
+    };
+    block_on(put_app(
+        &raced,
+        200,
+        &NewApp {
+            name: "w".into(),
+            validator_url: Some("https://v.example/new".into()),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let a = app_named(&db, "w");
+    assert_eq!(
+        (a.validator.as_str(), a.validator_url.as_str()),
+        ("bitwise", "https://v.example/new")
+    );
+    // The reverse: the call clears the URL of what it read as bitwise, and
+    // another call makes the app a webhook first. Checked again against the
+    // new row, the clearing is refused and nothing of it is written.
+    let db = world();
+    block_on(put_app(
+        &db,
+        100,
+        &NewApp {
+            name: "w".into(),
+            validator: Some("bitwise".into()),
+            validator_url: Some("https://v.example/old".into()),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let raced = AppRace {
+        inner: &db,
+        other: RefCell::new(Some(NewApp {
+            name: "w".into(),
+            validator: Some("webhook".into()),
+            ..Default::default()
+        })),
+    };
+    let e = block_on(put_app(
+        &raced,
+        200,
+        &NewApp {
+            name: "w".into(),
+            validator_url: Some(String::new()),
+            weight: Some(9.0),
+            ..Default::default()
+        },
+    ))
+    .unwrap_err();
+    assert!(e.to_string().contains("https validator_url"), "{e}");
+    let a = app_named(&db, "w");
+    assert_eq!((a.validator.as_str(), a.weight), ("webhook", 1.0));
+    assert_eq!(a.validator_url, "https://v.example/old");
+}
+
+#[test]
+fn creating_an_app_that_another_call_created_first_updates_it() {
+    let db = world();
+    let raced = RaceOnInsert {
+        inner: &db,
+        done: RefCell::new(false),
+    };
+    block_on(put_app(
+        &raced,
+        100,
+        &NewApp {
+            name: "n".into(),
+            weight: Some(5.0),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let a = app_named(&db, "n");
+    // The other call's setting and this call's both hold.
+    assert_eq!(a.weight, 5.0);
+    assert_eq!(a.min_version, 7);
+}
+
+struct RaceOnInsert<'a> {
+    inner: &'a SqliteDb,
+    done: RefCell<bool>,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for RaceOnInsert<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if stmts.iter().any(|s| s.sql.starts_with("INSERT INTO app")) && !*self.done.borrow() {
+            *self.done.borrow_mut() = true;
+            block_on(put_app(
+                self.inner,
+                90,
+                &NewApp {
+                    name: "n".into(),
+                    min_version: Some(7),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+/// A database that changes a staged file's MD5 between the reads and the
+/// write of `add_app_version`.
+struct FileSwap<'a> {
+    inner: &'a SqliteDb,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for FileSwap<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        if stmts
+            .iter()
+            .any(|s| s.sql.starts_with("INSERT INTO app_version"))
+        {
+            self.inner
+                .apply("UPDATE job_file SET md5 = 'ffffffffffffffffffffffffffffffff' WHERE name = 'app_1.02_file7'")
+                .unwrap();
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
+#[test]
+fn a_file_replaced_while_a_version_is_registered_stops_it() {
+    let db = world();
+    block_on(db.batch(vec![
+        stmt!("INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (1, 0, 'p', 'p')"),
+        stmt!("INSERT INTO app (id, create_time, name, user_friendly_name, validator) VALUES (1, 0, 'app', 'app', 'trivial')"),
+    ]))
+    .unwrap();
+    let version = NewAppVersion {
+        app: "app".into(),
+        platform: "p".into(),
+        version_num: 102,
+        files: files(&db, 100),
+        ..Default::default()
+    };
+    let config = Config::parse(CONFIG).unwrap();
+    let e = block_on(add_app_version(
+        &FileSwap { inner: &db },
+        &config,
+        None,
+        20,
+        &version,
+    ))
+    .unwrap_err();
+    assert!(matches!(e, CoreError::Conflict(_)), "{e}");
+    // Nothing was written: no version, and the files are not marked kept.
+    let n: i64 = block_on(query_one::<N>(
+        &db,
+        Stmt::new("SELECT count(*) AS n FROM app_version"),
+    ))
+    .unwrap()
+    .unwrap()
+    .n;
+    assert_eq!(n, 0);
+    let kept: i64 = block_on(query_one::<N>(
+        &db,
+        Stmt::new("SELECT count(*) AS n FROM job_file WHERE no_delete = 1"),
+    ))
+    .unwrap()
+    .unwrap()
+    .n;
+    assert_eq!(kept, 0);
+    // Registered again after the file is staged properly, it goes through.
+    let version = NewAppVersion {
+        files: files(&db, 100),
+        ..version
+    };
+    db.apply("UPDATE job_file SET no_delete = 0").ok();
+    assert!(add(&db, &version).is_ok());
 }

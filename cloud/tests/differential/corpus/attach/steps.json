@@ -1,0 +1,56 @@
+[
+  {
+    "name": "01-get_project_config",
+    "kind": "web",
+    "method": "GET",
+    "url": "get_project_config.php"
+  },
+  {
+    "name": "02-lookup_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "lookup_account.php?email_addr=tester%40example%2Eorg&passwd_hash=2bf06d436f6197ab0c1e78cb7f1f2436"
+  },
+  {
+    "name": "03-lookup_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "lookup_account.php?email_addr=tester%40example%2Eorg&passwd_hash=6f5c43710cd2eae01199e437e44cc27a"
+  },
+  {
+    "name": "04-lookup_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "lookup_account.php?email_addr=nobody%40example%2Eorg&passwd_hash=4491ff9533a742a07cfc29e00847daa5"
+  },
+  {
+    "name": "05-create_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "create_account.php?email_addr=new%40example%2Eorg&passwd_hash=84a94ea3ccb2304813295ebee76b2803&user_name=New%20Person"
+  },
+  {
+    "name": "06-create_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "create_account.php?email_addr=tester%40example%2Eorg&passwd_hash=2bf06d436f6197ab0c1e78cb7f1f2436&user_name=Test%20User"
+  },
+  {
+    "name": "07-create_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "create_account.php?email_addr=tester%40example%2Eorg&passwd_hash=74754aafd7b166cdfb0e5d48e8b9609a&user_name=Test%20User"
+  },
+  {
+    "name": "08-create_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "create_account.php?email_addr=bad%2Demail&passwd_hash=706cc3a6010f512ac4ede5a3fb582e9d&user_name=Bad"
+  },
+  {
+    "name": "09-create_account",
+    "kind": "web",
+    "method": "GET",
+    "url": "create_account.php?email_addr=short%40example%2Eorg&passwd_hash=b8c6595ab0cf2b0fe164abe0dc096bdd&user_name=Short"
+  }
+]

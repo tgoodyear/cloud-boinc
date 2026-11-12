@@ -1,0 +1,25 @@
+[
+  {
+    "name": "01-master",
+    "kind": "web",
+    "method": "GET",
+    "url": "",
+    "compare": "master"
+  },
+  {
+    "name": "02-sched",
+    "kind": "sched",
+    "request": "02-sched.request.xml"
+  },
+  {
+    "name": "03-sched",
+    "kind": "sched",
+    "request": "03-sched.request.xml"
+  },
+  {
+    "name": "04-sched-forgot-tasks",
+    "kind": "sched",
+    "request": "04-sched-forgot-tasks.request.xml",
+    "derived": "the previous request with other_results emptied and rpc_seqno one higher: a client that lost its tasks"
+  }
+]

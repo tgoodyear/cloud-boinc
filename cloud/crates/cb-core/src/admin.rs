@@ -203,7 +203,10 @@ pub async fn put_app(db: &dyn Db, now: i64, a: &NewApp) -> CoreResult<i64> {
         add("weight", a.weight.map(Value::from));
         add("beta", flag(a.beta).map(Value::from));
         add("target_nresults", a.target_nresults.map(Value::from));
-        add("non_cpu_intensive", flag(a.non_cpu_intensive).map(Value::from));
+        add(
+            "non_cpu_intensive",
+            flag(a.non_cpu_intensive).map(Value::from),
+        );
         add(
             "fraction_done_exact",
             flag(a.fraction_done_exact).map(Value::from),
@@ -524,7 +527,60 @@ pub async fn add_app_version(
         }
         writes.push(keep);
     }
-    let done = db.batch(writes).await?;
+    // The signatures were checked against the MD5s read above. A file staged
+    // again with other contents (`replace=1`) since would leave a version that
+    // describes the old one, so the batch checks every file still has the MD5
+    // that was read, and fails, writing nothing, if one does not. The check
+    // raises an error when the count is off: `abs` of the smallest integer
+    // overflows in SQLite.
+    let keys: Vec<String> = v
+        .files
+        .iter()
+        .filter_map(|f| {
+            staged
+                .get(f.name.as_str())
+                .map(|s| format!("{}:{}", f.name, s.md5))
+        })
+        .collect();
+    let mut distinct = keys.clone();
+    distinct.sort();
+    distinct.dedup();
+    for chunk in distinct.chunks(MAX_IN_LIST) {
+        let mut guard = Stmt::new(format!(
+            "SELECT CASE WHEN (SELECT count(*) FROM job_file WHERE name || ':' || md5 IN ({})) = ? \
+             THEN 1 ELSE abs(-9223372036854775808) END AS ok",
+            vec!["?"; chunk.len()].join(", ")
+        ));
+        for k in chunk {
+            guard = guard.bind(k.as_str());
+        }
+        writes.push(guard.bind(chunk.len() as i64));
+    }
+    let done = match db.batch(writes).await {
+        Ok(d) => d,
+        Err(e) => {
+            // Was it the check? Look at the files again.
+            let mut changed = false;
+            for chunk in distinct.chunks(MAX_IN_LIST) {
+                let mut q = Stmt::new(format!(
+                    "SELECT count(*) AS n FROM job_file WHERE name || ':' || md5 IN ({})",
+                    vec!["?"; chunk.len()].join(", ")
+                ));
+                for k in chunk {
+                    q = q.bind(k.as_str());
+                }
+                let n = db.run(q).await?.scalar_i64().unwrap_or(0);
+                changed |= n != chunk.len() as i64;
+            }
+            return Err(if changed {
+                CoreError::Conflict(
+                    "a staged file changed while the version was registered; try again".into(),
+                )
+            } else {
+                e.into()
+            });
+        }
+    };
     match done.first().and_then(|r| r.scalar_i64()) {
         Some(id) => Ok(id),
         None => Err(CoreError::Conflict(format!(

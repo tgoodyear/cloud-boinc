@@ -2,8 +2,8 @@
 //! value a Worker loads and keeps for a few seconds.
 
 use cb_crypto::PublicKey;
-use cb_proto::xml::{xml_unescape, XmlParser};
 use cb_db::{stmt, Db, Stmt};
+use cb_proto::xml::{xml_unescape, XmlParser};
 use serde::Deserialize;
 
 use crate::plan_class::PlanClassSpecs;

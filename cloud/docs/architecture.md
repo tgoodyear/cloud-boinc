@@ -281,10 +281,10 @@ of ones it is not stay in front: the host is told what stopped it ("Tasks need m
 this computer makes available") and the next request reads the same four windows. The remedy
 is to give jobs of very different sizes their own apps; size classes are not ported.
 
-A read that finds no candidate at all does not mean the project has no tasks, since the query
-leaves out what the host cannot take. When a request that wanted work gets none, one probe on
-the index of unsent results says whether there is unsent work of the host's apps: if there is,
-the reply says "No tasks sent" and not "Project has no tasks available".
+The query leaves out what the host cannot take, so an empty read does not mean the project
+has no tasks. The decision between "Project has no tasks available" and "No tasks sent" is the
+project-wide probe of `UNSENT_EXISTS` (see D10 in `compatibility.md`), which asks about unsent
+work of any app, as upstream's cache does.
 
 If D1 read latency or row reads ever limit throughput, the next step is a Durable Object that
 holds the unsent window in memory, which is the feeder again. We build it only if measurements
@@ -1785,8 +1785,27 @@ only if the document is still the one read; if another write got in between, the
 again to the new document, up to five times, and then refused with a conflict. The result must
 pass the same checks as a whole-config write, so an edit that would leave the config unparseable,
 without a master URL, or with a bad sender address is refused and nothing is stored. A tag stated
-twice keeps the first and loses the rest. The reply gives the value the tag had and whether the
+twice is changed in its last occurrence, which is the one the loader uses (each reading replaces the one
+before), and removed everywhere. The reply gives the value the tag had and whether the
 document changed. A flag is set with `--value 1`.
+
+The config is read with the loader's own tokenizer (`XmlParser`, `scan_config` in
+`crates/cb-core/src/project.rs`), not by searching the text: a commented-out `<config>` or tag
+is skipped, `<config >` and a `<config>` with attributes are the element, CDATA is text, and the
+first `<config>` tag starts it, as in `Config::parse`. The tokenizer reports where each token
+starts, which is what the edit uses. After the edit the result is read back the same way and
+refused, with nothing stored, unless the tag has the value asked for (or is gone) and every other
+element reads as before. That refuses a value the loader would not return as it was (leading or
+trailing space, characters XML cannot hold).
+
+`cboinc app-put` and the other operations that keep what a call leaves out follow one rule: a
+write changes only what the call states, and a check that depends on what was read is part of the
+write's `WHERE`, with a retry on no row. `put_app` writes only the stated columns; the webhook
+validator needs a URL, so a call that states one of the two holds the other to the value its
+check read, and reads and checks again if it changed. `add_app_version` checks in the same
+batch that every file still has the MD5 its signature was checked against, and writes nothing
+if one was staged again meanwhile. The release of HR commitments and the config edit are single
+guarded statements.
 
 An app version takes up to 1000 files (`MAX_VERSION_FILES` in `crates/cb-core/src/admin.rs`; it
 was 40) and a description of at most 1 MiB, under D1's limit of a row. The lookups and the
@@ -1874,9 +1893,14 @@ reference deployment's observed rate is about 0.1 requests a second.
 5. Load test against the dev deployment with `cboinc load`.
 6. Parser oracle: the stock client's own parsers read the replies the server writes; see
    [compatibility.md](compatibility.md).
+7. Differential test: requests recorded from a stock client are answered by this server on
+   SQLite, and the replies are compared field by field with those the stock server gave to the
+   same requests from the same starting rows. Every intended difference is listed in
+   [compatibility.md](compatibility.md). The stock server runs in a container and is not part
+   of CI; the replies it gave are kept in the repository and `cargo test` checks against them.
 
-The `cloud-ci` workflow runs formatting, Clippy, the native tests, the WebAssembly builds and
-the parser oracle.
+The `cloud-ci` workflow runs formatting, Clippy, the native tests (the differential test
+among them), the WebAssembly builds and the parser oracle.
 
 ## Implementation status
 

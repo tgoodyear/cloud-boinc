@@ -241,7 +241,9 @@ pub struct ProjectConfig {
     /// Base URL of the web RPCs; clients append `lookup_account.php` and
     /// so on. Must be HTTPS for current clients to send passwords.
     pub web_rpc_url_base: String,
-    /// `major.minor.release` of the server software.
+    /// `major.minor.release` of the web interface: `$server_version` in
+    /// `html/inc/server_version.inc`, which upstream raises when a web RPC
+    /// changes. It is not the BOINC release.
     pub server_version: String,
     pub account_manager: bool,
     pub web_stopped: bool,
@@ -265,7 +267,7 @@ impl Default for ProjectConfig {
             name: String::new(),
             master_url: String::new(),
             web_rpc_url_base: String::new(),
-            server_version: "8.3.0".to_string(),
+            server_version: "1.1.0".to_string(),
             account_manager: false,
             web_stopped: false,
             account_creation_disabled: false,
@@ -465,7 +467,7 @@ mod tests {
             config().write(),
             "<?xml version=\"1.0\" encoding=\"ISO-8859-1\" ?>\n\
 <project_config>\n    <name>Example Project</name>\n    <master_url>https://example.org/proj/</master_url>\n    <web_rpc_url_base>https://example.org/proj/</web_rpc_url_base>\n\
-<server_version>8.3.0</server_version>\n    <web_stopped>0</web_stopped>\n    <min_passwd_length>6</min_passwd_length>\n    <sched_stopped>0</sched_stopped>\n    <platforms>\n            <platform>\n                <platform_name>x86_64-pc-linux-gnu</platform_name>\n                <user_friendly_name>Linux running on an AMD x86_64 or Intel EM64T CPU</user_friendly_name>\n            </platform>\n            <platform>\n                <platform_name>windows_x86_64</platform_name>\n                <user_friendly_name>Microsoft Windows running on an AMD x86_64 or Intel EM64T CPU</user_friendly_name>\n                <plan_class>cuda</plan_class>\n\n            </platform>\n    </platforms>\n</project_config>"
+<server_version>1.1.0</server_version>\n    <web_stopped>0</web_stopped>\n    <min_passwd_length>6</min_passwd_length>\n    <sched_stopped>0</sched_stopped>\n    <platforms>\n            <platform>\n                <platform_name>x86_64-pc-linux-gnu</platform_name>\n                <user_friendly_name>Linux running on an AMD x86_64 or Intel EM64T CPU</user_friendly_name>\n            </platform>\n            <platform>\n                <platform_name>windows_x86_64</platform_name>\n                <user_friendly_name>Microsoft Windows running on an AMD x86_64 or Intel EM64T CPU</user_friendly_name>\n                <plan_class>cuda</plan_class>\n\n            </platform>\n    </platforms>\n</project_config>"
         );
     }
 
