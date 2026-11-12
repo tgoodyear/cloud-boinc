@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use cb_core::mail::Mailer;
 use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS};
 use cb_core::web::{
-    am_get_info, am_set_host_info, am_set_info, create_account, lookup_account, master_page,
-    project_config, server_status, server_status_page, server_status_xml, NewAccount,
-    MAX_FORM_BYTES,
+    am_get_info, am_set_host_info, am_set_info, create_account, html_cache_control, lookup_account,
+    master_page, project_config, server_status, server_status_page, server_status_xml, NewAccount,
+    FAVICON_SVG, MAX_FORM_BYTES,
 };
 use cb_proto::web_rpc::AccountError;
 use cb_worker::{
@@ -29,7 +29,7 @@ fn html(body: String) -> Result<Response> {
         .with_header("Content-Type", "text/html; charset=utf-8")?
         .with_header(
             "Cache-Control",
-            &format!("public, max-age={PAGE_CACHE_SECS}"),
+            &html_cache_control(&format!("public, max-age={PAGE_CACHE_SECS}")),
         )?
         .fixed(body.into_bytes()))
 }
@@ -49,7 +49,7 @@ fn site_response(page: SitePage) -> Result<Response> {
     let mut builder = Response::builder()
         .with_status(page.status)
         .with_header("Content-Type", page.content_type)?
-        .with_header("Cache-Control", "private, no-store")?;
+        .with_header("Cache-Control", &html_cache_control("private, no-store"))?;
     for (name, value) in SITE_HEADERS {
         builder = builder.with_header(name, value)?;
     }
@@ -93,6 +93,13 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         return text(405, "method not allowed\n");
     }
     let path = req.path();
+    if path == "/favicon.ico" && matches!(req.method(), Method::Get | Method::Head) {
+        return Ok(Response::builder()
+            .with_header("Content-Type", "image/svg+xml")?
+            .with_header("Cache-Control", "public, max-age=86400")?
+            .with_header("X-Content-Type-Options", "nosniff")?
+            .fixed(FAVICON_SVG.as_bytes().to_vec()));
+    }
     let cache_key = is_static_page(&req, &path).then(|| req.url().map(|u| u.to_string()));
     let cache_key = cache_key.transpose()?;
     if let Some(key) = &cache_key {
@@ -103,9 +110,18 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
             if let Some(kind) = hit.headers().get("Content-Type")? {
                 headers.set("Content-Type", &kind)?;
             }
+            let base = format!("public, max-age={PAGE_CACHE_SECS}");
+            let is_html = hit
+                .headers()
+                .get("Content-Type")?
+                .is_some_and(|k| k.starts_with("text/html"));
             headers.set(
                 "Cache-Control",
-                &format!("public, max-age={PAGE_CACHE_SECS}"),
+                &if is_html {
+                    html_cache_control(&base)
+                } else {
+                    base
+                },
             )?;
             return Ok(Response::from_body(hit.body().clone())?.with_headers(headers));
         }

@@ -801,6 +801,35 @@ pub fn html_escape(s: &str) -> String {
 /// `frame-ancestors`, so inline styles are allowed.
 pub const SITE_CSS: &str = include_str!("site.css");
 
+/// `Cache-Control` value of an HTML page built from `base`: the page lifetime
+/// as it was, plus `no-transform`, so that a CDN or proxy in front does not
+/// rewrite the page (the master URL page carries the `boinc_scheduler` link
+/// clients read, and the site pages carry forms).
+pub fn html_cache_control(base: &str) -> String {
+    format!("{base}, no-transform")
+}
+
+/// The icon of every page: a small SVG, used by the pages as a data URL and
+/// served at `/favicon.ico` for the clients that ask for that path.
+pub const FAVICON_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 32 32\">\
+<rect width=\"32\" height=\"32\" rx=\"7\" fill=\"#0b5cad\"/>\
+<circle cx=\"16\" cy=\"16\" r=\"6\" fill=\"none\" stroke=\"#fff\" stroke-width=\"3\"/></svg>";
+
+/// [`FAVICON_SVG`] as the `href` of a `<link rel="icon">`.
+fn favicon_href() -> String {
+    let mut out = String::from("data:image/svg+xml,");
+    for c in FAVICON_SVG.chars() {
+        match c {
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '#' => out.push_str("%23"),
+            '"' => out.push('\''),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The HTML shell. A body that starts with the site header (see
 /// `site_ui::site_header`) has the rest put in `<main>`. Tables are wrapped
 /// in a `scroll` box, so that a wide table scrolls sideways inside its own
@@ -823,10 +852,11 @@ pub(crate) fn page(title: &str, head: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{}</title>\n{head}\
+         <title>{}</title>\n{head}<link rel=\"icon\" href=\"{}\">\n\
          <style>{SITE_CSS}</style>\n\
          </head>\n<body>\n{header}<main>\n{main}</main>\n</body>\n</html>\n",
-        html_escape(title)
+        html_escape(title),
+        favicon_href()
     )
 }
 
