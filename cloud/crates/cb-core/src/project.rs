@@ -138,10 +138,15 @@ pub async fn delete_setting(db: &dyn Db, name: &str) -> CoreResult<bool> {
         return Err(CoreError::NotFound(format!("setting {name}")));
     }
     if name == SETTING_CONFIG {
-        return Err(CoreError::Invalid("the config setting cannot be removed".into()));
+        return Err(CoreError::Invalid(
+            "the config setting cannot be removed".into(),
+        ));
     }
     let rows = db
-        .run(stmt!("DELETE FROM config WHERE name = ? RETURNING name", name))
+        .run(stmt!(
+            "DELETE FROM config WHERE name = ? RETURNING name",
+            name
+        ))
         .await?;
     Ok(!rows.rows.is_empty())
 }

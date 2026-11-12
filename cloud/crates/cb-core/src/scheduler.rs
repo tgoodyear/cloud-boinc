@@ -2830,9 +2830,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                             // `get_app_version_anonymous` does not look at it.
                             None => {
                                 !hom.hav
-                                    && ctx.routing.permits(
-                                        &app.name, &c.wu.name, c.wu.batch, assigned, None,
-                                    )
+                                    && ctx
+                                        .routing
+                                        .permits(&app.name, &c.wu.name, c.wu.batch, assigned, None)
                             }
                         }
                 };

@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 
 use cb_core::model::JobResult;
 use cb_core::plan_class::PlanClassSpecs;
-use cb_core::project::{delete_setting, put_setting, Project, SETTING_CONFIG, SETTING_ROUTING_RULES};
+use cb_core::project::{
+    delete_setting, put_setting, Project, SETTING_CONFIG, SETTING_ROUTING_RULES,
+};
 use cb_core::routing::RoutingRules;
 use cb_core::scheduler::{handle_request, Catalog, SchedCtx, SchedOutcome};
 use cb_core::work::{create_work, Assign, AssignTarget, JobSpec, Submission};
@@ -114,7 +116,9 @@ impl World {
         if let Some(names) = other {
             xml.push_str("<other_results>\n");
             for n in names {
-                xml.push_str(&format!("<other_result>\n<name>{n}</name>\n</other_result>\n"));
+                xml.push_str(&format!(
+                    "<other_result>\n<name>{n}</name>\n</other_result>\n"
+                ));
             }
             xml.push_str("</other_results>\n");
         }
@@ -238,18 +242,20 @@ fn a_lost_result_is_not_resent_to_a_version_a_rule_refuses() {
     .unwrap();
     let out = w.rpc(host, 3, Some(&[]), 2100);
     assert_eq!(out.n_resent, 0);
-    assert!(out
-        .reply
-        .messages
-        .iter()
-        .any(|m| m.message.contains(&format!("Didn't resend lost task {name}"))));
+    assert!(out.reply.messages.iter().any(|m| m
+        .message
+        .contains(&format!("Didn't resend lost task {name}"))));
 
     // Another world, where the rule allows the version it went with: resent.
     let w = World::new("");
     let host = w.host();
     let wu = w.submit(&["lin_1"], 0, None)[0];
     assert_eq!(w.rpc(host, 2, None, 2000).n_sent, 1);
-    let this = if sent_with(&w, wu) == Some(7) { LINUX } else { MAC };
+    let this = if sent_with(&w, wu) == Some(7) {
+        LINUX
+    } else {
+        MAC
+    };
     *w.routing.borrow_mut() = RoutingRules::parse(&format!(
         r#"{{"rules":[{{"app":"a","allow":[{{"platform":"{this}"}}]}}]}}"#
     ))
@@ -290,7 +296,13 @@ fn the_setting_is_checked_loaded_and_removed() {
         1,
     ))
     .unwrap();
-    assert!(block_on(put_setting(&db, SETTING_ROUTING_RULES, r#"{"rules":[{"app":""}]}"#, 2)).is_err());
+    assert!(block_on(put_setting(
+        &db,
+        SETTING_ROUTING_RULES,
+        r#"{"rules":[{"app":""}]}"#,
+        2
+    ))
+    .is_err());
     assert!(block_on(Project::load(&db)).unwrap().routing.is_empty());
     block_on(put_setting(&db, SETTING_ROUTING_RULES, BY_NAME, 3)).unwrap();
     assert_eq!(block_on(Project::load(&db)).unwrap().routing.rules.len(), 3);

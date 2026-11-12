@@ -203,7 +203,10 @@ impl RoutingRules {
             }
             if r.min_batch < 0 || r.max_batch < 0 || (r.max_batch != 0 && r.min_batch > r.max_batch)
             {
-                return Err(invalid(i, "min_batch and max_batch must be 0 or more, in order"));
+                return Err(invalid(
+                    i,
+                    "min_batch and max_batch must be 0 or more, in order",
+                ));
             }
             if r.allow.len() > MAX_ALLOW {
                 return Err(invalid(i, "too many allow entries"));
@@ -212,7 +215,10 @@ impl RoutingRules {
                 if a.platform.as_deref().is_some_and(|p| !word(p)) {
                     return Err(invalid(i, "platform must be a platform name"));
                 }
-                if a.plan_class.as_deref().is_some_and(|p| !p.is_empty() && !word(p)) {
+                if a.plan_class
+                    .as_deref()
+                    .is_some_and(|p| !p.is_empty() && !word(p))
+                {
                     return Err(invalid(i, "plan_class must be a plan class name or empty"));
                 }
                 if a.min_version < 0
@@ -329,10 +335,28 @@ mod tests {
         let mac = v("arm64-apple-darwin", "", 7);
         // Rule 1: only version 3 on Linux, 5 and up on macOS with no plan class.
         assert!(r.permits("calib", "calib_a_1", 0, false, Some(&lin)));
-        assert!(!r.permits("calib", "calib_a_1", 0, false, Some(&v("x86_64-pc-linux-gnu", "", 4))));
+        assert!(!r.permits(
+            "calib",
+            "calib_a_1",
+            0,
+            false,
+            Some(&v("x86_64-pc-linux-gnu", "", 4))
+        ));
         assert!(r.permits("calib", "calib_a_1", 0, false, Some(&mac)));
-        assert!(!r.permits("calib", "calib_a_1", 0, false, Some(&v("arm64-apple-darwin", "cuda", 7))));
-        assert!(!r.permits("calib", "calib_a_1", 0, false, Some(&v("arm64-apple-darwin", "", 4))));
+        assert!(!r.permits(
+            "calib",
+            "calib_a_1",
+            0,
+            false,
+            Some(&v("arm64-apple-darwin", "cuda", 7))
+        ));
+        assert!(!r.permits(
+            "calib",
+            "calib_a_1",
+            0,
+            false,
+            Some(&v("arm64-apple-darwin", "", 4))
+        ));
         // Rule 2 selects by batch; rule 3 refuses the other calib_ names, but not
         // rows rule 2 admitted first.
         assert!(r.permits("calib", "other", 15, false, Some(&v("p", "cuda", 1))));
@@ -397,10 +421,8 @@ mod tests {
         // An app with no rule has no condition, and a rule that allows the
         // version adds none.
         assert_eq!(r.sql_condition("other", false, Some(&lin)), "");
-        let only = RoutingRules::parse(
-            r#"{"rules":[{"app":"a","allow":[{"platform":"p"}]}]}"#,
-        )
-        .unwrap();
+        let only =
+            RoutingRules::parse(r#"{"rules":[{"app":"a","allow":[{"platform":"p"}]}]}"#).unwrap();
         assert_eq!(only.sql_condition("a", false, Some(&v("p", "", 1))), "");
         assert_eq!(
             only.sql_condition("a", false, Some(&v("q", "", 1))),
