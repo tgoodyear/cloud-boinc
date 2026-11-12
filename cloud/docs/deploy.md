@@ -41,6 +41,12 @@ Keep `code_sign_private` on the machine that signs app versions. It is never upl
 Clients pin the code-signing public key when they attach, so losing the private key means
 every client has to detach and attach again.
 
+A project moving from a stock server does not make new pairs. It keeps the stock ones: the public keys
+go in with `cboinc config-put --name code_sign_public_key` and `--name upload_public_key`, and the
+upload private key is the `UPLOAD_PRIVATE_KEY` secret ("Secrets", below). The importer does not
+handle keys; `cb-import import --code-sign-public-key` only checks that the code-signing public key
+verifies the signatures stored in the imported app versions. See [migration.md](migration.md).
+
 ## Resources
 
 ```

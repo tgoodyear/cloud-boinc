@@ -2,10 +2,12 @@
 # The whole migration check.
 #   run.sh --work DIR --clients FILE --image NAME --cboinc FILE --app-binary FILE
 #          [--steps "up drive release probe switch observe down"] [--long-seconds N]
-#          [--cloud-config TAG=VALUE]... [--no-uploads]
+#          [--cloud-config TAG=VALUE]... [--no-uploads] [--importer FILE]
 # The project's URLs name no port, so both servers listen on port 80 and this script takes no
 # --port (the scripts it calls have one for use on their own). --cboinc and --app-binary
-# are used by `up`, `switch` and `observe`. Any failed step stops the run.
+# are used by `up`, `switch` and `observe`. --importer FILE (a built cb-import) makes `switch`
+# copy the rows and the files with the importer (see README.md); the stock server must be
+# one this script started. Any failed step stops the run.
 # See README.md. The steps, which can be run one at a time (--steps) in this order:
 #   up       the stock server and its project (stock-up.sh)
 #   drive    each client of FILE is attached and brought to the state it is left in at the
@@ -21,12 +23,13 @@
 usage() { sed -n '2,/^usage()/p' "$0" | sed '$d' >&2; exit 2; }
 set -eu
 work="" clients="" image="" cboinc="" app="" steps="up drive release probe switch observe down"
-long=240 cfg="" uploads="--carry-uploads"
+long=240 cfg="" uploads="--carry-uploads" importer=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --work) work="$2" ;; --clients) clients="$2" ;; --image) image="$2" ;;
         --cboinc) cboinc="$2" ;; --app-binary) app="$2" ;; --steps) steps="$2" ;;
         --long-seconds) long="$2" ;;
+        --importer) importer="$2" ;;
         --cloud-config) cfg="$cfg --config-set $2" ;;
         --no-uploads) uploads=""; shift; continue ;;
         *) usage ;;
@@ -85,6 +88,8 @@ if has switch; then
             *) die "$t has no mode" ;;
         esac
     done
+    # The importer's manifest names the files to copy, uploads included.
+    [ -z "$importer" ] || { uploads=""; args="--importer $importer"; }
     # shellcheck disable=SC2086
     sh "$HERE/switch.sh" --work "$WORK" --clients "$CLIENTS" --tags "$tags" --cboinc "$cboinc" \
         $uploads $args $cfg || die "switch.sh failed"
