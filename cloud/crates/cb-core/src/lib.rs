@@ -13,6 +13,7 @@ pub mod countries;
 pub mod feed;
 pub mod hr;
 pub mod mail;
+pub mod mail_guard;
 pub mod model;
 pub mod pipeline;
 pub mod plan_class;
