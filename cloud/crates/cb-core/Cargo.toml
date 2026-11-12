@@ -16,7 +16,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
+[features]
+# Lets a fake mailer in tests keep `@example.org` addresses (see
+# `mail_guard`). Not enabled by any deployment build.
+test-support = []
+
 [dev-dependencies]
+cb-core = { path = ".", features = ["test-support"] }
 cb-sqlite = { path = "../cb-sqlite" }
 cb-crypto = { path = "../cb-crypto", features = ["keygen"] }
 futures-lite = "2"
