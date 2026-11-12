@@ -1869,11 +1869,11 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         //
         // The result's `sent_time` is the time of this sending, as
         // `possibly_give_result_new_deadline` in `sched/sched_resend.cpp`
-        // sets it. The upload size query needs where this attempt starts
-        // for each of the result's files, and reads it from `upload_epoch`
-        // (`file_size` in `crates/cb-core/src/upload.rs`), which is written
-        // below by name: a file's name is whatever the output template made
-        // of it, so the result cannot be told from it.
+        // sets it. The uploads need the attempt number of each of the
+        // result's files, in `upload_epoch` (`current_epoch` in
+        // `crates/cb-core/src/upload.rs`), which is written below by name: a
+        // file's name is whatever the output template made of it, so the
+        // result cannot be told from it.
         let rerecord = version.anon
             && (ip.app_version_id != version.result_av_id
                 || ip.flops_estimate != version.hu.peak_flops);
@@ -1917,15 +1917,15 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             params.push(now.into());
             params.push(c.result_id.into());
             writes.push(Stmt { sql, params });
-            // The pieces of the lost attempt are the old attempt's.
+            // The task runs again: a new attempt at each upload file, so
+            // that pieces of the lost one are never taken for its own.
             for f in output_files(&c.xml_doc_in).iter().filter(|f| f.uploadable) {
                 writes.push(stmt!(
-                    "INSERT INTO upload_epoch (name, result_id, since) VALUES (?, ?, ?) \
+                    "INSERT INTO upload_epoch (name, result_id, epoch) VALUES (?, ?, 1) \
                      ON CONFLICT (name) DO UPDATE SET result_id = excluded.result_id, \
-                     since = excluded.since",
+                     epoch = upload_epoch.epoch + 1",
                     f.name.as_str(),
-                    c.result_id,
-                    now
+                    c.result_id
                 ));
             }
         }

@@ -797,7 +797,7 @@ fn purge_archives_then_deletes_finished_workunits() {
 
     // Rows of resent results, which go with their results.
     block_on(w.db.run(stmt!(
-        "INSERT INTO upload_epoch (name, result_id, since) \
+        "INSERT INTO upload_epoch (name, result_id, epoch) \
          SELECT 'file_of_' || name, id, 1 FROM result WHERE workunitid IN (?, ?)",
         done,
         kept

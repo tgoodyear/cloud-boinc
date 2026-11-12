@@ -179,7 +179,7 @@ One bucket per project.
 | --- | --- | --- | --- |
 | `download/<name>` | app version files, job inputs | admin API | job inputs: `delete_delay_hours` after assimilation, or forever when marked `no_delete`; app files: until the version is removed |
 | `upload/<name>` | result outputs | files Worker | `delete_delay_hours` after assimilation |
-| `partial/<name>/<md5>/<start>` | pieces of unfinished uploads over 8 MiB (see "Upload") | files Worker | until the file is finished, else by bucket lifecycle rule |
+| `partial/<name>/<epoch>/<md5>/<start>` | pieces of unfinished uploads over 8 MiB (see "Upload") | files Worker | until the file is finished, else by bucket lifecycle rule |
 | `archive/<date>/` | purged workunit and result rows, as JSON lines, one object per purge pass | pipeline cron | by bucket lifecycle rule |
 
 Names are flat. The stock fan-out directories exist to keep directory sizes down on a POSIX
@@ -620,10 +620,13 @@ disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receiv
 `file_size`) keeps the bytes in pieces:
 
 - The file is divided on a fixed grid of 8 MiB (`PIECE_BYTES`). Each grid piece that ends
-  before the last byte of the file is stored as its own object, `partial/<name>/<md5>/<start>`,
-  as soon as its bytes have arrived. A put is atomic, so a piece exists only if all its bytes
-  do. `<md5>` is the whole-file `<md5_cksum>` the client sent, so pieces of two different files
-  that share a name never share a key, and a request reuses only the pieces under its own MD5.
+  before the last byte of the file is stored as its own object,
+  `partial/<name>/<epoch>/<md5>/<start>`, as soon as its bytes have arrived. A put is atomic,
+  so a piece exists only if all its bytes do. `<md5>` is the whole-file `<md5_cksum>` the client
+  sent, so pieces of two different files that share a name never share a key, and a request
+  reuses only the pieces under its own MD5. `<epoch>` is the file's attempt number, 0 until the
+  scheduler sends the task again after the client lost it (see "A recomputed file under an old
+  name").
   A request whose `<md5_cksum>` is missing or not an MD5 writes no pieces: its file goes into
   one put and no earlier piece is reused (stock clients always send the checksum: they compute
   it when the task ends, `md5_file` in `client/cs_apps.cpp`, and put it in every upload
@@ -635,9 +638,8 @@ disk; R2 cannot append, so the policy in `crates/cb-core/src/upload.rs` (`receiv
   validation keeps reading MD5s from metadata. Pieces are only composed with that check on.
   The pieces are deleted afterwards.
 - `<get_file_size>` answers the size of the finished object, or else the pieces present
-  without a gap from offset 0, or 0 when pieces of more than one file are present. Pieces stored
-  before the result's latest sending are not counted (see "A recomputed file under an old name"
-  below). The tail is never a piece, so that number is always below the size of the file that
+  without a gap from offset 0, or 0 when pieces of more than one file are present. Only pieces
+  of the file's current epoch count (see "A recomputed file under an old name" below). The tail is never a piece, so that number is always below the size of the file that
   wrote the pieces. A request whose data stops early keeps the pieces it finished; the bytes of
   the piece in flight are lost and sent again. A dropped connection keeps pieces only with a zone
   rule; see below.
@@ -713,44 +715,58 @@ first attempt left pieces and the new output differs, three cases follow:
   answer, a new file no longer than they are would never be sent, nothing would be stored under
   the finished name, and the pipeline would reject the result for its missing output and issue
   the work again (the stock handler has the same exposure, with the old bytes on disk as the
-  answer, and there the stale file stays as the output). The server tells the attempts apart
-  by time instead:
-  - The resend records the time under each upload name of the result, in the table
-    `upload_epoch` (`name` primary key, `result_id`, `since`; `migrations/0005_upload_epoch.sql`),
-    in the same batch as the resend's `UPDATE` (`resend_lost_work` in
-    `crates/cb-core/src/scheduler.rs`). It also sets the result's `sent_time` to the time of the
-    resend, as upstream's `possibly_give_result_new_deadline` does, so turnaround is measured
-    from the latest sending; the size query does not read it. The deadline rule is unchanged: it
-    moves only when the result is past it.
-  - `<get_file_size>` ignores pieces that R2 stored at or before `since` for that name
-    (`file_size`, `attempt_start` in `crates/cb-core/src/upload.rs`; the Worker passes the
-    pieces' `uploaded` times from the listing it already makes). A name with no row has had
-    one attempt, and nothing is ignored.
-  - Why a table keyed by the name, and not the result: the name is all a size query has, and
-    what a result template makes of it is not for a reader to take apart. `process_result_template`
-    keeps whatever literal text stands before and after `<OUTFILE_n/>`, so a name can be
-    `pre_<result>_r<random>_0_r1_log`, and no rule over its shape finds the result exactly (an
-    earlier version of this change cut the name at the last `_r<digits>_`, which maps such
-    names to the wrong result or to none). The other exact choice, a row per output at result
-    creation, would add rows to every job and to the write budget; the table here is written
-    only when a result is resent, which is rare. The alternative of treating every name that
-    cannot be attributed as stale would turn resume off for projects whose names are decorated.
-  - The rows are deleted with their result by the purge (`commit_purge` in
-    `crates/cb-core/src/purge.rs`, which selects them by `result_id`).
+  answer, and there the stale file stays as the output). The server tells the attempts apart by
+  an attempt number, the file's epoch, and not by when R2 stored a piece:
+  - The resend adds one to the epoch of each upload name of the result, in the table
+    `upload_epoch` (`name` primary key, `result_id`, `epoch`; a name with no row is epoch 0;
+    `migrations/0005_upload_epoch.sql`), in the same batch as the resend's `UPDATE`
+    (`resend_lost_work` in `crates/cb-core/src/scheduler.rs`). It also sets the result's
+    `sent_time` to the time of the resend, as upstream's `possibly_give_result_new_deadline`
+    does, so turnaround is measured from the latest sending; uploads do not read it. The
+    deadline rule is unchanged: it moves only when the result is past it.
+  - An upload request that reads or writes pieces (a file longer than one piece, or an offset
+    above 0) reads the file's epoch once when it starts, before it consumes its body (in
+    parallel with the check for a stored file), and writes every piece under that epoch
+    (`receive` in `crates/cb-core/src/upload.rs`). A piece written late by a request of the
+    lost attempt, such as an upload that goes on under `wait_until` after the client is gone
+    and after the resend, therefore lands under the old epoch, whatever time R2 gives it. An
+    earlier version of this change compared R2's upload time with the time of the resend, and a
+    late write passed that test.
+  - `<get_file_size>` lists the pieces of the name and counts those of the current epoch
+    (`file_size`, `current_epoch`); older ones are ignored. The composition of the finished
+    object reads the request's epoch only. The request lists pieces of every epoch and deletes
+    those of older ones and of other contents, so garbage of a lost attempt goes at the next
+    request of the new one; pieces a late old write leaves after the file is finished are
+    removed by the lifecycle rule on `partial/`, as other leftovers are.
+  - A request that finds pieces of a later epoch than the one it read belongs to the lost
+    attempt and stops with a transient error, deleting nothing. Before it writes the finished
+    object, a request reads the epoch again and stops the same way if it moved, so a request of
+    the lost attempt does not finish the file after the resend. The check and the put are two
+    steps; a resend landing between them lets the put store the lost attempt's whole,
+    checksummed file, which the new attempt's request then meets as a stored file (refused if
+    its contents differ, never mixed). R2 and D1 cannot be updated together, so that window,
+    milliseconds wide, is left.
+  - Why a table keyed by the name, and not the result: the name is all an upload request has,
+    and what a result template makes of it is not for a reader to take apart.
+    `process_result_template` keeps whatever literal text stands before and after
+    `<OUTFILE_n/>`, so a name can be `pre_<result>_r<random>_0_r1_log`, and no rule over its
+    shape finds the result exactly. A row per output at result creation would add rows to every
+    job and to the write budget; this table is written only when a result is resent, which is
+    rare. Treating every name that cannot be attributed as stale would turn resume off for
+    projects whose names are decorated. The rows are deleted with their result by the purge
+    (`commit_purge` in `crates/cb-core/src/purge.rs`, which selects them by `result_id`).
   - The client then hears 0, sends the file from the start, and the finished object is exactly
-    the new file whatever its length. A genuine resume within one attempt is unaffected: its
-    pieces were stored after the task was sent again.
-  - Cost: one read by primary key per size query, made only when pieces exist for the name (a
-    query for a file with no pieces, or a finished file, reads nothing), and one row written per
-    upload name each time a result is resent. The upload request itself does not read the
-    database for this.
-  - Times: a piece counts as the current attempt's only when it was stored in a later second than
-    `since`. Both sides are whole seconds (a piece at 1000.1 and a resend at 1000.9 are the
-    same second), so a piece stored in the second of the resend is taken for the old attempt's.
-    A piece wrongly taken for stale only costs its bytes sent again, and a genuine resume within
-    that second sends them again; the failure this closes is the other way. R2 and the scheduler
-    Worker are on Cloudflare's clocks, and a margin would make that failure more likely, so
-    there is none.
+    the new file whatever its length. A genuine resume within one attempt is unaffected, at any
+    time after the resend, however close.
+  - Cost. A file of one piece or less (8 MiB) reads no epoch: one head and one put, as before,
+    since its put is all or nothing and no piece is involved; a request of the lost attempt
+    that finishes such a put after the resend stores that attempt's whole, checksummed file,
+    the same outcome as the window above. A request that reads or writes pieces reads
+    `upload_epoch` by primary key twice, at its start and before the finished object (one read
+    for a request that is cut before then), with no change in its R2 operations. A size query
+    reads it once, only when pieces exist. A resend writes one row per upload name. Keys
+    have a new segment, so pieces written before this layout are not seen: an upload cut across
+    a deployment of it restarts from 0.
 
   Whether a client can recompute an output without a resend: in the stock client a result
   moves from computing to `RESULT_FILES_UPLOADING` when the app exits
@@ -766,8 +782,9 @@ first attempt left pieces and the new output differs, three cases follow:
   file, the third in a rejected result and a reissue, never in a wrong file served. The tests
   pin both (`a_recomputed_file_never_mixes_with_an_earlier_attempt`,
   `a_resent_task_does_not_inherit_the_pieces_of_the_lost_one`,
-  `a_resumed_upload_of_the_same_attempt_keeps_its_pieces`,
-  `pieces_stored_in_the_second_of_a_resend_are_the_old_attempts` in `crates/cb-core/tests/upload.rs`),
+  `a_piece_of_the_lost_attempt_written_after_the_resend_is_never_counted`,
+  `an_old_request_cannot_finish_the_file_after_the_resend`,
+  `a_resumed_upload_of_the_same_attempt_keeps_its_pieces` in `crates/cb-core/tests/upload.rs`),
   and `a_result_without_its_finished_output_is_not_accepted_by_any_validator` in
   `crates/cb-core/tests/pipeline.rs` drives a result without its output through validation.
 
@@ -803,10 +820,14 @@ R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
 | Upload of a file of 8 MiB or less from offset 0 | 1 head, 1 put (unchanged) |
 | Upload of a larger file from offset 0, with n pieces | 1 head, 1 list, n + 1 puts, n gets, 1 delete |
 | Resumed upload | the same; pieces already held are not written again |
-| `<get_file_size>` | 1 head and 1 list, run together; with pieces present, 1 read of `upload_epoch` by name (`file_size` in `crates/cb-core/tests/upload.rs`: `a_size_query_reads_the_database_only_when_pieces_exist`) |
+| `<get_file_size>` | 1 head and 1 list, run together; with pieces present, 1 read of `upload_epoch` by name |
 
-An upload request adds no database query, and the settings read on the upload path is unchanged.
-A retry of an upload for a stored file is one head, which now also reads the stored MD5.
+Database reads for the epoch, counted in the same file
+(`database_reads_are_few_and_none_for_a_file_of_one_piece`): none for a file of 8 MiB or less,
+two for a request with pieces (at its start and before the finished object), one for a size
+query with pieces, none for a size query without. The settings read on the upload path is
+unchanged. A retry of an upload for a stored file is one head, which also reads the stored MD5
+(and, for a file of more than one piece, the epoch).
 
 Validation adds R2 heads in the pipeline Worker: one per required output of each result that
 is validated, for the `trivial` validator too (`bitwise` and `webhook` already looked up every

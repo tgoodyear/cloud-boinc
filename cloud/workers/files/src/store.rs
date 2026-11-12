@@ -8,7 +8,8 @@
 
 use async_trait::async_trait;
 use cb_core::upload::{
-    parse_piece_name, piece_name, CompleteWrite, PieceWrite, StoredFile, StoredPiece, UploadStore,
+    parse_piece_name, piece_name, CompleteWrite, PieceRun, PieceWrite, StoredFile, StoredPiece,
+    UploadStore,
 };
 use cb_core::{CoreError, CoreResult, FileKind};
 use cb_worker::object_key;
@@ -88,8 +89,8 @@ fn files_err(e: Error) -> CoreError {
     CoreError::Files(e.to_string())
 }
 
-fn partial_key(name: &str, md5: &[u8; 16], start: u64) -> String {
-    object_key(FileKind::Partial, &piece_name(name, md5, start))
+fn partial_key(name: &str, epoch: u64, md5: &[u8; 16], start: u64) -> String {
+    object_key(FileKind::Partial, &piece_name(name, epoch, md5, start))
 }
 
 pub struct R2Uploads(pub Bucket);
@@ -121,13 +122,14 @@ impl UploadStore for R2Uploads {
             }
             let page = list.execute().await.map_err(files_err)?;
             for o in page.objects() {
-                if let Some((md5, start)) = o.key().strip_prefix(&prefix).and_then(parse_piece_name)
+                if let Some((epoch, md5, start)) =
+                    o.key().strip_prefix(&prefix).and_then(parse_piece_name)
                 {
                     out.push(StoredPiece {
+                        epoch,
                         md5,
                         start,
                         size: o.size(),
-                        uploaded: (o.uploaded().as_millis() / 1000) as i64,
                     });
                 }
             }
@@ -148,6 +150,7 @@ impl UploadStore for R2Uploads {
     async fn put_piece(
         &self,
         name: &str,
+        epoch: u64,
         md5: &[u8; 16],
         start: u64,
         body: &Body,
@@ -156,7 +159,7 @@ impl UploadStore for R2Uploads {
         let data = body.0.take(len as f64);
         match self
             .0
-            .put(partial_key(name, md5, start), data)
+            .put(partial_key(name, epoch, md5, start), data)
             .execute()
             .await
         {
@@ -168,19 +171,23 @@ impl UploadStore for R2Uploads {
 
     async fn put_complete(
         &self,
-        name: &str,
-        starts: &[u64],
-        piece: u64,
+        pieces: &PieceRun<'_>,
         body: &Body,
         tail: u64,
         md5: Option<[u8; 16]>,
     ) -> CoreResult<CompleteWrite> {
         // Pieces are only composed under the MD5 they were stored for, and
         // `receive` passes starts only with one.
+        let PieceRun {
+            name,
+            epoch,
+            starts,
+            piece,
+        } = *pieces;
         let keys: Array = match md5 {
             Some(m) => starts
                 .iter()
-                .map(|s| JsValue::from(partial_key(name, &m, *s)))
+                .map(|s| JsValue::from(partial_key(name, epoch, &m, *s)))
                 .collect(),
             None => Array::new(),
         };
@@ -213,7 +220,7 @@ impl UploadStore for R2Uploads {
         for chunk in pieces.chunks(1000) {
             let keys: Vec<String> = chunk
                 .iter()
-                .map(|p| partial_key(name, &p.md5, p.start))
+                .map(|p| partial_key(name, p.epoch, &p.md5, p.start))
                 .collect();
             self.0.delete_multiple(keys).await.map_err(files_err)?;
         }

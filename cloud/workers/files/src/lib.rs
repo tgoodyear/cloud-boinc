@@ -166,7 +166,8 @@ async fn upload(req: Request, env: Env) -> Result<Response> {
                 return refuse(UploadError::permanent("invalid filename"));
             }
             // The database is read only when pieces of the file exist, to
-            // tell the pieces of this attempt from an earlier one's.
+            // tell the pieces of this attempt from an earlier one's (the
+            // file's epoch).
             let db = db(&env)?;
             match upload::file_size(&store, &db, &file_name, PIECE_BYTES).await {
                 Ok(size) => xml(reply_file_size(size)),
@@ -199,7 +200,7 @@ async fn upload(req: Request, env: Env) -> Result<Response> {
                 return refuse(e);
             }
             body.start_data(header.data_offset.min(buf.len()));
-            match upload::receive(&store, &header, &body, PIECE_BYTES).await {
+            match upload::receive(&store, &db, &header, &body, PIECE_BYTES).await {
                 Ok(Ok(())) => {
                     console_log!(
                         "upload {} {} bytes from offset {}",

@@ -8,14 +8,17 @@
 //!
 //! - The file is divided on a fixed grid of `piece` bytes. Every grid piece
 //!   that ends before the last byte of the file is written as its own
-//!   object, `partial/<name>/<md5>/<start>`, as soon as its bytes have
-//!   arrived. A put of a piece is atomic, so a piece exists only when all
-//!   its bytes do. `<md5>` is the client's whole-file `<md5_cksum>`: pieces
-//!   of two files that share a name (a task recomputed after it was lost
-//!   can write another file under the name its first attempt used) never
-//!   share a key, and a request reuses only the pieces under its own MD5.
-//!   A request whose `<md5_cksum>` is missing or not an MD5 writes no
+//!   object, `partial/<name>/<epoch>/<md5>/<start>`, as soon as its bytes
+//!   have arrived. A put of a piece is atomic, so a piece exists only when
+//!   all its bytes do. `<md5>` is the client's whole-file `<md5_cksum>`:
+//!   pieces of two files that share a name (a task recomputed after it was
+//!   lost can write another file under the name its first attempt used)
+//!   never share a key, and a request reuses only the pieces under its own
+//!   MD5. A request whose `<md5_cksum>` is missing or not an MD5 writes no
 //!   pieces: its file goes into one put, and no earlier piece is reused.
+//!   `<epoch>` is the file's attempt number, 0 until the scheduler sends the
+//!   task again after the client lost it and one more each time it does
+//!   (`upload_epoch`, see below).
 //! - The last stretch of the file, between 1 and `piece` bytes and called
 //!   the tail here, is never written as a piece. It goes straight into the
 //!   finished object: one conditional put of `upload/<name>` whose body is
@@ -24,20 +27,26 @@
 //!   computes its MD5 (bitwise validation reads it) and checks it against
 //!   the client's `<md5_cksum>`; pieces are only ever composed with that
 //!   check on. The pieces are deleted afterwards.
-//! - The bytes held for an unfinished file are the grid pieces present
-//!   without a gap from offset 0. Because the tail is never a piece, that
-//!   number is always less than the size of the file that wrote the pieces.
-//!   A `<get_file_size>` request carries only the name, so it cannot be
-//!   checked against the file the client is about to send: a client that
-//!   hears a size at least as large as its file counts the upload as done
-//!   (`FILE_XFER_SET::poll` in `client/file_xfer.cpp`), and a name whose
-//!   pieces came from a longer file of an earlier attempt could make that
-//!   happen for a shorter recomputed file. The attempt is known instead from
-//!   the scheduler: a task it sends again after the client lost it runs
-//!   again under the same file names, and the resend records the time under
-//!   each of them (`upload_epoch`). The size query ignores pieces stored up
-//!   to that time (`file_size`). A request that does arrive removes the
-//!   pieces of any other file under its name.
+//! - The bytes held for an unfinished file are the grid pieces of the
+//!   file's current epoch present without a gap from offset 0. Because the
+//!   tail is never a piece, that number is always less than the size of the
+//!   file that wrote the pieces. A `<get_file_size>` request carries only
+//!   the name, so it cannot be checked against the file the client is about
+//!   to send: a client that hears a size at least as large as its file
+//!   counts the upload as done (`FILE_XFER_SET::poll` in
+//!   `client/file_xfer.cpp`), and a name whose pieces came from a longer
+//!   file of an earlier attempt could make that happen for a shorter
+//!   recomputed file. The attempt is told instead by the epoch. A task the
+//!   scheduler sends again runs again under the same file names, and the
+//!   resend adds one to the epoch of each of them. A request reads the
+//!   epoch once when it starts, before it consumes its body, and writes
+//!   every piece under it; so a piece written late by a request of the lost
+//!   attempt (an upload that goes on after its connection dropped) lands
+//!   under the old epoch and is never counted or composed, and the size
+//!   query and the composition read the current epoch only. Before it
+//!   writes the finished object, a request reads the epoch again and stops
+//!   if it moved. A request that does arrive removes the pieces of any other
+//!   file under its name and of older epochs.
 //!
 //! A file no larger than one piece has no pieces: its upload is one head
 //! and one put, as before resume existed.
@@ -77,23 +86,25 @@ pub fn md5_to_hex(md5: &[u8; 16]) -> String {
     md5.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The name under the `partial/` prefix of the piece of `name`, for the file
-/// with this MD5, that starts at byte `start`.
-pub fn piece_name(name: &str, md5: &[u8; 16], start: u64) -> String {
-    format!("{name}/{}/{start}", md5_to_hex(md5))
+/// The name under the `partial/` prefix of the piece of `name`, in the
+/// attempt `epoch`, for the file with this MD5, that starts at byte `start`.
+pub fn piece_name(name: &str, epoch: u64, md5: &[u8; 16], start: u64) -> String {
+    format!("{name}/{epoch}/{}/{start}", md5_to_hex(md5))
 }
 
-/// Splits what follows `<name>/` in a piece's name into its MD5 and start;
-/// `None` for a name that is not a piece's.
-pub fn parse_piece_name(rest: &str) -> Option<([u8; 16], u64)> {
-    let (md5, start) = rest.split_once('/')?;
+/// Splits what follows `<name>/` in a piece's name into its epoch, MD5 and
+/// start; `None` for a name that is not a piece's.
+pub fn parse_piece_name(rest: &str) -> Option<(u64, [u8; 16], u64)> {
+    let mut parts = rest.splitn(3, '/');
+    let (epoch, md5, start) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |t: &str| !t.is_empty() && t.len() <= 18 && t.bytes().all(|c| c.is_ascii_digit());
     if md5.len() != 32 || !md5.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
         return None;
     }
-    if start.is_empty() || !start.bytes().all(|c| c.is_ascii_digit()) {
+    if !digits(epoch) || !digits(start) {
         return None;
     }
-    Some((parse_md5(md5)?, start.parse().ok()?))
+    Some((epoch.parse().ok()?, parse_md5(md5)?, start.parse().ok()?))
 }
 
 /// Where the tail of a file of `nbytes` bytes starts: the last grid
@@ -215,15 +226,24 @@ impl StoredFile {
     }
 }
 
-/// A stored piece: the file's MD5 as its client sent it, where the piece
-/// starts, its size, and when it was stored.
+/// A stored piece: the attempt it was written in, the file's MD5 as its
+/// client sent it, where the piece starts, and its size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPiece {
+    pub epoch: u64,
     pub md5: [u8; 16],
     pub start: u64,
     pub size: u64,
-    /// When the store finished writing it, in seconds since the epoch.
-    pub uploaded: i64,
+}
+
+/// The pieces a finished file is made of: those of `name` in the attempt
+/// `epoch` that start at `starts`, in that order, each `piece` bytes long.
+#[derive(Debug, Clone, Copy)]
+pub struct PieceRun<'a> {
+    pub name: &'a str,
+    pub epoch: u64,
+    pub starts: &'a [u64],
+    pub piece: u64,
 }
 
 /// The object store as the upload path needs it: `upload/<name>` for
@@ -235,29 +255,30 @@ pub trait UploadStore {
 
     /// The finished file, if it is stored.
     async fn complete(&self, name: &str) -> CoreResult<Option<StoredFile>>;
-    /// Every stored piece of `name`, whatever file wrote it, in any order.
+    /// Every stored piece of `name`, of any attempt and whatever file wrote
+    /// it, in any order.
     async fn list_pieces(&self, name: &str) -> CoreResult<Vec<StoredPiece>>;
     /// Reads and drops `n` bytes of the body. False if it ended first.
     async fn skip(&self, body: &Self::Body, n: u64) -> CoreResult<bool>;
     /// Stores the next `len` bytes of the body as the piece at `start` of
-    /// the file with this `md5`, replacing a piece of the same name.
+    /// the file with this `md5`, in the attempt `epoch`, replacing a piece
+    /// of the same name.
     async fn put_piece(
         &self,
         name: &str,
+        epoch: u64,
         md5: &[u8; 16],
         start: u64,
         body: &Self::Body,
         len: u64,
     ) -> CoreResult<PieceWrite>;
-    /// Stores the finished file, unless it exists: the pieces at `starts`
-    /// (of the file with this `md5`, which is then present), in that order,
-    /// each `piece` bytes long, then the next `tail` bytes of the body.
-    /// With `md5`, the store refuses contents with another MD5.
+    /// Stores the finished file, unless it exists: the pieces `pieces`
+    /// names, in order, then the next `tail` bytes of the body. With `md5`
+    /// (which the pieces are then of), the store refuses contents with
+    /// another MD5.
     async fn put_complete(
         &self,
-        name: &str,
-        starts: &[u64],
-        piece: u64,
+        pieces: &PieceRun<'_>,
         body: &Self::Body,
         tail: u64,
         md5: Option<[u8; 16]>,
@@ -266,27 +287,27 @@ pub trait UploadStore {
     async fn delete_pieces(&self, name: &str, pieces: &[StoredPiece]) -> CoreResult<()>;
 }
 
-/// Where the current attempt at an upload file starts, in seconds: the time
-/// a lost result was last sent again, written to `upload_epoch` under each of
-/// its upload names by the scheduler's resend. `None` for a name no resend
-/// has touched, which has had one attempt. One read by primary key.
+/// The attempt the scheduler has sent an upload file's task in: 0 until a
+/// lost result is sent again, one more for each resend. The resend adds one
+/// to the row of each uploadable output name of the result (`upload_epoch`).
+/// One read by primary key.
 ///
-/// The row is keyed by the name itself because the name is all a size query
-/// has, and what an output template makes of it is not for a reader to take
-/// apart: literal text may stand before and after `<OUTFILE_n/>`
+/// The row is keyed by the name itself because the name is all an upload
+/// request has, and what an output template makes of it is not for a reader
+/// to take apart: literal text may stand before and after `<OUTFILE_n/>`
 /// (`process_result_template`), so no part of a name says which result it
 /// belongs to.
-pub async fn attempt_start(db: &dyn Db, upload_name: &str) -> CoreResult<Option<i64>> {
+pub async fn current_epoch(db: &dyn Db, upload_name: &str) -> CoreResult<u64> {
     #[derive(Deserialize)]
     struct Row {
-        since: i64,
+        epoch: i64,
     }
     let row: Option<Row> = query_one(
         db,
-        stmt!("SELECT since FROM upload_epoch WHERE name = ?", upload_name),
+        stmt!("SELECT epoch FROM upload_epoch WHERE name = ?", upload_name),
     )
     .await?;
-    Ok(row.map(|r| r.since))
+    Ok(row.map_or(0, |r| r.epoch.max(0) as u64))
 }
 
 /// The answer to `<get_file_size>` (`handle_get_file_size`): the size of the
@@ -296,16 +317,14 @@ pub async fn attempt_start(db: &dyn Db, upload_name: &str) -> CoreResult<Option<
 /// The request names the file and nothing else, so the answer cannot depend
 /// on the file the client will send. Two things stand in for it:
 ///
-/// - Pieces stored up to the time the task was last sent again
-///   (`attempt_start`) are from an attempt the client no longer has: it lost
-///   the task, and the resend runs it again, so a recomputed file would
-///   otherwise be told it is done when it is no longer than the pieces of
-///   the old one. They are not counted. Both times are whole seconds, so
-///   pieces stored in the second of the resend are taken for the old
-///   attempt's too: a piece taken for stale only costs its bytes sent
-///   again, and one taken for current repeats the failure this prevents.
-///   The time is read only when pieces exist, so a query for a file with
-///   none costs no database read.
+/// - Only pieces of the file's current epoch count. Pieces of an older one
+///   are from an attempt the client no longer has: it lost the task, and the
+///   resend runs it again, so a recomputed file would otherwise be told it
+///   is done when it is no longer than the pieces of the old one. Whenever
+///   such a piece was written, even by a request of the lost attempt that
+///   went on after the resend, it is under the old epoch's name. The epoch
+///   is read only when pieces exist, so a query for a file with none costs
+///   no database read.
 /// - When pieces of more than one file are present, which one the client
 ///   has is unknown and the answer is 0.
 pub async fn file_size<S: UploadStore>(
@@ -323,9 +342,8 @@ pub async fn file_size<S: UploadStore>(
     if listed.is_empty() {
         return Ok(0);
     }
-    if let Some(since) = attempt_start(db, name).await? {
-        listed.retain(|p| p.uploaded > since);
-    }
+    let epoch = current_epoch(db, name).await?;
+    listed.retain(|p| p.epoch == epoch);
     let Some(first) = listed.first() else {
         return Ok(0);
     };
@@ -344,6 +362,12 @@ fn exists_with_other_contents(name: &str) -> UploadError {
     UploadError::permanent(format!("file {name} exists with other contents"))
 }
 
+fn sent_again(name: &str) -> UploadError {
+    UploadError::transient(format!(
+        "the task of file {name} was sent again; ask for its size and upload it again"
+    ))
+}
+
 fn cut_off(name: &str, kept: u64) -> UploadError {
     UploadError::transient(format!(
         "the upload of {name} ended early; {kept} bytes are held"
@@ -358,6 +382,7 @@ fn cut_off(name: &str, kept: u64) -> UploadError {
 /// `Err` a store failure, which the caller answers with a transient error.
 pub async fn receive<S: UploadStore>(
     store: &S,
+    db: &dyn Db,
     header: &UploadHeader,
     body: &S::Body,
     piece: u64,
@@ -370,33 +395,54 @@ pub async fn receive<S: UploadStore>(
         ))));
     };
     let md5 = parse_md5(&header.md5_cksum);
+    let last = tail_start(nbytes, piece);
+    // A request with pieces to read or write reads the file's epoch now,
+    // before it consumes its body, together with the check for a stored
+    // file. A file of one piece or less has neither: it goes in one put and
+    // is not tied to an epoch.
+    let with_pieces = last > 0 || offset > 0;
+    let (complete, epoch) = if with_pieces {
+        let (complete, epoch) =
+            futures_util::future::join(store.complete(name), current_epoch(db, name)).await;
+        (complete?, epoch?)
+    } else {
+        (store.complete(name).await?, 0)
+    };
     // A stored file is never replaced or appended to: the upload was
     // complete, and the result may have been validated against it since.
     // Success only for the same file (size and MD5), as a retry sends it.
-    if let Some(file) = store.complete(name).await? {
+    if let Some(file) = complete {
         return Ok(if file.is(nbytes, md5) {
             Ok(())
         } else {
             Err(exists_with_other_contents(name))
         });
     }
-    let last = tail_start(nbytes, piece);
     // Pieces are kept, and reused, only under a whole-file MD5 that the
     // finished object can be checked against.
     let mut held = 0;
     let mut dropped_others = false;
-    if last > 0 || offset > 0 {
-        let (mine, others): (Vec<StoredPiece>, Vec<StoredPiece>) = store
-            .list_pieces(name)
-            .await?
-            .into_iter()
-            .partition(|p| Some(p.md5) == md5);
+    if with_pieces {
+        let listed = store.list_pieces(name).await?;
+        // Pieces of a later attempt: the task was sent again after this
+        // request started, and it belongs to the lost one.
+        if listed.iter().any(|p| p.epoch > epoch) {
+            return Ok(Err(sent_again(name)));
+        }
+        // Pieces of an earlier attempt, of any file, are never used again.
+        let (older, current): (Vec<StoredPiece>, Vec<StoredPiece>) =
+            listed.into_iter().partition(|p| p.epoch < epoch);
+        let (mine, others): (Vec<StoredPiece>, Vec<StoredPiece>) =
+            current.into_iter().partition(|p| Some(p.md5) == md5);
         // Pieces of another file under this name are never composed into
         // this one. Dropping them also keeps a later size query from
         // reporting bytes this client does not have.
         if !others.is_empty() {
-            store.delete_pieces(name, &others).await?;
             dropped_others = true;
+        }
+        let garbage: Vec<StoredPiece> = older.into_iter().chain(others).collect();
+        if !garbage.is_empty() {
+            store.delete_pieces(name, &garbage).await?;
         }
         held = held_of(&mine, piece, last);
     }
@@ -429,7 +475,7 @@ pub async fn receive<S: UploadStore>(
     let mut at = start;
     if let Some(m) = &md5 {
         while at < last {
-            match store.put_piece(name, m, at, body, piece).await? {
+            match store.put_piece(name, epoch, m, at, body, piece).await? {
                 PieceWrite::Stored => at += piece,
                 PieceWrite::BodyEnded => return Ok(Err(cut_off(name, at))),
             }
@@ -441,18 +487,29 @@ pub async fn receive<S: UploadStore>(
             .iter()
             .filter_map(|&start| {
                 md5.map(|md5| StoredPiece {
+                    epoch,
                     md5,
                     start,
                     size: piece,
-                    uploaded: 0,
                 })
             })
             .collect()
     };
-    match store
-        .put_complete(name, &starts, piece, body, tail, md5)
-        .await?
-    {
+    // The finished object is written only if the task has not been sent
+    // again since this request started. The check and the put are two
+    // steps, so a resend between them is not caught here; what the put
+    // writes is then the lost attempt's whole, checksummed file, which the
+    // new attempt's request meets as a stored file.
+    if with_pieces && current_epoch(db, name).await? != epoch {
+        return Ok(Err(sent_again(name)));
+    }
+    let run = PieceRun {
+        name,
+        epoch,
+        starts: &starts,
+        piece,
+    };
+    match store.put_complete(&run, body, tail, md5).await? {
         CompleteWrite::Stored => {
             if !starts.is_empty() {
                 // Pieces left by a failed delete expire under the lifecycle
@@ -557,24 +614,29 @@ mod tests {
         assert!(!is_flat_name(&"x".repeat(256)));
         let m = parse_md5("d41d8cd98f00b204e9800998ecf8427e").unwrap();
         assert_eq!(
-            piece_name("f", &m, 8388608),
-            "f/d41d8cd98f00b204e9800998ecf8427e/8388608"
+            piece_name("f", 0, &m, 8388608),
+            "f/0/d41d8cd98f00b204e9800998ecf8427e/8388608"
         );
         assert_eq!(
-            parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/8388608"),
-            Some((m, 8388608))
+            parse_piece_name("3/d41d8cd98f00b204e9800998ecf8427e/8388608"),
+            Some((3, m, 8388608))
         );
-        // Not pieces: the old layout, a stray object, upper case, a bad
-        // start.
+        // Not pieces: the layout before epochs, a stray object, upper case,
+        // a bad epoch or start.
+        let md5 = "d41d8cd98f00b204e9800998ecf8427e";
         assert_eq!(parse_piece_name("8388608"), None);
-        assert_eq!(parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/"), None);
-        assert_eq!(parse_piece_name("D41D8CD98F00B204E9800998ECF8427E/1"), None);
+        assert_eq!(parse_piece_name(&format!("{md5}/8388608")), None);
+        assert_eq!(parse_piece_name(&format!("0/{md5}/")), None);
+        assert_eq!(parse_piece_name(&format!("/{md5}/1")), None);
         assert_eq!(
-            parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/1/2"),
+            parse_piece_name(&format!("0/{}/1", md5.to_uppercase())),
             None
         );
+        assert_eq!(parse_piece_name(&format!("0/{md5}/1/2")), None);
+        assert_eq!(parse_piece_name(&format!("0/{md5}/-1")), None);
+        assert_eq!(parse_piece_name(&format!("-1/{md5}/1")), None);
         assert_eq!(
-            parse_piece_name("d41d8cd98f00b204e9800998ecf8427e/-1"),
+            parse_piece_name(&format!("99999999999999999999/{md5}/1")),
             None
         );
     }

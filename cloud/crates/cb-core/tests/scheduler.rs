@@ -206,10 +206,10 @@ impl World {
         .unwrap()
     }
 
-    /// Rows of `upload_epoch`: `(name, result ID, since)`, by name.
+    /// Rows of `upload_epoch`: `(name, result ID, epoch)`, by name.
     fn epochs(&self) -> Vec<(String, i64, i64)> {
         let rows = block_on(self.db.run(stmt!(
-            "SELECT name, result_id, since FROM upload_epoch ORDER BY name"
+            "SELECT name, result_id, epoch FROM upload_epoch ORDER BY name"
         )))
         .unwrap()
         .rows;
@@ -218,7 +218,7 @@ impl World {
                 (
                     r["name"].as_str().unwrap().to_string(),
                     r["result_id"].as_i64().unwrap(),
-                    r["since"].as_i64().unwrap(),
+                    r["epoch"].as_i64().unwrap(),
                 )
             })
             .collect()
@@ -530,7 +530,7 @@ fn lost_results_are_resent() {
     let name = cb_core::template::output_files(&r.xml_doc_in)[0]
         .name
         .clone();
-    assert_eq!(w.epochs(), vec![(name, r.id, 2100)]);
+    assert_eq!(w.epochs(), vec![(name, r.id, 1)]);
 
     // The client holds it: nothing to resend.
     req.seqno = 4;
@@ -871,7 +871,7 @@ fn an_assigned_claim_race_has_one_winner() {
 #[test]
 fn a_resend_records_where_each_upload_file_starts() {
     // Output names carry whatever text the template puts around
-    // `<OUTFILE_n/>`; the epoch is recorded under each uploadable one, as
+    // `<OUTFILE_n/>`; the epoch is moved for each uploadable one, as
     // generated, and not for a file that stays on the client.
     let mut w = World::new();
     w.config.resend_lost_results = true;
@@ -898,7 +898,7 @@ fn a_resend_records_where_each_upload_file_starts() {
     let base = format!("{}_r", r.name);
     let epochs = w.epochs();
     assert_eq!(epochs.len(), 2, "{epochs:?}");
-    assert!(epochs.iter().all(|e| e.1 == r.id && e.2 == 2100));
+    assert!(epochs.iter().all(|e| e.1 == r.id && e.2 == 1));
     assert!(epochs
         .iter()
         .any(|e| e.0.starts_with("pre_") && e.0.contains(&base) && e.0.ends_with("_0_r1_log")));
@@ -906,11 +906,11 @@ fn a_resend_records_where_each_upload_file_starts() {
         .iter()
         .any(|e| e.0.starts_with(&base) && e.0.ends_with("_1.zip")));
 
-    // Sent again later: the time moves, no new rows.
+    // Sent again later: the epoch moves, no new rows.
     req.seqno = 3;
     let out = w.rpc(&req, 2300);
     assert_eq!(out.n_resent, 1);
     let later = w.epochs();
     assert_eq!(later.len(), 2);
-    assert!(later.iter().all(|e| e.2 == 2300));
+    assert!(later.iter().all(|e| e.2 == 2));
 }
