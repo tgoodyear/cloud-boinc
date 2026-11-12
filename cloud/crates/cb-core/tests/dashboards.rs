@@ -338,7 +338,7 @@ fn top_hosts_names_only_owners_who_show_their_computers() {
     assert!(!page.contains("hostid=12"));
     // The hardware is public; the machine's name and addresses are not.
     assert!(page.contains("Core &lt;i7&gt; (8 cores)"));
-    assert!(page.contains("[1] CUDA (8192MB)"));
+    assert!(page.contains("1 CUDA; 8.00 GB RAM"));
     assert!(page.contains("Linux 6.1"));
     for secret in [
         "secret-pc.lan",

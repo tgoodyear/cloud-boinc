@@ -12,6 +12,7 @@ pub mod config;
 pub mod countries;
 pub mod cron;
 pub mod feed;
+pub mod host_desc;
 pub mod host_misc;
 pub mod hr;
 pub mod mail;
