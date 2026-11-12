@@ -102,6 +102,8 @@ struct World {
     config: Config,
     plan_classes: PlanClassSpecs,
     seq: Cell<u32>,
+    /// The output template jobs are submitted with.
+    result_template: RefCell<String>,
 }
 
 impl World {
@@ -124,6 +126,7 @@ impl World {
             config,
             plan_classes: PlanClassSpecs::default(),
             seq: Cell::new(0),
+            result_template: RefCell::new(RESULT_TEMPLATE.into()),
         }
     }
 
@@ -147,7 +150,7 @@ impl World {
         let sub = Submission {
             app: "a".into(),
             input_template: INPUT_TEMPLATE.into(),
-            result_template: RESULT_TEMPLATE.into(),
+            result_template: self.result_template.borrow().clone(),
             jobs: vec![JobSpec {
                 name: name.into(),
                 min_quorum: Some(quorum),
@@ -201,6 +204,24 @@ impl World {
             stmt!("SELECT * FROM result WHERE workunitid = ? ORDER BY id", wu),
         ))
         .unwrap()
+    }
+
+    /// Rows of `upload_epoch`: `(name, result ID, since)`, by name.
+    fn epochs(&self) -> Vec<(String, i64, i64)> {
+        let rows = block_on(self.db.run(stmt!(
+            "SELECT name, result_id, since FROM upload_epoch ORDER BY name"
+        )))
+        .unwrap()
+        .rows;
+        rows.iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_string(),
+                    r["result_id"].as_i64().unwrap(),
+                    r["since"].as_i64().unwrap(),
+                )
+            })
+            .collect()
     }
 
     fn host(&self, id: i64) -> Host {
@@ -500,10 +521,16 @@ fn lost_results_are_resent() {
         RESULT_SERVER_STATE_IN_PROGRESS
     );
     // The resend is a new sending, as upstream's `resend_lost_work` records
-    // it: the upload size query takes the pieces of the lost attempt for
-    // stale by this time. The deadline is the one it had.
+    // it. The deadline is the one it had.
     assert_eq!(w.results(wu)[0].sent_time, 2100);
     assert_eq!(w.results(wu)[0].report_deadline, 5600);
+    // The upload size query takes the pieces of the lost attempt for stale
+    // by the time recorded under the file's name.
+    let r = &w.results(wu)[0];
+    let name = cb_core::template::output_files(&r.xml_doc_in)[0]
+        .name
+        .clone();
+    assert_eq!(w.epochs(), vec![(name, r.id, 2100)]);
 
     // The client holds it: nothing to resend.
     req.seqno = 4;
@@ -839,4 +866,51 @@ fn an_assigned_claim_race_has_one_winner() {
     assert_eq!(rs.len(), 1);
     assert_eq!(rs[0].hostid, b.hostid);
     assert_eq!(w.hav(b.hostid).n_jobs_today, 1);
+}
+
+#[test]
+fn a_resend_records_where_each_upload_file_starts() {
+    // Output names carry whatever text the template puts around
+    // `<OUTFILE_n/>`; the epoch is recorded under each uploadable one, as
+    // generated, and not for a file that stays on the client.
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    *w.result_template.borrow_mut() = "<output_template>\n\
+<file_info><name>pre_<OUTFILE_0/>_r1_log</name><generated_locally/><upload_when_present/><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_1/>.zip</name><generated_locally/><upload_when_present/><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_2/></name><generated_locally/></file_info>\n\
+<result>\n\
+<file_ref><file_name>pre_<OUTFILE_0/>_r1_log</file_name><open_name>a</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_1/>.zip</file_name><open_name>b</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_2/></file_name><open_name>c</open_name></file_ref>\n\
+</result>\n</output_template>\n"
+        .to_string();
+    let wu = w.submit("j1", 1000, 1, 1);
+    let out = w.rpc(&Req::new(0), 2000);
+    assert_eq!(out.n_sent, 1);
+    assert!(w.epochs().is_empty());
+    let mut req = Req::new(out.host_id);
+    req.seqno = 2;
+    req.other = Some(Vec::new());
+    let out = w.rpc(&req, 2100);
+    assert_eq!(out.n_resent, 1);
+    let r = w.results(wu)[0].clone();
+    let base = format!("{}_r", r.name);
+    let epochs = w.epochs();
+    assert_eq!(epochs.len(), 2, "{epochs:?}");
+    assert!(epochs.iter().all(|e| e.1 == r.id && e.2 == 2100));
+    assert!(epochs
+        .iter()
+        .any(|e| e.0.starts_with("pre_") && e.0.contains(&base) && e.0.ends_with("_0_r1_log")));
+    assert!(epochs
+        .iter()
+        .any(|e| e.0.starts_with(&base) && e.0.ends_with("_1.zip")));
+
+    // Sent again later: the time moves, no new rows.
+    req.seqno = 3;
+    let out = w.rpc(&req, 2300);
+    assert_eq!(out.n_resent, 1);
+    let later = w.epochs();
+    assert_eq!(later.len(), 2);
+    assert!(later.iter().all(|e| e.2 == 2300));
 }

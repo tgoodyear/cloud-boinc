@@ -146,7 +146,7 @@ follows from that:
 
 The schema is a port of `db/schema.sql` reduced to the tables in scope: `platform`, `app`,
 `app_version`, `user`, `host`, `host_app_version`, `workunit`, `result`, `assignment`,
-`batch`, `job_file`, plus `config` (key, JSON value, version). Column names and state
+`batch`, `job_file`, plus `config` (key, JSON value, version) and `upload_epoch` (see "Upload"). Column names and state
 constants match upstream so that the upstream documentation still describes the data, and so a
 MySQL dump can be imported later.
 
@@ -715,28 +715,42 @@ first attempt left pieces and the new output differs, three cases follow:
   the work again (the stock handler has the same exposure, with the old bytes on disk as the
   answer, and there the stale file stays as the output). The server tells the attempts apart
   by time instead:
-  - The resend sets the result's `sent_time` to the time of the resend, as upstream's
-    `possibly_give_result_new_deadline` does (`resend_lost_work` in
-    `crates/cb-core/src/scheduler.rs`). The deadline rule is unchanged: it moves only when the
-    result is past it.
-  - `<get_file_size>` ignores pieces that R2 stored before the `sent_time` of the result the file
-    belongs to (`file_size`, `attempt_start` in `crates/cb-core/src/upload.rs`; the Worker
-    passes the pieces' `uploaded` times from the listing it already makes). The file's result
-    is found from its name: `new_result` names an output `<result name>_r<random>_<n>`, so the
-    result's name is what precedes the last `_r<digits>_` (`result_name_of`), and the
-    `result` table has a unique index on it. A name of another form, or no such result, means
-    no pieces are ignored, as before.
+  - The resend records the time under each upload name of the result, in the table
+    `upload_epoch` (`name` primary key, `result_id`, `since`; `migrations/0004_upload_epoch.sql`),
+    in the same batch as the resend's `UPDATE` (`resend_lost_work` in
+    `crates/cb-core/src/scheduler.rs`). It also sets the result's `sent_time` to the time of the
+    resend, as upstream's `possibly_give_result_new_deadline` does, so turnaround is measured
+    from the latest sending; the size query does not read it. The deadline rule is unchanged: it
+    moves only when the result is past it.
+  - `<get_file_size>` ignores pieces that R2 stored at or before `since` for that name
+    (`file_size`, `attempt_start` in `crates/cb-core/src/upload.rs`; the Worker passes the
+    pieces' `uploaded` times from the listing it already makes). A name with no row has had
+    one attempt, and nothing is ignored.
+  - Why a table keyed by the name, and not the result: the name is all a size query has, and
+    what a result template makes of it is not for a reader to take apart. `process_result_template`
+    keeps whatever literal text stands before and after `<OUTFILE_n/>`, so a name can be
+    `pre_<result>_r<random>_0_r1_log`, and no rule over its shape finds the result exactly (an
+    earlier version of this change cut the name at the last `_r<digits>_`, which maps such
+    names to the wrong result or to none). The other exact choice, a row per output at result
+    creation, would add rows to every job and to the write budget; the table here is written
+    only when a result is resent, which is rare. The alternative of treating every name that
+    cannot be attributed as stale would turn resume off for projects whose names are decorated.
+  - The rows are deleted with their result by the purge (`commit_purge` in
+    `crates/cb-core/src/purge.rs`, which selects them by `result_id`).
   - The client then hears 0, sends the file from the start, and the finished object is exactly
     the new file whatever its length. A genuine resume within one attempt is unaffected: its
-    pieces were stored after the task was sent.
-  - Cost: one indexed read of `result` per size query, made only when pieces exist for the
-    name (a query for a file with no pieces, or a finished file, reads nothing), and one more
-    column in the same `UPDATE` of a resent result, which upstream writes too. The upload
-    request itself does not read the database for this.
-  - Times: a piece counts as the current attempt's when it was stored in the second of the
-    `sent_time` or later. R2 and the scheduler Worker are on Cloudflare's clocks. A piece
-    wrongly taken for stale only costs its bytes sent again; the failure this closes is the
-    other way, which a margin would make more likely, so there is none.
+    pieces were stored after the task was sent again.
+  - Cost: one read by primary key per size query, made only when pieces exist for the name (a
+    query for a file with no pieces, or a finished file, reads nothing), and one row written per
+    upload name each time a result is resent. The upload request itself does not read the
+    database for this.
+  - Times: a piece counts as the current attempt's only when it was stored in a later second than
+    `since`. Both sides are whole seconds (a piece at 1000.1 and a resend at 1000.9 are the
+    same second), so a piece stored in the second of the resend is taken for the old attempt's.
+    A piece wrongly taken for stale only costs its bytes sent again, and a genuine resume within
+    that second sends them again; the failure this closes is the other way. R2 and the scheduler
+    Worker are on Cloudflare's clocks, and a margin would make that failure more likely, so
+    there is none.
 
   Whether a client can recompute an output without a resend: in the stock client a result
   moves from computing to `RESULT_FILES_UPLOADING` when the app exits
@@ -752,7 +766,8 @@ first attempt left pieces and the new output differs, three cases follow:
   file, the third in a rejected result and a reissue, never in a wrong file served. The tests
   pin both (`a_recomputed_file_never_mixes_with_an_earlier_attempt`,
   `a_resent_task_does_not_inherit_the_pieces_of_the_lost_one`,
-  `a_resumed_upload_of_the_same_attempt_keeps_its_pieces` in `crates/cb-core/tests/upload.rs`),
+  `a_resumed_upload_of_the_same_attempt_keeps_its_pieces`,
+  `pieces_stored_in_the_second_of_a_resend_are_the_old_attempts` in `crates/cb-core/tests/upload.rs`),
   and `a_result_without_its_finished_output_is_not_accepted_by_any_validator` in
   `crates/cb-core/tests/pipeline.rs` drives a result without its output through validation.
 
@@ -788,7 +803,7 @@ R2 operations per upload request, counted in `crates/cb-core/tests/upload.rs`
 | Upload of a file of 8 MiB or less from offset 0 | 1 head, 1 put (unchanged) |
 | Upload of a larger file from offset 0, with n pieces | 1 head, 1 list, n + 1 puts, n gets, 1 delete |
 | Resumed upload | the same; pieces already held are not written again |
-| `<get_file_size>` | 1 head and 1 list, run together; with pieces present, 1 indexed read of `result` (`file_size` in `crates/cb-core/tests/upload.rs`: `a_size_query_reads_the_database_only_when_pieces_exist`) |
+| `<get_file_size>` | 1 head and 1 list, run together; with pieces present, 1 read of `upload_epoch` by name (`file_size` in `crates/cb-core/tests/upload.rs`: `a_size_query_reads_the_database_only_when_pieces_exist`) |
 
 An upload request adds no database query, and the settings read on the upload path is unchanged.
 A retry of an upload for a stored file is one head, which now also reads the stored MD5.
@@ -1305,6 +1320,9 @@ Differences:
   (`{"id": n, "action": "added"}`). A platform is deprecated with
   `cboinc platform-put --name <name> --deprecated true`; the scheduler skips deprecated
   platforms as upstream's `sched/sched_shmem.cpp` does.
+- The read that decides `added`, `updated` or `unchanged` and the write are one batch, one
+  transaction, so the action describes the row the write found even when another request is
+  writing the same name; `xadd` looks first and writes after.
 - Names are matched exactly. `xadd`'s lookup goes through MySQL's collation and ignores case, so
   `Windows_x86_64` would update `windows_x86_64` there and is another platform here. The
   scheduler matches a client's platform name exactly too.

@@ -135,19 +135,19 @@ impl MemStore {
         self.objects.borrow_mut().remove(key);
     }
 
-    /// The result `wu_1_0` (the one `NAME` belongs to) was sent at `at`:
-    /// the first sending, or a resend, which sets the time again.
-    fn sent_at(&self, at: i64) {
+    /// The scheduler sent the result of the file `name` again at `at`, as
+    /// its resend records it for each upload name of the result.
+    fn resent_at(&self, name: &str, at: i64) {
         block_on(self.db.run(stmt!(
-            "INSERT INTO result (create_time, workunitid, server_state, name, xml_doc_in, \
-             appid, sent_time) VALUES (1, 1, 4, 'wu_1_0', '', 1, ?) \
-             ON CONFLICT (name) DO UPDATE SET sent_time = excluded.sent_time",
+            "INSERT INTO upload_epoch (name, result_id, since) VALUES (?, 1, ?) \
+             ON CONFLICT (name) DO UPDATE SET since = excluded.since",
+            name,
             at
         )))
         .unwrap();
     }
 
-    /// Database statements run so far (the file's lookup of its result).
+    /// Database statements run so far (the lookup of where the attempt starts).
     fn db_statements(&self) -> u64 {
         self.db.statements()
     }
@@ -751,110 +751,181 @@ fn a_recomputed_file_never_mixes_with_an_earlier_attempt() {
     }
 }
 
-/// The result `wu_1_0` was sent at 500; its first attempt stored pieces
-/// at 1000, was cut at 70 bytes and left 64 in pieces.
-fn lost_attempt(a: &[u8]) -> MemStore {
+/// Names an output template can make of one output: the plain form, text
+/// after `<OUTFILE_n/>`, text before it, and both, with the `_r<digits>_`
+/// of the generated part repeated in the decoration.
+const NAMES: [&str; 5] = [
+    NAME,
+    "wu_1_0_r9_0_r1_log",
+    "wu_1_0_r9_0.zip",
+    "pre_wu_1_0_r9_0",
+    "wu_1_0_r9_0_r1_pre_wu_1_0_r9_0_log",
+];
+
+fn send_as(
+    name: &str,
+    store: &MemStore,
+    data: &[u8],
+    offset: u64,
+    cut: Option<usize>,
+) -> Result<(), UploadError> {
+    send_with(store, &header(name, data, offset as f64), data, cut, P)
+}
+
+fn size_as(store: &MemStore, name: &str) -> u64 {
+    block_on(file_size(store, &store.db, name, P)).unwrap()
+}
+
+/// `stock_client` for a file of this name.
+fn stock_client_as(store: &MemStore, name: &str, data: &[u8]) -> Client {
+    for _ in 0..3 {
+        let held = size_as(store, name);
+        if held >= data.len() as u64 {
+            return Client::DoneWithoutSending;
+        }
+        if send_as(name, store, data, held, None).is_ok() {
+            return Client::Sent;
+        }
+    }
+    Client::GaveUp
+}
+
+/// A first attempt at the file `name` stored pieces at 1000, was cut at 70
+/// bytes and left 64 in pieces.
+fn lost_attempt(name: &str, a: &[u8]) -> MemStore {
     let store = MemStore::default();
-    store.sent_at(500);
-    assert!(send(&store, a, 0, Some(70)).is_err());
-    assert_eq!(size(&store), 64);
+    assert!(send_as(name, &store, a, 0, Some(70)).is_err());
+    assert_eq!(size_as(&store, name), 64);
     store
 }
 
 #[test]
 fn a_resent_task_does_not_inherit_the_pieces_of_the_lost_one() {
-    // The client lost the task; the scheduler sent it again, which sets the
-    // result's sent time after the pieces were stored. The recomputed file
-    // is of any length, including one no longer than the 64 bytes held, and
-    // the client sends it whole every time: the new file is stored and the
-    // size query never reports it done before it is.
+    // The client lost the task; the scheduler sent it again, which records
+    // the time under the file's name after the pieces were stored. The
+    // recomputed file is of any length, including one no longer than the 64
+    // bytes held, and the client sends it whole every time: the new file is
+    // stored and the size query never reports it done before it is. The
+    // names are those an output template can make, whatever their shape.
     let a = file(100, 30);
-    for len in 1usize..=200 {
-        let b = file(len, 31);
-        let store = lost_attempt(&a);
-        store.clock.set(2000);
-        store.sent_at(1500);
-        assert_eq!(size(&store), 0, "{len} bytes");
-        assert_eq!(stock_client(&store, &b), Client::Sent, "{len} bytes");
-        assert_eq!(store.complete(NAME), Some(b), "{len} bytes");
-        if len > P as usize {
-            assert!(store.pieces().is_empty(), "{len} bytes");
+    for name in NAMES {
+        for len in 1usize..=200 {
+            let b = file(len, 31);
+            let store = lost_attempt(name, &a);
+            store.clock.set(2000);
+            store.resent_at(name, 1500);
+            assert_eq!(size_as(&store, name), 0, "{name} {len} bytes");
+            assert_eq!(
+                stock_client_as(&store, name, &b),
+                Client::Sent,
+                "{name} {len} bytes"
+            );
+            assert_eq!(
+                store.objects.borrow().get(&upload_key(name)),
+                Some(&b),
+                "{name} {len} bytes"
+            );
+            if len > P as usize {
+                assert!(store.pieces().is_empty(), "{name} {len} bytes");
+            }
         }
-    }
 
-    // The same with a file of the very length that was lost.
-    let b = file(100, 32);
-    let store = lost_attempt(&a);
-    store.clock.set(2000);
-    store.sent_at(1500);
-    assert_eq!(stock_client(&store, &b), Client::Sent);
-    assert_eq!(store.complete(NAME), Some(b));
+        // The same with a file of the very length that was lost.
+        let b = file(100, 32);
+        let store = lost_attempt(name, &a);
+        store.clock.set(2000);
+        store.resent_at(name, 1500);
+        assert_eq!(stock_client_as(&store, name, &b), Client::Sent, "{name}");
+        assert_eq!(store.objects.borrow().get(&upload_key(name)), Some(&b));
+    }
 
     // A file the old attempt finished is still reported as it is.
     let store = MemStore::default();
-    store.sent_at(500);
     assert_eq!(send(&store, &a, 0, None), Ok(()));
-    store.sent_at(1500);
+    store.resent_at(NAME, 1500);
     assert_eq!(size(&store), a.len() as u64);
+
+    // The time is kept for the file it names: another file of the same
+    // result is not touched by it.
+    let other = "wu_1_0_r9_1";
+    let store = lost_attempt(other, &a);
+    store.resent_at(NAME, 1500);
+    store.clock.set(2000);
+    assert_eq!(size_as(&store, other), 64);
 }
 
 #[test]
 fn a_resumed_upload_of_the_same_attempt_keeps_its_pieces() {
     let data = file(100, 33);
-    // Sent at 500, pieces stored at 1000 and 1100 by two requests.
-    let store = MemStore::default();
-    store.sent_at(500);
-    assert!(send(&store, &data, 0, Some(40)).is_err());
-    assert_eq!(size(&store), 32);
-    store.clock.set(1100);
-    assert!(send(&store, &data, 32, Some(70)).is_err());
-    assert_eq!(size(&store), 64);
-    store.clock.set(1200);
-    assert_eq!(stock_client(&store, &data), Client::Sent);
-    assert_eq!(store.complete(NAME), Some(data.clone()));
-
-    // A piece stored in the second the task was sent counts as this
-    // attempt's: a piece taken for stale only costs its bytes sent again,
-    // one taken for current would repeat the lost upload.
-    let store = MemStore::default();
-    store.sent_at(1000);
-    assert!(send(&store, &data, 0, Some(70)).is_err());
-    assert_eq!(size(&store), 64);
-    store.sent_at(1001);
-    assert_eq!(size(&store), 0);
+    // A task sent again at 500, pieces stored at 1000 and 1100 by two
+    // requests.
+    for name in NAMES {
+        let store = MemStore::default();
+        store.resent_at(name, 500);
+        assert!(send_as(name, &store, &data, 0, Some(40)).is_err());
+        assert_eq!(size_as(&store, name), 32);
+        store.clock.set(1100);
+        assert!(send_as(name, &store, &data, 32, Some(70)).is_err());
+        assert_eq!(size_as(&store, name), 64);
+        store.clock.set(1200);
+        assert_eq!(stock_client_as(&store, name, &data), Client::Sent);
+        assert_eq!(store.objects.borrow().get(&upload_key(name)), Some(&data));
+    }
 }
 
 #[test]
-fn pieces_of_a_name_no_result_gave_are_reported_as_before() {
-    let a = file(100, 34);
-    // No result row: nothing to compare with.
+fn pieces_stored_in_the_second_of_a_resend_are_the_old_attempts() {
+    // Times are whole seconds on both sides, so a piece at 1000.100 and a
+    // resend at 1000.900 look alike. A piece taken for stale only costs its
+    // bytes sent again; one taken for current would repeat the lost upload.
+    let data = file(100, 36);
     let store = MemStore::default();
-    assert!(send(&store, &a, 0, Some(70)).is_err());
+    assert!(send(&store, &data, 0, Some(70)).is_err());
     assert_eq!(size(&store), 64);
-    // A name that is not one an output template makes.
-    let plain = "model.bin";
+    // The resend after the old pieces, in the same second.
+    store.resent_at(NAME, 1000);
+    assert_eq!(size(&store), 0);
+    // A resend a second earlier leaves them as this attempt's.
+    store.resent_at(NAME, 999);
+    assert_eq!(size(&store), 64);
+    // The shorter recomputed file is sent, not counted done.
+    store.resent_at(NAME, 1000);
+    let shorter = file(40, 37);
+    assert_eq!(stock_client(&store, &shorter), Client::Sent);
+    assert_eq!(store.complete(NAME), Some(shorter));
+    // A genuine resume within the second after the resend sends the
+    // bytes again and still completes.
     let store = MemStore::default();
-    store.sent_at(5000);
-    let h = header(plain, &a, 0.0);
-    assert!(send_with(&store, &h, &a, Some(70), P).is_err());
-    assert_eq!(
-        block_on(file_size(&store, &store.db, plain, P)).unwrap(),
-        64
-    );
-    assert_eq!(store.db_statements(), 1);
+    store.resent_at(NAME, 1000);
+    assert!(send(&store, &data, 0, Some(70)).is_err());
+    assert_eq!(size(&store), 0);
+    assert_eq!(stock_client(&store, &data), Client::Sent);
+    assert_eq!(store.complete(NAME), Some(data));
+}
+
+#[test]
+fn a_name_the_scheduler_never_resent_keeps_its_pieces() {
+    let a = file(100, 34);
+    // No row: one attempt, whatever the name looks like.
+    for name in NAMES.into_iter().chain(["model.bin"]) {
+        let store = lost_attempt(name, &a);
+        assert_eq!(size_as(&store, name), 64);
+        store.resent_at("another_file", 5000);
+        assert_eq!(size_as(&store, name), 64);
+    }
 }
 
 #[test]
 fn a_size_query_reads_the_database_only_when_pieces_exist() {
     let a = file(100, 35);
     let store = MemStore::default();
-    store.sent_at(500);
+    store.resent_at(NAME, 500);
     let before = store.db_statements();
     // Nothing held: no read.
     assert_eq!(size(&store), 0);
     assert_eq!(store.db_statements(), before);
     store.take_ops();
-    // Pieces held: one read of the result, and the same R2 operations as
+    // Pieces held: one read, by primary key, and the same R2 operations as
     // before (a head and a list).
     assert!(send(&store, &a, 0, Some(70)).is_err());
     store.take_ops();

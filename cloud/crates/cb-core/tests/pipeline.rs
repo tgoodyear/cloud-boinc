@@ -795,8 +795,23 @@ fn purge_archives_then_deletes_finished_workunits() {
     let count = |sql: &str| w.scalar(sql) as i64;
     assert_eq!(count("SELECT count(*) FROM workunit"), 3);
 
+    // Rows of resent results, which go with their results.
+    block_on(w.db.run(stmt!(
+        "INSERT INTO upload_epoch (name, result_id, since) \
+         SELECT 'file_of_' || name, id, 1 FROM result WHERE workunitid IN (?, ?)",
+        done,
+        kept
+    )))
+    .unwrap();
+    assert_eq!(count("SELECT count(*) FROM upload_epoch"), 2);
+
     let rep = block_on(purge_pass(&w.db, &w.files, &w.config, 3 * day, 10)).unwrap();
     assert_eq!((rep.workunits, rep.results), (1, 1));
+    assert_eq!(count("SELECT count(*) FROM upload_epoch"), 1);
+    assert_eq!(
+        count("SELECT count(*) FROM upload_epoch WHERE name = 'file_of_p2_nodelete_0'"),
+        1
+    );
     let name = rep.archive.unwrap();
     let archive = w.files.archive.borrow();
     assert_eq!(

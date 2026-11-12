@@ -68,35 +68,39 @@ pub async fn put_platform(db: &dyn Db, now: i64, p: &NewPlatform) -> CoreResult<
     if !is_name(&p.name) {
         return invalid("platform: bad name");
     }
-    let existing: Option<Platform> = query_one(
-        db,
-        stmt!("SELECT * FROM platform WHERE name = ?", p.name.as_str()),
-    )
-    .await?;
     let friendly = if p.user_friendly_name.is_empty() {
         &p.name
     } else {
         &p.user_friendly_name
     };
-    // One statement that also holds when another request created the
-    // platform since the read: the fields the request leaves out keep what
-    // the row has.
-    let rows = db
-        .run(stmt!(
-            "INSERT INTO platform (create_time, name, user_friendly_name, deprecated) VALUES (?, ?, ?, ?) \
-             ON CONFLICT (name) DO UPDATE SET \
-             user_friendly_name = CASE WHEN ? THEN excluded.user_friendly_name \
-                 ELSE platform.user_friendly_name END, \
-             deprecated = CASE WHEN ? THEN excluded.deprecated ELSE platform.deprecated END \
-             RETURNING id",
-            now,
-            p.name.as_str(),
-            friendly.as_str(),
-            p.deprecated.unwrap_or(false),
-            !p.user_friendly_name.is_empty(),
-            p.deprecated.is_some()
-        ))
-        .await?;
+    // The read and the write are one batch, which runs as one transaction
+    // on both back ends, so the row the action is judged by is the one the
+    // write found, whatever else is writing. The upsert also holds when the
+    // platform did not exist at the read: the fields the request leaves out
+    // keep what the row has.
+    let mut out = db
+        .batch(vec![
+            stmt!("SELECT * FROM platform WHERE name = ?", p.name.as_str()),
+            stmt!(
+                "INSERT INTO platform (create_time, name, user_friendly_name, deprecated) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (name) DO UPDATE SET \
+                 user_friendly_name = CASE WHEN ? THEN excluded.user_friendly_name \
+                     ELSE platform.user_friendly_name END, \
+                 deprecated = CASE WHEN ? THEN excluded.deprecated ELSE platform.deprecated END \
+                 RETURNING id",
+                now,
+                p.name.as_str(),
+                friendly.as_str(),
+                p.deprecated.unwrap_or(false),
+                !p.user_friendly_name.is_empty(),
+                p.deprecated.is_some()
+            ),
+        ])
+        .await?
+        .into_iter();
+    let existing: Option<Platform> = out.next().unwrap_or_default().first()?;
+    let rows = out.next().unwrap_or_default();
     let action = match &existing {
         None => PutAction::Added,
         Some(e)

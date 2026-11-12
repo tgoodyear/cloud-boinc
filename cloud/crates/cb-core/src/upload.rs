@@ -33,12 +33,11 @@
 //!   (`FILE_XFER_SET::poll` in `client/file_xfer.cpp`), and a name whose
 //!   pieces came from a longer file of an earlier attempt could make that
 //!   happen for a shorter recomputed file. The attempt is known instead from
-//!   the result: a task the scheduler sends again after the client lost it
-//!   runs again under the same file names, and the resend sets the result's
-//!   `sent_time` (`possibly_give_result_new_deadline` in
-//!   `sched/sched_resend.cpp`). The size query ignores pieces stored before
-//!   that time (`file_size`). A request that does arrive removes the pieces
-//!   of any other file under its name.
+//!   the scheduler: a task it sends again after the client lost it runs
+//!   again under the same file names, and the resend records the time under
+//!   each of them (`upload_epoch`). The size query ignores pieces stored up
+//!   to that time (`file_size`). A request that does arrive removes the
+//!   pieces of any other file under its name.
 //!
 //! A file no larger than one piece has no pieces: its upload is one head
 //! and one put, as before resume existed.
@@ -267,37 +266,27 @@ pub trait UploadStore {
     async fn delete_pieces(&self, name: &str, pieces: &[StoredPiece]) -> CoreResult<()>;
 }
 
-/// The result an upload file belongs to: the name the output template gave
-/// it is the result's name, `_r`, a random number, `_` and the file's number
-/// (`new_result` in `pipeline.rs`), possibly with more after the number. The
-/// result's name is what precedes the last `_r<digits>_`. `None` for a name
-/// that does not have that form (a file the project named itself).
-pub fn result_name_of(upload_name: &str) -> Option<&str> {
-    upload_name.rmatch_indices("_r").find_map(|(at, _)| {
-        let rest = &upload_name[at + 2..];
-        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-        (at > 0 && digits > 0 && rest[digits..].starts_with('_')).then(|| &upload_name[..at])
-    })
-}
-
-/// When the result an upload file belongs to was last sent to its host, in
-/// seconds: the time of its first sending, or of its latest resend after the
-/// client lost it. `None` when the name is not one a result gave, or the
-/// result is not there. One indexed read of the `result` table.
+/// Where the current attempt at an upload file starts, in seconds: the time
+/// a lost result was last sent again, written to `upload_epoch` under each of
+/// its upload names by the scheduler's resend. `None` for a name no resend
+/// has touched, which has had one attempt. One read by primary key.
+///
+/// The row is keyed by the name itself because the name is all a size query
+/// has, and what an output template makes of it is not for a reader to take
+/// apart: literal text may stand before and after `<OUTFILE_n/>`
+/// (`process_result_template`), so no part of a name says which result it
+/// belongs to.
 pub async fn attempt_start(db: &dyn Db, upload_name: &str) -> CoreResult<Option<i64>> {
     #[derive(Deserialize)]
     struct Row {
-        sent_time: i64,
+        since: i64,
     }
-    let Some(result) = result_name_of(upload_name) else {
-        return Ok(None);
-    };
     let row: Option<Row> = query_one(
         db,
-        stmt!("SELECT sent_time FROM result WHERE name = ?", result),
+        stmt!("SELECT since FROM upload_epoch WHERE name = ?", upload_name),
     )
     .await?;
-    Ok(row.map(|r| r.sent_time))
+    Ok(row.map(|r| r.since))
 }
 
 /// The answer to `<get_file_size>` (`handle_get_file_size`): the size of the
@@ -307,12 +296,16 @@ pub async fn attempt_start(db: &dyn Db, upload_name: &str) -> CoreResult<Option<
 /// The request names the file and nothing else, so the answer cannot depend
 /// on the file the client will send. Two things stand in for it:
 ///
-/// - Pieces stored before the result's latest sending (`attempt_start`) are
-///   from an attempt the client no longer has: it lost the task, and the
-///   resend runs it again, so a recomputed file would otherwise be told it
-///   is done when it is no longer than the pieces of the old one. They are
-///   not counted. The result is read only when pieces exist, so a query for
-///   a file with none costs no database read.
+/// - Pieces stored up to the time the task was last sent again
+///   (`attempt_start`) are from an attempt the client no longer has: it lost
+///   the task, and the resend runs it again, so a recomputed file would
+///   otherwise be told it is done when it is no longer than the pieces of
+///   the old one. They are not counted. Both times are whole seconds, so
+///   pieces stored in the second of the resend are taken for the old
+///   attempt's too: a piece taken for stale only costs its bytes sent
+///   again, and one taken for current repeats the failure this prevents.
+///   The time is read only when pieces exist, so a query for a file with
+///   none costs no database read.
 /// - When pieces of more than one file are present, which one the client
 ///   has is unknown and the answer is 0.
 pub async fn file_size<S: UploadStore>(
@@ -331,7 +324,7 @@ pub async fn file_size<S: UploadStore>(
         return Ok(0);
     }
     if let Some(since) = attempt_start(db, name).await? {
-        listed.retain(|p| p.uploaded >= since);
+        listed.retain(|p| p.uploaded > since);
     }
     let Some(first) = listed.first() else {
         return Ok(0);
@@ -531,23 +524,6 @@ mod tests {
         // Pieces past the tail of this file do not count.
         assert_eq!(held_bytes(&[(0, 16), (16, 16), (32, 16)], 16, 32), 32);
         assert_eq!(held_bytes(&[(0, 16)], 16, 15), 0);
-    }
-
-    #[test]
-    fn result_names() {
-        assert_eq!(result_name_of("wu_1_0_r9_0"), Some("wu_1_0"));
-        assert_eq!(result_name_of("wu_1_0_r123456_17"), Some("wu_1_0"));
-        // More after the file number.
-        assert_eq!(result_name_of("wu_1_0_r9_0.zip"), Some("wu_1_0"));
-        // The workunit's own name may contain `_r<digits>_`; the last one is
-        // the result's.
-        assert_eq!(result_name_of("a_r5_b_3_r77_1"), Some("a_r5_b_3"));
-        assert_eq!(result_name_of("a_rx_1_r2_0"), Some("a_rx_1"));
-        // Not result files.
-        assert_eq!(result_name_of("input.dat"), None);
-        assert_eq!(result_name_of("_r1_0"), None);
-        assert_eq!(result_name_of("wu_r_0"), None);
-        assert_eq!(result_name_of("wu_r12"), None);
     }
 
     #[test]

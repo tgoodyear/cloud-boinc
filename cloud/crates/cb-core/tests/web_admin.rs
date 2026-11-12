@@ -640,3 +640,97 @@ fn put_platform_follows_xadd() {
         assert_ne!(put(1000, ok, ok, None).id, 0, "{ok}");
     }
 }
+
+/// A database that lets another writer in after the first call a request
+/// makes returns: where a request's read and write are two calls, whatever
+/// the hook writes lands between them.
+struct RacingDb<'a> {
+    inner: &'a SqliteDb,
+    calls: Cell<u32>,
+    after_first: std::cell::RefCell<Option<Hook>>,
+}
+
+type Hook = Box<dyn FnOnce(&SqliteDb)>;
+
+#[async_trait::async_trait(?Send)]
+impl Db for RacingDb<'_> {
+    async fn batch(&self, stmts: Vec<cb_db::Stmt>) -> cb_db::DbResult<Vec<cb_db::Rows>> {
+        self.calls.set(self.calls.get() + 1);
+        let out = self.inner.batch(stmts).await;
+        if let Some(hook) = self.after_first.borrow_mut().take() {
+            hook(self.inner);
+        }
+        out
+    }
+}
+
+#[test]
+fn put_platform_reports_what_its_own_write_did_under_a_race() {
+    let put = |db: &dyn Db, now: i64, friendly: &str| {
+        block_on(put_platform(
+            db,
+            now,
+            &NewPlatform {
+                name: "linux_x".into(),
+                user_friendly_name: friendly.into(),
+                ..Default::default()
+            },
+        ))
+        .unwrap()
+    };
+    let w = World::new();
+    // Another request creates the platform right after this one's first
+    // call. With the read and the write in separate calls this request
+    // would have seen no row and reported `added` for a row that its write
+    // found; it is one call, so the report is about the row its write saw.
+    let racing = RacingDb {
+        inner: &w.db,
+        calls: Cell::new(0),
+        after_first: std::cell::RefCell::new(Some(Box::new(|db: &SqliteDb| {
+            block_on(put_platform(
+                db,
+                5,
+                &NewPlatform {
+                    name: "linux_x".into(),
+                    user_friendly_name: "from the other request".into(),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        }))),
+    };
+    let first = put(&racing, 10, "Linux");
+    assert_eq!(racing.calls.get(), 1);
+    assert_eq!(first.action, PutAction::Added);
+    // The other request ran second and found this one's row.
+    let count: i64 = block_on(w.db.run(stmt!(
+        "SELECT count(*) AS n FROM platform WHERE name = 'linux_x'"
+    )))
+    .unwrap()
+    .scalar_i64()
+    .unwrap();
+    assert_eq!(count, 1);
+
+    // The same for an update: an edit after this request's call cannot
+    // turn its `updated` into `unchanged` or the reverse.
+    let racing = RacingDb {
+        inner: &w.db,
+        calls: Cell::new(0),
+        after_first: std::cell::RefCell::new(Some(Box::new(|db: &SqliteDb| {
+            block_on(put_platform(
+                db,
+                20,
+                &NewPlatform {
+                    name: "linux_x".into(),
+                    user_friendly_name: "Linux again".into(),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        }))),
+    };
+    let second = put(&racing, 30, "Linux 2");
+    assert_eq!(racing.calls.get(), 1);
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.action, PutAction::Updated);
+}

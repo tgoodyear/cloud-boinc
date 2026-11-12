@@ -138,6 +138,10 @@ Likewise, `migrations/0003_user_tasks.sql` adds the index behind an account's ta
 deployed, whether or not the deployment sends email: those Workers write columns and tables it
 adds (see step 4 under Email).
 
+`migrations/0005_upload_epoch.sql` adds the table the files Worker reads to tell the pieces of a
+resent task's earlier attempt from its current one; apply it before the scheduler and files
+Workers that use it are deployed.
+
 ## Email
 
 The site's password recovery, address verification and address-change notices

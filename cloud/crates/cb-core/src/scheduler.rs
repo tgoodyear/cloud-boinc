@@ -46,6 +46,7 @@ use crate::model::{
     AppVersion, Host, HostAppVersion, Platform, User, Workunit,
 };
 use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost, DEFAULT_FPOPS};
+use crate::template::output_files;
 use crate::{Config, CoreError, CoreResult};
 
 /// Number of processor types the work request distinguishes.
@@ -1868,9 +1869,11 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         //
         // The result's `sent_time` is the time of this sending, as
         // `possibly_give_result_new_deadline` in `sched/sched_resend.cpp`
-        // sets it. The upload size query reads it to tell the pieces of a
-        // file the lost attempt left from those of the attempt that runs
-        // now (`file_size` in `crates/cb-core/src/upload.rs`).
+        // sets it. The upload size query needs where this attempt starts
+        // for each of the result's files, and reads it from `upload_epoch`
+        // (`file_size` in `crates/cb-core/src/upload.rs`), which is written
+        // below by name: a file's name is whatever the output template made
+        // of it, so the result cannot be told from it.
         let rerecord = version.anon
             && (ip.app_version_id != version.result_av_id
                 || ip.flops_estimate != version.hu.peak_flops);
@@ -1914,6 +1917,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             params.push(now.into());
             params.push(c.result_id.into());
             writes.push(Stmt { sql, params });
+            // The pieces of the lost attempt are the old attempt's.
+            for f in output_files(&c.xml_doc_in).iter().filter(|f| f.uploadable) {
+                writes.push(stmt!(
+                    "INSERT INTO upload_epoch (name, result_id, since) VALUES (?, ?, ?) \
+                     ON CONFLICT (name) DO UPDATE SET result_id = excluded.result_id, \
+                     since = excluded.since",
+                    f.name.as_str(),
+                    c.result_id,
+                    now
+                ));
+            }
         }
         if new_deadline {
             writes.push(stmt!(
