@@ -37,6 +37,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$dir" ] || { echo "client.sh: --dir is required" >&2; exit 2; }
 redact() { sed -E 's/[0-9a-f]{32,}/<redacted>/g'; }
+# redacted CMD ARGS...: as in lib.sh, the output is redacted and the status is the command's.
+redacted() {
+    _st="$(mktemp)"
+    { _rc=0; "$@" 2>&1 || _rc=$?; echo "$_rc" > "$_st"; } | redact
+    _rc="$(cat "$_st")"
+    rm -f "$_st"
+    return "$_rc"
+}
 case "$action" in
 start)
     [ -n "$boinc" ] && [ -n "$port" ] && [ -n "$name" ] || { usage; }
@@ -72,13 +80,13 @@ XML
     ;;
 cmd)
     [ -n "$boinccmd" ] || { usage; }
-    LD_LIBRARY_PATH="$lib" "$boinccmd" --host "127.0.0.1:$(cat "$dir/port")" \
-        --passwd "$(cat "$dir/gui_rpc_auth.cfg")" "$@" 2>&1 | redact
+    redacted env LD_LIBRARY_PATH="$lib" "$boinccmd" --host "127.0.0.1:$(cat "$dir/port")" \
+        --passwd "$(cat "$dir/gui_rpc_auth.cfg")" "$@"
     ;;
 stop)
     pid="$(cat "$dir/pid" 2>/dev/null || true)"
-    LD_LIBRARY_PATH="$lib" "$boinccmd" --host "127.0.0.1:$(cat "$dir/port")" \
-        --passwd "$(cat "$dir/gui_rpc_auth.cfg")" --quit 2>&1 | redact || true
+    redacted env LD_LIBRARY_PATH="$lib" "$boinccmd" --host "127.0.0.1:$(cat "$dir/port")" \
+        --passwd "$(cat "$dir/gui_rpc_auth.cfg")" --quit || true
     i=0
     while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ $i -lt 100 ]; do
         i=$((i + 1)); /bin/sleep 0.5

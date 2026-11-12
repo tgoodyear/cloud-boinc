@@ -7,7 +7,7 @@ the clients do. The result and what it means for a project moving over are in
 
 Everything runs on one Linux host as root. Nothing touches a deployment: the project's host
 name, `project.test`, exists only in each client's private hosts file, and both servers listen on
-`127.0.0.1` port 80 (`--port` changes it).
+`127.0.0.1` port 80. The project's URLs name no port, so `run.sh` has no `--port`.
 
 ## What it needs
 
@@ -57,8 +57,8 @@ cloud/tests/migration-check/run.sh --work /some/empty/dir --clients FILE \
 `--steps` runs some of the steps, in this order: `up drive release probe switch observe down`.
 `--long-seconds` is how long the two long tasks of each client take (default 240). `--cloud-config
 TAG=VALUE` changes one tag of the config that cloud-boinc gets (for example
-`send_result_abort=0`). The scripts it calls
-can be used alone; each prints its flags when called without any.
+`send_result_abort=0`). A step that fails stops the run with its output kept; `--steps down`
+cleans up. The scripts it calls can be used alone; each prints its flags when called without any.
 
 1. `up` (`stock-up.sh`): makes new code-signing and upload key pairs and three accounts with random
    account keys (`prepare.py`), starts the stock server as project `proj` with the master URL
@@ -82,8 +82,9 @@ can be used alone; each prints its flags when called without any.
    stock `<config>` element, the two public keys, the files of the stock download directory and
    the upload directory (`cloud-load.sh`), and the rows. The clients' network is switched on.
 6. `observe` (`observe.sh`): waits for the long tasks to end, adds new work (an application version
-   1.01 signed with the stock code-signing key, and jobs), asks for it, detaches and attaches
-   every client again, and repeats the web probe on cloud-boinc.
+   1.01 signed with the stock code-signing key, and jobs), asks for it and waits until the database shows every result of the new work received (an
+   empty task list on a client does not count, and a wait that runs out is reported and fails the
+   step), detaches and attaches every client again, and repeats the web probe on cloud-boinc.
 7. `down`: stops the clients, cloud-boinc and the stock server.
 
 ## What it leaves in the work directory

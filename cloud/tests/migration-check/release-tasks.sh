@@ -18,5 +18,6 @@ load_client "$tag"
 cc --task "$MASTER_URL" "${prefix}_c_0" resume > /dev/null
 cc --task "$MASTER_URL" "${prefix}_d_0" resume > /dev/null
 /bin/sleep 3
-cc --get_tasks | grep -E "^   (name|state|active_task_state)" | tr '\n' ' ' | sed 's/   name/\n  name/g'
+tasks="$(cc --get_tasks)" || die "boinccmd --get_tasks failed for $C_TAG"
+printf '%s\n' "$tasks" | grep -E "^   (name|state|active_task_state)" | tr '\n' ' ' | sed 's/   name/\n  name/g'
 echo

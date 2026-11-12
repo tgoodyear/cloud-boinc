@@ -31,6 +31,7 @@ nohup setsid nice -n 10 dev/local.sh --state "$state" --port "$port" --skip-buil
 echo $! > "$state/pid"
 i=0
 until grep -q "Ready on" "$state/wrangler.log" 2>/dev/null; do
+    kill -0 "$(cat "$state/pid")" 2>/dev/null || { tail -20 "$state/wrangler.log" >&2; die "wrangler stopped"; }
     i=$((i + 1))
     [ "$i" -le 180 ] || { tail -20 "$state/wrangler.log" >&2; echo "cloud-up.sh: not ready" >&2; exit 1; }
     /bin/sleep 1

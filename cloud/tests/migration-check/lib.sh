@@ -8,6 +8,17 @@ STOCK_NAME=cb-migration-stock
 
 log() { echo "### $(date -u +%T) $*"; }
 redact() { sed -E 's/[0-9a-f]{32,}/<redacted>/g'; }
+die() { echo "$(basename "$0"): $*" >&2; exit 1; }
+# redacted CMD ARGS...: runs the command, prints its output (stderr included) with every
+# run of 32 or more hex digits replaced, and returns the command's own exit status, which a
+# plain `cmd | redact` would hide (sh has no pipefail).
+redacted() {
+    _st="$(mktemp)"
+    { _rc=0; "$@" 2>&1 || _rc=$?; echo "$_rc" > "$_st"; } | redact
+    _rc="$(cat "$_st")"
+    rm -f "$_st"
+    return "$_rc"
+}
 
 # secret USERNO FIELD: a value of fixtures/secrets.json. Never printed by the scripts.
 secret() {

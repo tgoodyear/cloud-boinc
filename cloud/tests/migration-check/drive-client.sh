@@ -52,5 +52,6 @@ cc --set_run_mode auto > /dev/null
 wait_log "Finished upload of ${prefix}_b_0" 1 60
 cc --set_network_mode never > /dev/null
 log "$C_TAG: network off"
-cc --get_tasks | grep -E "^   (name|state|active_task_state|ready to report)" | tr '\n' ' ' | sed 's/   name/\n  name/g'
+tasks="$(cc --get_tasks)" || die "boinccmd --get_tasks failed for $C_TAG"
+printf '%s\n' "$tasks" | grep -E "^   (name|state|active_task_state|ready to report)" | tr '\n' ' ' | sed 's/   name/\n  name/g'
 echo

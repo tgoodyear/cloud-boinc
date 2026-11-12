@@ -43,22 +43,39 @@ PY
 "$cboinc" config-put --name code_sign_public_key --file "$WORK/fixtures/keys/code_sign_public"
 "$cboinc" config-put --name upload_public_key --file "$WORK/fixtures/keys/upload_public"
 # The stock server caches the MD5 of each file in a .md5 file beside it; they are not job files.
-find "$WORK/stock-state/project/download" -type f ! -name '*.md5' | sort | while read -r f; do
-    "$cboinc" file-put --file "$f" --name "$(basename "$f")" --no-delete > /dev/null
+list="$(mktemp)"
+trap 'rm -f "$list"' EXIT
+find "$WORK/stock-state/project/download" -type f ! -name '*.md5' | sort > "$list"
+while read -r f; do
+    "$cboinc" file-put --file "$f" --name "$(basename "$f")" --no-delete > /dev/null ||
+        die "file-put of $f failed"
     echo "file $(basename "$f")"
-done
+done < "$list"
 for kv in $sets; do
     "$cboinc" config-set --tag "${kv%%=*}" --value "${kv#*=}"
 done
 if [ "$uploads" = 1 ]; then
-    find "$WORK/stock-state/project/upload" -type f | sort | while read -r f; do
-        (cd "$cloud/workers/files" && npx wrangler r2 object put "cloud-boinc-dev/upload/$(basename "$f")" \
-            --file "$f" --local --persist-to "$state/wrangler" > /dev/null 2>&1)
+    find "$WORK/stock-state/project/upload" -type f | sort > "$list"
+    while read -r f; do
+        out="$(cd "$cloud/workers/files" && npx wrangler r2 object put "cloud-boinc-dev/upload/$(basename "$f")" \
+            --file "$f" --local --persist-to "$state/wrangler" 2>&1)" ||
+            { echo "$out" | tail -5 >&2; die "storing $f in the bucket failed"; }
         echo "upload $(basename "$f")"
-    done
+    done < "$list"
 fi
 if [ "$rows" = 1 ]; then
     cd "$cloud/workers/scheduler"
-    npx wrangler d1 execute cloud-boinc-dev --local --persist-to "$state/wrangler" \
-        --file "$WORK/rows.sql" 2>&1 | tail -5
+    # The exit status is wrangler's own: a pipe into tail would hide a refused file.
+    out="$(npx wrangler d1 execute cloud-boinc-dev --local --persist-to "$state/wrangler" \
+        --file "$WORK/rows.sql" 2>&1)" || { echo "$out" | tail -8 >&2; die "importing rows.sql failed"; }
+    # And a count of rows that arrived, for the tables the check reads.
+    for table in user host workunit result; do
+        want="$(grep -c "^INSERT INTO $table " "$WORK/rows.sql" || true)"
+        out="$(npx wrangler d1 execute cloud-boinc-dev --local --persist-to "$state/wrangler" --json \
+            --command "SELECT count(*) AS n FROM $table" 2>&1)" || { echo "$out" | tail -5 >&2; die "counting $table failed"; }
+        got="$(printf '%s' "$out" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[0]["results"][0]["n"])')" ||
+            die "could not read the count of $table"
+        [ "$got" = "$want" ] || die "$table has $got rows after the import, rows.sql has $want"
+        echo "rows $table $got"
+    done
 fi
