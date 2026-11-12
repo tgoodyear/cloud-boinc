@@ -916,3 +916,178 @@ fn a_resend_records_where_each_upload_file_starts() {
     assert_eq!(later.len(), 2);
     assert!(later.iter().all(|e| e.2 == 2));
 }
+
+/// A database that keeps the text of every statement run through it.
+struct Recording<'a> {
+    inner: &'a SqliteDb,
+    sqls: RefCell<Vec<String>>,
+}
+
+#[async_trait(?Send)]
+impl<'a> Db for Recording<'a> {
+    async fn batch(&self, stmts: Vec<Stmt>) -> DbResult<Vec<Rows>> {
+        self.sqls
+            .borrow_mut()
+            .extend(stmts.iter().map(|s| s.sql.clone()));
+        self.inner.batch(stmts).await
+    }
+}
+
+impl World {
+    /// Adds an app that has a version for another platform only, as the
+    /// host of these tests cannot run it.
+    fn add_app_b(&self) {
+        block_on(self.db.batch(vec![
+            stmt!("INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (2, 0, 'windows_x86_64', 'Windows')"),
+            stmt!("INSERT INTO app (id, create_time, name, user_friendly_name, validator) VALUES (2, 0, 'b', 'B', 'trivial')"),
+            stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (8, 0, 2, 100, 2, ?)", APP_VERSION_XML.replace("a_100", "b_100").replace(">a<", ">b<")),
+        ]))
+        .unwrap();
+    }
+
+    fn submit_b(&self, name: &str, now: i64) {
+        let sub = Submission {
+            app: "b".into(),
+            input_template: INPUT_TEMPLATE.into(),
+            result_template: RESULT_TEMPLATE.into(),
+            jobs: vec![JobSpec {
+                name: name.into(),
+                ..Default::default()
+            }],
+        };
+        let random = || self.rand();
+        let out = block_on(create_work(
+            &self.db,
+            &self.config,
+            Some(signer()),
+            now,
+            &random,
+            &sub,
+        ))
+        .unwrap();
+        assert_eq!(out[0].error, None);
+    }
+
+    /// `rpc`, and the statements the request ran.
+    fn rpc_recorded(&self, req: &Req, now: i64) -> (SchedOutcome, Vec<String>) {
+        let catalog = block_on(Catalog::load(&self.db)).unwrap();
+        let random = || self.rand();
+        let db = Recording {
+            inner: &self.db,
+            sqls: RefCell::new(Vec::new()),
+        };
+        let ctx = SchedCtx {
+            db: &db,
+            config: &self.config,
+            plan_classes: &self.plan_classes,
+            catalog: &catalog,
+            code_sign_key: "",
+            now,
+            random: &random,
+            client_ip: "198.51.100.9",
+        };
+        let out = block_on(handle_request(&ctx, &req.xml())).unwrap();
+        (out, db.sqls.into_inner())
+    }
+}
+
+fn probes(sqls: &[String]) -> usize {
+    sqls.iter()
+        .filter(|s| s.as_str() == cb_core::scheduler::UNSENT_EXISTS)
+        .count()
+}
+
+#[test]
+fn the_unsent_work_probe_uses_the_partial_index_and_reads_one_entry() {
+    let w = World::new();
+    w.submit("j1", 1000, 1, 1);
+    let plan = block_on(w.db.run(Stmt::new(format!(
+        "EXPLAIN QUERY PLAN {}",
+        cb_core::scheduler::UNSENT_EXISTS
+    ))))
+    .unwrap()
+    .rows;
+    let detail: Vec<&str> = plan.iter().map(|r| r["detail"].as_str().unwrap()).collect();
+    assert_eq!(detail.len(), 1, "{detail:?}");
+    assert!(
+        detail[0].contains("INDEX res_unsent"),
+        "no use of the partial index: {detail:?}"
+    );
+    // One row at most, whatever the number of unsent results.
+    for n in 2..6 {
+        w.submit(&format!("j{n}"), 1000, 1, 1);
+    }
+    let rows = block_on(w.db.run(Stmt::new(cb_core::scheduler::UNSENT_EXISTS)))
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn a_request_that_got_work_runs_no_probe() {
+    let w = World::new();
+    w.submit("j1", 1000, 1, 1);
+    let (out, sqls) = w.rpc_recorded(&Req::new(0), 2000);
+    assert_eq!(out.n_sent, 1);
+    assert_eq!(probes(&sqls), 0);
+}
+
+#[test]
+fn work_for_other_apps_is_work_in_the_cache() {
+    // The host has a version of app A. Only app B has unsent tasks, and the
+    // host cannot run it. Upstream's cache holds B's tasks, so its reply is
+    // "No tasks sent", not "Project has no tasks available".
+    let w = World::new();
+    w.add_app_b();
+    w.submit_b("b1", 1000);
+    let (out, sqls) = w.rpc_recorded(&Req::new(0), 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(has_message(&out, "No tasks sent"));
+    assert!(!has_message(&out, "Project has no tasks available"));
+    assert_eq!(probes(&sqls), 1);
+}
+
+#[test]
+fn an_empty_project_is_told_only_that_it_has_no_tasks() {
+    let w = World::new();
+    let (out, sqls) = w.rpc_recorded(&Req::new(0), 2000);
+    assert_eq!(out.n_sent, 0);
+    assert!(has_message(&out, "Project has no tasks available"));
+    assert!(!has_message(&out, "No tasks sent"));
+    assert_eq!(probes(&sqls), 1);
+}
+
+#[test]
+fn a_resend_says_the_project_has_no_tasks_only_if_it_has_none() {
+    let mut w = World::new();
+    w.config.resend_lost_results = true;
+    w.add_app_b();
+    w.submit("j1", 1000, 1, 1);
+    let out = w.rpc(&Req::new(0), 2000);
+    assert_eq!(out.n_sent, 1);
+    let host = out.host_id;
+    let mut req = Req::new(host);
+    req.seqno = 2;
+    req.other = Some(Vec::new());
+
+    // App B has unsent work: the cache is not empty.
+    w.submit_b("b1", 2050);
+    let (out, sqls) = w.rpc_recorded(&req, 2100);
+    assert_eq!(out.n_resent, 1);
+    assert!(has_message(&out, "Resent lost task j1_0"));
+    assert!(!has_message(&out, "Project has no tasks available"));
+    assert!(!has_message(&out, "No tasks sent"));
+    assert_eq!(probes(&sqls), 1);
+
+    // Nothing unsent anywhere: the cache is empty.
+    block_on(w.db.run(stmt!(
+        "UPDATE result SET server_state = 5 WHERE server_state = 2"
+    )))
+    .unwrap();
+    req.seqno = 3;
+    let (out, sqls) = w.rpc_recorded(&req, 2200);
+    assert_eq!(out.n_resent, 1);
+    assert!(has_message(&out, "Project has no tasks available"));
+    assert!(!has_message(&out, "No tasks sent"));
+    assert_eq!(probes(&sqls), 1);
+}

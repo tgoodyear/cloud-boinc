@@ -1,0 +1,21 @@
+<data_server_request>
+    <core_client_major_version>8</core_client_major_version>
+    <core_client_minor_version>0</core_client_minor_version>
+    <core_client_release>4</core_client_release>
+<file_upload>
+<file_info>
+<name>diff_0001_0_r1013884258_0</name>
+<xml_signature>
+12b4e767307a63860b9d711bf2a155ad478a236f5b687adf047bf53a64b7304f
+a890b37296077b89f37d2a23f486a90cac3f5b2e38648316cea37a7a43b044d9
+4c726c3b9709e0c34b18757dad902f6c235c06d675e3d6fa350bc0e20f18c5ee
+178736987f16cf11274500f8868910c459bf9566da3aca33c33d77aa9158f955
+.</xml_signature>
+<max_nbytes>5000000</max_nbytes>
+</file_info>
+<nbytes>22</nbytes>
+<md5_cksum>2da01eb4eb91da2cf34f9c39f6dfd299</md5_cksum>
+<offset>0</offset>
+<data>
+INPUT FILE 1
+LINE TWO

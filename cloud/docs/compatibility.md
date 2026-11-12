@@ -1,8 +1,10 @@
 # Compatibility with the stock client
 
 The aim is that an existing project can move to this server without its volunteers installing a
-new client. The parser oracle checks one part of that claim: that the stock client's own C++
-parsers accept the replies this server writes and read the values the server meant.
+new client. Two tests check parts of that claim. The parser oracle checks that the stock client's
+own C++ parsers accept the replies this server writes and read the values the server meant. The
+differential test, further down, checks that the replies equal what the stock server writes to the
+same requests, field by field, apart from differences that are listed here with their reasons.
 
 ## What the oracle is
 
@@ -203,3 +205,235 @@ The run found nothing else: every field listed above matched, the client linked 
 workunit, result and file of the work replies, verified the application file signatures against the
 key in the reply, accepted the stored preferences, and built upload requests the upload handler
 accepts.
+
+## Differential test against the stock server
+
+The oracle shows that the client can read this server's replies. It does not show that they are the
+replies the stock server would give. The differential test gives both servers the same requests
+from the same starting rows, and compares what they answer.
+
+### How it works
+
+1. A stock server, built from the upstream tree of this repository
+   (`cloud/tests/differential/Containerfile`): Debian 12, `./configure --enable-server
+   --disable-client --disable-manager`, MariaDB, Apache with PHP 8.2, the `cgi` scheduler, the
+   `file_upload_handler` and the feeder. `tools/make_project` makes the project. Then
+   `stock/load_fixture.py` installs the fixture: the key pairs, `xadd` for platforms and apps,
+   `update_versions` for the app version (which signs the file with the code-signing key),
+   `stage_file_native` and `create_work` for the jobs, and one pass of `transitioner`, which makes
+   their results. Users are inserted with SQL, since no stock tool takes a given account key; the
+   stored password hash is `password_hash()` of the client's hash, as the stock site stores it.
+2. The same project on this server. `World::new` in
+   `cloud/crates/cb-core/tests/differential/world.rs` reads the same files
+   (`cloud/tests/differential/project/`) and builds the project on SQLite with `put_platform`,
+   `put_app`, `add_app_version`, `register_job_file` and `create_work`, and the users with SQL. The
+   code-signing and upload key pairs are the same files, made by the stock `crypt_prog -genkey`, so
+   signatures of equal data are equal. The URLs are the stock layout of a project moved from a stock server
+   (`stock_short_name` and `uldl_dir_fanout` 1024, see "Moving from a stock server: URLs"), so
+   download and upload URLs and the scheduler URL on the master page equal the stock ones. The
+   other settings are those `make_project` writes to
+   `config.xml` (the ones this server reads), plus `config-options.xml`, which turns on upload
+   certificates (`make_project` switches them off with `dont_generate_upload_certificates` and
+   `ignore_upload_certificates`) and `resend_lost_results`.
+3. The request corpus (`cloud/tests/differential/corpus/<scenario>/`). `capture.sh` runs a stock
+   BOINC 8.0.4 client against the stock server through a recording proxy
+   (`record-proxy.py`), drives it with `boinccmd`, and keeps every exchange.
+   `build-corpus.py` turns that into `steps.json` and one request file per step. The scheduler
+   requests are the client's, byte for byte, except for what identifies the machine, which gets
+   fixed test values (`sanitize_sched` in `build-corpus.py`: host name, IP address, host CPID,
+   processor vendor, model and features, OS version, memory and disk sizes, and paths in
+   stderr texts). The account key in them is the test user's.
+   Some steps are derived from a captured request by changing one thing, or are written by hand
+   (the account manager and status requests, which no client sends); each such step says so in its
+   `derived` field in `steps.json`. No reply is written by hand.
+4. The stock replies. `golden.sh` starts the stock server, puts the project back into its starting
+   state for each scenario (`stock.sh --action reset` restores a database dump taken after the
+   fixture was loaded), and `replay.py` sends the scenario's requests in order and writes each
+   reply to `<step>.reply` and the time of the request to `golden.json`. The stock server's own
+   address in a reply becomes `http://project.test`, which is what this server's project is
+   configured with. Scheduler requests wait seven seconds for each other, because the stock server
+   sends no work to a host that asked less than `min_sendwork_interval` (6 seconds, as
+   `make_project` sets it) ago; steps with `"gap": 0` do not wait, to test that.
+5. The test (`cargo test -p cb-core --test differential`, part of `cargo test`, and so of CI). For
+   each scenario it builds the world, answers every step with the functions the Workers call
+   (`handle_request`, `check_header` and `receive` with an in-memory bucket, `file_size`, and the
+   web functions), at the time the stock request was sent, and compares the answer with the stock
+   reply. CI does not run the stock server; it checks against the stored replies.
+
+### Job names
+
+The stock scheduler picks among the jobs in its feeder's shared memory from a random place, so
+which job a request gets differs from run to run, and this server picks in an order of its own.
+The corpus therefore names jobs in the order a host was first sent them, `diff_0001`, `diff_0002`,
+and so on (the jobs of one reply in the order of their real names). `replay.py` and the test learn
+the real names from the replies and write them into the requests that follow (`names.py` and
+`names.rs`); the replies are compared with the real names replaced by those. Output file names
+(`diff_0001_0_r1013884258_0`) carry a random number. Each complete name becomes a placeholder:
+the job's canonical name and `r1` for the first different name that output file has had, `r2`
+for the next. The same name gets the same placeholder everywhere, in a reply and in a resend,
+and different names get different ones, so a `<file_ref>` that does not match its `<file_info>`
+stays visible. Before any renaming the test also checks that every `file_ref/file_name` in a
+scheduler reply, from either server, has a `file_info/name` in the same reply, which is what the
+client needs to link a result to its files; two tests in `main.rs` show that a reply with a
+mismatched reference fails. All jobs use the same input file, so that nothing else differs between
+jobs.
+
+### What is compared
+
+Both replies are read into a tree by a tolerant reader (`xmltree.rs`): the stock server writes
+text next to elements, `<message priority="low">` attributes, and, in the upload handler, an
+unescaped `<` in a message, which a strict parser refuses. The tree becomes a list of leaves, each
+with a path such as `scheduler_reply/result[diff_0001_0]/report_deadline`. Records with a name
+(`file_info`, `workunit`, `result`, `app`, `app_version`, `host`, `platform`) are keyed by it, so
+that replies listing the same records in a different order line up; other repeated elements are
+numbered. A difference is a leaf that is only in one reply, or has another value. Numbers are
+compared as numbers, since the stock server writes `%f`. Whitespace around text is not compared.
+
+What is left after these rules is a finding and fails the test (`compare.rs`):
+
+- Time fields (`TIMES`) may differ by two seconds, because the stock server reads its clock while
+  this server is given the time the request was sent: `host_create_time`, `report_deadline`, and
+  the times of a computer in `show_user.php`.
+- Random fields (`RANDOM`) must have the same form, not the same value: the account key
+  `create_account.php` makes, the weak account key in `am_get_info.php` (it includes the stored
+  password hash, which differs between the servers), and the upload certificate of an output file
+  (it signs a name with a random part). The test checks every upload certificate in both replies
+  against the upload public key, so that two certificates for different names are not taken as
+  equal merely because both are long.
+- Transforms (`TRANSFORMS`): the number of seconds a host must wait (see D9), the translation
+  markers in messages (see D11), and the URL of the application file (see D12).
+- Intended differences (`INTENDED`), below. An entry names the step it applies to and the
+  element, so it cannot cover a difference elsewhere.
+
+A rule or entry that no step needs makes the test fail, so a list cannot outlive the difference
+it describes. The master page (`/`) is a web page; the test compares only the scheduler URLs in
+it, which the client reads.
+
+### Coverage
+
+| Scenario | Origin | Steps |
+|----------|--------|-------|
+| `attach` | client 8.0.4: `boinccmd --get_project_config`, `--lookup_account`, `--create_account` | `get_project_config.php`; `lookup_account.php` with the right password, a wrong one, and an unknown address; `create_account.php` for a new account, for an existing one with its password and with another, with a bad address, and with a short password |
+| `work` | client | the master page; the first request (work for one second, hostid 0); a request for more work; four uploads; the request that reports the tasks |
+| `report` | client | master page, first request, one upload, a report-only request (`work_req_seconds` 0) |
+| `anon` | client with an `app_info.xml`, attached by its account file | as `work`, on the anonymous platform: the request lists the client's `<app_versions>` |
+| `lost` | client, plus one derived request | the first request, a request while the first task runs (its `other_results` lists it), then the same with `other_results` empty, so that the server resends the tasks |
+| `quick` | derived from the first request of `work` | a request at once after another (the lost task is resent), one that lists its task, so that the server comes to `min_sendwork_interval`, and one after the wait that does not list it, with jobs still unsent |
+| `uploads` | uploads of `work`, changed one field at a time | a size query before and after an upload; an offset for a file the server does not hold; the upload; the same upload again; the same name with other contents; a bad certificate; a certificate for another name; more bytes than the certificate allows; an upload cut after ten bytes, a size query, and the rest from offset 10; a request without a name; not a request |
+| `web` | written by hand | the first request (so that a computer exists), `get_project_config.php`, `server_status.php?xml=1`, `show_user.php?format=xml` by ID, by key, and for an unknown user, `am_get_info.php` with a key and with a wrong key, `lookup_account.php` without a hash, `am_set_info.php` |
+
+63 steps: 18 scheduler requests, 23 upload requests (14 of them in `uploads`) and 22 web
+requests. Scheduler replies are compared with work sent (`<app>`, `<file_info>`,
+`<app_version>`, `<workunit>`, `<result>`, upload certificates, file signatures, the code-signing
+key), result acknowledgements, resent lost tasks, messages, `<request_delay>`, the preferences
+echo, the user, host and credit fields, and the `<gui_urls>` and `<rss_feeds>` lists.
+
+### Intended differences
+
+| ID | Where | Stock server | This server | Why, and what a client sees |
+|----|-------|--------------|-------------|-----------------------------|
+| D1 | `<gui_urls>` and `<rss_feeds>` in every scheduler reply | The project's buttons in the Manager (message boards, account, tasks) from `gui_urls.xml`, and the URL of the notices feed | Neither | There are no forums or notices. The Manager shows no project buttons and no notices for the project. |
+| D2 | `lookup_account.php` with a wrong password | A PHP fatal error, `Call to undefined function hash_equal()`, from `check_passwd_hash` in `html/inc/user_util.inc`. The reply is an HTML error text, not XML. | `<error>` with `ERR_BAD_PASSWD` (-206, "Invalid password"), which is what `html/user/lookup_account.php` means to send after the check | A typo in the upstream tree. Every wrong password and every use of the account-key form of the hash reaches it. The Manager's wizard shows an error either way, a different one. |
+| D3 | `am_set_info.php` | `<error>` with -1, "not supported"; the script is switched off | Changes the account as the disabled script's code does | See [architecture.md](architecture.md), "Web RPCs and site". |
+| D4 | `server_status.php?xml=1` | Daemon lists (download server, upload server, scheduler, feeder, transitioner and so on, with hosts), `tasks_by_app`, counts of workunits and results waiting for validation and deletion, users and computers with credit and registered in the last day, `current_floating_point_speed` | `daemon_status` with the scheduler and the pipeline, `update_time`, `software_version`, results ready and in progress, workunits waiting for assimilation, `transitioner_backlog_hours` (0.02 when anything is due, else 0), users and computers with recent credit | A Cloudflare-D1 deployment keeps no daemon table and does not count every row on each request. A consumer that reads the other elements finds nothing. |
+| D5 | Upload of a file smaller than one piece (8 MiB), cut short | Keeps the bytes received; `<file_size>` answers 10 after ten bytes; the request from offset 10 completes the file. The error for the cut request is "EOF on socket read : asked for 22, got 10". | Keeps nothing; `<file_size>` answers 0; a request from offset 10 gets "length of file ... 0 bytes < offset 10 bytes". The error for the cut request says the upload ended early. | Pieces are stored only for files of at least `PIECE_BYTES` (architecture.md, "Upload"). The client sends such a file again from the start. |
+| D6 | Upload under a name that is stored, with other contents | `<status>` 0 | `<status>` -1, "file ... exists with other contents" | A stored file is never replaced, because a result may have been validated against it. A retry of the same upload succeeds in both. |
+| D7 | Weak account key (`<weak_auth>` in `am_get_info.php`) | `userid_` and an MD5 that includes the stored password hash | The same form, with the hash this server stores (HMAC with the pepper) | Weak keys made by the stock server stop working after a move. The account key and the password keep working. |
+| D8 | Upload certificates of output files, and the random part of their names | Signed with the upload key | Signed with the same key, over another name | Both verify against the upload public key. |
+| D9 | "Not sending work. Last request too recent. Please wait N seconds." | N counts from the fraction of a second the last request came in | N counts from the stored time of the last request, in whole seconds, so it can be one more | Stock subtracts that stored time from the current time with its fraction (`handle_request.cpp`). |
+| D10 | "Project has no tasks available" and "No tasks sent" | Decided from the feeder's cache in shared memory: a window of `shmem_work_items` unsent results (100 unless set), refilled every few seconds, of any app and platform (`SCHED_SHMEM::no_work` in `sched/sched_shmem.cpp`). The window can be empty for a moment while unsent work exists. Empty: only "Project has no tasks available". Not empty: "No tasks sent" and the reasons. | One probe for an unsent result of any app or platform (`UNSENT_EXISTS` in `cloud/crates/cb-core/src/scheduler.rs`): `SELECT 1 FROM result WHERE server_state = 2 LIMIT 1`, which reads one entry of the partial index `res_unsent`. It runs only when the reply would carry one of the two messages: a work request that was sent nothing, or one that resent lost tasks. It does not run for a host that has candidates, or for a request that was sent work. | There is no cache to lag behind the database, so this server never says "no tasks" while unsent work exists, which the stock server can. A project whose feeder is slow sees "No tasks sent" here where stock says "Project has no tasks available". Log text only. |
+| D11 | Messages the stock scheduler marks for translation: 15 of them in `sched/handle_request.cpp`, `sched/sched_send.cpp` and `sched/sched_version.cpp`, among them "Invalid or missing account key", "Your BOINC client software is too old" and "Your app_info.xml file doesn't have a usable version of" | Written as `_("text")`; for the app_info message only the first part is marked: `_("Your app_info.xml file doesn't have a usable version of") App A.` (`#define _(x)` in `lib/sched_msgs.h`) | Plain text, without the marker | The client removes the marker before it shows the message (`strip_translation` in `lib/str_util.cpp`, called from `client/client_msgs.cpp`), so an English client shows the same text. The marker exists so that a message can be found and translated; whether a localized Manager translates these messages by it was not checked, and without the marker it could not. Recorded for the app_info message (scenarios `anon`); the other 14 follow from the macro. Not fixed. |
+| D12 | `<url>` of an application file | `download/name`: `update_versions` stages application files flat and writes flat URLs | `download/<hex>/name`: an app version registered through this server gets the hash directory, as input files do | A project that moves keeps the XML of its imported app versions, which has the flat URLs, and this server serves them with or without the directory (see "Moving from a stock server: URLs"). Only app versions added later get a directory. The client follows the URL it is given. Input file URLs are equal. |
+
+### Differences found, and what was done
+
+Each of these was a difference between the replies that the test found. The first group is fixed
+here, in `cloud/crates/cb-core/src/scheduler.rs` and `cloud/crates/cb-proto/src/web_rpc.rs`; the
+test covers each fix, because the stored stock replies carry the right values.
+
+1. `<request_delay>` was 1.01 times `min_sendwork_interval` (6.06 for 6). Stock writes the larger
+   of that and the interval plus one (`SCHEDULER_REPLY::write` in `sched/sched_types.cpp`): 7. A
+   client waited a second less than the project asked.
+2. The preferences were sent in every reply to a client that had no separate copy from the web
+   site, which is the usual client. Stock sends the account's preferences only when they are newer
+   than both of the client's copies, its working copy included (`handle_global_prefs` in
+   `sched/handle_request.cpp`). The client's copy replaces the account's only when it comes from
+   this account (`global_prefs_source_email_hash`); that check was missing.
+3. A new computer's `expavg_time` was 0; stock sets it to the creation time
+   (`handle_request` in `sched/handle_request.cpp`). It shows in the computers list of
+   `show_user.php?format=xml&auth=`.
+4. `get_project_config.php` wrote `<server_version>8.3.0</server_version>`, the BOINC release. Stock
+   writes `$server_version` of `html/inc/server_version.inc`, the version of the web interface,
+   1.1.0.
+5. After resending lost tasks, this server also sent new tasks and said "No tasks sent". Stock
+   sends nothing more after a resend (`ok_to_send_work` in `process_request`).
+6. The message for a request that came too soon was worded differently and was also written when
+   lost tasks were resent; stock writes it only when it would otherwise send work.
+7. With no jobs to send, this server wrote "No tasks sent" and then "Project has no tasks
+   available". Stock writes only the second when its cache is empty, and "No tasks sent" and the
+   reasons only when the cache holds jobs, of any app, that do not suit the host. The first
+   fix looked at the host's own candidates, which are only the apps it has a version of; it
+   now asks the project (D10). The fixture has a second app, with a version for Windows only, and
+   one job of it, so that the Linux host of the corpus always sees unsent work it cannot run:
+   the ordinary request and the request that resends lost tasks both cover it, in `work`,
+   `anon`, `lost` and `quick`, with replies recorded from the stock server.
+
+Not fixed, and recorded above: D1 (no project web pages), D4, D5 (pieces), D6, D10, D11.
+
+### What the stock tree gets wrong
+
+The test found these in the upstream tree. They are recorded because they decide what "the stock
+server's reply" is, and nothing here changes them.
+
+- `check_passwd_hash` calls `hash_equal` instead of `hash_equals` (D2).
+- `tools/stage_file` calls `parse_config`, which does not exist, so staging input files needs
+  `stage_file_native`.
+- `tools/make_project` writes `dont_generate_upload_certificates` and `ignore_upload_certificates`
+  as 1: a project made with it checks no upload certificates until its operator changes that.
+- The upload handler writes `0 bytes < offset 10 bytes` without escaping the `<`
+  (`return_error` in `sched/file_upload_handler.cpp`), the same defect the oracle found in
+  another message (finding 1 above). This server escapes it; the test reads both as the same text.
+
+### Running it
+
+On a Linux host with podman or docker, `python3`, `rsync`, and for a capture the stock client
+(`boinc` and `boinccmd`; Debian: `boinc-client`):
+
+```
+cloud/tests/differential/stock.sh --action build        # the image, about 10 minutes
+cloud/tests/differential/capture.sh --out /tmp/capture  # a client against the stock server
+cloud/tests/differential/build-corpus.py --capture /tmp/capture \
+    --out cloud/tests/differential/corpus               # requests, no replies
+cloud/tests/differential/golden.sh                      # the stock replies
+cd cloud && cargo test -p cb-core --test differential
+```
+
+`capture.sh` and `build-corpus.py` are needed only to record new requests; `golden.sh` alone makes
+new stock replies for the stored requests, after a change to the stock fixture or a merge from
+upstream. Everything binds to 127.0.0.1: Apache on port 18480 (`--port`), MariaDB on a socket
+inside the container. `stock.sh --action stop` removes the container. With
+`CB_DIFFERENTIAL_SUMMARY=1` and `--nocapture`, a failing run prints the differences grouped by
+element; `CB_DIFFERENTIAL_DUMP=<dir>` writes this server's replies there.
+
+The key pairs under `cloud/tests/differential/project/keys/` are throwaway keys made for this test
+and used nowhere else.
+
+### What it does not cover
+
+- One client version. The requests are from the stock 8.0.4 client. A client of this tree
+  (8.3.0) was not run, and older clients send other requests.
+- Only the paths a single computer takes: attach, work, upload and report, no work, report only,
+  anonymous platform, lost tasks, requests that come too soon. Not covered: several computers or
+  accounts, GPU and plan class applications, quorums of two or more (the replies of a workunit
+  with several results), assigned jobs, trickles, homogeneous redundancy, and the daemons'
+  work (validation, assimilation, credit, file deletion), whose output reaches a client only
+  through later replies.
+- The preferences of the account in `project_prefs` and the `<project_specific>` part.
+- HTTP: headers, `Content-Type`, redirects and downloads (status codes are compared). The files Worker serves downloads
+  from R2 and the stock server from Apache.
+- The Workers' own glue (`workers/*/src/lib.rs`): the test calls the functions it calls, with
+  the arguments it builds from the request. The parser oracle and the dev deployment cover the
+  rest.
+- The site's HTML pages. Only the master page's scheduler URL is compared.
+- Time-dependent behaviour beyond what the steps' timing reaches: daily quotas, deadlines passing,
+  back-off.

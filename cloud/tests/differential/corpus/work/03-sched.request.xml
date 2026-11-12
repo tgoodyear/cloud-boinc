@@ -1,0 +1,145 @@
+<scheduler_request>
+    <authenticator>5a1f0c3b9d7e42a6b8c0d1e2f3a4b5c6</authenticator>
+    <hostid>1</hostid>
+    <rpc_seqno>0</rpc_seqno>
+    <core_client_major_version>8</core_client_major_version>
+    <core_client_minor_version>0</core_client_minor_version>
+    <core_client_release>4</core_client_release>
+    <resource_share_fraction>1.000000</resource_share_fraction>
+    <rrs_fraction>1.000000</rrs_fraction>
+    <prrs_fraction>1.000000</prrs_fraction>
+    <duration_correction_factor>1.000000</duration_correction_factor>
+    <allow_multiple_clients>1</allow_multiple_clients>
+    <sandbox>0</sandbox>
+    <dont_send_work>0</dont_send_work>
+    <work_req_seconds>69112.706197</work_req_seconds>
+    <cpu_req_secs>69112.706197</cpu_req_secs>
+    <cpu_req_instances>3.000000</cpu_req_instances>
+    <estimated_delay>0.000000</estimated_delay>
+    <client_cap_plan_class>1</client_cap_plan_class>
+    <platform_name>x86_64-pc-linux-gnu</platform_name>
+    <code_sign_key>
+1024
+daf83c8ce96c31f7e7c680a4d1560bd628b0c0261737754019c8e45e76ae7cab
+64e7c862e4ea2deefdef2758bebddd7b2cabd9e3fd1f993de5271b2254b83bee
+68d10db075e2ad7c79953d5a962d63c315d35659a48fe458e6042115d10bb853
+05d05c88b4191be1c97f41339f8ca5983e505c9bd294b10dd2547e492f8fd579
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000010001
+.
+</code_sign_key>
+<working_global_preferences>
+<global_preferences>
+   <source_project>http://127.0.0.1:18480/diff/</source_project>
+   <mod_time>1700000000.000000</mod_time>
+   <battery_charge_min_pct>90.000000</battery_charge_min_pct>
+   <battery_max_temperature>40.000000</battery_max_temperature>
+   <run_on_batteries>0</run_on_batteries>
+   <run_if_user_active>1</run_if_user_active>
+   <run_gpu_if_user_active>0</run_gpu_if_user_active>
+   <suspend_if_no_recent_input>0.000000</suspend_if_no_recent_input>
+   <suspend_cpu_usage>0.000000</suspend_cpu_usage>
+   <start_hour>0.000000</start_hour>
+   <end_hour>0.000000</end_hour>
+   <net_start_hour>0.000000</net_start_hour>
+   <net_end_hour>0.000000</net_end_hour>
+   <leave_apps_in_memory>0</leave_apps_in_memory>
+   <confirm_before_connecting>0</confirm_before_connecting>
+   <hangup_if_dialed>0</hangup_if_dialed>
+   <dont_verify_images>0</dont_verify_images>
+   <work_buf_min_days>0.100000</work_buf_min_days>
+   <work_buf_additional_days>0.100000</work_buf_additional_days>
+   <max_ncpus_pct>100.000000</max_ncpus_pct>
+   <niu_max_ncpus_pct>100.000000</niu_max_ncpus_pct>
+   <niu_cpu_usage_limit>100.000000</niu_cpu_usage_limit>
+   <niu_suspend_cpu_usage>0.000000</niu_suspend_cpu_usage>
+   <cpu_scheduling_period_minutes>60.000000</cpu_scheduling_period_minutes>
+   <disk_interval>60.000000</disk_interval>
+   <disk_max_used_gb>0.000000</disk_max_used_gb>
+   <disk_max_used_pct>90.000000</disk_max_used_pct>
+   <disk_min_free_gb>0.100000</disk_min_free_gb>
+   <vm_max_used_pct>75.000000</vm_max_used_pct>
+   <ram_max_used_busy_pct>50.000000</ram_max_used_busy_pct>
+   <ram_max_used_idle_pct>90.000000</ram_max_used_idle_pct>
+   <idle_time_to_run>3.000000</idle_time_to_run>
+   <max_bytes_sec_up>0.000000</max_bytes_sec_up>
+   <max_bytes_sec_down>0.000000</max_bytes_sec_down>
+   <cpu_usage_limit>100.000000</cpu_usage_limit>
+   <daily_xfer_limit_mb>0.000000</daily_xfer_limit_mb>
+   <daily_xfer_period_days>0</daily_xfer_period_days>
+   <override_file_present>1</override_file_present>
+   <network_wifi_only>1</network_wifi_only>
+</global_preferences>
+</working_global_preferences>
+<cross_project_id>c0ffee00c0ffee00c0ffee00c0ffee00</cross_project_id>
+<time_stats>
+    <on_frac>1.000000</on_frac>
+    <connected_frac>-1.000000</connected_frac>
+    <cpu_and_network_available_frac>1.000000</cpu_and_network_available_frac>
+    <active_frac>1.000000</active_frac>
+    <gpu_active_frac>1.000000</gpu_active_frac>
+    <client_start_time>1794442866.401742</client_start_time>
+    <total_start_time>1794442866.774085</total_start_time>
+    <total_duration>20.044525</total_duration>
+    <total_active_duration>20.044525</total_active_duration>
+    <total_gpu_active_duration>20.044525</total_gpu_active_duration>
+    <now>1794442890.824613</now>
+    <previous_uptime>0.000000</previous_uptime>
+    <session_active_duration>20.044525</session_active_duration>
+    <session_gpu_active_duration>20.044525</session_gpu_active_duration>
+</time_stats>
+<net_stats>
+    <bwup>105689655.172416</bwup>
+    <avg_up>9141718584888.888672</avg_up>
+    <avg_time_up>1794442879.806845</avg_time_up>
+    <bwdown>30733644.112238</bwdown>
+    <avg_down>2577371966386.218750</avg_down>
+    <avg_time_down>1794442883.815904</avg_time_down>
+</net_stats>
+<host_info>
+    <timezone>0</timezone>
+    <domain_name>test-host</domain_name>
+    <ip_addr>192.0.2.10</ip_addr>
+    <host_cpid>0123456789abcdef0123456789abcdef</host_cpid>
+    <p_ncpus>4</p_ncpus>
+    <p_vendor>GenuineTest</p_vendor>
+    <p_model>Test CPU @ 3.00GHz</p_model>
+    <p_features>fpu sse2</p_features>
+    <p_fpops>1000000000.000000</p_fpops>
+    <p_iops>1000000000.000000</p_iops>
+    <p_membw>1000000000.000000</p_membw>
+    <p_calculated>1794442866.401742</p_calculated>
+    <p_vm_extensions_disabled>0</p_vm_extensions_disabled>
+    <m_nbytes>8589934592.000000</m_nbytes>
+    <m_cache>8388608.000000</m_cache>
+    <m_swap>2147483648.000000</m_swap>
+    <d_total>107374182400.000000</d_total>
+    <d_free>53687091200.000000</d_free>
+    <os_name>Linux Debian</os_name>
+    <os_version>Debian GNU/Linux 12 (bookworm) [6.1.0-test|libc 2.36]</os_version>
+    <n_usable_coprocs>0</n_usable_coprocs>
+    <wsl_available>0</wsl_available>
+</host_info>
+    <disk_usage>
+        <d_boinc_used_total>159744.000000</d_boinc_used_total>
+        <d_boinc_used_project>28672.000000</d_boinc_used_project>
+        <d_project_share>24981734891.520004</d_project_share>
+    </disk_usage>
+<app_versions>
+<app_version>
+    <app_name>upper</app_name>
+    <version_num>100</version_num>
+    <platform>x86_64-pc-linux-gnu</platform>
+    <avg_ncpus>1.000000</avg_ncpus>
+    <flops>1000000000.000000</flops>
+</app_version>
+</app_versions>
+<other_results>
+    <other_result>
+        <name>diff_0001_0</name>
+        <app_version>0</app_version>
+    </other_result>
+</other_results>
+</scheduler_request>

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Test application: upper-cases its input file. It does not use the BOINC API:
+# it resolves the link files the client puts in the slot directory itself and
+# writes the file the API writes when an application finishes.
+resolve() {
+    if [ -L "$1" ]; then echo "$1"; else sed -n 's:.*<soft_link>\(.*\)</soft_link>.*:\1:p' "$1"; fi
+}
+# Long enough for a request to be made while the task runs.
+sleep 8
+tr 'a-z' 'A-Z' < "$(resolve in)" > "$(resolve out)"
+echo 0 > boinc_finish_called

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<user>
+    <id>1</id>
+    <cpid>79a1c6a5cc87a9bfe7aca063270e0a69</cpid>
+    <create_time>1700000000</create_time>
+    <name>Test User</name>
+    <total_credit>0</total_credit>
+    <expavg_credit>0</expavg_credit>
+    <expavg_time>1700000000</expavg_time>
+    <teamid>0</teamid>
+    <has_profile>0</has_profile>
+   <venue></venue>
+    <host>
+        <id>1</id>
+        <create_time>1794450869</create_time>
+        <rpc_seqno>0</rpc_seqno>
+        <rpc_time>1794450869</rpc_time>
+        <host_cpid>cff31e8ff8450c3fc7901c3ce2c070d2</host_cpid>
+        <total_credit>0</total_credit>
+        <expavg_credit>0</expavg_credit>
+        <expavg_time>1794450869</expavg_time>
+        <domain_name>test-host</domain_name>
+        <p_ncpus>4</p_ncpus>
+        <p_vendor>GenuineTest</p_vendor>
+        <p_model>Test CPU @ 3.00GHz</p_model>
+        <p_fpops>1000000000</p_fpops>
+        <p_iops>1000000000</p_iops>
+        <os_name>Linux Debian</os_name>
+        <os_version>Debian GNU/Linux 12 (bookworm) [6.1.0-test|libc 2.36]</os_version>
+        <m_nbytes>8589934592</m_nbytes>
+        <d_free>53687091200</d_free>
+        <d_total>107374182400</d_total>
+        <venue></venue>
+    </host>
+     <country>United States</country>
+</user>
