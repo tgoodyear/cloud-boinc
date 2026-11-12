@@ -19,8 +19,8 @@ use cb_core::scheduler::{handle_request, SchedCtx};
 use cb_core::site::{site_page, SiteCtx};
 use cb_core::template::InputFile;
 use cb_core::upload::{
-    check_header, file_size, is_flat_name, md5_to_hex, receive, CompleteWrite, PieceWrite,
-    StoredFile, StoredPiece, UploadStore, PIECE_BYTES,
+    check_header, file_size, is_flat_name, md5_to_hex, receive, CompleteWrite, PieceRun,
+    PieceWrite, StoredFile, StoredPiece, UploadStore, PIECE_BYTES,
 };
 use cb_core::web::{
     am_get_info, am_set_info, create_account, lookup_account, master_page, project_config,
@@ -307,7 +307,7 @@ impl World {
                 if !is_flat_name(&file_name) {
                     return refuse(UploadError::permanent("invalid filename"));
                 }
-                match file_size(&self.store, &file_name, PIECE_BYTES).await {
+                match file_size(&self.store, &self.db, &file_name, PIECE_BYTES).await {
                     Ok(n) => reply_file_size(n),
                     Err(_) => reply_error(true, "cannot stat file"),
                 }
@@ -322,7 +322,7 @@ impl World {
                     return refuse(e);
                 }
                 let data = MemBody::new(body[header.data_offset.min(body.len())..].to_vec());
-                match receive(&self.store, &header, &data, PIECE_BYTES).await {
+                match receive(&self.store, &self.db, &header, &data, PIECE_BYTES).await {
                     Ok(Ok(())) => reply_success(),
                     Ok(Err(e)) => refuse(e),
                     Err(_) => reply_error(true, "the file could not be stored"),
@@ -502,6 +502,7 @@ impl UploadStore for MemStore {
     async fn put_piece(
         &self,
         _name: &str,
+        _epoch: u64,
         _md5: &[u8; 16],
         _start: u64,
         _body: &MemBody,
@@ -512,13 +513,12 @@ impl UploadStore for MemStore {
 
     async fn put_complete(
         &self,
-        name: &str,
-        _starts: &[u64],
-        _piece: u64,
+        pieces: &PieceRun<'_>,
         body: &MemBody,
         tail: u64,
         md5: Option<[u8; 16]>,
     ) -> CoreResult<CompleteWrite> {
+        let name = pieces.name;
         let Some(data) = body.take(tail) else {
             return Ok(CompleteWrite::BodyEnded);
         };
