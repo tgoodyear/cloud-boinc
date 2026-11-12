@@ -1,0 +1,272 @@
+<scheduler_reply>
+<scheduler_version>803</scheduler_version>
+<dont_use_dcf/>
+<master_url>http://project.test/diff/</master_url>
+<request_delay>7.000000</request_delay>
+<message priority="low">Resent lost task diff_0001_0</message>
+<message priority="low">Resent lost task diff_0002_0</message>
+<message priority="low">Resent lost task diff_0003_0</message>
+<message priority="low">Resent lost task diff_0004_0</message>
+<message priority="low">Project has no tasks available</message>
+<project_name>Differential test project</project_name>
+<userid>1</userid>
+<user_name>Test User</user_name>
+<user_total_credit>0.000000</user_total_credit>
+<user_expavg_credit>0.000000</user_expavg_credit>
+<user_create_time>1700000000</user_create_time>
+<email_hash>889759bfc8304d238a5fa51d52c62ce0</email_hash>
+<cross_project_id>c0ffee00c0ffee00c0ffee00c0ffee00</cross_project_id>
+<external_cpid>79a1c6a5cc87a9bfe7aca063270e0a69</external_cpid>
+
+<host_total_credit>0.000000</host_total_credit>
+<host_expavg_credit>0.000000</host_expavg_credit>
+<host_venue></host_venue>
+<host_create_time>1794445155</host_create_time>
+<team_name></team_name>
+<app>
+    <name>upper</name>
+    <user_friendly_name>Upper-case test app</user_friendly_name>
+    <non_cpu_intensive>0</non_cpu_intensive>
+    <fraction_done_exact>0</fraction_done_exact>
+</app>
+<file_info>
+    <name>upper_1.00_x86_64-pc-linux-gnu</name>
+    <url>http://project.test/diff/download/upper_1.00_x86_64-pc-linux-gnu</url>
+    <executable/>
+    <file_signature>
+5abc5ae0f59e77d48a99a35937f4545aed21f7c1c912c0061c5044498ab31d0b
+e763b7ef3c557b1d548465d96d602b8b0390d53a6fc1626c14de1d49e7583749
+94f16824c13ff390513e1362901332f019d5dae78887ab6bb6093832255ad651
+7564fc4f49f763bc6d3420ea05e47b6c470273b398020e292d09ca69c15f7ac7
+.
+    </file_signature>
+    <nbytes>493</nbytes>
+</file_info>
+<app_version>
+    <app_name>upper</app_name>
+    <version_num>100</version_num>
+<file_ref>
+    <file_name>upper_1.00_x86_64-pc-linux-gnu</file_name>
+    <main_program/>
+</file_ref>
+    <platform>x86_64-pc-linux-gnu</platform>
+    <avg_ncpus>1.000000</avg_ncpus>
+    <flops>1000000000.000000</flops>
+</app_version>
+<file_info>
+    <name>diff_in.txt</name>
+    <url>http://project.test/diff/download/3af/diff_in.txt</url>
+    <md5_cksum>89ccd1ee97f2a76a5a1efe9d4c135da1</md5_cksum>
+    <nbytes>20</nbytes>
+</file_info>
+<workunit>
+    <rsc_fpops_est>10000000000.000000</rsc_fpops_est>
+    <rsc_fpops_bound>10000000000000.000000</rsc_fpops_bound>
+    <rsc_memory_bound>10000000.000000</rsc_memory_bound>
+    <rsc_disk_bound>10000000.000000</rsc_disk_bound>
+    <name>diff_0001</name>
+    <app_name>upper</app_name>
+<command_line>
+
+</command_line>
+<file_ref>
+    <file_name>diff_in.txt</file_name>
+    <open_name>in</open_name>
+</file_ref>
+</workunit>
+<file_info>
+    <name>diff_in.txt</name>
+    <url>http://project.test/diff/download/3af/diff_in.txt</url>
+    <md5_cksum>89ccd1ee97f2a76a5a1efe9d4c135da1</md5_cksum>
+    <nbytes>20</nbytes>
+</file_info>
+<workunit>
+    <rsc_fpops_est>10000000000.000000</rsc_fpops_est>
+    <rsc_fpops_bound>10000000000000.000000</rsc_fpops_bound>
+    <rsc_memory_bound>10000000.000000</rsc_memory_bound>
+    <rsc_disk_bound>10000000.000000</rsc_disk_bound>
+    <name>diff_0002</name>
+    <app_name>upper</app_name>
+<command_line>
+
+</command_line>
+<file_ref>
+    <file_name>diff_in.txt</file_name>
+    <open_name>in</open_name>
+</file_ref>
+</workunit>
+<file_info>
+    <name>diff_in.txt</name>
+    <url>http://project.test/diff/download/3af/diff_in.txt</url>
+    <md5_cksum>89ccd1ee97f2a76a5a1efe9d4c135da1</md5_cksum>
+    <nbytes>20</nbytes>
+</file_info>
+<workunit>
+    <rsc_fpops_est>10000000000.000000</rsc_fpops_est>
+    <rsc_fpops_bound>10000000000000.000000</rsc_fpops_bound>
+    <rsc_memory_bound>10000000.000000</rsc_memory_bound>
+    <rsc_disk_bound>10000000.000000</rsc_disk_bound>
+    <name>diff_0003</name>
+    <app_name>upper</app_name>
+<command_line>
+
+</command_line>
+<file_ref>
+    <file_name>diff_in.txt</file_name>
+    <open_name>in</open_name>
+</file_ref>
+</workunit>
+<file_info>
+    <name>diff_in.txt</name>
+    <url>http://project.test/diff/download/3af/diff_in.txt</url>
+    <md5_cksum>89ccd1ee97f2a76a5a1efe9d4c135da1</md5_cksum>
+    <nbytes>20</nbytes>
+</file_info>
+<workunit>
+    <rsc_fpops_est>10000000000.000000</rsc_fpops_est>
+    <rsc_fpops_bound>10000000000000.000000</rsc_fpops_bound>
+    <rsc_memory_bound>10000000.000000</rsc_memory_bound>
+    <rsc_disk_bound>10000000.000000</rsc_disk_bound>
+    <name>diff_0004</name>
+    <app_name>upper</app_name>
+<command_line>
+
+</command_line>
+<file_ref>
+    <file_name>diff_in.txt</file_name>
+    <open_name>in</open_name>
+</file_ref>
+</workunit>
+<file_info>
+        <name>diff_0001_0_r747154402_0</name>
+        <generated_locally/>
+        <upload_when_present/>
+        <max_nbytes>5000000</max_nbytes>
+        <url>http://project.test/diff_cgi/file_upload_handler</url>
+    <xml_signature>
+6afba6ce6253c23aeb5ef1cf471f3b593fd060f7b2c8410932f577df68461dbd
+3ab195821b2beab3afd6483770cd9b49f49aa48f627cc71b92f69faa6fb5cd12
+2d6de682372f72ff9e1d987248d810dd1c427b23d063faeddc9af3b8151cf91c
+866cce64f94fe2466a3c67254f86309ef379704b2332ba3e841a0510d114fe5f
+.
+</xml_signature>
+</file_info>
+    <result>
+<report_deadline>1794452354</report_deadline>
+<wu_name>diff_0001</wu_name>
+<name>diff_0001_0</name>
+        <file_ref>
+            <file_name>diff_0001_0_r747154402_0</file_name>
+            <open_name>out</open_name>
+        </file_ref>
+    
+    <platform>x86_64-pc-linux-gnu</platform>
+    <version_num>100</version_num>
+    <plan_class></plan_class>
+</result>
+<file_info>
+        <name>diff_0002_0_r640710222_0</name>
+        <generated_locally/>
+        <upload_when_present/>
+        <max_nbytes>5000000</max_nbytes>
+        <url>http://project.test/diff_cgi/file_upload_handler</url>
+    <xml_signature>
+513586c85302b6397c4def1391c850e88c44ecb4fcfdcaeda37ce0c523b80f6b
+2c19fa0e219e5a6b50d79f5c1aa6d348cc46b20499476db399dfe930ebd58e3e
+6397bd3d309748b176ed34dfad64d82e1d7dbf1a953ff3e132b76f70bf5027d2
+5341617b01c1ae4bd67bf8aaddad4e07cb605e495c06b687f400821a0faa1ce7
+.
+</xml_signature>
+</file_info>
+    <result>
+<report_deadline>1794452361</report_deadline>
+<wu_name>diff_0002</wu_name>
+<name>diff_0002_0</name>
+        <file_ref>
+            <file_name>diff_0002_0_r640710222_0</file_name>
+            <open_name>out</open_name>
+        </file_ref>
+    
+    <platform>x86_64-pc-linux-gnu</platform>
+    <version_num>100</version_num>
+    <plan_class></plan_class>
+</result>
+<file_info>
+        <name>diff_0003_0_r1393263788_0</name>
+        <generated_locally/>
+        <upload_when_present/>
+        <max_nbytes>5000000</max_nbytes>
+        <url>http://project.test/diff_cgi/file_upload_handler</url>
+    <xml_signature>
+3c96b13c035410d3e3df6e677b59b9e00348089c6302724426fea5f63de39f19
+096f95cdb9e003e8adca01f861f158b8e20f7ae0c43dd1785f17be91cfc61ffa
+ef8a00d364d7912fc37a4bb23ebbc088bf6e84771735248fd706a6ef0ce1afb0
+05cc61ffb884ded294efe3f14dfd6ca912c04fb7003f42606dece96fa15d856f
+.
+</xml_signature>
+</file_info>
+    <result>
+<report_deadline>1794452361</report_deadline>
+<wu_name>diff_0003</wu_name>
+<name>diff_0003_0</name>
+        <file_ref>
+            <file_name>diff_0003_0_r1393263788_0</file_name>
+            <open_name>out</open_name>
+        </file_ref>
+    
+    <platform>x86_64-pc-linux-gnu</platform>
+    <version_num>100</version_num>
+    <plan_class></plan_class>
+</result>
+<file_info>
+        <name>diff_0004_0_r299108548_0</name>
+        <generated_locally/>
+        <upload_when_present/>
+        <max_nbytes>5000000</max_nbytes>
+        <url>http://project.test/diff_cgi/file_upload_handler</url>
+    <xml_signature>
+84755c0dafb9af809d891afe40506adc3750ad997a6915e49de04f4e6fb61378
+a265139303fc033a1c2d9e5b5dcd8b490d7d0aaa140627393a8b09f628a5a76a
+06e579f13b117daa37362513cd4825c50defa0280e2000de4a8623137a71627d
+1ceb2371a5ddca4212d36792ea18c583ecf4275f0bf4b4f8018c1c6397a4e15d
+.
+</xml_signature>
+</file_info>
+    <result>
+<report_deadline>1794452361</report_deadline>
+<wu_name>diff_0004</wu_name>
+<name>diff_0004_0</name>
+        <file_ref>
+            <file_name>diff_0004_0_r299108548_0</file_name>
+            <open_name>out</open_name>
+        </file_ref>
+    
+    <platform>x86_64-pc-linux-gnu</platform>
+    <version_num>100</version_num>
+    <plan_class></plan_class>
+</result>
+<gui_urls>
+    <gui_url>
+        <name>Message boards</name>
+        <description>Correspond with other users on the Differential test project message boards</description>
+        <url>http://project.test/diff/forum_index.php</url>
+    </gui_url>
+    <gui_url>
+        <name>Your account</name>
+        <description>View your account information</description>
+        <url>http://project.test/diff/home.php</url>
+    </gui_url>
+    <gui_url>
+        <name>Your tasks</name>
+        <description>View the last week or so of computational work</description>
+        <url>http://project.test/diff/results.php?userid=1</url>
+    </gui_url>
+    
+</gui_urls>
+<rss_feeds>
+    <rss_feed>
+        <url>http://project.test/diff/notices.php?userid=1&auth=1_7049c7494e602b223422675b3e4a7e42</url>
+        <poll_interval>86400</poll_interval>
+    </rss_feed>
+</rss_feeds>
+</scheduler_reply>

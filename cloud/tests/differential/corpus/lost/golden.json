@@ -1,0 +1,26 @@
+[
+  {
+    "name": "01-master",
+    "status": 200,
+    "content_type": "text/html; charset=utf-8",
+    "time": 1794445155
+  },
+  {
+    "name": "02-sched",
+    "status": 200,
+    "content_type": "text/xml",
+    "time": 1794445155
+  },
+  {
+    "name": "03-sched",
+    "status": 200,
+    "content_type": "text/xml",
+    "time": 1794445162
+  },
+  {
+    "name": "04-sched-forgot-tasks",
+    "status": 200,
+    "content_type": "text/xml",
+    "time": 1794445169
+  }
+]

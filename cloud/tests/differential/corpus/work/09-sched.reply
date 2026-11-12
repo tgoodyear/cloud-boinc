@@ -1,0 +1,55 @@
+<scheduler_reply>
+<scheduler_version>803</scheduler_version>
+<dont_use_dcf/>
+<master_url>http://project.test/diff/</master_url>
+<request_delay>7.000000</request_delay>
+<message priority="low">Project has no tasks available</message>
+<project_name>Differential test project</project_name>
+<userid>1</userid>
+<user_name>Test User</user_name>
+<user_total_credit>0.000000</user_total_credit>
+<user_expavg_credit>0.000000</user_expavg_credit>
+<user_create_time>1700000000</user_create_time>
+<email_hash>889759bfc8304d238a5fa51d52c62ce0</email_hash>
+<cross_project_id>c0ffee00c0ffee00c0ffee00c0ffee00</cross_project_id>
+<external_cpid>79a1c6a5cc87a9bfe7aca063270e0a69</external_cpid>
+
+<host_total_credit>0.000000</host_total_credit>
+<host_expavg_credit>0.000000</host_expavg_credit>
+<host_venue></host_venue>
+<host_create_time>1794445190</host_create_time>
+<team_name></team_name>
+<result_ack>
+    <name>diff_0004_0</name>
+</result_ack>
+<result_ack>
+    <name>diff_0003_0</name>
+</result_ack>
+<result_ack>
+    <name>diff_0002_0</name>
+</result_ack>
+<gui_urls>
+    <gui_url>
+        <name>Message boards</name>
+        <description>Correspond with other users on the Differential test project message boards</description>
+        <url>http://project.test/diff/forum_index.php</url>
+    </gui_url>
+    <gui_url>
+        <name>Your account</name>
+        <description>View your account information</description>
+        <url>http://project.test/diff/home.php</url>
+    </gui_url>
+    <gui_url>
+        <name>Your tasks</name>
+        <description>View the last week or so of computational work</description>
+        <url>http://project.test/diff/results.php?userid=1</url>
+    </gui_url>
+    
+</gui_urls>
+<rss_feeds>
+    <rss_feed>
+        <url>http://project.test/diff/notices.php?userid=1&auth=1_7049c7494e602b223422675b3e4a7e42</url>
+        <poll_interval>86400</poll_interval>
+    </rss_feed>
+</rss_feeds>
+</scheduler_reply>

@@ -1113,12 +1113,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let id = ctx
                 .db
                 .run(stmt!(
-                    "INSERT INTO host (create_time, userid, venue, host_cpid) VALUES (?, ?, ?, ?) \
-                     RETURNING id",
+                    "INSERT INTO host (create_time, userid, venue, host_cpid, expavg_time) \
+                     VALUES (?, ?, ?, ?, ?) RETURNING id",
                     now,
                     user.id,
                     user.venue.as_str(),
-                    request_cpid.as_str()
+                    request_cpid.as_str(),
+                    now
                 ))
                 .await?
                 .scalar_i64()
@@ -1129,6 +1130,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 userid: user.id,
                 venue: user.venue.clone(),
                 host_cpid: request_cpid.clone(),
+                // As `handle_request` in sched/handle_request.cpp sets it.
+                expavg_time: now as f64,
                 ..Default::default()
             }
         }
@@ -1690,13 +1693,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     });
 
     let mut too_recent = false;
+    let mut too_recent_message: Option<String> = None;
     if work_requested && config.min_sendwork_interval > 0 && host.rpc_time > 0 {
         let since = now - host.rpc_time;
         if since < i64::from(config.min_sendwork_interval) {
             too_recent = true;
-            out.reply.messages.push(UserMessage::new(
-                format!("Not sending work - last request too recent: {since} sec"),
-                "low",
+            // As `process_request` in sched/handle_request.cpp words it; the
+            // wait is what is left of the interval. Said below, unless the
+            // reply resends lost tasks, after which upstream looks no further.
+            too_recent_message = Some(format!(
+                "Not sending work. Last request too recent. Please wait {} seconds.",
+                i64::from(config.min_sendwork_interval) - since
             ));
         }
     }
@@ -1786,23 +1793,38 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         host.id
     ));
 
-    // Global preferences: whichever copy is newer wins.
-    let db_mod = line::parse_double(&user.global_prefs, "<mod_time>").unwrap_or(0.0);
-    let req_mod = line::parse_double(&req.global_prefs_xml, "<mod_time>").unwrap_or(0.0);
-    if !user.global_prefs.trim().is_empty()
-        && (req.global_prefs_xml.trim().is_empty() || db_mod > req_mod)
-    {
+    // Global preferences (`handle_global_prefs` in sched/handle_request.cpp).
+    // Three copies can exist: the client's working copy, the copy it got
+    // from a project's web site, and the account's. The account's is sent
+    // when it is newer than both of the client's; the client's web copy
+    // replaces the account's when it is newer and comes from this account.
+    // A time in the future counts as now.
+    let cap = |t: f64| t.min(now as f64);
+    let mod_time = |xml: &str| {
+        if xml.trim().is_empty() {
+            0.0
+        } else {
+            cap(line::parse_double(xml, "<mod_time>").unwrap_or(0.0))
+        }
+    };
+    let have_master = !req.global_prefs_xml.trim().is_empty();
+    let have_db = !user.global_prefs.trim().is_empty();
+    let master_mod = mod_time(&req.global_prefs_xml);
+    let working_mod = mod_time(&req.working_global_prefs_xml);
+    let db_mod = mod_time(&user.global_prefs);
+    let same_account = req.global_prefs_source_email_hash == email_hash(&user.email_addr);
+    if !weak_auth && have_master {
+        let newer = if have_db { master_mod > db_mod } else { true };
+        if newer && same_account {
+            writes.push(stmt!(
+                "UPDATE user SET global_prefs = ? WHERE id = ?",
+                truncate(&req.global_prefs_xml, MAX_BLOB),
+                user.id
+            ));
+        }
+    }
+    if have_db && db_mod > master_mod && db_mod > working_mod {
         out.reply.user.global_prefs = Some(user.global_prefs.clone());
-    } else if !weak_auth
-        && !req.global_prefs_xml.trim().is_empty()
-        && req_mod > db_mod
-        && req_mod <= now as f64
-    {
-        writes.push(stmt!(
-            "UPDATE user SET global_prefs = ? WHERE id = ?",
-            truncate(&req.global_prefs_xml, MAX_BLOB),
-            user.id
-        ));
     }
 
     // Batch 3: results the client lost, and candidates to send.
@@ -2251,6 +2273,18 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             claim: None,
             assigned: false,
         });
+    }
+
+    // When `process_request` has resent lost tasks it sends nothing else
+    // ("Resent lost jobs, don't send more" in sched/handle_request.cpp), and
+    // does not say why it sent no more.
+    let resent_lost = !outgoing.is_empty();
+    let had_candidates = queues.iter().any(|(_, q)| !q.is_empty()) || !assigned_rows.is_empty();
+    if resent_lost {
+        queues.clear();
+        assigned_rows.clear();
+    } else if let Some(m) = too_recent_message.take() {
+        out.reply.messages.push(UserMessage::new(m, "low"));
     }
 
     // Interleave the apps' candidates in proportion to app weight.
@@ -2787,10 +2821,24 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             "notice",
         ));
     }
-    if work_requested && out.n_sent == 0 && key_ok && !too_recent {
+    // With no job to send at all, upstream's feeder cache is empty and
+    // `process_request` says only that, whether or not it resent lost tasks;
+    // "No tasks sent" is for when the cache holds jobs and none suits the host.
+    // With assignment enabled, upstream does not look at the cache.
+    let no_jobs_cache = !config.dont_send_jobs
+        && !config.enable_assignment
+        && !req.dont_send_work
+        && !versions.is_empty()
+        && send
+        && !had_candidates
+        && apps_with_work.is_empty()
+        && !skipped.hr_class;
+    if resent_lost && no_jobs_cache {
         out.reply
             .messages
-            .push(UserMessage::new("No tasks sent", "low"));
+            .push(UserMessage::new("Project has no tasks available", "low"));
+    }
+    if work_requested && out.n_sent == 0 && key_ok && !too_recent && !resent_lost {
         // `hr_reject_temp`. The query leaves out workunits committed to other
         // classes, so for an HR app with nothing to offer this host, one
         // probe asks whether that is what it found.
@@ -2815,6 +2863,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 .await?
                 .iter()
                 .any(|r| !r.rows.is_empty());
+        }
+        // Jobs committed to other classes are jobs in upstream's cache.
+        if !(no_jobs_cache && !committed_elsewhere) {
+            out.reply
+                .messages
+                .push(UserMessage::new("No tasks sent", "low"));
         }
         let mut why: Vec<String> = Vec::new();
         if config.dont_send_jobs {
@@ -2874,10 +2928,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     }
 
     if config.min_sendwork_interval > 0 {
-        out.reply.request_delay = out
-            .reply
-            .request_delay
-            .max(1.01 * f64::from(config.min_sendwork_interval));
+        // `SCHEDULER_REPLY::write` in sched/sched_types.cpp: 1% more than the
+        // interval, for clock skew, and at least a second more.
+        let min = f64::from(config.min_sendwork_interval);
+        out.reply.request_delay = out.reply.request_delay.max((1.01 * min).max(min + 1.0));
     }
     out.reply.request_delay = out.reply.request_delay.min(DELAY_MAX);
     transition.sort_unstable();

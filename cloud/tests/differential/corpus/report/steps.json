@@ -1,0 +1,24 @@
+[
+  {
+    "name": "01-master",
+    "kind": "web",
+    "method": "GET",
+    "url": "",
+    "compare": "master"
+  },
+  {
+    "name": "02-sched",
+    "kind": "sched",
+    "request": "02-sched.request.xml"
+  },
+  {
+    "name": "03-upload",
+    "kind": "upload",
+    "request": "03-upload.request"
+  },
+  {
+    "name": "04-sched",
+    "kind": "sched",
+    "request": "04-sched.request.xml"
+  }
+]

@@ -1,0 +1,129 @@
+<scheduler_reply>
+<scheduler_version>803</scheduler_version>
+<dont_use_dcf/>
+<master_url>http://project.test/diff/</master_url>
+<request_delay>7.000000</request_delay>
+<project_name>Differential test project</project_name>
+<userid>1</userid>
+<user_name>Test User</user_name>
+<user_total_credit>0.000000</user_total_credit>
+<user_expavg_credit>0.000000</user_expavg_credit>
+<user_create_time>1700000000</user_create_time>
+<email_hash>889759bfc8304d238a5fa51d52c62ce0</email_hash>
+<cross_project_id>c0ffee00c0ffee00c0ffee00c0ffee00</cross_project_id>
+<external_cpid>79a1c6a5cc87a9bfe7aca063270e0a69</external_cpid>
+<global_preferences>
+   <mod_time>1700000000</mod_time>
+   <run_on_batteries>0</run_on_batteries>
+   <run_if_user_active>1</run_if_user_active>
+   <run_gpu_if_user_active>0</run_gpu_if_user_active>
+   <suspend_cpu_usage>25</suspend_cpu_usage>
+   <leave_apps_in_memory>0</leave_apps_in_memory>
+   <work_buf_min_days>0.1</work_buf_min_days>
+   <work_buf_additional_days>0.5</work_buf_additional_days>
+   <max_ncpus_pct>100</max_ncpus_pct>
+   <cpu_usage_limit>100</cpu_usage_limit>
+   <disk_max_used_pct>90</disk_max_used_pct>
+   <disk_min_free_gb>0.1</disk_min_free_gb>
+   <vm_max_used_pct>75</vm_max_used_pct>
+   <ram_max_used_busy_pct>50</ram_max_used_busy_pct>
+   <ram_max_used_idle_pct>90</ram_max_used_idle_pct>
+   <idle_time_to_run>3</idle_time_to_run>
+   <cpu_scheduling_period_minutes>60</cpu_scheduling_period_minutes>
+   <disk_interval>60</disk_interval>
+   <max_bytes_sec_up>0</max_bytes_sec_up>
+   <max_bytes_sec_down>0</max_bytes_sec_down>
+</global_preferences>
+
+
+<hostid>1</hostid>
+<host_total_credit>0.000000</host_total_credit>
+<host_expavg_credit>0.000000</host_expavg_credit>
+<host_venue></host_venue>
+<host_create_time>1794445123</host_create_time>
+<team_name></team_name>
+<file_info>
+    <name>diff_in.txt</name>
+    <url>http://project.test/diff/download/3af/diff_in.txt</url>
+    <md5_cksum>89ccd1ee97f2a76a5a1efe9d4c135da1</md5_cksum>
+    <nbytes>20</nbytes>
+</file_info>
+<workunit>
+    <rsc_fpops_est>10000000000.000000</rsc_fpops_est>
+    <rsc_fpops_bound>10000000000000.000000</rsc_fpops_bound>
+    <rsc_memory_bound>10000000.000000</rsc_memory_bound>
+    <rsc_disk_bound>10000000.000000</rsc_disk_bound>
+    <name>diff_0001</name>
+    <app_name>upper</app_name>
+<command_line>
+
+</command_line>
+<file_ref>
+    <file_name>diff_in.txt</file_name>
+    <open_name>in</open_name>
+</file_ref>
+</workunit>
+<file_info>
+        <name>diff_0001_0_r747154402_0</name>
+        <generated_locally/>
+        <upload_when_present/>
+        <max_nbytes>5000000</max_nbytes>
+        <url>http://project.test/diff_cgi/file_upload_handler</url>
+    <xml_signature>
+6afba6ce6253c23aeb5ef1cf471f3b593fd060f7b2c8410932f577df68461dbd
+3ab195821b2beab3afd6483770cd9b49f49aa48f627cc71b92f69faa6fb5cd12
+2d6de682372f72ff9e1d987248d810dd1c427b23d063faeddc9af3b8151cf91c
+866cce64f94fe2466a3c67254f86309ef379704b2332ba3e841a0510d114fe5f
+.
+</xml_signature>
+</file_info>
+    <result>
+<report_deadline>1794452323</report_deadline>
+<wu_name>diff_0001</wu_name>
+<name>diff_0001_0</name>
+        <file_ref>
+            <file_name>diff_0001_0_r747154402_0</file_name>
+            <open_name>out</open_name>
+        </file_ref>
+    
+    <platform>x86_64-pc-linux-gnu</platform>
+    <version_num>100</version_num>
+    <plan_class></plan_class>
+</result>
+<code_sign_key>
+1024
+daf83c8ce96c31f7e7c680a4d1560bd628b0c0261737754019c8e45e76ae7cab
+64e7c862e4ea2deefdef2758bebddd7b2cabd9e3fd1f993de5271b2254b83bee
+68d10db075e2ad7c79953d5a962d63c315d35659a48fe458e6042115d10bb853
+05d05c88b4191be1c97f41339f8ca5983e505c9bd294b10dd2547e492f8fd579
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000010001
+.
+</code_sign_key>
+<gui_urls>
+    <gui_url>
+        <name>Message boards</name>
+        <description>Correspond with other users on the Differential test project message boards</description>
+        <url>http://project.test/diff/forum_index.php</url>
+    </gui_url>
+    <gui_url>
+        <name>Your account</name>
+        <description>View your account information</description>
+        <url>http://project.test/diff/home.php</url>
+    </gui_url>
+    <gui_url>
+        <name>Your tasks</name>
+        <description>View the last week or so of computational work</description>
+        <url>http://project.test/diff/results.php?userid=1</url>
+    </gui_url>
+    
+</gui_urls>
+<rss_feeds>
+    <rss_feed>
+        <url>http://project.test/diff/notices.php?userid=1&auth=1_7049c7494e602b223422675b3e4a7e42</url>
+        <poll_interval>86400</poll_interval>
+    </rss_feed>
+</rss_feeds>
+</scheduler_reply>

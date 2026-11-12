@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<project_config>
+    <name>Differential test project</name>
+    <master_url>http://project.test/diff/</master_url>
+    <web_rpc_url_base>http://project.test/diff/</web_rpc_url_base>
+<server_version>1.1.0</server_version>
+    <web_stopped>0</web_stopped>
+    <min_passwd_length>6</min_passwd_length>
+    <sched_stopped>0</sched_stopped>
+    <platforms>
+            <platform>
+                <platform_name>x86_64-pc-linux-gnu</platform_name>
+                <user_friendly_name>Linux running on an AMD x86_64 or Intel EM64T CPU</user_friendly_name>
+            </platform>
+    </platforms>
+</project_config>

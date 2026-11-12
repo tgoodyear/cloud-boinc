@@ -1,0 +1,49 @@
+[
+  {
+    "name": "01-master",
+    "kind": "web",
+    "method": "GET",
+    "url": "",
+    "compare": "master"
+  },
+  {
+    "name": "02-sched",
+    "kind": "sched",
+    "request": "02-sched.request.xml"
+  },
+  {
+    "name": "03-sched",
+    "kind": "sched",
+    "request": "03-sched.request.xml"
+  },
+  {
+    "name": "04-upload",
+    "kind": "upload",
+    "request": "04-upload.request"
+  },
+  {
+    "name": "05-sched",
+    "kind": "sched",
+    "request": "05-sched.request.xml"
+  },
+  {
+    "name": "06-upload",
+    "kind": "upload",
+    "request": "06-upload.request"
+  },
+  {
+    "name": "07-upload",
+    "kind": "upload",
+    "request": "07-upload.request"
+  },
+  {
+    "name": "08-upload",
+    "kind": "upload",
+    "request": "08-upload.request"
+  },
+  {
+    "name": "09-sched",
+    "kind": "sched",
+    "request": "09-sched.request.xml"
+  }
+]

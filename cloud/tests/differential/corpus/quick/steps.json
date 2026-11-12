@@ -1,0 +1,27 @@
+[
+  {
+    "name": "01-sched-first",
+    "kind": "sched",
+    "request": "01-sched-first.request.xml"
+  },
+  {
+    "name": "02-sched-too-soon",
+    "kind": "sched",
+    "request": "02-sched-too-soon.request.xml",
+    "gap": 0,
+    "derived": "the first request again, from host 1 with rpc_seqno one higher, sent at once: a client that asks for work again before min_sendwork_interval has passed"
+  },
+  {
+    "name": "03-sched-too-soon-listed",
+    "kind": "sched",
+    "request": "03-sched-too-soon-listed.request.xml",
+    "gap": 0,
+    "derived": "the request before with its task listed under other_results, so that nothing is lost and the server comes to the check of min_sendwork_interval"
+  },
+  {
+    "name": "04-sched-forgot-jobs-left",
+    "kind": "sched",
+    "request": "04-sched-forgot-jobs-left.request.xml",
+    "derived": "the second request again, after the wait, with three jobs still unsent: the lost task is resent, and upstream sends nothing more"
+  }
+]
