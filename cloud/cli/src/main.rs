@@ -80,8 +80,14 @@ enum Command {
         server: Server,
         #[arg(long)]
         name: String,
+        /// New platforms get their name when this is left out; an existing
+        /// platform keeps the one it has.
         #[arg(long)]
-        user_friendly_name: String,
+        user_friendly_name: Option<String>,
+        /// true or false. Left out, a new platform is not deprecated and an
+        /// existing one stays as it is.
+        #[arg(long)]
+        deprecated: Option<bool>,
     },
     /// Create or update an app.
     AppPut {
@@ -423,11 +429,17 @@ fn run(cli: Cli) -> Res<()> {
             server,
             name,
             user_friendly_name,
-        } => show(&Client::new(&server)?.send(
-            "PUT",
-            "platforms",
-            &json!({ "name": name, "user_friendly_name": user_friendly_name }),
-        )?),
+            deprecated,
+        } => {
+            let mut body = json!({ "name": name });
+            if let Some(f) = user_friendly_name {
+                body["user_friendly_name"] = json!(f);
+            }
+            if let Some(d) = deprecated {
+                body["deprecated"] = json!(d);
+            }
+            show(&Client::new(&server)?.send("PUT", "platforms", &body)?)
+        }
         Command::AppPut {
             server,
             name,

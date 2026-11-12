@@ -211,6 +211,11 @@ pub async fn commit_purge(db: &dyn Db, plan: &PurgePlan) -> CoreResult<PurgeRepo
     };
     let out = db
         .batch(vec![
+            // Before the results, whose IDs it selects by.
+            bind(format!(
+                "DELETE FROM upload_epoch WHERE result_id IN (SELECT id FROM result \
+                 WHERE workunitid IN (SELECT id FROM workunit WHERE {unchanged}))"
+            )),
             bind(format!(
                 "DELETE FROM result WHERE workunitid IN (SELECT id FROM workunit WHERE {unchanged})"
             )),
@@ -221,8 +226,8 @@ pub async fn commit_purge(db: &dyn Db, plan: &PurgePlan) -> CoreResult<PurgeRepo
         ])
         .await?;
     Ok(PurgeReport {
-        workunits: out.get(2).map(|r| r.changes).unwrap_or(0),
-        results: out.first().map(|r| r.changes).unwrap_or(0),
+        workunits: out.get(3).map(|r| r.changes).unwrap_or(0),
+        results: out.get(1).map(|r| r.changes).unwrap_or(0),
         archive: Some(plan.name.clone()),
     })
 }

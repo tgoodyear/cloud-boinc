@@ -46,6 +46,7 @@ use crate::model::{
     AppVersion, Host, HostAppVersion, Platform, User, Workunit,
 };
 use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost, DEFAULT_FPOPS};
+use crate::template::output_files;
 use crate::{Config, CoreError, CoreResult};
 
 /// Number of processor types the work request distinguishes.
@@ -676,7 +677,7 @@ fn anon_usage(
     } else {
         p_fpops
     };
-    HostUsage {
+    let mut hu = HostUsage {
         proc_type: cav.proc_type,
         gpu_usage,
         gpu_ram: 0.0,
@@ -685,7 +686,9 @@ fn anon_usage(
         projected_flops: stated.clamp(MIN_ANON_FLOPS, MAX_ANON_FLOPS),
         peak_flops,
         cmdline: String::new(),
-    }
+    };
+    hu.sanitize();
+    hu
 }
 
 /// The speed to use for a version from the client's `app_info.xml`, and the
@@ -1863,12 +1866,20 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         // peak speed. On the anonymous platform the client's versions can
         // have changed since, and the statistics and limits follow the
         // result's row. One statement with the deadline's.
+        //
+        // The result's `sent_time` is the time of this sending, as
+        // `possibly_give_result_new_deadline` in `sched/sched_resend.cpp`
+        // sets it. The uploads need the attempt number of each of the
+        // result's files, in `upload_epoch` (`current_epoch` in
+        // `crates/cb-core/src/upload.rs`), which is written below by name: a
+        // file's name is whatever the output template made of it, so the
+        // result cannot be told from it.
         let rerecord = version.anon
             && (ip.app_version_id != version.result_av_id
                 || ip.flops_estimate != version.hu.peak_flops);
-        if new_deadline || rerecord {
-            let mut sql = String::from("UPDATE result SET ");
-            let mut params: Vec<cb_db::Value> = Vec::new();
+        {
+            let mut sql = String::from("UPDATE result SET sent_time = ?, ");
+            let mut params: Vec<cb_db::Value> = vec![now.into()];
             if new_deadline {
                 sql.push_str("report_deadline = ?, ");
                 params.push(deadline.into());
@@ -1906,6 +1917,17 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             params.push(now.into());
             params.push(c.result_id.into());
             writes.push(Stmt { sql, params });
+            // The task runs again: a new attempt at each upload file, so
+            // that pieces of the lost one are never taken for its own.
+            for f in output_files(&c.xml_doc_in).iter().filter(|f| f.uploadable) {
+                writes.push(stmt!(
+                    "INSERT INTO upload_epoch (name, result_id, epoch) VALUES (?, ?, 1) \
+                     ON CONFLICT (name) DO UPDATE SET result_id = excluded.result_id, \
+                     epoch = upload_epoch.epoch + 1",
+                    f.name.as_str(),
+                    c.result_id
+                ));
+            }
         }
         if new_deadline {
             writes.push(stmt!(

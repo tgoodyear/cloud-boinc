@@ -98,6 +98,27 @@ impl HostUsage {
     pub fn uses_gpu(&self) -> bool {
         self.proc_type != PROC_TYPE_CPU
     }
+
+    /// Replace a speed that is not a finite number with the default. The
+    /// peak speed becomes the result's `flops_estimate` and the base of its
+    /// credit from run time; NaN is stored as zero by the database, and a
+    /// result with a zero estimate earns nothing. Upstream has no such
+    /// check (its `flops_estimate` takes whatever the plan class computed).
+    pub fn sanitize(&mut self) {
+        for x in [&mut self.peak_flops, &mut self.projected_flops] {
+            if !x.is_finite() {
+                *x = DEFAULT_FPOPS;
+            }
+        }
+        for x in [&mut self.gpu_usage, &mut self.gpu_ram, &mut self.mem_usage] {
+            if !x.is_finite() || *x < 0.0 {
+                *x = 0.0;
+            }
+        }
+        if !self.avg_ncpus.is_finite() || self.avg_ncpus < 0.0 {
+            self.avg_ncpus = 1.0;
+        }
+    }
 }
 
 /// What a plan class check may look at besides the request itself.
@@ -525,11 +546,25 @@ fn coproc_perf(s1: f64, s2: f64, frac: f64) -> (f64, f64) {
 
 /// Peak FLOPS of a GPU, with the default in place of a value that cannot be
 /// right (`COPROC::bad_gpu_peak_flops`).
+///
+/// Upstream tests `x <= 0 || x > GPU_MAX_PEAK_FLOPS`, which a NaN passes
+/// (every comparison with it is false); a client that reports `nan` would
+/// get a NaN speed here and a result with no credit-bearing speed. A NaN
+/// takes the default as well.
 pub(crate) fn gpu_peak_flops(cp: &Coproc) -> f64 {
-    if cp.peak_flops <= 0.0 || cp.peak_flops > GPU_MAX_PEAK_FLOPS {
+    if !(cp.peak_flops > 0.0 && cp.peak_flops <= GPU_MAX_PEAK_FLOPS) {
         GPU_DEFAULT_PEAK_FLOPS
     } else {
         cp.peak_flops
+    }
+}
+
+/// A byte count the client stated, or 0 when it is not a finite number.
+fn ram_or_zero(x: f64) -> f64 {
+    if x.is_finite() && x > 0.0 {
+        x
+    } else {
+        0.0
     }
 }
 
@@ -543,6 +578,9 @@ fn has_vm_acceleration(req: &SchedulerRequest) -> bool {
 /// The GPU a plan class selected, with what the vendor-specific checks found.
 struct SelectedGpu<'a> {
     coproc: &'a Coproc,
+    /// Bytes of GPU RAM; 0 when unknown, and for a figure that is not a
+    /// finite positive number (the client states it, so a `nan` would pass
+    /// the minimum-RAM check and poison the usage computed from it).
     ram: f64,
     /// 0 when unknown.
     driver_version: i64,
@@ -784,10 +822,12 @@ impl PlanClassSpec {
             }
         }
 
-        match gpu {
-            Some(g) => self.gpu_usage(req, &prefs, &g),
-            None => self.cpu_usage(req, ncpus, can_use_multicore),
-        }
+        let mut hu = match gpu {
+            Some(g) => self.gpu_usage(req, &prefs, &g)?,
+            None => self.cpu_usage(req, ncpus, can_use_multicore)?,
+        };
+        hu.sanitize();
+        Ok(hu)
     }
 
     fn check_cpu_and_os(&self, host: &PlanHost<'_>, ncpus: i32) -> Result<(), PlanReject> {
@@ -1184,7 +1224,7 @@ impl PlanClassSpec {
             self.check_wsl_gpu(req, "nvidia")?;
             return Ok(Some(SelectedGpu {
                 coproc: &cp.base,
-                ram: cp.total_global_mem,
+                ram: ram_or_zero(cp.total_global_mem),
                 driver_version: i64::from(cp.display_driver_version),
             }));
         }
@@ -1214,7 +1254,7 @@ impl PlanClassSpec {
             }
             return Ok(Some(SelectedGpu {
                 coproc: &cp.base,
-                ram: cp.base.available_ram,
+                ram: ram_or_zero(cp.base.available_ram),
                 driver_version: 0,
             }));
         }
@@ -2079,6 +2119,57 @@ mod tests {
         assert_eq!(err.reason, "No AMD GPUs found");
         let cpu_only = linux_request("");
         assert!(s.check("cuda", &plan_host(&cpu_only)).is_none());
+    }
+
+    /// A peak speed or RAM figure that is not a number passes the range
+    /// checks (every comparison with NaN is false) unless they are written
+    /// to reject it; the usage must stay finite either way.
+    #[test]
+    fn non_finite_gpu_figures_take_the_defaults() {
+        let s = specs();
+        for bad in ["nan", "inf", "-inf", "-nan", "0", "1e30"] {
+            let nvidia = NVIDIA.replace("4728000000000.000000", bad);
+            let req = linux_request(&nvidia);
+            let host = plan_host(&req);
+            let hu = s.check("cuda", &host).unwrap();
+            let gpu = 0.2 * GPU_DEFAULT_PEAK_FLOPS;
+            let (cpu, y) = (5e9, 0.01 * gpu + 0.99 * 5e9);
+            assert!(hu.peak_flops.is_finite(), "{bad}: {hu:?}");
+            assert!(close(hu.peak_flops, gpu + 0.01 * gpu / y * cpu), "{bad}");
+            assert!(hu.projected_flops.is_finite() && hu.projected_flops > 0.0);
+            assert!(hu.avg_ncpus.is_finite() && hu.avg_ncpus > 0.0);
+        }
+
+        // A GPU RAM figure that is not a number counts as unknown (0): the
+        // class that needs memory rejects the GPU and the one that fills the
+        // card with tasks gets a finite usage.
+        let nvidia = NVIDIA.replace("8589934592.000000", "nan");
+        let req = linux_request(&nvidia);
+        let host = plan_host(&req);
+        let err = s.evaluate("cuda", &host).unwrap_err();
+        assert!(err.reason.contains("GPU RAM"), "{}", err.reason);
+        let hu = s.evaluate("opencl_nvidia", &host).unwrap();
+        for x in [hu.gpu_usage, hu.gpu_ram, hu.peak_flops, hu.projected_flops] {
+            assert!(x.is_finite(), "{hu:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_replaces_non_finite_speeds() {
+        let mut hu = HostUsage::sequential(5e9);
+        hu.peak_flops = f64::NAN;
+        hu.projected_flops = f64::INFINITY;
+        hu.gpu_usage = f64::NAN;
+        hu.avg_ncpus = f64::NAN;
+        hu.sanitize();
+        assert_eq!(hu.peak_flops, DEFAULT_FPOPS);
+        assert_eq!(hu.projected_flops, DEFAULT_FPOPS);
+        assert_eq!(hu.gpu_usage, 0.0);
+        assert_eq!(hu.avg_ncpus, 1.0);
+        let mut ok = HostUsage::sequential(5e9);
+        let before = ok.clone();
+        ok.sanitize();
+        assert_eq!(ok, before);
     }
 
     #[test]

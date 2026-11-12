@@ -124,6 +124,10 @@ fn finished(rx: &mpsc::Receiver<Vec<u8>>, kind: &str) -> Vec<u8> {
         .unwrap_or_else(|_| panic!("oracle {kind} exited but left a process holding its output"))
 }
 
+/// What `XML_PARSER::skip_unexpected` writes to `stderr` for an element no
+/// parser took: `<time>: Unrecognized XML tag '<x>' in <where>; skipping`.
+const UNKNOWN_TAG_ON_STDERR: &str = "Unrecognized XML tag";
+
 /// How long one oracle run may take before the test fails. The oracle's own
 /// watchdog (60 seconds unless `CB_PARSER_ORACLE_TIMEOUT_SECS` says
 /// otherwise) fires first, with its own message; this one covers an oracle
@@ -173,6 +177,10 @@ impl Oracle {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
+        let stderr = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .map(str::to_string)
+            .collect();
         let mut map = BTreeMap::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let (k, v) = line
@@ -180,7 +188,7 @@ impl Oracle {
                 .unwrap_or_else(|| panic!("bad oracle line {line:?}"));
             map.insert(k.to_string(), unescape(v));
         }
-        Dump { map }
+        Dump { map, stderr }
     }
 }
 
@@ -205,6 +213,12 @@ fn unescape(s: &str) -> String {
 /// What the oracle printed: one value per key.
 pub struct Dump {
     map: BTreeMap<String, String>,
+    /// The lines the oracle wrote to standard error. A run that exits
+    /// successfully can still have reported an element the parsers did not
+    /// know there: `XML_PARSER::skip_unexpected` writes to `stderr` and not
+    /// to the client's message log, and `GLOBAL_PREFS::parse_day` returns
+    /// success after calling it.
+    stderr: Vec<String>,
 }
 
 impl Dump {
@@ -322,11 +336,25 @@ impl<'a> Expect<'a> {
     /// does not know, except what `allowed` lists. Each entry of `allowed`
     /// is a substring of a message the stock server also sends and the stock
     /// client also ignores or reports; the caller says why.
+    ///
+    /// An element is unknown to the client when its message log says so
+    /// (`[unparsed_xml]`) or when a parser that cannot log wrote
+    /// "Unrecognized XML tag" to standard error
+    /// (`XML_PARSER::skip_unexpected` in `lib/parse.cpp`, called from
+    /// `GLOBAL_PREFS::parse_day` and other parsers of `lib/`). The allowlist
+    /// covers both.
     pub fn quiet(&mut self, allowed: &[&str]) {
+        let allowed_in = |text: &str| allowed.iter().any(|a| text.contains(a));
         for (prio, text) in self.dump.client_messages() {
             let bad = prio == "error" || text.contains("[unparsed_xml]");
-            if bad && !allowed.iter().any(|a| text.contains(a)) {
+            if bad && !allowed_in(&text) {
                 self.failures.push(format!("client logged {prio}: {text}"));
+            }
+        }
+        for line in &self.dump.stderr {
+            if line.contains(UNKNOWN_TAG_ON_STDERR) && !allowed_in(line) {
+                self.failures
+                    .push(format!("client reported on stderr: {line}"));
             }
         }
     }
@@ -342,6 +370,12 @@ impl<'a> Expect<'a> {
             self.failures
                 .push(format!("the client did not log {text:?}"));
         }
+    }
+
+    /// What would make [`Expect::finish`] fail, for a test of the checks
+    /// themselves.
+    pub fn into_failures(self) -> Vec<String> {
+        self.failures
     }
 
     pub fn finish(self) {

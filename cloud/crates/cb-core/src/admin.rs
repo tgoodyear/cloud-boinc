@@ -25,12 +25,46 @@ fn is_name(s: &str) -> bool {
 #[serde(default)]
 pub struct NewPlatform {
     pub name: String,
+    /// Empty: the platform's name for a new platform, and the name it has
+    /// for an existing one.
     pub user_friendly_name: String,
-    pub deprecated: bool,
+    /// Absent: not deprecated for a new platform, and as it is for an
+    /// existing one.
+    pub deprecated: Option<bool>,
 }
 
-/// Creates the platform or updates the one with this name.
-pub async fn put_platform(db: &dyn Db, now: i64, p: &NewPlatform) -> CoreResult<i64> {
+/// What `put_platform` did, as `tools/xadd` reports it ("added platform",
+/// "updated user friendly name", "already in DB").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PutAction {
+    Added,
+    Updated,
+    Unchanged,
+}
+
+/// The platform `put_platform` created or found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutPlatform {
+    pub id: i64,
+    pub action: PutAction,
+}
+
+/// Creates the platform or updates the one with this name, as `tools/xadd`
+/// does for each `<platform>` of `project.xml`, with these differences (see
+/// "Admin API and CLI" in `docs/architecture.md`):
+///
+/// - An existing platform changes only in the fields the request states.
+///   `xadd` never touches `deprecated` and updates only the user-friendly
+///   name; a request here without `deprecated` (the CLI's `platform-put`
+///   does not send it unless asked to) must not bring a deprecated platform
+///   back, and one without a user-friendly name must not replace it with the
+///   platform's name.
+/// - The name is looked up exactly; MySQL's collation makes `xadd`'s lookup
+///   ignore case.
+/// - The name must be at most 254 characters of letters, digits, `.`, `_`
+///   and `-`; `xadd` puts the text of `project.xml` into SQL as it is.
+pub async fn put_platform(db: &dyn Db, now: i64, p: &NewPlatform) -> CoreResult<PutPlatform> {
     if !is_name(&p.name) {
         return invalid("platform: bad name");
     }
@@ -39,18 +73,49 @@ pub async fn put_platform(db: &dyn Db, now: i64, p: &NewPlatform) -> CoreResult<
     } else {
         &p.user_friendly_name
     };
-    let rows = db
-        .run(stmt!(
-            "INSERT INTO platform (create_time, name, user_friendly_name, deprecated) VALUES (?, ?, ?, ?) \
-             ON CONFLICT (name) DO UPDATE SET user_friendly_name = excluded.user_friendly_name, \
-             deprecated = excluded.deprecated RETURNING id",
-            now,
-            p.name.as_str(),
-            friendly.as_str(),
-            p.deprecated
-        ))
-        .await?;
-    Ok(rows.scalar_i64().unwrap_or(0))
+    // The read and the write are one batch, which runs as one transaction
+    // on both back ends, so the row the action is judged by is the one the
+    // write found, whatever else is writing. The upsert also holds when the
+    // platform did not exist at the read: the fields the request leaves out
+    // keep what the row has.
+    let mut out = db
+        .batch(vec![
+            stmt!("SELECT * FROM platform WHERE name = ?", p.name.as_str()),
+            stmt!(
+                "INSERT INTO platform (create_time, name, user_friendly_name, deprecated) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT (name) DO UPDATE SET \
+                 user_friendly_name = CASE WHEN ? THEN excluded.user_friendly_name \
+                     ELSE platform.user_friendly_name END, \
+                 deprecated = CASE WHEN ? THEN excluded.deprecated ELSE platform.deprecated END \
+                 RETURNING id",
+                now,
+                p.name.as_str(),
+                friendly.as_str(),
+                p.deprecated.unwrap_or(false),
+                !p.user_friendly_name.is_empty(),
+                p.deprecated.is_some()
+            ),
+        ])
+        .await?
+        .into_iter();
+    let existing: Option<Platform> = out.next().unwrap_or_default().first()?;
+    let rows = out.next().unwrap_or_default();
+    let action = match &existing {
+        None => PutAction::Added,
+        Some(e)
+            if (p.user_friendly_name.is_empty()
+                || e.user_friendly_name == p.user_friendly_name)
+                && p.deprecated.is_none_or(|d| (e.deprecated != 0) == d) =>
+        {
+            PutAction::Unchanged
+        }
+        Some(_) => PutAction::Updated,
+    };
+    Ok(PutPlatform {
+        id: rows.scalar_i64().unwrap_or(0),
+        action,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

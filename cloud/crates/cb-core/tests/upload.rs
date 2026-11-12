@@ -11,12 +11,14 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use cb_core::upload::{
-    check_header, file_size, md5_to_hex, parse_piece_name, receive, CompleteWrite, PieceWrite,
-    StoredFile, StoredPiece, UploadStore, PIECE_BYTES,
+    check_header, file_size, md5_to_hex, parse_piece_name, receive, CompleteWrite, PieceRun,
+    PieceWrite, StoredFile, StoredPiece, UploadStore, PIECE_BYTES,
 };
 use cb_core::{CoreResult, FileKind};
 use cb_crypto::md5_hex;
+use cb_db::{stmt, Db};
 use cb_proto::upload::{UploadError, UploadHeader};
+use cb_sqlite::SqliteDb;
 use futures_lite::future::block_on;
 
 const P: u64 = 16;
@@ -44,13 +46,32 @@ impl MemBody {
 }
 
 type Hook = Box<dyn FnOnce(&MemStore)>;
+type PieceHook = Box<dyn FnMut(&MemStore, usize)>;
 
-#[derive(Default)]
 struct MemStore {
     objects: RefCell<BTreeMap<String, Vec<u8>>>,
     ops: RefCell<Vec<&'static str>>,
     /// Runs when the next finished-file write starts.
     before_complete: RefCell<Option<Hook>>,
+    /// Runs when each piece write starts, with the number of piece writes
+    /// so far.
+    before_piece: RefCell<Option<PieceHook>>,
+    pieces_put: Cell<usize>,
+    /// The project database, with no result in it until a test adds one.
+    db: SqliteDb,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        MemStore {
+            objects: Default::default(),
+            ops: Default::default(),
+            before_complete: Default::default(),
+            before_piece: Default::default(),
+            pieces_put: Cell::new(0),
+            db: SqliteDb::with_schema().unwrap(),
+        }
+    }
 }
 
 fn upload_key(name: &str) -> String {
@@ -58,18 +79,18 @@ fn upload_key(name: &str) -> String {
 }
 
 /// The key of the piece at `start` of the file `data`, as its client
-/// describes it with `md5_cksum`.
+/// describes it with `md5_cksum`, in the first attempt.
 fn piece_key(name: &str, data: &[u8], start: u64) -> String {
     format!(
-        "{}{name}/{}/{start}",
+        "{}{name}/0/{}/{start}",
         FileKind::Partial.prefix(),
         md5_hex(data)
     )
 }
 
-fn piece_key_md5(name: &str, md5: &[u8; 16], start: u64) -> String {
+fn piece_key_md5(name: &str, epoch: u64, md5: &[u8; 16], start: u64) -> String {
     format!(
-        "{}{name}/{}/{start}",
+        "{}{name}/{epoch}/{}/{start}",
         FileKind::Partial.prefix(),
         md5_to_hex(md5)
     )
@@ -114,6 +135,22 @@ impl MemStore {
     fn remove(&self, key: &str) {
         self.objects.borrow_mut().remove(key);
     }
+
+    /// The scheduler sent the result of the file `name` again, as its
+    /// resend records it for each upload name of the result.
+    fn resend(&self, name: &str) {
+        block_on(self.db.run(stmt!(
+            "INSERT INTO upload_epoch (name, result_id, epoch) VALUES (?, 1, 1) \
+             ON CONFLICT (name) DO UPDATE SET epoch = upload_epoch.epoch + 1",
+            name
+        )))
+        .unwrap();
+    }
+
+    /// Database statements run so far (the lookup of where the attempt starts).
+    fn db_statements(&self) -> u64 {
+        self.db.statements()
+    }
 }
 
 #[async_trait(?Send)]
@@ -136,8 +173,9 @@ impl UploadStore for MemStore {
             .borrow()
             .iter()
             .filter_map(|(k, v)| {
-                let (md5, start) = parse_piece_name(k.strip_prefix(&prefix)?)?;
+                let (epoch, md5, start) = parse_piece_name(k.strip_prefix(&prefix)?)?;
                 Some(StoredPiece {
+                    epoch,
                     md5,
                     start,
                     size: v.len() as u64,
@@ -153,30 +191,41 @@ impl UploadStore for MemStore {
     async fn put_piece(
         &self,
         name: &str,
+        epoch: u64,
         md5: &[u8; 16],
         start: u64,
         body: &MemBody,
         len: u64,
     ) -> CoreResult<PieceWrite> {
         self.op("put");
+        let n = self.pieces_put.get();
+        self.pieces_put.set(n + 1);
+        let hook = self.before_piece.borrow_mut().take();
+        if let Some(mut hook) = hook {
+            hook(self, n);
+            *self.before_piece.borrow_mut() = Some(hook);
+        }
         let Some(bytes) = body.read(len) else {
             return Ok(PieceWrite::BodyEnded);
         };
-        self.objects
-            .borrow_mut()
-            .insert(piece_key_md5(name, md5, start), bytes);
+        let key = piece_key_md5(name, epoch, md5, start);
+        self.objects.borrow_mut().insert(key, bytes);
         Ok(PieceWrite::Stored)
     }
 
     async fn put_complete(
         &self,
-        name: &str,
-        starts: &[u64],
-        piece: u64,
+        run: &PieceRun<'_>,
         body: &MemBody,
         tail: u64,
         md5: Option<[u8; 16]>,
     ) -> CoreResult<CompleteWrite> {
+        let PieceRun {
+            name,
+            epoch,
+            starts,
+            piece,
+        } = *run;
         self.op("put");
         if let Some(hook) = self.before_complete.borrow_mut().take() {
             hook(self);
@@ -187,7 +236,12 @@ impl UploadStore for MemStore {
         let mut data = Vec::new();
         for s in starts {
             self.op("get");
-            let key = piece_key_md5(name, &md5.expect("pieces are composed with an MD5"), *s);
+            let key = piece_key_md5(
+                name,
+                epoch,
+                &md5.expect("pieces are composed with an MD5"),
+                *s,
+            );
             match self.objects.borrow().get(&key) {
                 Some(p) if p.len() as u64 == piece => data.extend_from_slice(p),
                 _ => return Ok(CompleteWrite::PieceMissing),
@@ -210,7 +264,7 @@ impl UploadStore for MemStore {
     async fn delete_pieces(&self, name: &str, pieces: &[StoredPiece]) -> CoreResult<()> {
         self.op("delete");
         for p in pieces {
-            self.remove(&piece_key_md5(name, &p.md5, p.start));
+            self.remove(&piece_key_md5(name, p.epoch, &p.md5, p.start));
         }
         Ok(())
     }
@@ -250,7 +304,7 @@ fn send_with(
         pos: Cell::new(0),
         end: cut.map_or(data.len(), |c| c.max(from)) - from,
     };
-    block_on(receive(store, h, &body, piece)).unwrap()
+    block_on(receive(store, &store.db, h, &body, piece)).unwrap()
 }
 
 fn send(store: &MemStore, data: &[u8], offset: u64, cut: Option<usize>) -> Result<(), UploadError> {
@@ -258,7 +312,7 @@ fn send(store: &MemStore, data: &[u8], offset: u64, cut: Option<usize>) -> Resul
 }
 
 fn size(store: &MemStore) -> u64 {
-    block_on(file_size(store, NAME, P)).unwrap()
+    block_on(file_size(store, &store.db, NAME, P)).unwrap()
 }
 
 #[test]
@@ -385,7 +439,7 @@ fn offset_beyond_what_is_held_is_a_transient_error() {
             pos: Cell::new(0),
             end: 0,
         };
-        let e = block_on(receive(&store, &h, &body, P))
+        let e = block_on(receive(&store, &store.db, &h, &body, P))
             .unwrap()
             .unwrap_err();
         assert!(e.transient, "{e}");
@@ -678,8 +732,11 @@ fn stock_client(store: &MemStore, data: &[u8]) -> Client {
 #[test]
 fn a_recomputed_file_never_mixes_with_an_earlier_attempt() {
     // An earlier attempt at 100 bytes was cut at 70 and left 64 bytes in
-    // pieces. A lost task is sent again and writes another file under the
-    // same name, of any length.
+    // pieces. A task is run again and writes another file under the same
+    // name, of any length. Nothing says the pieces are from an earlier
+    // attempt: no result is known for the name, so the size query reports
+    // them (see `a_resent_task_does_not_inherit_the_pieces_of_the_lost_one`
+    // for the case the server can tell).
     let a = file(100, 20);
     for len in 17usize..=200 {
         let b = file(len, 21);
@@ -706,6 +763,317 @@ fn a_recomputed_file_never_mixes_with_an_earlier_attempt() {
             assert!(store.complete(NAME).is_none(), "{len} bytes");
         }
     }
+}
+
+/// Names an output template can make of one output: the plain form, text
+/// after `<OUTFILE_n/>`, text before it, and both, with the `_r<digits>_`
+/// of the generated part repeated in the decoration.
+const NAMES: [&str; 5] = [
+    NAME,
+    "wu_1_0_r9_0_r1_log",
+    "wu_1_0_r9_0.zip",
+    "pre_wu_1_0_r9_0",
+    "wu_1_0_r9_0_r1_pre_wu_1_0_r9_0_log",
+];
+
+fn send_as(
+    name: &str,
+    store: &MemStore,
+    data: &[u8],
+    offset: u64,
+    cut: Option<usize>,
+) -> Result<(), UploadError> {
+    send_with(store, &header(name, data, offset as f64), data, cut, P)
+}
+
+fn size_as(store: &MemStore, name: &str) -> u64 {
+    block_on(file_size(store, &store.db, name, P)).unwrap()
+}
+
+/// `stock_client` for a file of this name.
+fn stock_client_as(store: &MemStore, name: &str, data: &[u8]) -> Client {
+    for _ in 0..3 {
+        let held = size_as(store, name);
+        if held >= data.len() as u64 {
+            return Client::DoneWithoutSending;
+        }
+        if send_as(name, store, data, held, None).is_ok() {
+            return Client::Sent;
+        }
+    }
+    Client::GaveUp
+}
+
+/// A first attempt at the file `name` was cut at 70 bytes and left 64 in
+/// pieces.
+fn lost_attempt(name: &str, a: &[u8]) -> MemStore {
+    let store = MemStore::default();
+    assert!(send_as(name, &store, a, 0, Some(70)).is_err());
+    assert_eq!(size_as(&store, name), 64);
+    store
+}
+
+/// Pieces of the file `name` as (epoch, start), sorted.
+fn piece_epochs(store: &MemStore, name: &str) -> Vec<(u64, u64)> {
+    let prefix = format!("{}{name}/", FileKind::Partial.prefix());
+    let mut v: Vec<(u64, u64)> = store
+        .pieces()
+        .iter()
+        .filter_map(|k| {
+            let (epoch, _, start) = parse_piece_name(k.strip_prefix(&prefix)?)?;
+            Some((epoch, start))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn a_resent_task_does_not_inherit_the_pieces_of_the_lost_one() {
+    // The client lost the task; the scheduler sent it again, which moves
+    // the file to the next epoch. The recomputed file is of any length,
+    // including one no longer than the 64 bytes held, and the client sends
+    // it whole every time: the new file is stored and the size query never
+    // reports it done before it is. The names are those an output template
+    // can make, whatever their shape.
+    let a = file(100, 30);
+    for name in NAMES {
+        for len in 1usize..=200 {
+            let b = file(len, 31);
+            let store = lost_attempt(name, &a);
+            store.resend(name);
+            assert_eq!(size_as(&store, name), 0, "{name} {len} bytes");
+            assert_eq!(
+                stock_client_as(&store, name, &b),
+                Client::Sent,
+                "{name} {len} bytes"
+            );
+            assert_eq!(
+                store.objects.borrow().get(&upload_key(name)),
+                Some(&b),
+                "{name} {len} bytes"
+            );
+            // The old attempt's pieces are gone with the new file's.
+            if len > P as usize {
+                assert!(store.pieces().is_empty(), "{name} {len} bytes");
+            }
+        }
+
+        // The same with a file of the very length that was lost.
+        let b = file(100, 32);
+        let store = lost_attempt(name, &a);
+        store.resend(name);
+        assert_eq!(stock_client_as(&store, name, &b), Client::Sent, "{name}");
+        assert_eq!(store.objects.borrow().get(&upload_key(name)), Some(&b));
+    }
+
+    // A file the old attempt finished is still reported as it is.
+    let store = MemStore::default();
+    assert_eq!(send(&store, &a, 0, None), Ok(()));
+    store.resend(NAME);
+    assert_eq!(size(&store), a.len() as u64);
+
+    // The epoch is kept for the file it names: another file of the same
+    // result is not touched by it.
+    let other = "wu_1_0_r9_1";
+    let store = lost_attempt(other, &a);
+    store.resend(NAME);
+    assert_eq!(size_as(&store, other), 64);
+}
+
+/// The scheduler sends the task again when the request writes its piece
+/// number `at`.
+fn resend_at_piece(store: &MemStore, name: &str, at: usize) {
+    let name = name.to_string();
+    *store.before_piece.borrow_mut() = Some(Box::new(move |s: &MemStore, n: usize| {
+        if n == at {
+            s.resend(&name);
+        }
+    }));
+}
+
+#[test]
+fn a_piece_of_the_lost_attempt_written_after_the_resend_is_never_counted() {
+    // The reviewer's sequence. A request of the first attempt has read the
+    // file's epoch when the scheduler sends the task again; its piece write
+    // finishes afterwards (an upload that goes on after the client is gone).
+    // R2 stores the piece after the resend, but under the epoch the request
+    // captured. The recomputed file is no longer than the pieces it left.
+    let a = file(100, 40);
+    for name in NAMES {
+        for len in [5usize, 15, 16, 17, 40, 100] {
+            let store = MemStore::default();
+            resend_at_piece(&store, name, 0);
+            // The request goes on after the resend, cut at 70 bytes.
+            assert!(send_as(name, &store, &a, 0, Some(70)).is_err());
+            let epochs = piece_epochs(&store, name);
+            assert_eq!(epochs, vec![(0, 0), (0, 16), (0, 32), (0, 48)], "{name}");
+            *store.before_piece.borrow_mut() = None;
+            let b = file(len, 41);
+            assert_eq!(size_as(&store, name), 0, "{name} {len}");
+            assert_eq!(
+                stock_client_as(&store, name, &b),
+                Client::Sent,
+                "{name} {len}"
+            );
+            assert_eq!(
+                store.objects.borrow().get(&upload_key(name)),
+                Some(&b),
+                "{name} {len}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_old_request_cannot_finish_the_file_after_the_resend() {
+    // The request writes all its pieces and the task is sent again at its
+    // last piece: it reads the epoch again before the finished write and
+    // stops, with the file not stored.
+    let a = file(100, 42);
+    for name in NAMES {
+        for at in [0usize, 5] {
+            let store = MemStore::default();
+            resend_at_piece(&store, name, at);
+            let e = send_as(name, &store, &a, 0, None).unwrap_err();
+            assert!(
+                e.transient && e.message.contains("sent again"),
+                "{name} {at}: {e}"
+            );
+            assert!(store.objects.borrow().get(&upload_key(name)).is_none());
+            // Nothing the new attempt asks about is held, and the new
+            // attempt sends a file of its own.
+            assert_eq!(size_as(&store, name), 0);
+            let b = file(100, 43);
+            *store.before_piece.borrow_mut() = None;
+            assert_eq!(stock_client_as(&store, name, &b), Client::Sent);
+            assert_eq!(store.objects.borrow().get(&upload_key(name)), Some(&b));
+        }
+    }
+
+    // A request that finds pieces of a later epoch than the one it read
+    // belongs to a lost attempt: it stops, writes nothing and deletes
+    // nothing of the later one's.
+    let data = file(100, 44);
+    let store = MemStore::default();
+    let md5 = cb_core::upload::parse_md5(&md5_hex(&data)).unwrap();
+    store
+        .objects
+        .borrow_mut()
+        .insert(piece_key_md5(NAME, 1, &md5, 0), data[..16].to_vec());
+    let before = store.objects.borrow().clone();
+    let e = send(&store, &data, 0, None).unwrap_err();
+    assert!(e.transient && e.message.contains("sent again"), "{e}");
+    assert_eq!(*store.objects.borrow(), before);
+
+    // A finished-file write that the resend races with, between the check
+    // and the put, stores the old attempt's whole checksummed file; the new
+    // attempt's request meets a stored file and is refused if its contents
+    // differ, never mixed with it.
+    let store = MemStore::default();
+    let name = NAME.to_string();
+    *store.before_complete.borrow_mut() = Some(Box::new(move |s: &MemStore| s.resend(&name)));
+    assert_eq!(send(&store, &a, 0, None), Ok(()));
+    let b = file(100, 45);
+    let e = send(&store, &b, 0, None).unwrap_err();
+    assert!(!e.transient, "{e}");
+    assert_eq!(store.complete(NAME), Some(a));
+}
+
+#[test]
+fn pieces_of_older_epochs_are_dropped_by_the_next_request() {
+    let a = file(100, 46);
+    let store = lost_attempt(NAME, &a);
+    store.resend(NAME);
+    // The new attempt's first request lists, deletes the old epoch's pieces
+    // and writes its own.
+    assert!(send(&store, &a, 0, Some(40)).is_err());
+    assert_eq!(piece_epochs(&store, NAME), vec![(1, 0), (1, 16)]);
+    assert_eq!(size(&store), 32);
+}
+
+#[test]
+fn a_resumed_upload_of_the_same_attempt_keeps_its_pieces() {
+    let data = file(100, 33);
+    // A task sent again before the first request, pieces stored by two
+    // requests. A resume needs no later second to count its pieces: the
+    // epoch tells them from the lost attempt's however close the times.
+    for name in NAMES {
+        for resent in [false, true] {
+            let store = MemStore::default();
+            if resent {
+                store.resend(name);
+            }
+            assert!(send_as(name, &store, &data, 0, Some(40)).is_err());
+            assert_eq!(size_as(&store, name), 32);
+            assert!(send_as(name, &store, &data, 32, Some(70)).is_err());
+            assert_eq!(size_as(&store, name), 64);
+            assert_eq!(stock_client_as(&store, name, &data), Client::Sent);
+            assert_eq!(store.objects.borrow().get(&upload_key(name)), Some(&data));
+        }
+    }
+
+    // A second resend moves the epoch again, and pieces of the first resend
+    // are the lost attempt's then.
+    let store = MemStore::default();
+    store.resend(NAME);
+    assert!(send(&store, &data, 0, Some(70)).is_err());
+    assert_eq!(size(&store), 64);
+    store.resend(NAME);
+    assert_eq!(size(&store), 0);
+    assert_eq!(stock_client(&store, &data), Client::Sent);
+    assert_eq!(store.complete(NAME), Some(data));
+    assert!(store.pieces().is_empty());
+}
+
+#[test]
+fn a_name_the_scheduler_never_resent_keeps_its_pieces() {
+    let a = file(100, 34);
+    // No row: the first attempt, whatever the name looks like.
+    for name in NAMES.into_iter().chain(["model.bin"]) {
+        let store = lost_attempt(name, &a);
+        assert_eq!(size_as(&store, name), 64);
+        store.resend("another_file");
+        assert_eq!(size_as(&store, name), 64);
+        assert_eq!(
+            piece_epochs(&store, name),
+            vec![(0, 0), (0, 16), (0, 32), (0, 48)]
+        );
+    }
+}
+
+#[test]
+fn database_reads_are_few_and_none_for_a_file_of_one_piece() {
+    let a = file(100, 35);
+    let store = MemStore::default();
+    // Nothing held: a size query reads nothing.
+    assert_eq!(size(&store), 0);
+    assert_eq!(store.db_statements(), 0);
+    // A file of one piece or less: one head and one put, no database read,
+    // as before epochs.
+    let small = file(10, 36);
+    store.take_ops();
+    assert_eq!(send_as("wu_1_0_r9_5", &store, &small, 0, None), Ok(()));
+    assert_eq!(store.take_ops(), vec!["head", "put"]);
+    assert_eq!(store.db_statements(), 0);
+    // A larger file from offset 0: the epoch is read when the request starts
+    // and again before the finished object is written.
+    assert!(send(&store, &a, 0, Some(70)).is_err());
+    assert_eq!(store.db_statements(), 1);
+    assert_eq!(send(&store, &a, 64, None), Ok(()));
+    assert_eq!(store.db_statements(), 3);
+    // A size query with pieces held: one read; with a finished file: none.
+    let store = MemStore::default();
+    assert!(send(&store, &a, 0, Some(70)).is_err());
+    let before = store.db_statements();
+    store.take_ops();
+    assert_eq!(size(&store), 64);
+    assert_eq!(store.db_statements(), before + 1);
+    assert_eq!(store.take_ops(), vec!["head", "list"]);
+    assert_eq!(send(&store, &a, 64, None), Ok(()));
+    let before = store.db_statements();
+    assert_eq!(size(&store), 100);
+    assert_eq!(store.db_statements(), before);
 }
 
 #[test]

@@ -269,7 +269,7 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
             reply(
                 put_platform(&db, now(), &p)
                     .await
-                    .map(|id| json!({ "id": id })),
+                    .map(|r| json!({ "id": r.id, "action": r.action })),
             )
         }
         (Method::Put, ["apps"]) => {

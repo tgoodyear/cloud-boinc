@@ -924,6 +924,88 @@ fn optional_elements() {
     e.finish();
 }
 
+/// A reply that carries nothing but the account's global preferences.
+fn prefs_reply(h: &Harness, name: &str, global_prefs: &str) -> PathBuf {
+    let reply = SchedulerReply {
+        core_client_version: 80300,
+        master_url: MASTER.to_string(),
+        project_name: "Oracle Project".to_string(),
+        user: ReplyUser {
+            id: 1,
+            name: USER_NAME.to_string(),
+            create_time: 1_700_000_000,
+            email_hash: email_hash("ada@example.com"),
+            cross_project_id: "cpid1".to_string(),
+            external_cpid: user_cpid("cpid1", "ada@example.com"),
+            global_prefs: Some(global_prefs.to_string()),
+            ..ReplyUser::default()
+        },
+        ..SchedulerReply::default()
+    };
+    h.save(name, &reply.write().unwrap())
+}
+
+/// Global preferences with one `<day_prefs>` block holding `inner`.
+fn prefs_with_day(inner: &str) -> String {
+    format!(
+        "<global_preferences>\n    <mod_time>1750000100</mod_time>\n    <cpu_usage_limit>75</cpu_usage_limit>\n    <day_prefs>\n{inner}    </day_prefs>\n</global_preferences>"
+    )
+}
+
+#[test]
+fn day_prefs_the_client_knows_are_read_quietly() {
+    let h = Harness::new("scheduler");
+    let known = prefs_with_day(
+        "        <day_of_week>1</day_of_week>\n        <start_hour>9</start_hour>\n        <end_hour>17</end_hour>\n        <net_start_hour>6</net_start_hour>\n        <net_end_hour>22</net_end_hour>\n",
+    );
+    let path = prefs_reply(&h, "scheduler_day_prefs.xml", &known);
+    if !h.ready() {
+        return;
+    }
+    let d = run(&h, &path, &base_args());
+    let mut e = Expect::new("scheduler reply with day preferences", &d);
+    e.rc("parse.rc", 0);
+    e.rc("handle.rc", 0);
+    e.n("state.global_prefs.cpu_usage_limit", 75.0);
+    e.quiet(&[]);
+    e.finish();
+}
+
+#[test]
+fn an_unknown_element_inside_day_prefs_is_caught() {
+    // `GLOBAL_PREFS::parse_day` reports an element it does not know on
+    // standard error and goes on, so the client's own parse succeeds and its
+    // message log is empty. The check has to read standard error.
+    let h = Harness::new("scheduler");
+    let unknown = prefs_with_day(
+        "        <day_of_week>1</day_of_week>\n        <start_hour>9</start_hour>\n        <end_hour>17</end_hour>\n        <not_an_hour>3</not_an_hour>\n",
+    );
+    let path = prefs_reply(&h, "scheduler_day_prefs_unknown.xml", &unknown);
+    if !h.ready() {
+        return;
+    }
+    let d = run(&h, &path, &base_args());
+    let build = |allowed: &[&str]| {
+        let mut e = Expect::new("scheduler reply with an unknown day element", &d);
+        e.rc("parse.rc", 0);
+        e.rc("handle.rc", 0);
+        e.quiet(allowed);
+        e.into_failures()
+    };
+    // The run itself succeeded, with the preferences applied.
+    assert_eq!(d.get("parse.rc"), Some("0"));
+    assert_eq!(d.get("state.global_prefs.cpu_usage_limit"), Some("75"));
+    let failures = build(&[]);
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.contains("not_an_hour") && f.contains("parse_day")),
+        "{failures:?}"
+    );
+    // Listed in the allowlist, as for any other message, it passes.
+    assert!(build(&["not_an_hour"]).is_empty());
+}
+
 fn expect_msg_list(e: &mut Expect<'_>, messages: &[UserMessage]) {
     e.n("message.count", messages.len() as f64);
     for (i, m) in messages.iter().enumerate() {
