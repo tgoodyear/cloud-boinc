@@ -1168,10 +1168,7 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     )];
     reads.push(stmt!("SELECT * FROM host WHERE id = ?", req.hostid.max(0)));
     if let Some(id) = weak_id {
-        reads.push(stmt!(
-            format!("{USER_WITH_TEAM} WHERE u.id = ?"),
-            id as i64
-        ));
+        reads.push(stmt!(format!("{USER_WITH_TEAM} WHERE u.id = ?"), id as i64));
     }
     let mut rows = ctx.db.batch(reads).await?.into_iter();
     let by_auth: Option<UserRow> = rows.next().unwrap_or_default().first()?;

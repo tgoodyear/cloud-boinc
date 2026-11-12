@@ -1212,7 +1212,10 @@ fn credit_one_job(w: &World, name: &str) -> (u64, u64) {
     let (statements, written) = (w.db.statements(), w.db.rows_written());
     let rep = w.transition(wu, 1200);
     assert_eq!(rep.results_valid, 1);
-    (w.db.statements() - statements, w.db.rows_written() - written)
+    (
+        w.db.statements() - statements,
+        w.db.rows_written() - written,
+    )
 }
 
 /// Upstream's `grant_credit` (`sched/credit.cpp`) updates the user's team with
@@ -1240,11 +1243,16 @@ fn a_grant_goes_to_the_accounts_team_in_one_more_statement() {
     let credit = 2e9 * 100.0 * 200.0 / 86400e9;
     let user_total = with.scalar("SELECT total_credit FROM user WHERE id = 1");
     assert!((user_total - credit).abs() < 1e-9);
-    assert!((with.scalar("SELECT total_credit FROM team WHERE id = 7") - (3.0 + credit)).abs() < 1e-9);
+    assert!(
+        (with.scalar("SELECT total_credit FROM team WHERE id = 7") - (3.0 + credit)).abs() < 1e-9
+    );
     // The same average as the user's, brought up to date from the same time
     // (the team's first sample is at its own `expavg_time`).
     assert!(with.scalar("SELECT expavg_credit FROM team WHERE id = 7") > 0.0);
-    assert_eq!(with.scalar("SELECT expavg_time FROM team WHERE id = 7"), 1200.0);
+    assert_eq!(
+        with.scalar("SELECT expavg_time FROM team WHERE id = 7"),
+        1200.0
+    );
     assert!(with.scalar("SELECT recent_key FROM team WHERE id = 7") > -1e8);
     // Nothing else is touched.
     assert_eq!(with.scalar("SELECT nusers FROM team WHERE id = 7"), 1.0);
@@ -1256,7 +1264,8 @@ fn a_missing_team_costs_nothing() {
     let without = World::new("trivial");
     let (base_statements, _) = credit_one_job(&without, "j1");
     let w = World::new("trivial");
-    w.db.apply("UPDATE user SET teamid = 99 WHERE id = 1;").unwrap();
+    w.db.apply("UPDATE user SET teamid = 99 WHERE id = 1;")
+        .unwrap();
     let (statements, _) = credit_one_job(&w, "j1");
     assert_eq!(statements, base_statements);
 }

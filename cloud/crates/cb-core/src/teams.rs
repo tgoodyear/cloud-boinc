@@ -109,7 +109,8 @@ pub fn clean_url(raw: &str) -> Result<String, Refusal> {
     if url.is_empty() {
         return Ok(String::new());
     }
-    const BAD: Refusal = "The team's web address is not valid. Use http:// or https:// and a host name.";
+    const BAD: Refusal =
+        "The team's web address is not valid. Use http:// or https:// and a host name.";
     if url.chars().count() > MAX_URL {
         return Err("The team's web address is too long.");
     }
@@ -278,11 +279,7 @@ pub struct Search {
 pub async fn search_teams(db: &dyn Db, s: &Search, now: i64) -> CoreResult<Vec<Team>> {
     // Active: the recent average now is above 0.1, which is
     // `ln(0.1) + now * ln 2 / half life` in the key's terms.
-    let active_clause = if s.active {
-        " AND recent_key > ?"
-    } else {
-        ""
-    };
+    let active_clause = if s.active { " AND recent_key > ?" } else { "" };
     let threshold = 0.1f64.ln() + now as f64 * std::f64::consts::LN_2 / CREDIT_HALF_LIFE;
     let finish = |mut st: Stmt| {
         if s.active {
@@ -438,7 +435,7 @@ mod tests {
     #[test]
     fn names_are_plain_one_line_text() {
         assert_eq!(clean_name("  Team A  ").unwrap(), "Team A");
-        assert_eq!(clean_name("R&D <3").unwrap_err().contains("< or >"), true);
+        assert!(clean_name("R&D <3").unwrap_err().contains("< or >"));
         assert!(clean_name("   ").is_err());
         assert!(clean_name("a\nb").is_err());
         assert!(clean_name(&"x".repeat(MAX_NAME)).is_ok());
@@ -507,7 +504,10 @@ mod tests {
             }
         };
         let t = check_team_input(&form(&[("name", "A"), ("type", "3")])).unwrap();
-        assert_eq!((t.team_type, t.country.as_str(), t.joinable), (3, "International", false));
+        assert_eq!(
+            (t.team_type, t.country.as_str(), t.joinable),
+            (3, "International", false)
+        );
         assert!(check_team_input(&form(&[("name", "A"), ("type", "13")])).is_err());
         assert!(check_team_input(&form(&[("name", "A"), ("type", "x")])).is_err());
         assert!(check_team_input(&form(&[("name", "A"), ("country", "Atlantis")])).is_err());

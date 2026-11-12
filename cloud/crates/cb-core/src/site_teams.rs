@@ -63,11 +63,7 @@ const FORM_PAGE: usize = 50;
 const REMOVE_MAX: usize = 90;
 
 /// Routes a team page. `None` for a path that is not one.
-pub async fn team_page(
-    ctx: &SiteCtx<'_>,
-    path: &str,
-    q: &Params,
-) -> CoreResult<Option<SitePage>> {
+pub async fn team_page(ctx: &SiteCtx<'_>, path: &str, q: &Params) -> CoreResult<Option<SitePage>> {
     if !TEAM_PATHS.contains(&path) {
         return Ok(None);
     }
@@ -149,7 +145,11 @@ fn type_select(selected: i64, none_label: &str) -> String {
         let label = if i == 0 { none_label } else { name };
         out.push_str(&format!(
             "<option value=\"{i}\"{}>{}</option>\n",
-            if i as i64 == selected { " selected" } else { "" },
+            if i as i64 == selected {
+                " selected"
+            } else {
+                ""
+            },
             html_escape(label)
         ));
     }
@@ -230,8 +230,18 @@ fn team_form(user: &User, now: i64, team: Option<&Team>, action: &str, label: &s
             html_escape(description)
         ),
     );
-    label_row(&mut b, "type", "Type of team", &type_select(team_type, "---"));
-    label_row(&mut b, "country", "Country", &country_select(country, false));
+    label_row(
+        &mut b,
+        "type",
+        "Type of team",
+        &type_select(team_type, "---"),
+    );
+    label_row(
+        &mut b,
+        "country",
+        "Country",
+        &country_select(country, false),
+    );
     label_row(
         &mut b,
         "joinable",
@@ -272,11 +282,8 @@ fn search_form(s: &Search) -> String {
 pub fn team_home(ctx: &SiteCtx<'_>) -> SitePage {
     let project = ctx.project;
     let mut types: Vec<(String, String)> = vec![("All teams".into(), "top_teams.php".into())];
-    for i in 1..TEAM_TYPES.len() {
-        types.push((
-            format!("{} teams", TEAM_TYPES[i]),
-            format!("top_teams.php?type={i}"),
-        ));
+    for (i, name) in TEAM_TYPES.iter().enumerate().skip(1) {
+        types.push((format!("{name} teams"), format!("top_teams.php?type={i}")));
     }
     let types: Vec<(&str, String)> = types.iter().map(|(a, b)| (a.as_str(), b.clone())).collect();
     let mut b = format!(
@@ -290,13 +297,20 @@ pub fn team_home(ctx: &SiteCtx<'_>) -> SitePage {
          <p>To join a team, open its page and choose Join this team.</p>\n",
         html_escape(&project.config.long_name)
     );
-    b.push_str(&site_ui::card("Find a team", &search_form(&Search::default())));
+    b.push_str(&site_ui::card(
+        "Find a team",
+        &search_form(&Search::default()),
+    ));
     b.push_str(&site_ui::card("Top teams", &site_ui::link_list(&types)));
     b.push_str(&site_ui::card(
         "Create a new team",
         &format!(
             "<p>If you cannot find a team that is right for you, you can create one.</p>\n{}",
-            site_ui::actions(&[site_ui::button_link("Create a team", "team_create_form.php", false)])
+            site_ui::actions(&[site_ui::button_link(
+                "Create a team",
+                "team_create_form.php",
+                false
+            )])
         ),
     ));
     page(ctx, "Teams", &b)
@@ -519,7 +533,7 @@ impl TopSort {
 /// Stock's `offset`: a multiple of [`PAGE_SIZE`], else 0; clamped.
 fn top_offset(q: &Params) -> usize {
     let n = int_param(q, "offset").unwrap_or(0).max(0) as usize;
-    if n % PAGE_SIZE != 0 || n >= MAX_TOP_OFFSET {
+    if !n.is_multiple_of(PAGE_SIZE) || n >= MAX_TOP_OFFSET {
         0
     } else {
         n
@@ -582,7 +596,10 @@ pub async fn top_teams(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         String::new()
     };
     let title = if team_type > 0 {
-        format!("Top {} teams", TEAM_TYPES[team_type as usize].to_lowercase())
+        format!(
+            "Top {} teams",
+            TEAM_TYPES[team_type as usize].to_lowercase()
+        )
     } else {
         "Top teams".to_string()
     };
@@ -665,9 +682,17 @@ fn sort_link(current: TopSort, this: TopSort, label: &str, type_url: &str) -> St
 // One team.
 
 /// A team that was asked for by `teamid`, or the page that says there is none.
-async fn team_from_query(ctx: &SiteCtx<'_>, q: &Params, name: &str) -> CoreResult<Result<Team, SitePage>> {
+async fn team_from_query(
+    ctx: &SiteCtx<'_>,
+    q: &Params,
+    name: &str,
+) -> CoreResult<Result<Team, SitePage>> {
     let Some(id) = int_param(q, name) else {
-        return Ok(Err(error_page(ctx.project, 400, "missing or bad parameter: teamid")));
+        return Ok(Err(error_page(
+            ctx.project,
+            400,
+            "missing or bad parameter: teamid",
+        )));
     };
     Ok(team_by_id(ctx.db, id)
         .await?
@@ -763,7 +788,11 @@ pub async fn team_display(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage>
             }
             let mut links = Vec::new();
             if member {
-                links.push(site_ui::button_link("Quit this team", "team_quit_form.php", true));
+                links.push(site_ui::button_link(
+                    "Quit this team",
+                    "team_quit_form.php",
+                    true,
+                ));
             }
             if team.userid == user.id {
                 links.push(site_ui::button_link(
@@ -946,7 +975,13 @@ pub async fn team_create_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
     Ok(page(
         ctx,
         "Create a team",
-        &team_form(&user, ctx.now, None, "team_create_action.php", "Create a team"),
+        &team_form(
+            &user,
+            ctx.now,
+            None,
+            "team_create_action.php",
+            "Create a team",
+        ),
     ))
 }
 
@@ -981,7 +1016,12 @@ pub async fn team_create_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
     };
     let out = ctx
         .db
-        .batch(create_statements(user.id, &user.authenticator, &input, ctx.now))
+        .batch(create_statements(
+            user.id,
+            &user.authenticator,
+            &input,
+            ctx.now,
+        ))
         .await?;
     match out.first().and_then(|r| r.scalar_i64()) {
         Some(id) => Ok(go_to_team(ctx, id)),
@@ -1044,7 +1084,9 @@ pub async fn team_join(ctx: &SiteCtx<'_>, q: &Params, redirect_home: bool) -> Co
                 )));
             }
         }
-        return Ok(need_post(ctx).unwrap_or_else(|| error_page(project, 405, "This page takes a POST.")));
+        return Ok(
+            need_post(ctx).unwrap_or_else(|| error_page(project, 405, "This page takes a POST."))
+        );
     }
     let Some(user) = viewer(ctx).await? else {
         return Ok(to_login(ctx.base, "team_search.php"));
@@ -1100,7 +1142,9 @@ pub async fn team_quit_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePage> {
         return Ok(error_page(ctx.project, 404, "You are not in a team."));
     }
     let team = team_by_id(ctx.db, user.teamid).await?;
-    let name = team.as_ref().map_or("your team".to_string(), |t| t.name.clone());
+    let name = team
+        .as_ref()
+        .map_or("your team".to_string(), |t| t.name.clone());
     let b = format!(
         "<p>Please note before quitting a team:</p>\n<ul>\n\
          <li>If you quit a team, you may rejoin later, or join any other team you like.</li>\n\
@@ -1184,7 +1228,13 @@ pub async fn team_edit_form(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePag
     Ok(page(
         ctx,
         &format!("Edit {}", team.name),
-        &team_form(&user, ctx.now, Some(&team), "team_edit_action.php", "Update team info"),
+        &team_form(
+            &user,
+            ctx.now,
+            Some(&team),
+            "team_edit_action.php",
+            "Update team info",
+        ),
     ))
 }
 
@@ -1311,7 +1361,11 @@ pub async fn team_manage(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
         team.id,
         site_ui::link_list(&links)
     );
-    Ok(page(ctx, &format!("Team administration for {}", team.name), &b))
+    Ok(page(
+        ctx,
+        &format!("Team administration for {}", team.name),
+        &b,
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1408,7 +1462,11 @@ async fn member_form(ctx: &SiteCtx<'_>, q: &Params, kind: MemberForm) -> CoreRes
     }
     b.push_str(&format!(
         "</table>\n<p><input type=\"submit\" class=\"{}\" value=\"{button}\"></p>\n</form>\n",
-        if kind == MemberForm::Remove { "danger" } else { "secondary" }
+        if kind == MemberForm::Remove {
+            "danger"
+        } else {
+            "secondary"
+        }
     ));
     if offset > 0 || has_next {
         b.push_str("<p>");
@@ -1446,7 +1504,9 @@ pub async fn team_remove_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Sit
     if !token_ok(ctx, &user, q) {
         return Ok(error_page(project, 403, TIMED_OUT));
     }
-    let n = int_param(q, "ninactive_users").unwrap_or(0).clamp(0, REMOVE_MAX as i64);
+    let n = int_param(q, "ninactive_users")
+        .unwrap_or(0)
+        .clamp(0, REMOVE_MAX as i64);
     let mut ids: Vec<i64> = (0..n)
         .filter_map(|i| int_param(q, &format!("remove_{i}")))
         .filter(|id| *id > 0)
@@ -1567,7 +1627,11 @@ pub async fn team_founder_transfer_form(ctx: &SiteCtx<'_>) -> CoreResult<SitePag
     };
     let title = format!("Request foundership of {}", team.name);
     if team.userid == user.id {
-        return Ok(page(ctx, &title, &site_ui::notice("You are the founder of this team.")));
+        return Ok(page(
+            ctx,
+            &title,
+            &site_ui::notice("You are the founder of this team."),
+        ));
     }
     if team.userid != 0 {
         return Ok(page(
@@ -1626,7 +1690,11 @@ pub async fn team_founder_transfer_action(ctx: &SiteCtx<'_>, q: &Params) -> Core
         .await?;
     match done.scalar_i64() {
         Some(id) => Ok(go_to_team(ctx, id)),
-        None => Ok(error_page(project, 409, "Foundership request not allowed now.")),
+        None => Ok(error_page(
+            project,
+            409,
+            "Foundership request not allowed now.",
+        )),
     }
 }
 
@@ -1636,7 +1704,10 @@ pub async fn team_founder_transfer_action(ctx: &SiteCtx<'_>, q: &Params) -> Core
 /// What an account's page says about teams: the team it is in with the links
 /// that apply, and the teams it founded and is not a member of. Rows of a list
 /// of label and HTML. One statement.
-pub async fn account_rows(ctx: &SiteCtx<'_>, user: &User) -> CoreResult<Vec<(&'static str, String)>> {
+pub async fn account_rows(
+    ctx: &SiteCtx<'_>,
+    user: &User,
+) -> CoreResult<Vec<(&'static str, String)>> {
     if ctx.project.config.disable_teams {
         return Ok(Vec::new());
     }
@@ -1650,7 +1721,10 @@ pub async fn account_rows(ctx: &SiteCtx<'_>, user: &User) -> CoreResult<Vec<(&'s
         .await?
         .decode()?;
     let mut rows = Vec::new();
-    match teams.iter().find(|t| t.id == user.teamid && user.teamid > 0) {
+    match teams
+        .iter()
+        .find(|t| t.id == user.teamid && user.teamid > 0)
+    {
         Some(t) => {
             let mut x = format!(
                 "{} &middot; <a href=\"team_quit_form.php\">Quit team</a>",
@@ -1669,7 +1743,10 @@ pub async fn account_rows(ctx: &SiteCtx<'_>, user: &User) -> CoreResult<Vec<(&'s
             "None &middot; <a href=\"team_search.php\">find a team</a>".to_string(),
         )),
     }
-    for t in teams.iter().filter(|t| t.userid == user.id && t.id != user.teamid) {
+    for t in teams
+        .iter()
+        .filter(|t| t.userid == user.id && t.id != user.teamid)
+    {
         rows.push((
             "Founder but not member of",
             format!(

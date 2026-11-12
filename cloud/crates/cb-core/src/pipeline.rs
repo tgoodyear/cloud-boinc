@@ -1251,7 +1251,10 @@ async fn host_statements(st: &State, ctx: &Ctx<'_>, token: i64) -> CoreResult<Ve
                     );
                     *user_credit.entry(*user_id).or_default() += credit;
                     *user_valid.entry(*user_id).or_default() += 1;
-                    if let Some(t) = u.team_id.filter(|_| u.teamid > 0).and_then(|id| teams.get_mut(&id))
+                    if let Some(t) = u
+                        .team_id
+                        .filter(|_| u.teamid > 0)
+                        .and_then(|id| teams.get_mut(&id))
                     {
                         update_average(
                             now,

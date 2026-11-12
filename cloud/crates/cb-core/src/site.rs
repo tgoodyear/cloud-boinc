@@ -998,7 +998,11 @@ pub async fn show_user(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     // Upstream's `community_links` shows the team, or a dash when there is none.
     if !project.config.disable_teams {
         let team = site_teams::public_team_row(ctx, user.teamid).await?;
-        row2(&mut b, "Team", &team.unwrap_or_else(|| "&mdash;".to_string()));
+        row2(
+            &mut b,
+            "Team",
+            &team.unwrap_or_else(|| "&mdash;".to_string()),
+        );
     }
     if user.show_hosts != 0 || project.config.host_owner_public {
         row2(

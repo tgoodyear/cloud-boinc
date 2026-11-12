@@ -144,7 +144,8 @@ impl World {
     }
 
     fn get(&self, path: &str, auth: Option<&Account>, params: &[(&str, &str)]) -> SitePage {
-        self.page(path, auth.map(|a| a.auth.as_str()), false, params).0
+        self.page(path, auth.map(|a| a.auth.as_str()), false, params)
+            .0
     }
 
     /// A form as a browser sends it: the hidden fields of `form`, then `changes`.
@@ -184,7 +185,11 @@ impl World {
             Some(who),
             &[("teamid", &team.to_string())],
         );
-        assert!(page.body.contains("action=\"team_join.php\""), "{}", page.body);
+        assert!(
+            page.body.contains("action=\"team_join.php\""),
+            "{}",
+            page.body
+        );
         self.submit(&page, "/team_join.php", who, &[]).0
     }
 
@@ -240,7 +245,10 @@ fn creating_a_team_makes_the_founder_a_member() {
         "Team \"Alpha\" & Co",
         &[
             ("url", "example.org/team"),
-            ("description", "We <b>compute</b>.\r\nTogether.\r\n\r\nSecond paragraph."),
+            (
+                "description",
+                "We <b>compute</b>.\r\nTogether.\r\n\r\nSecond paragraph.",
+            ),
             ("type", "6"),
             ("country", "Canada"),
             ("joinable", "on"),
@@ -260,8 +268,14 @@ fn creating_a_team_makes_the_founder_a_member() {
     .unwrap()
     .unwrap();
     assert_eq!(row.name, "Team \"Alpha\" & Co");
-    assert_eq!(row.description, "We <b>compute</b>.\nTogether.\n\nSecond paragraph.");
-    assert_eq!((row.team_type, row.joinable, row.country.as_str()), (6, 1, "Canada"));
+    assert_eq!(
+        row.description,
+        "We <b>compute</b>.\nTogether.\n\nSecond paragraph."
+    );
+    assert_eq!(
+        (row.team_type, row.joinable, row.country.as_str()),
+        (6, 1, "Canada")
+    );
     assert_eq!(row.url, "example.org/team");
     assert_eq!(row.expavg_time, NOW as f64);
 
@@ -271,7 +285,9 @@ fn creating_a_team_makes_the_founder_a_member() {
     assert_eq!(page.status, 200);
     assert!(page.body.contains("Team &quot;Alpha&quot; &amp; Co"));
     assert!(!page.body.contains("& Co") && !page.body.contains("<b>compute"));
-    assert!(page.body.contains("We &lt;b&gt;compute&lt;/b&gt;.<br>\nTogether.</p>"));
+    assert!(page
+        .body
+        .contains("We &lt;b&gt;compute&lt;/b&gt;.<br>\nTogether.</p>"));
     assert!(page.body.contains("<p>Second paragraph.</p>"));
     assert!(page.body.contains(
         "<a href=\"https://example.org/team\" rel=\"nofollow ugc noopener noreferrer\">example.org/team</a>"
@@ -279,7 +295,9 @@ fn creating_a_team_makes_the_founder_a_member() {
     assert!(page.body.contains("University or department"));
     assert!(page.body.contains("show_user.php?userid=1"));
     // A visitor is asked to log in; no form for a stranger.
-    assert!(page.body.contains("login_form.php?next_url=team_display.php%3Fteamid%3D1"));
+    assert!(page
+        .body
+        .contains("login_form.php?next_url=team_display.php%3Fteamid%3D1"));
     assert!(!page.body.contains("team_join.php"));
 }
 
@@ -295,17 +313,37 @@ fn creating_needs_a_login_a_token_a_post_and_a_new_name() {
 
     // No token, a token of another account, a GET: nothing is made.
     let fields = [("name", "T")];
-    assert_eq!(w.page("/team_create_action.php", Some(&ada.auth), true, &fields).0.status, 403);
+    assert_eq!(
+        w.page("/team_create_action.php", Some(&ada.auth), true, &fields)
+            .0
+            .status,
+        403
+    );
     let (page, _) = w.submit(&form, "/team_create_action.php", &bob, &[("name", "T")]);
     assert_eq!(page.status, 403);
     let mut q = hidden_fields(&form.body);
     q.push(("name".into(), "T".into()));
     let pairs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    assert_eq!(w.page("/team_create_action.php", Some(&ada.auth), false, &pairs).0.status, 405);
-    assert_eq!(w.page("/team_create_action.php", None, true, &pairs).0.status, 303);
+    assert_eq!(
+        w.page("/team_create_action.php", Some(&ada.auth), false, &pairs)
+            .0
+            .status,
+        405
+    );
+    assert_eq!(
+        w.page("/team_create_action.php", None, true, &pairs)
+            .0
+            .status,
+        303
+    );
     // A form older than a day is refused.
     w.now.set(NOW + 86_401);
-    assert_eq!(w.page("/team_create_action.php", Some(&ada.auth), true, &pairs).0.status, 403);
+    assert_eq!(
+        w.page("/team_create_action.php", Some(&ada.auth), true, &pairs)
+            .0
+            .status,
+        403
+    );
     w.now.set(NOW);
     assert_eq!(w.n("SELECT count(*) FROM team"), 0);
 
@@ -321,7 +359,12 @@ fn creating_needs_a_login_a_token_a_post_and_a_new_name() {
     // An account in a team must quit it first, on the form and in the action.
     let page = w.get("/team_create_form.php", Some(&ada), &[]);
     assert!(page.body.contains("You belong to a team"));
-    let (page, _) = w.submit(&form, "/team_create_action.php", &ada, &[("name", "Second")]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_create_action.php",
+        &ada,
+        &[("name", "Second")],
+    );
     assert_eq!(page.status, 403);
 }
 
@@ -348,17 +391,31 @@ fn what_may_not_be_stored_is_refused() {
         assert_eq!(page.status, 400, "{fields:?}: {}", page.body);
     }
     let long = "x".repeat(192);
-    assert_eq!(w.submit(&form, "/team_create_action.php", &ada, &[("name", &long)]).0.status, 400);
+    assert_eq!(
+        w.submit(&form, "/team_create_action.php", &ada, &[("name", &long)])
+            .0
+            .status,
+        400
+    );
     let long = "x".repeat(4001);
     assert_eq!(
-        w.submit(&form, "/team_create_action.php", &ada, &[("name", "ok"), ("description", &long)]).0.status,
+        w.submit(
+            &form,
+            "/team_create_action.php",
+            &ada,
+            &[("name", "ok"), ("description", &long)]
+        )
+        .0
+        .status,
         400
     );
     assert_eq!(w.n("SELECT count(*) FROM team"), 0);
     // An empty country is "International".
     let id = w.create(&ada, "Fine", &[("country", "")]);
     assert_eq!(
-        w.n(&format!("SELECT count(*) FROM team WHERE id = {id} AND country = 'International'")),
+        w.n(&format!(
+            "SELECT count(*) FROM team WHERE id = {id} AND country = 'International'"
+        )),
         1
     );
 }
@@ -378,7 +435,11 @@ fn joining_and_quitting_keep_the_member_counts() {
     // Joining a team from the page, through the form token, replaces the
     // account's team and moves the counts. Joining takes the account, the team,
     // and the update.
-    let form = w.get("/team_display.php", Some(&bob), &[("teamid", &t1.to_string())]);
+    let form = w.get(
+        "/team_display.php",
+        Some(&bob),
+        &[("teamid", &t1.to_string())],
+    );
     assert!(form.body.contains("action=\"team_join.php\""));
     let (done, n) = w.submit(&form, "/team_join.php", &bob, &[]);
     assert_eq!(done.status, 303);
@@ -393,26 +454,68 @@ fn joining_and_quitting_keep_the_member_counts() {
     assert_eq!(count(t1), 2);
 
     // A closed team cannot be joined, from the page or by a made-up POST.
-    let page = w.get("/team_display.php", Some(&ada), &[("teamid", &t3.to_string())]);
+    let page = w.get(
+        "/team_display.php",
+        Some(&ada),
+        &[("teamid", &t3.to_string())],
+    );
     assert!(page.body.contains("Not accepting new members"));
     assert!(!page.body.contains("team_join.php"));
     let ada_form = w.get("/team_quit_form.php", Some(&ada), &[]);
-    let (done, _) = w.submit(&ada_form, "/team_join_action.php", &ada, &[("teamid", &t3.to_string())]);
+    let (done, _) = w.submit(
+        &ada_form,
+        "/team_join_action.php",
+        &ada,
+        &[("teamid", &t3.to_string())],
+    );
     assert_eq!(done.status, 403);
     assert!(done.body.contains("is not joinable"));
     assert_eq!(w.team_of(&ada), t1);
 
     // Tokens and methods.
     assert_eq!(
-        w.page("/team_join_action.php", Some(&bob.auth), true, &[("teamid", &t2.to_string())]).0.status,
+        w.page(
+            "/team_join_action.php",
+            Some(&bob.auth),
+            true,
+            &[("teamid", &t2.to_string())]
+        )
+        .0
+        .status,
         403
     );
-    assert_eq!(w.page("/team_join_action.php", Some(&bob.auth), false, &[("teamid", "1")]).0.status, 405);
+    assert_eq!(
+        w.page(
+            "/team_join_action.php",
+            Some(&bob.auth),
+            false,
+            &[("teamid", "1")]
+        )
+        .0
+        .status,
+        405
+    );
     // The stock link (a GET of `team_join.php`) goes to the form, which joins nothing.
-    let page = w.page("/team_join.php", Some(&bob.auth), false, &[("teamid", &t2.to_string())]).0;
-    assert_eq!(page.location.as_deref(), Some(&*format!("https://p.example/team_join_form.php?id={t2}")));
-    let page = w.get("/team_join_form.php", Some(&bob), &[("id", &t2.to_string())]);
-    assert!(page.body.contains("Joining a team does not change your account's credit"));
+    let page = w
+        .page(
+            "/team_join.php",
+            Some(&bob.auth),
+            false,
+            &[("teamid", &t2.to_string())],
+        )
+        .0;
+    assert_eq!(
+        page.location.as_deref(),
+        Some(&*format!("https://p.example/team_join_form.php?id={t2}"))
+    );
+    let page = w.get(
+        "/team_join_form.php",
+        Some(&bob),
+        &[("id", &t2.to_string())],
+    );
+    assert!(page
+        .body
+        .contains("Joining a team does not change your account's credit"));
     assert!(page.body.contains("action=\"team_join_action.php\""));
     assert_eq!(w.team_of(&bob), t1);
 
@@ -420,9 +523,21 @@ fn joining_and_quitting_keep_the_member_counts() {
     // team it names.
     let form = w.get("/team_quit_form.php", Some(&bob), &[]);
     assert!(form.body.contains("does not affect your personal credit"));
-    let stale = w.page("/team_quit_action.php", Some(&bob.auth), true, &[("id", &t2.to_string())]).0;
+    let stale = w
+        .page(
+            "/team_quit_action.php",
+            Some(&bob.auth),
+            true,
+            &[("id", &t2.to_string())],
+        )
+        .0;
     assert_eq!(stale.status, 403);
-    let (wrong, _) = w.submit(&form, "/team_quit_action.php", &bob, &[("id", &t2.to_string())]);
+    let (wrong, _) = w.submit(
+        &form,
+        "/team_quit_action.php",
+        &bob,
+        &[("id", &t2.to_string())],
+    );
     assert_eq!(wrong.status, 409);
     assert_eq!(w.team_of(&bob), t1);
     let (done, _) = w.submit(&form, "/team_quit_action.php", &bob, &[]);
@@ -432,10 +547,16 @@ fn joining_and_quitting_keep_the_member_counts() {
     // Not in a team: nothing to quit.
     assert_eq!(w.get("/team_quit_form.php", Some(&bob), &[]).status, 404);
     // A team this server does not have (an account moved from elsewhere) can be quit.
-    w.sql(&format!("UPDATE user SET teamid = 4000 WHERE id = {}", bob.id));
+    w.sql(&format!(
+        "UPDATE user SET teamid = 4000 WHERE id = {}",
+        bob.id
+    ));
     let form = w.get("/team_quit_form.php", Some(&bob), &[]);
     assert_eq!(form.status, 200);
-    assert_eq!(w.submit(&form, "/team_quit_action.php", &bob, &[]).0.status, 303);
+    assert_eq!(
+        w.submit(&form, "/team_quit_action.php", &bob, &[]).0.status,
+        303
+    );
     assert_eq!(w.team_of(&bob), 0);
 }
 
@@ -449,7 +570,10 @@ fn the_member_count_follows_every_way_teamid_changes() {
     let count = || w.n(&format!("SELECT nusers FROM team WHERE id = {t}"));
     assert_eq!(count(), 2);
     // Writing the same value is not a change; deleting a member is one.
-    w.sql(&format!("UPDATE user SET teamid = {t} WHERE id = {}", bob.id));
+    w.sql(&format!(
+        "UPDATE user SET teamid = {t} WHERE id = {}",
+        bob.id
+    ));
     assert_eq!(count(), 2);
     w.sql(&format!("DELETE FROM user WHERE id = {}", bob.id));
     assert_eq!(count(), 1);
@@ -477,27 +601,56 @@ fn the_members_page_lists_by_credit_and_pages() {
     }
     let hidden = w.account("Blocked <i>");
     w.join(&hidden, t);
-    w.sql(&format!("UPDATE user SET blocked = 1, total_credit = 9999 WHERE id = {}", hidden.id));
+    w.sql(&format!(
+        "UPDATE user SET blocked = 1, total_credit = 9999 WHERE id = {}",
+        hidden.id
+    ));
     let id = t.to_string();
     // By total credit, 20 to a page.
-    let (page, n) = w.page("/team_members.php", None, false, &[("teamid", &id), ("sort_by", "total_credit")]);
+    let (page, n) = w.page(
+        "/team_members.php",
+        None,
+        false,
+        &[("teamid", &id), ("sort_by", "total_credit")],
+    );
     assert_eq!(n, 2);
     let body = &page.body;
-    assert!(body.contains("Member 23") && body.contains("Member 04") && !body.contains("Member 03"));
+    assert!(
+        body.contains("Member 23") && body.contains("Member 04") && !body.contains("Member 03")
+    );
     assert!(!body.contains("Blocked"));
-    assert!(body.contains("[Founder]") == false, "the founder has no credit and is on page 2");
+    assert!(
+        !body.contains("[Founder]"),
+        "the founder has no credit and is on page 2"
+    );
     assert!(body.find("Member 23").unwrap() < body.find("Member 22").unwrap());
     assert!(body.contains("Next 20"));
-    let page2 = w.get("/team_members.php", None, &[("teamid", &id), ("sort_by", "total_credit"), ("offset", "20")]);
+    let page2 = w.get(
+        "/team_members.php",
+        None,
+        &[
+            ("teamid", &id),
+            ("sort_by", "total_credit"),
+            ("offset", "20"),
+        ],
+    );
     assert!(page2.body.contains("Member 03") && page2.body.contains("[Founder]"));
     assert!(page2.body.contains("Previous 20") && !page2.body.contains("Next 20"));
     // By recent average the order is the other way round.
     let page = w.get("/team_members.php", None, &[("teamid", &id)]);
     assert!(page.body.find("Member 00").unwrap() < page.body.find("Member 01").unwrap());
     // The depth is capped as upstream's.
-    let deep = w.get("/team_members.php", None, &[("teamid", &id), ("offset", "1001")]);
+    let deep = w.get(
+        "/team_members.php",
+        None,
+        &[("teamid", &id), ("offset", "1001")],
+    );
     assert_eq!(deep.status, 400);
-    assert_eq!(w.get("/team_members.php", None, &[("teamid", "999")]).status, 404);
+    assert_eq!(
+        w.get("/team_members.php", None, &[("teamid", "999")])
+            .status,
+        404
+    );
     assert_eq!(w.get("/team_members.php", None, &[]).status, 400);
 }
 
@@ -529,24 +682,39 @@ fn top_teams_orders_filters_pages_and_uses_its_indexes() {
     let b = &page.body;
     // Recent average first by default: Gamma, Alpha, Beta, Idle.
     let at = |s: &str| b.find(s).unwrap();
-    assert!(at("Gamma") < at("Alpha &lt;b&gt;") && at("Alpha &lt;b&gt;") < at("Beta") && at("Beta") < at("Idle"));
+    assert!(
+        at("Gamma") < at("Alpha &lt;b&gt;")
+            && at("Alpha &lt;b&gt;") < at("Beta")
+            && at("Beta") < at("Idle")
+    );
     assert!(!b.contains("<b>"));
     assert!(b.contains("<strong aria-current=\"true\">Recent average credit</strong>"));
     let page = w.get("/top_teams.php", None, &[("sort_by", "total_credit")]);
     let b = &page.body;
-    assert!(b.find("Beta").unwrap() < b.find("Alpha").unwrap() && b.find("Alpha").unwrap() < b.find("Gamma").unwrap());
+    assert!(
+        b.find("Beta").unwrap() < b.find("Alpha").unwrap()
+            && b.find("Alpha").unwrap() < b.find("Gamma").unwrap()
+    );
     let page = w.get("/top_teams.php", None, &[("type", "6")]);
-    assert!(page.body.contains("Beta") && page.body.contains("Idle") && !page.body.contains("Gamma"));
+    assert!(
+        page.body.contains("Beta") && page.body.contains("Idle") && !page.body.contains("Gamma")
+    );
     assert!(page.body.contains("Top university or department teams"));
     // A bad offset is the first page; the stock links keep their parameters.
     let page = w.get("/top_teams.php", None, &[("offset", "7"), ("type", "99")]);
     assert!(page.body.contains("Gamma"));
     // The cache key is the same whatever else the query says.
     let key = |pairs: &[(&str, &str)]| {
-        let q: Params = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let q: Params = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         cb_core::site_boards::public_cache_key("/top_teams.php", &q).unwrap()
     };
-    assert_eq!(key(&[("x", "1")]), key(&[("offset", "7"), ("sort_by", "bogus")]));
+    assert_eq!(
+        key(&[("x", "1")]),
+        key(&[("offset", "7"), ("sort_by", "bogus")])
+    );
     assert_ne!(key(&[("type", "3")]), key(&[]));
     assert!(cb_core::site_boards::PUBLIC_PATHS.contains(&"/top_teams.php"));
 
@@ -558,11 +726,19 @@ fn top_teams_orders_filters_pages_and_uses_its_indexes() {
     }
     let page = w.get("/top_teams.php", None, &[("sort_by", "total_credit")]);
     assert!(page.body.contains("Next 20") && !page.body.contains("Previous 20"));
-    let page = w.get("/top_teams.php", None, &[("sort_by", "total_credit"), ("offset", "20")]);
+    let page = w.get(
+        "/top_teams.php",
+        None,
+        &[("sort_by", "total_credit"), ("offset", "20")],
+    );
     assert!(page.body.contains("Previous 20") && !page.body.contains("Next 20"));
 
     // Each ordering reads one index and sorts nothing.
-    for (sort, ty) in [("expavg_credit", ""), ("total_credit", ""), ("total_credit", "6")] {
+    for (sort, ty) in [
+        ("expavg_credit", ""),
+        ("total_credit", ""),
+        ("total_credit", "6"),
+    ] {
         let spy = Spy {
             inner: &w.db,
             log: RefCell::new(Vec::new()),
@@ -622,7 +798,8 @@ fn plans(spy: &Spy<'_>) -> Vec<String> {
             if let Some(rest) = d.strip_prefix("SCAN ") {
                 let table = rest.split_whitespace().next().unwrap_or("");
                 assert!(
-                    !["user", "host", "result", "workunit"].contains(&table) || d.contains(" USING "),
+                    !["user", "host", "result", "workunit"].contains(&table)
+                        || d.contains(" USING "),
                     "full scan of {table}: {d}\nin: {}",
                     s.sql
                 );
@@ -648,7 +825,14 @@ fn the_search_scores_by_name_words_type_and_country() {
     };
     add(1, "Prime Finders", "hunting primes", 6, "Canada", 1.0);
     add(2, "The Prime Team", "", 2, "France", 9.0);
-    add(3, "Climate", "we study prime climate data", 6, "France", 5.0);
+    add(
+        3,
+        "Climate",
+        "we study prime climate data",
+        6,
+        "France",
+        5.0,
+    );
     add(4, "Other", "", 6, "Canada", 0.0);
     add(5, "100% Real", "", 0, "", 0.0);
     add(6, "Prime", "", 0, "", 0.0);
@@ -657,7 +841,11 @@ fn the_search_scores_by_name_words_type_and_country() {
         pairs.extend_from_slice(q);
         let page = w.get("/team_search.php", None, &pairs);
         assert_eq!(page.status, 200);
-        let results = page.body.split("<h2>Change your search</h2>").next().unwrap();
+        let results = page
+            .body
+            .split("<h2>Change your search</h2>")
+            .next()
+            .unwrap();
         results
             .split("<a href=\"team_display.php?teamid=")
             .skip(1)
@@ -666,7 +854,10 @@ fn the_search_scores_by_name_words_type_and_country() {
     };
     // The exact name first (20 + 5 + 3), then the name that begins with the
     // words (5 + 3, by recent average), then the words in a name or description.
-    assert_eq!(names(&[("keywords", "prime")]), ["Prime", "Prime Finders", "The Prime Team", "Climate"]);
+    assert_eq!(
+        names(&[("keywords", "prime")]),
+        ["Prime", "Prime Finders", "The Prime Team", "Climate"]
+    );
     // Case does not matter; a pattern character is just a character.
     assert_eq!(names(&[("keywords", "PRIME F")]), ["Prime Finders"]);
     assert_eq!(names(&[("keywords", "%")]), ["100% Real"]);
@@ -676,24 +867,54 @@ fn the_search_scores_by_name_words_type_and_country() {
         names(&[("keywords", "prime"), ("type", "6"), ("country", "France")])[..3],
         ["Prime", "Prime Finders", "Climate"]
     );
-    assert_eq!(names(&[("country", "France")]), ["The Prime Team", "Climate"]);
+    assert_eq!(
+        names(&[("country", "France")]),
+        ["The Prime Team", "Climate"]
+    );
     assert_eq!(names(&[("type", "2")]), ["The Prime Team"]);
     // Only active teams: a recent average above 0.1 now.
-    assert_eq!(names(&[("keywords", "prime"), ("active", "on")]), ["Prime Finders", "The Prime Team", "Climate"]);
+    assert_eq!(
+        names(&[("keywords", "prime"), ("active", "on")]),
+        ["Prime Finders", "The Prime Team", "Climate"]
+    );
     // No criteria: the teams with the best averages.
     assert_eq!(names(&[]).len(), 6);
     assert!(names(&[]).first().unwrap() == "The Prime Team");
     // The form without `submit` is the form.
-    assert!(w.get("/team_search.php", None, &[]).body.contains("name=\"keywords\""));
+    assert!(w
+        .get("/team_search.php", None, &[])
+        .body
+        .contains("name=\"keywords\""));
     // XML, in the same order.
-    let xml = w.get("/team_search.php", None, &[("xml", "1"), ("keywords", "prime")]);
+    let xml = w.get(
+        "/team_search.php",
+        None,
+        &[("xml", "1"), ("keywords", "prime")],
+    );
     assert!(xml.content_type.starts_with("text/xml"));
-    assert_eq!(tag(&xml.body, "name"), ["Prime", "Prime Finders", "The Prime Team", "Climate"]);
+    assert_eq!(
+        tag(&xml.body, "name"),
+        ["Prime", "Prime Finders", "The Prime Team", "Climate"]
+    );
     // Nothing found says so and links to creating a team.
-    let page = w.get("/team_search.php", None, &[("submit", "x"), ("keywords", "zzzz")]);
+    let page = w.get(
+        "/team_search.php",
+        None,
+        &[("submit", "x"), ("keywords", "zzzz")],
+    );
     assert!(page.body.contains("No teams were found"));
     // The search is one round trip.
-    let (_, n) = w.page("/team_search.php", None, false, &[("submit", "x"), ("keywords", "prime"), ("type", "6"), ("country", "France")]);
+    let (_, n) = w.page(
+        "/team_search.php",
+        None,
+        false,
+        &[
+            ("submit", "x"),
+            ("keywords", "prime"),
+            ("type", "6"),
+            ("country", "France"),
+        ],
+    );
     assert_eq!(n, 5);
 }
 
@@ -720,15 +941,36 @@ fn team_lookup_answers_with_the_stock_elements() {
     let page = lookup(&[("team_ids", "4, 3,zz,99,4")]);
     assert!(page.body.contains("<teams>\n<team>"));
     assert_eq!(tag(&page.body, "id"), ["4", "3", "4"]);
-    let many = (1..=150).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let many = (1..=150)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     assert_eq!(tag(&lookup(&[("team_ids", &many)]).body, "id").len(), 3);
     // By name: a substring, best recent average first; `%` and `_` are characters.
     let page = lookup(&[("team_name", "fast"), ("format", "xml")]);
     assert_eq!(tag(&page.body, "id"), ["3", "4"]);
-    assert_eq!(tag(&lookup(&[("team_name", "%"), ("format", "xml")]).body, "id"), ["5"]);
-    assert_eq!(tag(&lookup(&[("team_name", "FAST & <"), ("format", "xml")]).body, "id"), ["3"]);
-    assert_eq!(tag(&lookup(&[("team_name", "nope"), ("format", "xml")]).body, "id").len(), 0);
-    assert!(lookup(&[("team_name", "nope"), ("format", "xml")]).body.contains("<teams>\n</teams>"));
+    assert_eq!(
+        tag(&lookup(&[("team_name", "%"), ("format", "xml")]).body, "id"),
+        ["5"]
+    );
+    assert_eq!(
+        tag(
+            &lookup(&[("team_name", "FAST & <"), ("format", "xml")]).body,
+            "id"
+        ),
+        ["3"]
+    );
+    assert_eq!(
+        tag(
+            &lookup(&[("team_name", "nope"), ("format", "xml")]).body,
+            "id"
+        )
+        .len(),
+        0
+    );
+    assert!(lookup(&[("team_name", "nope"), ("format", "xml")])
+        .body
+        .contains("<teams>\n</teams>"));
     // Without `format=xml` a name gets a page of links, escaped.
     let page = lookup(&[("team_name", "fast")]);
     assert!(page.content_type.starts_with("text/html"));
@@ -765,7 +1007,11 @@ fn the_founders_pages_are_the_founders() {
         assert_eq!(w.get(path, None, &q).status, 303, "{path}");
         assert_eq!(w.get(path, Some(&ada), &q).status, 200, "{path}");
     }
-    assert_eq!(w.get("/team_manage.php", Some(&ada), &[("teamid", "99")]).status, 404);
+    assert_eq!(
+        w.get("/team_manage.php", Some(&ada), &[("teamid", "99")])
+            .status,
+        404
+    );
     // The menu does not offer the removal of a team with members.
     let page = w.get("/team_manage.php", Some(&ada), &q);
     assert!(page.body.contains("team_edit_form.php") && !page.body.contains("action=delete"));
@@ -782,7 +1028,12 @@ fn the_founders_pages_are_the_founders() {
         &form,
         "/team_edit_action.php",
         &ada,
-        &[("name", "Alpha Prime"), ("description", "New <i>text</i>"), ("type", "9"), ("country", "France")],
+        &[
+            ("name", "Alpha Prime"),
+            ("description", "New <i>text</i>"),
+            ("type", "9"),
+            ("country", "France"),
+        ],
     );
     assert_eq!(page.status, 303);
     assert_eq!(
@@ -791,7 +1042,12 @@ fn the_founders_pages_are_the_founders() {
         1
     );
     // The same name in another case is the team's own name.
-    let (page, _) = w.submit(&form, "/team_edit_action.php", &ada, &[("name", "ALPHA PRIME"), ("joinable", "on")]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_edit_action.php",
+        &ada,
+        &[("name", "ALPHA PRIME"), ("joinable", "on")],
+    );
     assert_eq!(page.status, 303);
     assert_eq!(w.n("SELECT joinable FROM team WHERE id = 1"), 1);
 
@@ -804,18 +1060,36 @@ fn the_founders_pages_are_the_founders() {
         &form,
         "/team_remove_inactive_action.php",
         &ada,
-        &[("ninactive_users", "3"), ("remove_1", &ada.id.to_string()), ("remove_2", &cy.id.to_string())],
+        &[
+            ("ninactive_users", "3"),
+            ("remove_1", &ada.id.to_string()),
+            ("remove_2", &cy.id.to_string()),
+        ],
     );
     assert_eq!(page.status, 200);
     assert!(page.body.contains("0 members removed"));
-    assert_eq!((w.team_of(&ada), w.team_of(&bob), w.team_of(&cy)), (1, 1, 2));
-    let (page, n) = w.submit(&form, "/team_remove_inactive_action.php", &ada, &[("remove_0", &bob.id.to_string())]);
+    assert_eq!(
+        (w.team_of(&ada), w.team_of(&bob), w.team_of(&cy)),
+        (1, 1, 2)
+    );
+    let (page, n) = w.submit(
+        &form,
+        "/team_remove_inactive_action.php",
+        &ada,
+        &[("remove_0", &bob.id.to_string())],
+    );
     assert!(page.body.contains("1 member removed"), "{}", page.body);
     // The account, the team, the update.
     assert_eq!(n, 3);
-    assert_eq!((w.team_of(&bob), w.n("SELECT nusers FROM team WHERE id = 1")), (0, 1));
+    assert_eq!(
+        (w.team_of(&bob), w.n("SELECT nusers FROM team WHERE id = 1")),
+        (0, 1)
+    );
     // Nobody left to remove.
-    assert!(w.get("/team_remove_inactive_form.php", Some(&ada), &q).body.contains("No members are eligible"));
+    assert!(w
+        .get("/team_remove_inactive_form.php", Some(&ada), &q)
+        .body
+        .contains("No members are eligible"));
     let (page, _) = w.submit(&form, "/team_remove_inactive_action.php", &bob, &[]);
     assert_eq!(page.status, 403);
 
@@ -823,13 +1097,28 @@ fn the_founders_pages_are_the_founders() {
     w.join(&bob, t);
     let form = w.get("/team_change_founder_form.php", Some(&ada), &q);
     assert!(form.body.contains("type=\"radio\""));
-    let (page, _) = w.submit(&form, "/team_change_founder_action.php", &ada, &[("userid", &cy.id.to_string())]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_change_founder_action.php",
+        &ada,
+        &[("userid", &cy.id.to_string())],
+    );
     assert_eq!(page.status, 409);
-    let (page, _) = w.submit(&form, "/team_change_founder_action.php", &bob, &[("userid", &bob.id.to_string())]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_change_founder_action.php",
+        &bob,
+        &[("userid", &bob.id.to_string())],
+    );
     assert_eq!(page.status, 403);
-    let (page, _) = w.submit(&form, "/team_change_founder_action.php", &ada, &[("userid", &bob.id.to_string())]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_change_founder_action.php",
+        &ada,
+        &[("userid", &bob.id.to_string())],
+    );
     assert_eq!(page.status, 200, "{}", page.body);
-    assert!(page.body.contains("Bob is now the founder of Alpha Prime"));
+    assert!(page.body.contains("Bob is now the founder of ALPHA PRIME"));
     assert_eq!(w.n("SELECT userid FROM team WHERE id = 1"), bob.id);
     assert_eq!(w.get("/team_manage.php", Some(&ada), &q).status, 403);
     assert_eq!(w.get("/team_manage.php", Some(&bob), &q).status, 200);
@@ -853,14 +1142,22 @@ fn a_team_with_no_members_can_be_removed_and_its_id_is_not_reused() {
     assert_eq!(w.n("SELECT nusers FROM team WHERE id = 1"), 0);
     // The account page lists the team it founded and is not in.
     let home = w.get("/home.php", Some(&ada), &[]);
-    assert!(home.body.contains("Founder but not member of") && home.body.contains("team_manage.php?teamid=1"));
+    assert!(
+        home.body.contains("Founder but not member of")
+            && home.body.contains("team_manage.php?teamid=1")
+    );
     // Another account asking is refused; the page asks first (a GET removes nothing).
     assert_eq!(w.get("/team_manage.php", Some(&bob), &q).status, 403);
     let form = w.get("/team_manage.php", Some(&ada), &q);
     assert!(form.body.contains("Remove team") && form.body.contains("name=\"ttok\""));
     assert_eq!(w.n("SELECT count(*) FROM team"), 1);
     // No token: nothing happens.
-    assert_eq!(w.page("/team_manage.php", Some(&ada.auth), true, &q).0.status, 403);
+    assert_eq!(
+        w.page("/team_manage.php", Some(&ada.auth), true, &q)
+            .0
+            .status,
+        403
+    );
     let (page, _) = w.page_with(&w, &form, "/team_manage.php", &ada, &q);
     assert_eq!(page.status, 200, "{}", page.body);
     assert_eq!(w.n("SELECT count(*) FROM team"), 0);
@@ -903,25 +1200,53 @@ fn a_team_without_a_founder_can_be_taken_by_a_member_and_not_otherwise() {
     assert!(page.body.contains("This team has a founder"));
     assert!(!page.body.contains("<form"));
     let form = w.get("/team_quit_form.php", Some(&bob), &[]);
-    let (page, _) = w.submit(&form, "/team_founder_transfer_action.php", &bob, &[("action", "initiate_transfer")]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_founder_transfer_action.php",
+        &bob,
+        &[("action", "initiate_transfer")],
+    );
     assert_eq!(page.status, 409, "{}", page.body);
     // The other actions of the request flow are not offered.
-    let (page, _) = w.submit(&form, "/team_founder_transfer_action.php", &bob, &[("action", "finalize_transfer")]);
+    let (page, _) = w.submit(
+        &form,
+        "/team_founder_transfer_action.php",
+        &bob,
+        &[("action", "finalize_transfer")],
+    );
     assert_eq!(page.status, 400);
     // Not a member: nothing.
-    assert_eq!(w.get("/team_founder_transfer_form.php", Some(&cy), &[]).status, 403);
+    assert_eq!(
+        w.get("/team_founder_transfer_form.php", Some(&cy), &[])
+            .status,
+        403
+    );
     // The founder's account is deleted: the team has none, and a member takes it.
     w.sql(&format!("UPDATE team SET userid = 0 WHERE id = {t}"));
     let page = w.get("/team_founder_transfer_form.php", Some(&bob), &[]);
-    assert!(page.body.contains("This team has no founder") && page.body.contains("initiate_transfer"));
-    let team_page = w.get("/team_display.php", Some(&bob), &[("teamid", &t.to_string())]);
+    assert!(
+        page.body.contains("This team has no founder") && page.body.contains("initiate_transfer")
+    );
+    let team_page = w.get(
+        "/team_display.php",
+        Some(&bob),
+        &[("teamid", &t.to_string())],
+    );
     assert!(team_page.body.contains("Become the founder"));
     let (page, _) = w.submit(&page, "/team_founder_transfer_action.php", &bob, &[]);
     assert_eq!(page.status, 303);
-    assert_eq!(w.n(&format!("SELECT userid FROM team WHERE id = {t}")), bob.id);
+    assert_eq!(
+        w.n(&format!("SELECT userid FROM team WHERE id = {t}")),
+        bob.id
+    );
     // Only once.
     let ada_form = w.get("/team_quit_form.php", Some(&ada), &[]);
-    let (page, _) = w.submit(&ada_form, "/team_founder_transfer_action.php", &ada, &[("action", "initiate_transfer")]);
+    let (page, _) = w.submit(
+        &ada_form,
+        "/team_founder_transfer_action.php",
+        &ada,
+        &[("action", "initiate_transfer")],
+    );
     assert_eq!(page.status, 409);
 }
 
@@ -945,12 +1270,19 @@ fn deleting_an_account_leaves_its_teams_without_a_founder_and_counts_right() {
         ada.id,
         NOW + 1000
     ));
-    let user: cb_core::model::User =
-        block_on(cb_db::query_one(&w.db, stmt!("SELECT * FROM user WHERE id = ?", ada.id)))
-            .unwrap()
-            .unwrap();
+    let user: cb_core::model::User = block_on(cb_db::query_one(
+        &w.db,
+        stmt!("SELECT * FROM user WHERE id = ?", ada.id),
+    ))
+    .unwrap()
+    .unwrap();
     let started = block_on(cb_core::site_delete::start_deletion(
-        &w.db, &user, hash, "deleted_1_x", 2, NOW,
+        &w.db,
+        &user,
+        hash,
+        "deleted_1_x",
+        2,
+        NOW,
     ))
     .unwrap();
     assert!(started);
@@ -960,7 +1292,10 @@ fn deleting_an_account_leaves_its_teams_without_a_founder_and_counts_right() {
     assert_eq!(w.n("SELECT userid FROM team WHERE id = 1"), 0);
     assert_eq!(w.n("SELECT userid FROM team WHERE id = 2"), 0);
     assert_eq!(w.n("SELECT nusers FROM team WHERE id = 1"), 1);
-    assert_eq!(w.n(&format!("SELECT userid FROM team WHERE id = {t2}")), bob.id);
+    assert_eq!(
+        w.n(&format!("SELECT userid FROM team WHERE id = {t2}")),
+        bob.id
+    );
     let page = w.get("/team_display.php", None, &[("teamid", "1")]);
     assert!(page.body.contains("<dt>Founder</dt><dd>---</dd>"));
 }
@@ -982,12 +1317,18 @@ fn the_account_pages_show_the_team() {
     assert!(home.body.contains("Member of team") && !home.body.contains("Administer"));
     // The public page of an account links to its team, and a dash when none.
     let page = w.get("/show_user.php", None, &[("userid", &bob.id.to_string())]);
-    assert!(page.body.contains(&format!("<th>Team</th><td><a href=\"team_display.php?teamid={t}\">Alpha &quot;x&quot;</a></td>")));
+    assert!(page.body.contains(&format!(
+        "<th>Team</th><td><a href=\"team_display.php?teamid={t}\">Alpha &quot;x&quot;</a></td>"
+    )));
     w.sql(&format!("UPDATE user SET teamid = 0 WHERE id = {}", bob.id));
     let page = w.get("/show_user.php", None, &[("userid", &bob.id.to_string())]);
     assert!(page.body.contains("<th>Team</th><td>&mdash;</td>"));
     // The XML carries the ID as upstream's (and no more).
-    let xml = w.get("/show_user.php", None, &[("userid", &ada.id.to_string()), ("format", "xml")]);
+    let xml = w.get(
+        "/show_user.php",
+        None,
+        &[("userid", &ada.id.to_string()), ("format", "xml")],
+    );
     assert!(xml.body.contains(&format!("<teamid>{t}</teamid>")));
     // The navigation has one Teams entry.
     let nav = w.get("/top_teams.php", None, &[]).body;
@@ -1007,9 +1348,19 @@ fn account_managers_join_and_quit_teams() {
     let set = |who: &Account, params: &[(&str, &str)]| -> (String, u64) {
         let mut pairs = vec![("account_key", who.auth.as_str())];
         pairs.extend_from_slice(params);
-        let q: Params = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let q: Params = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let before = w.db.statements();
-        let reply = block_on(cb_core::web::am_set_info(&w.db, &w.project.config, PEPPER, NOW, &q)).unwrap();
+        let reply = block_on(cb_core::web::am_set_info(
+            &w.db,
+            &w.project.config,
+            PEPPER,
+            NOW,
+            &q,
+        ))
+        .unwrap();
         (reply, w.db.statements() - before)
     };
     let cy = w.account("Cy");
@@ -1021,7 +1372,12 @@ fn account_managers_join_and_quit_teams() {
     assert_eq!(w.n(&format!("SELECT nusers FROM team WHERE id = {t}")), 2);
     // A team that is not joinable, one that does not exist, and a value that is
     // not a number leave the account where it is, as upstream's silent skip.
-    for v in [closed.to_string(), "999".to_string(), "x".to_string(), "-3".to_string()] {
+    for v in [
+        closed.to_string(),
+        "999".to_string(),
+        "x".to_string(),
+        "-3".to_string(),
+    ] {
         let (reply, _) = set(&cy, &[("teamid", &v)]);
         assert!(reply.contains("<success/>"), "{reply}");
         assert_eq!(w.team_of(&cy), t, "{v}");
@@ -1034,11 +1390,16 @@ fn account_managers_join_and_quit_teams() {
     let info = block_on(am_get_info(&w.db, &cy.auth)).unwrap();
     assert!(info.contains(&format!("<teamid>{t}</teamid>")) && !info.contains("<teamfounder/>"));
     let info = block_on(am_get_info(&w.db, &ada.auth)).unwrap();
-    assert!(info.contains("<venue></venue>\n<teamfounder/>\n</am_get_info_reply>"), "{info}");
+    assert!(
+        info.contains("<venue></venue>\n<teamfounder/>\n</am_get_info_reply>"),
+        "{info}"
+    );
     // A founder who is not a member is not reported as founder, as upstream's
     // check is made only for an account with a team.
     w.sql(&format!("UPDATE user SET teamid = 0 WHERE id = {}", ada.id));
-    assert!(!block_on(am_get_info(&w.db, &ada.auth)).unwrap().contains("teamfounder"));
+    assert!(!block_on(am_get_info(&w.db, &ada.auth))
+        .unwrap()
+        .contains("teamfounder"));
     // Quit.
     let (reply, n) = set(&cy, &[("teamid", "0")]);
     assert!(reply.contains("<success/>"));
@@ -1058,7 +1419,11 @@ fn a_project_can_turn_teams_off() {
         ada.id
     ));
     for path in TEAM_PATHS {
-        let q: &[(&str, &str)] = if path == "/team_lookup.php" { &[] } else { &[("teamid", "1")] };
+        let q: &[(&str, &str)] = if path == "/team_lookup.php" {
+            &[]
+        } else {
+            &[("teamid", "1")]
+        };
         let page = w.get(path, Some(&ada), q);
         assert_eq!(page.status, 404, "{path}");
         assert!(page.body.contains("Teams are disabled"), "{path}");
@@ -1066,7 +1431,10 @@ fn a_project_can_turn_teams_off() {
         assert_eq!(page.status, 404, "{path}");
     }
     // The RPC answers an XML error.
-    for q in [&[("team_id", "1")][..], &[("team_name", "a"), ("format", "xml")]] {
+    for q in [
+        &[("team_id", "1")][..],
+        &[("team_name", "a"), ("format", "xml")],
+    ] {
         let page = w.get("/team_lookup.php", None, q);
         assert_eq!(page.status, 200);
         assert_eq!(error_num(&page.body), Some(-1));
@@ -1078,7 +1446,10 @@ fn a_project_can_turn_teams_off() {
         w.get("/top_users.php", None, &[]).body,
         cb_core::web::master_page_with(&w.project, None, NOW),
     ] {
-        assert!(!body.contains("team.php") && !body.contains("Teams"), "{body}");
+        assert!(
+            !body.contains("team.php") && !body.contains("Teams"),
+            "{body}"
+        );
     }
     let page = w.get("/show_user.php", None, &[("userid", &ada.id.to_string())]);
     assert!(!page.body.contains("Team"));
@@ -1087,7 +1458,14 @@ fn a_project_can_turn_teams_off() {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     let (project_config, _) = (&w.project.config, 0);
-    let reply = block_on(cb_core::web::am_set_info(&w.db, project_config, PEPPER, NOW, &q)).unwrap();
+    let reply = block_on(cb_core::web::am_set_info(
+        &w.db,
+        project_config,
+        PEPPER,
+        NOW,
+        &q,
+    ))
+    .unwrap();
     assert!(reply.contains("<success/>"));
     assert_eq!(w.team_of(&ada), 0);
     // On by default.
@@ -1099,10 +1477,15 @@ fn team_creation_can_be_restricted() {
     let w = World::with_config("<team_create_need_credit/>\n");
     let ada = w.account("Ada");
     let page = w.get("/team_create_form.php", Some(&ada), &[]);
-    assert!(page.body.contains("You must complete a task to create a team"));
+    assert!(page
+        .body
+        .contains("You must complete a task to create a team"));
     assert!(!page.body.contains("<form"));
     w.sql("UPDATE user SET total_credit = 1");
-    assert!(w.get("/team_create_form.php", Some(&ada), &[]).body.contains("<form"));
+    assert!(w
+        .get("/team_create_form.php", Some(&ada), &[])
+        .body
+        .contains("<form"));
     w.create(&ada, "Alpha", &[]);
 
     let w = World::with_config("<disable_team_creation/>\n");
@@ -1110,7 +1493,9 @@ fn team_creation_can_be_restricted() {
     let page = w.get("/team_create_form.php", Some(&ada), &[]);
     assert!(page.body.contains("Team creation is disabled") && !page.body.contains("<form"));
     let q = [("name", "x")];
-    let page = w.page("/team_create_action.php", Some(&ada.auth), true, &q).0;
+    let page = w
+        .page("/team_create_action.php", Some(&ada.auth), true, &q)
+        .0;
     assert_eq!(page.status, 403);
     // Joining and the other pages are unaffected.
     assert_eq!(w.get("/team.php", None, &[]).status, 200);
@@ -1123,14 +1508,40 @@ fn page_costs_are_bounded() {
     let t = w.create(&ada, "Alpha", &[("joinable", "on")]);
     let id = t.to_string();
     // The visitor, then the team with its founder.
-    assert_eq!(w.page("/team_display.php", Some(&ada.auth), false, &[("teamid", &id)]).1, 2);
-    assert_eq!(w.page("/team_display.php", None, false, &[("teamid", &id)]).1, 1);
+    assert_eq!(
+        w.page(
+            "/team_display.php",
+            Some(&ada.auth),
+            false,
+            &[("teamid", &id)]
+        )
+        .1,
+        2
+    );
+    assert_eq!(
+        w.page("/team_display.php", None, false, &[("teamid", &id)])
+            .1,
+        1
+    );
     // The viewer and the team's members, and the list.
-    assert_eq!(w.page("/team_members.php", None, false, &[("teamid", &id)]).1, 2);
+    assert_eq!(
+        w.page("/team_members.php", None, false, &[("teamid", &id)])
+            .1,
+        2
+    );
     assert_eq!(w.page("/top_teams.php", None, false, &[]).1, 1);
     assert_eq!(w.page("/team.php", None, false, &[]).1, 0);
     // The public page of an account with a team costs one more.
-    assert_eq!(w.page("/show_user.php", None, false, &[("userid", &ada.id.to_string())]).1, 2);
+    assert_eq!(
+        w.page(
+            "/show_user.php",
+            None,
+            false,
+            &[("userid", &ada.id.to_string())]
+        )
+        .1,
+        2
+    );
     // Creating takes the account, then the one batch (two statements).
     let bob = w.account("Bob");
     let form = w.get("/team_create_form.php", Some(&bob), &[]);
@@ -1142,7 +1553,11 @@ fn page_costs_are_bounded() {
         1
     )))
     .unwrap();
-    let text: Vec<String> = plan.rows.iter().map(|r| r["detail"].as_str().unwrap().to_string()).collect();
+    let text: Vec<String> = plan
+        .rows
+        .iter()
+        .map(|r| r["detail"].as_str().unwrap().to_string())
+        .collect();
     assert!(text.iter().any(|d| d.contains("user_team")), "{text:?}");
     // The founder's teams and the deletion check use their indexes too.
     let plan_of = |sql: &str, params: Vec<cb_db::Value>| -> Vec<String> {

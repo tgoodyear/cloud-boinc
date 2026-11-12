@@ -329,7 +329,8 @@ fn the_reply_names_the_accounts_team() {
     let xml = out.reply.write().unwrap();
     assert!(xml.contains("<team_name></team_name>\n") && !xml.contains("<teamid>"));
 
-    w.db.apply("UPDATE user SET teamid = 5 WHERE id = 1;").unwrap();
+    w.db.apply("UPDATE user SET teamid = 5 WHERE id = 1;")
+        .unwrap();
     let mut req = Req::new(out.host_id);
     req.seqno = 2;
     let (out, with_team) = statements(&w, &req, 2100);
