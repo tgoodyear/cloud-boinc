@@ -82,14 +82,15 @@ impl World {
         let upload_signer = Signer::new(&upload_private).unwrap();
         let short = spec["short_name"].as_str().unwrap();
 
-        // The URLs stock `make_project` gives a project made at BASE, and the
+        // The URLs of a stock project made at BASE (the stock layout of a project
+        // moved from a stock server: `stock_short_name`, `uldl_dir_fanout`), and the
         // other options it writes to config.xml that this server reads
         // (`Project.config` in py/Boinc/setup_project.py). Then the options
         // the stock project is given besides (config-options.xml).
         let config_xml = format!(
             "<config>\n<long_name>{}</long_name>\n<master_url>{BASE}/{short}/</master_url>\n\
-             <download_url>{BASE}/{short}/download</download_url>\n\
-             <upload_url>{BASE}/{short}_cgi/file_upload_handler</upload_url>\n\
+             <stock_short_name>{short}</stock_short_name>\n\
+             <uldl_dir_fanout>1024</uldl_dir_fanout>\n\
              <min_sendwork_interval>6</min_sendwork_interval>\n\
              <max_wus_to_send>50</max_wus_to_send>\n\
              <daily_result_quota>500</daily_result_quota>\n\
@@ -393,6 +394,7 @@ impl World {
                 let ctx = SiteCtx {
                     db: &self.db,
                     project: &self.project,
+                    base: &self.project.config.master_url,
                     auth: None,
                     post: method == "POST",
                     pepper: Some(PEPPER),

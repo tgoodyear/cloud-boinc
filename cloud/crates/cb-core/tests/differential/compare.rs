@@ -89,14 +89,6 @@ pub const RANDOM: &[(&str, &str)] = &[
 /// to both values before they are compared.
 pub const TRANSFORMS: &[(&str, &str, &str, &str)] = &[
     (
-        // The stock server spreads the files in `download/` over directories,
-        // named by a hash of the file name (`uldl_dir_fanout`).
-        "download-fanout",
-        "scheduler_reply/file_info/url",
-        "/download/[0-9a-f]+/",
-        "/download/",
-    ),
-    (
         // The seconds a host must wait: stock counts from the fraction of a
         // second its last request came in, this server from whole seconds.
         "wait-seconds",
@@ -108,7 +100,7 @@ pub const TRANSFORMS: &[(&str, &str, &str, &str)] = &[
         // The stock scheduler marks some messages for translation, as
         // `_("text")`, which the client removes before it shows them
         // (`strip_translation` in `lib/str_util.cpp`). This server sends the
-        // plain text. See D13.
+        // plain text. See D11.
         "translation-markers",
         "scheduler_reply/message",
         "_\\(\"|\"\\)",
@@ -117,7 +109,7 @@ pub const TRANSFORMS: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub const INTENDED: &[Intended] = &[
-    // D2: no project web pages, so no `<gui_urls>` and `<rss_feeds>`.
+    // D1: no project web pages, so no `<gui_urls>` and `<rss_feeds>`.
     Intended {
         id: "gui-urls",
         step: "*",
@@ -130,7 +122,7 @@ pub const INTENDED: &[Intended] = &[
         shape: "scheduler_reply/rss_feeds/*",
         kind: Kind::OnlyStock,
     },
-    // D3: a wrong password. The stock script dies with a PHP error.
+    // D2: a wrong password. The stock script dies with a PHP error.
     Intended {
         id: "lookup-bad-password",
         step: "attach/03-*",
@@ -143,7 +135,7 @@ pub const INTENDED: &[Intended] = &[
         shape: "error/*",
         kind: Kind::OnlyOurs,
     },
-    // D4: `am_set_info.php`.
+    // D3: `am_set_info.php`.
     Intended {
         id: "am-set-info",
         step: "web/10-*",
@@ -156,7 +148,7 @@ pub const INTENDED: &[Intended] = &[
         shape: "am_set_info_reply/*",
         kind: Kind::OnlyOurs,
     },
-    // D5: `server_status.php?xml=1`.
+    // D4: `server_status.php?xml=1`.
     Intended {
         id: "server-status",
         step: "web/03-*",
@@ -175,7 +167,7 @@ pub const INTENDED: &[Intended] = &[
         shape: "server_status/*",
         kind: Kind::Differs,
     },
-    // D6: uploads of files smaller than a piece are not resumable.
+    // D5: uploads of files smaller than a piece are not resumable.
     Intended {
         id: "upload-pieces",
         step: "uploads/10-*|uploads/11-*|uploads/12-*",
@@ -188,7 +180,7 @@ pub const INTENDED: &[Intended] = &[
         shape: "data_server_reply/*",
         kind: Kind::OnlyOurs,
     },
-    // D7: a file that exists is never replaced.
+    // D6: a file that exists is never replaced.
     Intended {
         id: "upload-exists",
         step: "uploads/06-*",

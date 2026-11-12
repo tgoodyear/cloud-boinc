@@ -204,7 +204,9 @@ fn replies_match_the_stock_server() {
                     "{name}/{step_name}: no scheduler link"
                 );
                 if a != b {
-                    *used.intended.entry("scheduler-url").or_default() += 1;
+                    findings.push(format!(
+                        "{name}/{step_name}: scheduler links differ: stock {a:?}, ours {b:?}"
+                    ));
                 }
                 continue;
             }
