@@ -14,6 +14,7 @@ use cb_crypto::account::{pepper_passwd_hash, random_hex_string, token_hash};
 use cb_db::{stmt, Stmt};
 
 use crate::mail::Mail;
+use crate::mail_guard::{Delivery, CANNOT_RECEIVE};
 use crate::model::User;
 use crate::site::{
     error_page, layout, login_cookie, str_param, time_str, to_login, viewer, Params, SiteCtx,
@@ -225,21 +226,27 @@ pub(crate) enum Budget {
     Exempt,
 }
 
-/// Sends a message to `to`: nowhere unless it is a well-formed address, and
+/// Sends a message to `to`, the address of account `userid`: nowhere unless
+/// it is a well-formed address that can receive mail (`mail_guard`), and
 /// counted against the day's allowance (`Budget`) in one statement that cannot
-/// let two requests past the last one. `false` when the address is refused,
-/// the allowance is used or the transport failed; callers treat all of them as
-/// "not sent". A message that fails still counts.
+/// let two requests past the last one. The check on the address comes first:
+/// a refused message is not counted, does not reach the transport, and is
+/// logged with the reason and `userid`. Every message the site sends goes
+/// through here. A message that fails still counts.
 async fn deliver(
     ctx: &SiteCtx<'_>,
     mail: &Mail<'_>,
+    userid: i64,
     to: &str,
     subject: &str,
     body: &str,
     budget: Budget,
-) -> CoreResult<bool> {
+) -> CoreResult<Delivery> {
     if !is_strict_email(to) {
-        return Ok(false);
+        return Ok(Delivery::NotSent);
+    }
+    if let Some(reason) = mail.refuse(userid, to) {
+        return Ok(Delivery::Undeliverable(reason));
     }
     let cap = ctx.project.config.email_max_per_day;
     let day = ctx.now.div_euclid(86400);
@@ -275,9 +282,13 @@ async fn deliver(
         }
     };
     if !counted {
-        return Ok(false);
+        return Ok(Delivery::NotSent);
     }
-    Ok(mail.send(to, subject, body).await.is_ok())
+    Ok(if mail.send(to, subject, body).await.is_ok() {
+        Delivery::Sent
+    } else {
+        Delivery::NotSent
+    })
 }
 
 fn no_mail_page(ctx: &SiteCtx<'_>) -> SitePage {
@@ -372,7 +383,9 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
         .first()?;
     // An address the site would not mail (an account made under the looser
     // rule) gets no token either: it would use the account's slot for nothing.
-    if let Some(user) = user.filter(|u| is_strict_email(&u.email_addr)) {
+    if let Some(user) = user
+        .filter(|u| is_strict_email(&u.email_addr) && mail.refuse(u.id, &u.email_addr).is_none())
+    {
         if let Some(token) = issue_token(ctx, &user, &LOGIN, "").await? {
             let n = name(ctx);
             let body = format!(
@@ -395,6 +408,7 @@ pub async fn mail_passwd(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> 
             deliver(
                 ctx,
                 &mail,
+                user.id,
                 &user.email_addr,
                 &format!("{n} account information"),
                 &body,
@@ -524,6 +538,8 @@ pub(crate) enum Sent {
     /// One was sent within [`MAIL_INTERVAL_SECS`]; nothing was sent now.
     Recent,
     Failed,
+    /// The address cannot receive mail; nothing was issued or sent.
+    Undeliverable,
 }
 
 /// Mails the account the link that verifies its current address, unless it
@@ -537,6 +553,9 @@ pub(crate) async fn send_verification(
     if !is_strict_email(&user.email_addr) {
         return Ok(Sent::Failed);
     }
+    if mail.refuse(user.id, &user.email_addr).is_some() {
+        return Ok(Sent::Undeliverable);
+    }
     let Some(token) = issue_token(ctx, user, &VERIFY, &user.email_addr).await? else {
         return Ok(Sent::Recent);
     };
@@ -547,9 +566,10 @@ pub(crate) async fn send_verification(
          (This link is valid for 1 day and works once.)\n",
         ctx.project.config.master_url, user.id
     );
-    if !deliver(
+    match deliver(
         ctx,
         mail,
+        user.id,
         &user.email_addr,
         "Validate BOINC email address",
         &body,
@@ -557,11 +577,12 @@ pub(crate) async fn send_verification(
     )
     .await?
     {
+        Delivery::Sent => Ok(Sent::Delivered),
+        Delivery::Undeliverable(_) => Ok(Sent::Undeliverable),
         // The limit stays used, and so does the link if the message did get
         // there after all.
-        return Ok(Sent::Failed);
+        Delivery::NotSent => Ok(Sent::Failed),
     }
-    Ok(Sent::Delivered)
 }
 
 /// `validate_email_addr.php`. Logged in, a GET shows the button and a POST
@@ -719,6 +740,13 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
             503,
             &format!("Can't send email to {}.", user.email_addr),
         ),
+        Sent::Undeliverable => error_page(
+            project,
+            400,
+            &format!(
+                "{CANNOT_RECEIVE} Change the address of your account on the account page, then                  ask for the message again."
+            ),
+        ),
     })
 }
 
@@ -755,13 +783,25 @@ pub(crate) async fn send_change_notices(
          (This link is valid for 7 days and works once.)\n",
         time_str(ctx.now),
     );
-    let sent_old = deliver(ctx, mail, previous, &subject, &to_old, Budget::Exempt).await?;
+    let sent_old = deliver(
+        ctx,
+        mail,
+        userid,
+        previous,
+        &subject,
+        &to_old,
+        Budget::Exempt,
+    )
+    .await?
+    .is_sent();
     let to_new = format!(
         "This email address was set on an account at {n} ({master}) on {}. If that was not \
          you, you can ignore this message.\n",
         time_str(ctx.now),
     );
-    let sent_new = deliver(ctx, mail, new, &subject, &to_new, Budget::Exempt).await?;
+    let sent_new = deliver(ctx, mail, userid, new, &subject, &to_new, Budget::Exempt)
+        .await?
+        .is_sent();
     Ok(sent_new && sent_old)
 }
 

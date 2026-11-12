@@ -16,6 +16,7 @@ use cb_crypto::account::{
 use cb_db::stmt;
 
 use crate::countries::{is_valid_country, COUNTRIES};
+use crate::mail_guard::{cannot_receive, CANNOT_RECEIVE};
 use crate::model::User;
 use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
@@ -218,6 +219,9 @@ pub async fn create_account_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<
             400,
             "Invalid email address: please enter a valid address of the form name@xxx.yyy",
         ));
+    }
+    if cannot_receive(ctx, &email) {
+        return Ok(error_page(project, 400, CANNOT_RECEIVE));
     }
     let passwd = q.get("passwd").map(String::as_str).unwrap_or_default();
     if let Some(e) = passwd_error(passwd) {
@@ -603,6 +607,9 @@ pub async fn edit_email_action(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Site
             400,
             "The new email address is invalid.",
         ));
+    }
+    if cannot_receive(ctx, &email) {
+        return Ok(error_page(project, 400, CANNOT_RECEIVE));
     }
     if email == user.email_addr {
         return Ok(error_page(

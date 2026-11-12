@@ -7,11 +7,11 @@ use std::cell::Cell;
 
 use async_trait::async_trait;
 use cb_core::mail::{error_class, MailError, MailMessage, Mailer};
-use worker::console_error;
 use worker::email::{EmailAddress, SendEmail, SendEmailBuilder};
 use worker::js_sys::Reflect;
 use worker::wasm_bindgen::JsValue;
 use worker::Env;
+use worker::{console_error, console_warn};
 
 /// Name of the `send_email` binding. A Worker without it sends no email.
 pub const EMAIL: &str = "EMAIL";
@@ -50,6 +50,11 @@ pub struct EmailBinding(SendEmail);
 
 #[async_trait(?Send)]
 impl Mailer for EmailBinding {
+    fn log_refused(&self, userid: i64, reason: &str) {
+        // The reason word and the account id: never the address.
+        console_warn!("email not sent: undeliverable address ({reason}), user {userid}");
+    }
+
     async fn send(&self, message: &MailMessage) -> Result<(), MailError> {
         let f = message.fields();
         let builder = match f.from_name {
