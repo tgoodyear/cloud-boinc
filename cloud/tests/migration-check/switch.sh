@@ -44,6 +44,7 @@ else
     sh "$HERE/dump-rows.sh" --work "$WORK" $likes
 fi
 podman exec "$STOCK_NAME" mariadb-dump --socket=/run/mysqld/mysqld.sock --databases "$PROJECT" > "$WORK/stock-final.sql"
+chmod 600 "$WORK/stock-final.sql"
 for t in $tags; do
     load_client "$t"
     wc -l < "$(client_log)" > "$C_DIR/log-lines-at-switch"

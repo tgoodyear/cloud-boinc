@@ -14,6 +14,8 @@
 # The account, the forward and the DSN file are removed at the end.
 usage() { sed -n '2,/^usage()/p' "$0" | sed '$d' >&2; exit 2; }
 set -eu
+# Everything this script makes holds accounts' keys and hashes: private to this user.
+umask 077
 work="" importer="" finished=leave
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -68,5 +70,6 @@ rm -f "$WORK/import-check.sqlite"
     --config "$proj/config.xml" --passwd-pepper-file "$WORK/cloud-state/pepper" \
     --finished "$finished" --target-sqlite "$WORK/import-check.sqlite" --sample 1000 \
     >> "$WORK/import-verify.txt" 2>&1 || { cat "$WORK/import-verify.txt" >&2; die "verify failed"; }
-cat "$WORK"/import-sql/*.sql > "$WORK/rows.sql"
+cat "$WORK"/import-sql/*.sql > "$WORK/rows.sql.tmp"
+mv "$WORK/rows.sql.tmp" "$WORK/rows.sql"
 log "rows.sql ready"

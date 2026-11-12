@@ -246,14 +246,6 @@ pub fn verify_with(
 ) -> Result<VerifyReport> {
     let conn = Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| ImportError::usage("cannot open the --target-sqlite file"))?;
-    let own;
-    let pre = match pre {
-        Some(p) => p,
-        None => {
-            own = preflight(src, opts, summary)?;
-            &own
-        }
-    };
     // The mapping needs the table layouts; they come from the migrations.
     let mem = Connection::open_in_memory()?;
     crate::schema::apply_migrations(&mem)?;
@@ -261,11 +253,20 @@ pub fn verify_with(
     let mut vopts = opts.clone();
     vopts.files_manifest = None;
     // The import wrote its time into the file (`user_version`): the open workunits'
-    // `transition_time` and the `recent` window were derived from it, not from now.
+    // `transition_time` and the `recent` window were derived from it, not from now. It is put
+    // back before the preflight, which chooses the workunits with that window.
     let recorded: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if recorded > 0 {
         vopts.now = recorded;
     }
+    let own;
+    let pre = match pre {
+        Some(p) => p,
+        None => {
+            own = preflight(src, &vopts, summary)?;
+            &own
+        }
+    };
     let mut sink = VerifySink {
         conn: &conn,
         sample,

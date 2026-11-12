@@ -137,6 +137,8 @@ pub struct SqlDirSink {
     part: u32,
     written: u64,
     pub files: Vec<PathBuf>,
+    /// The import time marker, once this run has written it.
+    pub marker: Option<PathBuf>,
     pub max_statement_seen: usize,
     pub split_rows: u64,
 }
@@ -149,12 +151,15 @@ impl SqlDirSink {
             .map_err(|_| ImportError::usage("cannot read the --target-sql-dir directory"))?
             .any(|e| {
                 e.ok()
-                    .map(|e| e.file_name().to_string_lossy().ends_with(".sql"))
+                    .map(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        n.ends_with(".sql") || n == IMPORT_TIME_FILE
+                    })
                     .unwrap_or(false)
             });
         if any {
             return Err(ImportError::usage(
-                "the --target-sql-dir directory already holds .sql files; give an empty one",
+                "the --target-sql-dir directory already holds output of an import (.sql files or import_time.txt); give an empty one",
             ));
         }
         Ok(SqlDirSink {
@@ -167,6 +172,7 @@ impl SqlDirSink {
             part: 0,
             written: 0,
             files: Vec::new(),
+            marker: None,
             max_statement_seen: 0,
             split_rows: 0,
         })
@@ -329,8 +335,10 @@ impl Sink for SqlDirSink {
     fn set_import_time(&mut self, t: i64) -> Result<()> {
         // Not a `.sql` file, so nothing that loads the directory's `.sql` files sees it.
         use std::io::Write as _;
-        let mut f = crate::fsutil::create_private_file(&self.dir.join(IMPORT_TIME_FILE))
+        let path = self.dir.join(IMPORT_TIME_FILE);
+        let mut f = crate::fsutil::create_private_file(&path)
             .map_err(|_| ImportError::target("cannot write the import time file"))?;
+        self.marker = Some(path);
         writeln!(f, "{t}").map_err(|_| ImportError::target("cannot write the import time file"))
     }
     fn finish(&mut self, floors: &[(String, i64)]) -> Result<()> {
@@ -437,6 +445,22 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         apply_migrations(&conn).unwrap();
         table_info(&conn, table).unwrap()
+    }
+
+    #[test]
+    fn the_marker_is_tracked_and_a_stale_one_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("o");
+        let mut sink = SqlDirSink::create(&dir, DEFAULT_MAX_FILE_BYTES).unwrap();
+        assert!(sink.marker.is_none());
+        sink.set_import_time(5).unwrap();
+        let m = sink.marker.clone().unwrap();
+        assert!(m.exists());
+        // A directory that holds an earlier run's marker is not an empty output directory.
+        assert!(SqlDirSink::create(&dir, DEFAULT_MAX_FILE_BYTES).is_err());
+        // The one this run wrote is the one cleanup would remove.
+        std::fs::remove_file(&m).unwrap();
+        assert!(SqlDirSink::create(&dir, DEFAULT_MAX_FILE_BYTES).is_ok());
     }
 
     #[cfg(unix)]

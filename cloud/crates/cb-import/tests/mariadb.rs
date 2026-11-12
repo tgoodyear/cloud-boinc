@@ -1592,3 +1592,28 @@ fn verify_uses_the_import_time_recorded_in_the_file() {
     let r = verify(&mut src, &path, &later, 1000, &mut s).unwrap();
     assert!(r.ok(), "{}", r.render());
 }
+
+#[test]
+fn verify_with_recent_uses_the_recorded_window() {
+    let fx = fx!("recentverify");
+    // wu1 was created at 1_700_000_001; the window of the import reaches it.
+    let mut o = fx.options();
+    o.finished = Finished::Recent;
+    o.now = 1_700_000_001 + 5 * 86400;
+    o.finished_days = 10;
+    let (_, path, _) = fx.import_sqlite(&o, "recent.sqlite").unwrap();
+    assert_eq!(
+        q_i(
+            &Connection::open(&path).unwrap(),
+            "SELECT count(*) FROM workunit"
+        ),
+        5
+    );
+    // Verified later: the same window flags, a clock past the edge of the window.
+    let mut later = o.clone();
+    later.now = 1_700_000_001 + 60 * 86400;
+    let mut src = Source::connect(&fx.dsn_file).unwrap();
+    let mut s = Summary::default();
+    let r = verify(&mut src, &path, &later, 1000, &mut s).unwrap();
+    assert!(r.ok(), "{}", r.render());
+}

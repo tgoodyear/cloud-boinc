@@ -137,3 +137,64 @@ fn a_loaded_sqlite_file_is_private() {
         0o600
     );
 }
+
+#[test]
+fn output_paths_that_collide_are_refused_before_anything_is_created() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    let dsn = p.join("dsn");
+    std::fs::write(&dsn, "mysql://u:p@127.0.0.1:1/db\n").unwrap();
+    std::fs::create_dir(p.join("sub")).unwrap();
+    let run = |args: &[&std::ffi::OsStr]| {
+        bin()
+            .args(["import", "--source-dsn-file"])
+            .arg(&dsn)
+            .arg("--project-dir")
+            .arg(p)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let db = p.join("x.sqlite");
+    let spelled = p.join("sub/../x.sqlite");
+    let sql = p.join("out");
+    let cases: Vec<Vec<std::path::PathBuf>> = vec![
+        // manifest = target, two spellings
+        vec![
+            "--target-sqlite".into(),
+            db.clone(),
+            "--files-manifest".into(),
+            spelled,
+        ],
+        // manifest inside the .sql directory, named like a numbered file
+        vec![
+            "--target-sql-dir".into(),
+            sql.clone(),
+            "--files-manifest".into(),
+            sql.join("0001_platform.sql"),
+        ],
+        // manifest = the DSN file
+        vec![
+            "--target-sqlite".into(),
+            db.clone(),
+            "--files-manifest".into(),
+            dsn.clone(),
+        ],
+    ];
+    for c in cases {
+        let a: Vec<&std::ffi::OsStr> = c.iter().map(|x| x.as_os_str()).collect();
+        let out = run(&a);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("same path"));
+    }
+    assert!(!db.exists() && !sql.exists());
+    assert_eq!(
+        std::fs::read_to_string(&dsn).unwrap(),
+        "mysql://u:p@127.0.0.1:1/db\n"
+    );
+}

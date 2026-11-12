@@ -45,7 +45,7 @@ cb-import load-sql --sql-dir DIR --target-sqlite FILE
 ```
 
 Every argument is a named flag. A target is created new: the tool refuses a SQLite file that exists and
-a directory that already holds `.sql` files, and when an import fails it removes what it wrote (only what it created). Every file the tool writes (the SQLite file, the `.sql` files, the manifest) is created with mode 0600, and a directory it has to create with mode 0700, whatever the umask: they hold accounts' keys and password hashes. `import_time.txt` beside the `.sql` files is the Unix time of the import.
+a directory that already holds `.sql` files, and when an import fails it removes what it wrote (only what it created). Before anything is created or connected the tool refuses outputs that name the same path or one inside another under any spelling (a manifest equal to the SQLite file, a manifest inside the `.sql` directory, an output equal to the DSN, `--config`, pepper or key file, also through a symlink). A directory that already holds `.sql` files or `import_time.txt` is refused, and a failed import removes the marker it wrote with the `.sql` files. Every file the tool writes (the SQLite file, the `.sql` files, the manifest) is created with mode 0600, and a directory it has to create with mode 0700, whatever the umask: they hold accounts' keys and password hashes. `import_time.txt` beside the `.sql` files is the Unix time of the import.
 
 | Flag | Meaning |
 |------|---------|
@@ -479,6 +479,17 @@ download directory (D32), listed no application file in the manifest and warned 
 did not need the file. That is why D32 is there.
 
 The check ran one client and one version. The multi-client matrix of `compatibility.md` was not rerun.
+
+## Known gap: application file URLs without a hash directory
+
+With a non-zero `uldl_dir_fanout`, the stock `update_versions` writes the URL of an application file without a hash
+directory (`<download URL>/<name>`, D32), and a client that does not have the file cached fetches it from that URL.
+This server answers a stock download path only when it has the hash directory: `StockLayout::download_name` in
+`cloud/crates/cb-core/src/stock.rs` returns nothing for `<download prefix>/<name>` when the fan-out is not 0, and
+`route_files` then has no route for it. Checked with `route_files`: `/<short>/download/<dir>/<name>` is routed to the
+download, `/<short>/download/<name>` is `NotFound`, so a request for an application file by its stored URL
+gets a 404. (Not run against a stack; the routing function is the whole decision.) A move of a project whose
+clients may need to download an application file again needs that fixed first. Input files are unaffected: `create_work` writes them with the hash directory.
 
 ## Not covered
 

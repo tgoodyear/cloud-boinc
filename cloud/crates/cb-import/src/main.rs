@@ -171,6 +171,36 @@ fn options(c: &Common, manifest: Option<PathBuf>) -> Result<Options, ImportError
     })
 }
 
+fn check_output_paths(
+    c: &Common,
+    sqlite: Option<&std::path::Path>,
+    sql_dir: Option<&std::path::Path>,
+    manifest: Option<&std::path::Path>,
+) -> Result<(), ImportError> {
+    let mut outputs: Vec<(&str, PathBuf)> = Vec::new();
+    let mut inputs: Vec<(&str, PathBuf)> = Vec::new();
+    if let Some(p) = sqlite {
+        outputs.push(("--target-sqlite", p.to_path_buf()));
+    }
+    if let Some(p) = sql_dir {
+        outputs.push(("--target-sql-dir", p.to_path_buf()));
+    }
+    if let Some(p) = manifest {
+        outputs.push(("--files-manifest", p.to_path_buf()));
+    }
+    inputs.push(("--source-dsn-file", c.source_dsn_file.clone()));
+    for (n, p) in [
+        ("--config", &c.config),
+        ("--passwd-pepper-file", &c.passwd_pepper_file),
+        ("--code-sign-public-key", &c.code_sign_public_key),
+    ] {
+        if let Some(p) = p {
+            inputs.push((n, p.clone()));
+        }
+    }
+    cb_import::fsutil::check_distinct_paths(&outputs, &inputs)
+}
+
 fn opts_rows_only_manifest(c: &Common, m: &Option<PathBuf>) -> bool {
     c.rows_only && m.is_some()
 }
@@ -212,6 +242,14 @@ fn go() -> Result<i32, ImportError> {
                     "give exactly one of --target-sqlite and --target-sql-dir",
                 ));
             }
+            // Before anything is created or connected: no output may be another output, or
+            // an input, under any spelling of its path.
+            check_output_paths(
+                &common,
+                target_sqlite.as_deref(),
+                target_sql_dir.as_deref(),
+                files_manifest.as_deref(),
+            )?;
             let opts = options(&common, files_manifest)?;
             let mut src = Source::connect(&common.source_dsn_file)?;
             let mut summary = Summary::default();
@@ -236,7 +274,9 @@ fn go() -> Result<i32, ImportError> {
                     summary.count("rows split into more than one statement", sink.split_rows);
                     summary.count("longest statement in bytes", sink.max_statement_seen as u64);
                 } else {
-                    for f in &sink.files {
+                    // Only what this run created: the marker is in the list only once
+                    // this run has written it.
+                    for f in sink.files.iter().chain(sink.marker.iter()) {
                         let _ = std::fs::remove_file(f);
                     }
                 }

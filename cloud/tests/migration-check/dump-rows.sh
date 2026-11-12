@@ -33,4 +33,5 @@ stock_exec python3 /state/migrate/copy_rows.py --db "$PROJECT" --socket /run/mys
     --migrations /state/migrate/migrations --project-dir /state/project \
     --pepper-file /state/migrate/pepper --out /state/migrate/rows.sql $likes
 mv "$mig/rows.sql" "$WORK/rows.sql"
+chmod 600 "$WORK/rows.sql"
 rm -f "$mig/pepper"
