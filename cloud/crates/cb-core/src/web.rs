@@ -648,7 +648,7 @@ pub async fn am_set_info(
         let credentials = !password_hash.is_empty() || !email.is_empty();
         // The account key too, every time: a request that authenticated before
         // `reset_account_key.php` replaced it must not write afterwards.
-        let mut guard = String::from(" AND authenticator = ?");
+        let mut guard = String::from(" AND authenticator = ? AND blocked = 0");
         let mut observed: Vec<&str> = vec![user.authenticator.as_str()];
         if credentials {
             guard.push_str(" AND email_addr = ? AND passwd_hash = ?");

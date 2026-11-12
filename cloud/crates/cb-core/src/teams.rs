@@ -18,7 +18,7 @@ use cb_proto::xml::xml_escape_text;
 use crate::avg::CREDIT_HALF_LIFE;
 use crate::countries::is_valid_country;
 use crate::model::Team;
-use crate::web::{html_escape, next_id_sql};
+use crate::web::html_escape;
 use crate::CoreResult;
 
 /// `$team_types` in `html/inc/team_types.inc`. Index 0 is "none".
@@ -345,6 +345,18 @@ pub async fn search_teams(db: &dyn Db, s: &Search, now: i64) -> CoreResult<Vec<T
     Ok(list.into_iter().map(|(t, _)| t).collect())
 }
 
+/// The next team ID: above the table, the ID floor of deleted teams, and every
+/// team an account still names. An account moved from a stock server can carry a
+/// `teamid` for a team this server does not have; that ID must not go to an
+/// unrelated new team. The last term is a `max` over the partial index
+/// `user_team` (`teamid > 0`), one index entry read, not a scan of `user`.
+pub fn next_team_id_sql() -> String {
+    "(SELECT max(coalesce((SELECT max(id) FROM team), 0), \
+     coalesce((SELECT last_id FROM id_floor WHERE name = 'team'), 0), \
+     coalesce((SELECT max(teamid) FROM user WHERE teamid > 0), 0)) + 1)"
+        .to_string()
+}
+
 /// The statement that makes a team (`make_team` in `html/inc/team.inc`) and
 /// the one that puts the founder in it (`user_join_team`). They run in one
 /// batch. The team is made only when the account is still the one read, in no
@@ -362,7 +374,7 @@ pub fn create_statements(user_id: i64, authenticator: &str, t: &TeamInput, now: 
                  SELECT {}, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ? \
                  WHERE EXISTS (SELECT 1 FROM user WHERE id = ? AND authenticator = ? \
                  AND teamid = 0 AND blocked = 0) RETURNING id",
-                next_id_sql("team")
+                next_team_id_sql()
             ),
             params: vec![
                 now.into(),

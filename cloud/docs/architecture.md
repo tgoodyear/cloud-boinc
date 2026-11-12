@@ -1789,8 +1789,9 @@ and RPCs read: `id`, `create_time`, `userid` (the founder, 0 when that account w
 `expavg_time` and `joinable`, and one of its own, `recent_key`, which orders by recent average
 as `user.recent_key` does. `user.teamid` was already there. `name_lc` is the name in lower case under a
 unique index, so a team is found and refused by its name without regard to case, as MySQL's
-collation does for upstream. Team IDs are not given out twice (`next_id_sql("team")`, the
-`id_floor` table of `0007`). The columns upstream has for what is not built (`name_html`,
+collation does for upstream. Team IDs are not given out twice (`next_team_id_sql` in `teams.rs`: above the table, the
+`id_floor` table of `0007`, and any `user.teamid` that names a team this server does not have, as an
+account moved from a stock server can; the last is a `max` over the partial index `user_team`). The columns upstream has for what is not built (`name_html`,
 `seti_id`, `ping_user`, `ping_time`, `mod_time`) are not there.
 
 `team.nusers` is kept exactly. Two triggers on `user` (`user_team_changed`, `user_team_deleted`)
@@ -1814,7 +1815,7 @@ read (see "Account and preference pages").
 | `team_search.php` | GET | the form; with `submit` the matching teams; with `xml=1` the same as XML. One round trip, at most five statements |
 | `team_display.php?teamid=` | GET | a team: description (plain text, paragraphs), created, web site, country, type, founder, members, credit; for the visitor a join form, a quit link, the founder's link |
 | `team_members.php?teamid=&sort_by=&offset=` | GET | the members, 20 to a page, by recent average or total credit; the first 1000 only; blocked accounts left out |
-| `top_teams.php?sort_by=&type=&offset=` | GET | the board, 20 to a page, by recent average (default) or total credit, for all types or one; public and cached for 60 seconds like the other boards |
+| `top_teams.php?sort_by=&type=&offset=` | GET | the board, 20 to a page, to an offset of 2000 (an offset past it is a 400 "Limit exceeded", as upstream's `ITEM_LIMIT`; the account leaderboards clamp to their last page), by recent average (default) or total credit, for all types or one; public and cached for 60 seconds like the other boards |
 | `team_create_form.php`, `team_create_action.php` | GET, POST | makes the team and joins its founder to it |
 | `team_join_form.php?id=`, `team_join_action.php`, `team_join.php` | GET, POST, POST | the notes and the form; the join; the join that returns to the account page (a GET of `team_join.php` goes to the form) |
 | `team_quit_form.php`, `team_quit_action.php` | GET, POST | quits the team the account is in |

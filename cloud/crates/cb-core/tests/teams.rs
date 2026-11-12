@@ -1936,3 +1936,97 @@ fn the_account_page_keeps_the_current_team_whatever_the_account_founded() {
         .collect();
     assert!(text.iter().all(|d| !d.starts_with("SCAN team")), "{text:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Review round 2.
+
+#[test]
+fn a_new_team_does_not_take_the_id_an_account_still_names() {
+    let w = World::new();
+    let ada = w.account("Ada");
+    let old = w.account("Imported");
+    // An account moved from a stock server names team 1, which this server does not have.
+    w.sql(&format!("UPDATE user SET teamid = 1 WHERE id = {}", old.id));
+    let t = w.create(&ada, "Alpha", &[]);
+    assert_eq!(t, 2);
+    assert_eq!(w.team_of(&old), 1);
+    assert_eq!(w.n("SELECT nusers FROM team WHERE id = 2"), 1);
+    // The ID is also above one an account names higher still, and above the floor.
+    w.sql(&format!("UPDATE user SET teamid = 40 WHERE id = {}", old.id));
+    let bob = w.account("Bob");
+    assert_eq!(w.create(&bob, "Beta", &[]), 41);
+    // The extra term reads one index entry, not the user table.
+    let plan = block_on(w.db.run(stmt!(
+        "EXPLAIN QUERY PLAN SELECT max(teamid) FROM user WHERE teamid > 0"
+    )))
+    .unwrap();
+    let text: Vec<String> = plan.rows.iter().map(|r| r["detail"].as_str().unwrap().to_string()).collect();
+    assert!(text.iter().any(|d| d.contains("user_team")), "{text:?}");
+    assert!(text.iter().all(|d| !d.starts_with("SCAN user")), "{text:?}");
+}
+
+#[test]
+fn am_set_info_writes_nothing_for_an_account_blocked_after_it_was_read() {
+    let w = World::new();
+    let ada = w.account("Ada");
+    let bob = w.account("Bob");
+    let t = w.create(&ada, "Alpha", &[("joinable", "on")]);
+    let run = |db: &dyn Db, who: &Account, team: &str| {
+        let q: Params = [("account_key", who.auth.as_str()), ("teamid", team), ("venue", "work")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        block_on(cb_core::web::am_set_info(db, &w.project.config, PEPPER, NOW, &q)).unwrap()
+    };
+    // Blocked between the read and the write: no join, and the other fields
+    // of the same request are not written either.
+    let between = Between {
+        inner: &w.db,
+        prefix: "UPDATE user SET",
+        change: BLOCK,
+        user_id: bob.id,
+        fired: Cell::new(false),
+    };
+    let reply = run(&between, &bob, &t.to_string());
+    assert!(between.fired.get());
+    assert_eq!(error_num(&reply), Some(-199), "{reply}");
+    assert_eq!(w.team_of(&bob), 0);
+    assert_eq!(w.n(&format!("SELECT count(*) FROM user WHERE id = {} AND venue = 'work'", bob.id)), 0);
+    // The read already refuses an account that is blocked: the same reply as an unknown key.
+    assert_eq!(error_num(&run(&w.db, &bob, &t.to_string())), Some(-136));
+    // Quitting is guarded the same way.
+    w.sql(&format!("UPDATE user SET blocked = 0, teamid = {t} WHERE id = {}", bob.id));
+    let between = Between {
+        inner: &w.db,
+        prefix: "UPDATE user SET",
+        change: BLOCK,
+        user_id: bob.id,
+        fired: Cell::new(false),
+    };
+    assert_eq!(error_num(&run(&between, &bob, "0")), Some(-199));
+    assert_eq!(w.team_of(&bob), t);
+}
+
+#[test]
+fn top_teams_past_its_limit_is_an_error_not_the_first_page() {
+    let w = World::new();
+    let ada = w.account("Ada");
+    w.create(&ada, "Alpha", &[]);
+    assert_eq!(w.get("/top_teams.php", None, &[("offset", "1980")]).status, 200);
+    for off in ["2000", "2020", "100000"] {
+        let page = w.get("/top_teams.php", None, &[("offset", off)]);
+        assert_eq!(page.status, 400, "{off}");
+        assert!(page.body.contains("Limit exceeded"), "{off}");
+        assert!(!page.body.contains("Alpha"));
+    }
+    // Not a multiple of the page size: the first page, as upstream.
+    assert!(w.get("/top_teams.php", None, &[("offset", "7")]).body.contains("Alpha"));
+    // The cache key of an offset past the limit is its own, not the first page's.
+    let key = |off: &str| {
+        let q: Params = [("offset", off)].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        cb_core::site_boards::public_cache_key("/top_teams.php", &q).unwrap()
+    };
+    assert_ne!(key("2000"), key("0"));
+    assert_eq!(key("2000"), key("100000"));
+    assert_eq!(key("7"), key("0"));
+}

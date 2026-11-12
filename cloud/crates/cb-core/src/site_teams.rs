@@ -540,13 +540,17 @@ impl TopSort {
     }
 }
 
-/// Stock's `offset`: a multiple of [`PAGE_SIZE`], else 0; clamped.
-fn top_offset(q: &Params) -> usize {
+/// Stock's `offset`: a multiple of [`PAGE_SIZE`], else 0. An offset at or past
+/// [`MAX_TOP_OFFSET`] is `Err`: stock answers "Limit exceeded" past its
+/// `ITEM_LIMIT`, and so does this page, so it never repeats the first page.
+fn top_offset(q: &Params) -> Result<usize, ()> {
     let n = int_param(q, "offset").unwrap_or(0).max(0) as usize;
-    if !n.is_multiple_of(PAGE_SIZE) || n >= MAX_TOP_OFFSET {
-        0
+    if !n.is_multiple_of(PAGE_SIZE) {
+        Ok(0)
+    } else if n >= MAX_TOP_OFFSET {
+        Err(())
     } else {
-        n
+        Ok(n)
     }
 }
 
@@ -566,7 +570,8 @@ pub fn top_teams_cache_key(q: &Params) -> String {
         "/top_teams.php?sort_by={}&type={}&offset={}",
         TopSort::parse(str_param(q, "sort_by")).key(),
         top_type(q),
-        top_offset(q)
+        // Past the limit the page is an error, never cached; its key is its own.
+        top_offset(q).unwrap_or(MAX_TOP_OFFSET)
     )
 }
 
@@ -578,7 +583,13 @@ pub fn top_teams_cache_key(q: &Params) -> String {
 pub async fn top_teams(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
     let sort = TopSort::parse(str_param(q, "sort_by"));
     let team_type = top_type(q);
-    let offset = top_offset(q);
+    let Ok(offset) = top_offset(q) else {
+        return Ok(error_page(
+            ctx.project,
+            400,
+            &format!("Limit exceeded - sorry, first {MAX_TOP_OFFSET} items only."),
+        ));
+    };
     let (cond, mut params): (&str, Vec<cb_db::Value>) = if team_type > 0 {
         ("WHERE type = ?", vec![team_type.into()])
     } else {
