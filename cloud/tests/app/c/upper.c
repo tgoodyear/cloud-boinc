@@ -49,10 +49,21 @@ static int run(int argc, char **argv) {
     resolve("out", path, sizeof path);
     FILE *out = fopen(path, "wb");
     if (!out) { fclose(in); fprintf(stderr, "cb-test-app: out: cannot open\n"); return 1; }
-    int c;
-    while ((c = fgetc(in)) != EOF) fputc(c >= 'a' && c <= 'z' ? c - 32 : c, out);
+    int c, failed = 0;
+    while ((c = fgetc(in)) != EOF) {
+        if (fputc(c >= 'a' && c <= 'z' ? c - 32 : c, out) == EOF) {
+            failed = 1;
+            break;
+        }
+    }
+    if (ferror(in)) failed = 1;
     fclose(in);
-    fclose(out);
+    /* Buffered output can fail when it is flushed. */
+    if (fclose(out) != 0) failed = 1;
+    if (failed) {
+        fprintf(stderr, "cb-test-app: read or write failed\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -61,6 +72,8 @@ int main(int argc, char **argv) {
     /* What boinc_finish leaves for the client: the exit status, a message line, and a line
      * saying whether the message is a notice. */
     FILE *f = fopen("boinc_finish_called", "wb");
-    if (f) { fprintf(f, "%d\n\n", status); fclose(f); }
+    if (f) {
+        if (fprintf(f, "%d\n\n", status) < 0 || fclose(f) != 0) status = status ? status : 1;
+    }
     return status;
 }

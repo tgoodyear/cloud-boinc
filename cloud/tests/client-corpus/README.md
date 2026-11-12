@@ -1,7 +1,7 @@
 # Client request corpus
 
 Scheduler requests recorded from stock BOINC clients of six versions on 64-bit Linux, and of
-clients on four other platforms, scrubbed, and replayed by
+clients on five other platforms, scrubbed, and replayed by
 `cloud/crates/cb-core/tests/client_corpus.rs`. They show what each client version and platform
 sends, and that this server's request parser and `handle_request` accept it.
 
@@ -33,8 +33,8 @@ The directories named by a version alone are the 64-bit Linux clients: 7.16.6, 7
 | `8.2.15-windows_x86_64-wine` | the Windows client binary under Wine, not a Windows host | `windows_x86_64` |
 | `8.0.4-i386-on-64-bit-kernel` | the i386 package on a 64-bit kernel, for an alternate platform | `x86_64-pc-linux-gnu`, alternate `i686-pc-linux-gnu` |
 
-Android clients, 32-bit Windows and Mac clients, and GPU hosts other than the Apple GPU of the
-Mac are not in the corpus. The last directory has the first contact and the work request only, and
+Android clients, 32-bit Windows and macOS clients, and GPU hosts other than the Apple GPU of the
+macOS client are not in the corpus. The last directory has first-contact, work-request, report and no-work files only, and
 `manifest.json` says so with `scenarios`; its `version_platform` is the platform of the app version
 that the replay serves it.
 
@@ -84,8 +84,8 @@ has no code-signing key, so what the server does when a client holds another key
    Submit the job for the step after a re-attach only once the client has attached: the client
    sends a last request while it detaches, the server can send the job in answer to it, and the
    client drops the reply.
-5. One project app serves all clients of a run, so run one client at a time: a client of another
-   platform with a version of the same app takes the jobs.
+5. Give the run one app with a version for each platform, and run one client at a time. A second
+   client would take the jobs meant for the first.
 
 Other platforms:
 
@@ -99,8 +99,7 @@ Other platforms:
   qemu's.
 - macOS: the installed client binary copied to a scratch directory and started as a second
   instance, so that the installed one is not touched: `--dir`, `--allow_multiple_clients`,
-  `--gui_rpc_port`, and `-insecure` because the data directory is not owned by the Mac's BOINC
-  accounts (the client says "File ownership or permissions are set in a way that does not allow
+  `--gui_rpc_port`, and `-insecure` because the data directory is not owned by the accounts of the installed client (the client says "File ownership or permissions are set in a way that does not allow
   sandboxed execution" and exits without it). Run from inside the application bundle,
   the client could not create files in a data directory under `/tmp` ("Can't open
   client_state_next.xml: fopen() failed"); the same binary copied to a scratch directory could. There is no `boinccmd` in the bundle; the

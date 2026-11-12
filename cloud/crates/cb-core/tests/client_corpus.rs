@@ -264,6 +264,8 @@ fn scrub_script_keeps_the_shape_of_each_platform() {
             " neon ",
         ),
         ("arm64-apple-darwin", "Apple Fixture", " arm64 "),
+        ("x86_64-apple-darwin", "Fixture CPU @ 3.00GHz", " avx2"),
+        ("i686-apple-darwin", "Fixture CPU @ 3.00GHz", " avx2"),
     ] {
         std::fs::write(
             &input,

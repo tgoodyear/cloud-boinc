@@ -64,19 +64,21 @@ TEXT_ELEMENTS = {
 # client fills them from /proc/cpuinfo, `sysctl` or the registry). The values name no real CPU:
 # the ARM ones are what qemu-user's emulated CPU reports, the Apple one an M1's generic list.
 CPU_PLACEHOLDERS = [
-    # (a word of `<platform_name>`, p_model, p_features)
+    # (a prefix of `<platform_name>`, p_model, p_features). Prefixes, not substrings: Intel Macs
+    # (`x86_64-apple-darwin`) and 64-bit ARM Macs (`arm64-apple-darwin`) need different ones, and
+    # `arm-` must not match `arm64-`. Other platforms get the x86 placeholders.
     (
-        "apple-darwin",
+        "arm64-apple-darwin",
         "Apple Fixture",
         "amx_version_1 arm64 armv8_1_atomics armv8_2_fhm armv8_2_sha3 armv8_2_sha512 armv8_crc32 floatingpoint neon neon_fp16 neon_hpfp ucnormal_mem",
     ),
     (
-        "aarch64",
+        "aarch64-",
         "ARMv8 Processor rev 0 (v8l) [Impl 0x00 Arch 8 Variant 0x0 Part 0x051 Rev 0]",
         "fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp sve2 sveaes svepmull svebitperm svesha3 svesm4 flagm2 frint svei8mm svef32mm svef64mm svebf16 i8mm bf16 rng bti mte mte3 sme smei16i64 smef64f64 smei8i32 smef16f32 smeb16f32 smef32f32 smefa64 mops hbc",
     ),
     (
-        "arm-unknown",
+        "arm-",
         "ARMv8 Processor rev 0 (v8l) [Impl 0x41 Arch 8 Variant 0x1 Part 0xd07 Rev 0]",
         "swp half thumb fast_mult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae fphp asimdhp asimddp asimdfhm asimdbf16 i8mm aes pmull sha1 sha2 crc32 sb ssbs",
     ),
@@ -126,8 +128,8 @@ def cpu_placeholders(text):
     """The `p_model` and `p_features` placeholders for the platform the request names."""
     m = re.search(r"<platform_name>([^<]*)</platform_name>", text)
     platform = m.group(1) if m else ""
-    for word, model, features in CPU_PLACEHOLDERS:
-        if word in platform:
+    for prefix, model, features in CPU_PLACEHOLDERS:
+        if platform.startswith(prefix):
             return model, features
     return TEXT_ELEMENTS["p_model"], TEXT_ELEMENTS["p_features"]
 
