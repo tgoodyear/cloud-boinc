@@ -1357,7 +1357,7 @@ below it. Every other request keeps the plain `not found` text: any method but `
 does not accept `text/html` (`curl`, a BOINC client and most tools send `*/*` or no `Accept`), and
 the RPC paths whatever the `Accept` header says (`is_rpc_path`: `*_account.php`, `am_*.php`,
 `get_project_config.php`, `server_status.php`, and the scheduler, upload and download paths). The
-choice is made by path and method and the `Accept` header, not by `User-Agent`. Unknown paths of
+choice is made by path and method and the `Accept` header, not by `User-Agent`. Only an explicit `text/html` entry counts (`text/*` and `*/*` do not); the media type and the `q` name are compared without regard to case, white space around `;` and `=` is ignored, and an entry with a weight of 0 or a malformed weight is refused (`accepts_html` in `site.rs`). `is_rpc_path` compares in lower case and without trailing slashes. Unknown paths of
 the files and scheduler Workers keep their own plain replies.
 
 ### Dashboards

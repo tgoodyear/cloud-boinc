@@ -304,6 +304,25 @@ fn the_xml_form_follows_upstream() {
 }
 
 #[test]
+fn the_xml_parameter_is_true_as_in_php() {
+    let db = busy_world();
+    // PHP: only "" and "0" are false; "0.0", " 0", "false" and "no" are true.
+    for (v, xml) in [
+        ("1", true),
+        ("true", true),
+        ("false", true),
+        ("0.0", true),
+        (" 0", true),
+        ("00", true),
+        ("0", false),
+        ("", false),
+    ] {
+        let (page, _) = get(&db, &[("xml", v)]);
+        assert_eq!(page.content_type.starts_with("text/xml"), xml, "{v:?}");
+    }
+}
+
+#[test]
 fn the_home_page_links_to_the_applications_page() {
     let db = busy_world();
     let project = block_on(Project::load(&db)).unwrap();
@@ -330,6 +349,106 @@ fn a_browser_get_of_an_unknown_path_gets_the_page() {
     assert!(wants_html_404(true, "/a/b/c", Some("text/html")));
     assert!(wants_html_404(true, "/x", Some("TEXT/HTML; charset=utf-8")));
     assert!(wants_html_404(true, "/short/nope.php", Some(BROWSER)));
+}
+
+#[test]
+fn the_accept_header_is_read_as_the_rfc_has_it() {
+    let html = |accept: &str| wants_html_404(true, "/nope.php", Some(accept));
+    // Media type without regard to case, and several entries.
+    for accept in [
+        "text/html",
+        "Text/HTML",
+        "TEXT/HTML;q=0.5",
+        "application/json, text/html",
+        "application/json,text/html;q=0.1",
+        " text/html ",
+        "*/*;q=0.1, text/html",
+    ] {
+        assert!(html(accept), "{accept}");
+    }
+    // Optional white space around `;` and `=`; the parameter name in any case.
+    for accept in [
+        "text/html ; q=0.8",
+        "text/html;q = 0.8",
+        "text/html ;  Q = 1",
+        "text/html;Q=1.000",
+        "text/html;q=0.001",
+        "text/html;level=1;q=0.5",
+        "text/html;charset=utf-8",
+    ] {
+        assert!(html(accept), "{accept}");
+    }
+    // A weight of 0 refuses the type, however it is written.
+    for accept in [
+        "text/html;q=0",
+        "text/html;Q=0",
+        "text/html;q=0.",
+        "text/html;q=0.0",
+        "text/html;q=0.00",
+        "text/html;q=0.000",
+        "text/html;Q=0.000",
+        "text/html ; q = 0",
+        "text/html;level=1;q=0",
+        "text/html;q=0, */*",
+        "*/*, text/html;q=0",
+    ] {
+        assert!(!html(accept), "{accept}");
+    }
+    // A malformed weight refuses the entry; another entry may still ask.
+    for accept in [
+        "text/html;q=",
+        "text/html;q=abc",
+        "text/html;q=nan",
+        "text/html;q=-1",
+        "text/html;q=+1",
+        "text/html;q=1.5",
+        "text/html;q=2",
+        "text/html;q=0.0001",
+        "text/html;q=1e0",
+        "text/html;q",
+    ] {
+        assert!(!html(accept), "{accept}");
+    }
+    assert!(html("text/html;q=abc, text/html"));
+    // Only an explicit text/html asks for the page.
+    for accept in [
+        "text/*",
+        "*/*",
+        "text/plain",
+        "application/xhtml+xml",
+        "",
+        " ",
+        "text/htm",
+        "xtext/html",
+    ] {
+        assert!(!html(accept), "{accept}");
+    }
+}
+
+#[test]
+fn rpc_paths_are_found_whatever_the_case_or_trailing_slash() {
+    for path in [
+        "/AM_get_info.php",
+        "/Lookup_Account.php",
+        "/am_get_info.php/",
+        "/Get_Project_Config.php",
+        "/SERVER_STATUS.PHP",
+        "/Download/x",
+        "/Short_CGI/cgi",
+    ] {
+        assert!(is_rpc_path(path), "{path}");
+        assert!(!wants_html_404(true, path, Some(BROWSER)), "{path}");
+    }
+    for path in [
+        "",
+        "/",
+        "//",
+        "/not_am.php",
+        "/amazing.php",
+        "/accounts.php",
+    ] {
+        assert!(!is_rpc_path(path), "{path}");
+    }
 }
 
 #[test]
