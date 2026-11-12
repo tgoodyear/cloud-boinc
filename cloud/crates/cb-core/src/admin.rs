@@ -348,9 +348,9 @@ pub async fn add_app_version(
             }
         }
         xml.push_str(&format!(
-            "<file_info>\n    <name>{0}</name>\n    <url>{1}/{0}</url>\n",
+            "<file_info>\n    <name>{}</name>\n    <url>{}</url>\n",
             xml_escape(&f.name),
-            config.download_url
+            xml_escape(&config.download_urls().download(&f.name))
         ));
         if f.executable || f.main_program {
             xml.push_str("    <executable/>\n");

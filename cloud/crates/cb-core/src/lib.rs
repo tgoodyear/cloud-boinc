@@ -27,6 +27,7 @@ pub mod site_email;
 pub mod site_ui;
 pub mod site_work;
 pub mod stats;
+pub mod stock;
 pub mod template;
 pub mod upload;
 pub mod web;

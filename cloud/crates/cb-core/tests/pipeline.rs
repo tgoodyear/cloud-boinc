@@ -339,6 +339,81 @@ fn quorum_one_job_runs_to_deletion() {
     assert!(written <= 18, "{written} rows written");
 }
 
+/// Work imported from a stock server carries the stock download URL in its
+/// workunit XML. Its files go with the workunit; a file with `<no_delete/>`
+/// or on another host stays, as before.
+#[test]
+fn files_named_by_stock_urls_are_deleted_with_their_workunit() {
+    use cb_core::stock::filename_dir;
+    let mut w = World::new("trivial");
+    w.config = Config::parse(
+        "<config><master_url>https://p.example/</master_url>\
+         <delete_delay_hours>1</delete_delay_hours>\
+         <stock_short_name>testproj</stock_short_name>\
+         <uldl_dir_fanout>1024</uldl_dir_fanout></config>",
+    )
+    .unwrap();
+    let wu = w.submit("j1", 1000, 1, 1);
+    let stock_url = |host: &str, name: &str| {
+        format!(
+            "{host}/testproj/download/{}/{name}",
+            filename_dir(name, 1024).unwrap()
+        )
+    };
+    let info = |name: &str, url: &str, extra: &str| {
+        format!("<file_info>\n    <name>{name}</name>\n    <url>{url}</url>\n{extra}    <md5_cksum>0cc175b9c0f1b6a831c399e269772661</md5_cksum>\n    <nbytes>1</nbytes>\n</file_info>\n")
+    };
+    let doc = [
+        info("in_a", &stock_url("https://p.example", "in_a"), ""),
+        // Scheme and host case differ from the master URL's.
+        info("in_b", &stock_url("http://P.Example", "in_b"), ""),
+        info(
+            "in_keep",
+            &stock_url("https://p.example", "in_keep"),
+            "    <no_delete/>\n",
+        ),
+        info("in_far", &stock_url("https://mirror.example", "in_far"), ""),
+        info("in_native", "https://p.example/download/in_native", ""),
+        "<workunit>\n</workunit>\n".to_string(),
+    ]
+    .concat();
+    block_on(w.db.run(stmt!(
+        "UPDATE workunit SET xml_doc = ? WHERE id = ?",
+        doc.as_str(),
+        wu
+    )))
+    .unwrap();
+    for name in ["in_a", "in_b", "in_keep", "in_far", "in_native"] {
+        w.files.objects.borrow_mut().insert(
+            (FileKind::Download, name.to_string()),
+            FileStat {
+                nbytes: 1,
+                md5: "0cc175b9c0f1b6a831c399e269772661".into(),
+            },
+        );
+    }
+
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("out"), 0);
+    w.transition(wu, 1200);
+    block_on(acknowledge_assimilation(&w.db, &[wu], 1300)).unwrap();
+    w.transition(wu, 4800);
+    w.transition(wu, 4800);
+
+    let mut left: Vec<String> = w
+        .files
+        .objects
+        .borrow()
+        .keys()
+        .filter(|(kind, _)| *kind == FileKind::Download)
+        .map(|(_, name)| name.clone())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["in_far", "in_keep"]);
+    assert_eq!(w.wu(wu).file_delete_state, FILE_DELETE_DONE);
+}
+
 #[test]
 fn quorum_two_disagreement_gets_a_third_result() {
     let w = World::new("bitwise");

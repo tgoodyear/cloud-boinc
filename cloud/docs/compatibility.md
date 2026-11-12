@@ -142,6 +142,39 @@ has not finished after 120 seconds.
   bytes (only the signature check against a given MD5 is run), scheduling and backoff.
 - The BOINC Manager's use of the project config (the attach wizard), and account managers.
 
+## Moving from a stock server: URLs
+
+A client attached to a stock server holds that server's URLs and keeps using them. The parser
+oracle does not cover this; the tests are in `cloud/crates/cb-core/src/stock.rs`,
+`cloud/crates/cb-core/src/config.rs` and `cloud/crates/cb-core/tests/stock_layout.rs`, and the
+design is under "Stock URL layout" in [architecture.md](architecture.md).
+
+A project moving from a stock server sets, in the `config` setting:
+
+- `stock_short_name` with the short name it was made with, which fills in the `make_project`
+  defaults (`/<short>_cgi/cgi`, `/<short>_cgi/file_upload_handler`, `/<short>/download/<dir>/<name>`,
+  pages under `/<short>/`), or each of `stock_cgi_prefix`, `stock_upload_prefix`,
+  `stock_download_prefix` and `stock_page_prefix` if its `config.xml` put them elsewhere;
+- `uldl_dir_fanout` as in the stock `config.xml` (1024 from `make_project`; leave it out if the
+  stock server had none);
+- `master_url` as before, and the routes of `docs/deploy.md` ("Stock layout routes").
+
+What keeps working: a client's scheduler URL; the download URLs of app versions and input files
+it already has, with or without the hash directory; the upload URL of tasks it has not finished,
+including `<get_file_size>`, an upload and a resumed upload; the project's pages and web RPCs
+under `/<short>/` (including `get_project_config.php`, account pages, the account manager RPCs,
+sign-in cookies, which are set for the path the visitor signed in under and cleared for it and the paths above it at logout) and at the root; the
+download, upload and scheduler URLs inside imported `app_version.xml_doc`, `workunit.xml_doc` and
+`result.xml_doc_in`, unchanged. The file deletion step recognizes the stock download URL as the
+project's own. The master page lists the stock scheduler URL by default
+(`stock_advertise`), so a client that re-reads it keeps its URL.
+
+What does not: `/<short>_ops/`, `/<short>/stats`, `/<short>/user_profile`, other CGI scripts of a
+stock server, and `.md5` files in the download directory. A download URL with a hash directory
+other than the one `uldl_dir_fanout` gives is a 404, as it is on the stock server; a project that
+changes its fanout in `config.xml` must change it here. The importer for the MySQL database is
+not written, so none of this has been run against a copy of a real project's rows.
+
 ## Findings
 
 Each is a difference between what the server writes and what the client reads, with the client

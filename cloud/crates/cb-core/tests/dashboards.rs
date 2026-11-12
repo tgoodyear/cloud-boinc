@@ -91,6 +91,7 @@ fn ctx<'a>(db: &'a dyn Db, project: &'a Project, now: i64) -> SiteCtx<'a> {
     SiteCtx {
         db,
         project,
+        base: "https://p.example/",
         auth: None,
         post: false,
         pepper: None,

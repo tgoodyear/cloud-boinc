@@ -16,8 +16,8 @@ use cb_db::{stmt, Stmt};
 use crate::mail::Mail;
 use crate::model::User;
 use crate::site::{
-    error_page, layout, login_cookie, logout_cookie, str_param, time_str, to_login, viewer, Params,
-    SiteCtx, SitePage,
+    error_page, layout, login_cookie, str_param, time_str, to_login, viewer, Params, SiteCtx,
+    SitePage,
 };
 use crate::site_account::{token_fields, token_ok, TIMED_OUT};
 pub use crate::web::EMAIL_CHANGE_WAIT_SECS;
@@ -433,7 +433,6 @@ pub async fn login_via_link(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePag
     if ctx.mail().is_none() {
         return Ok(no_mail_page(ctx));
     }
-    let project = ctx.project;
     let t = str_param(q, "t");
     let id = str_param(q, "id").parse::<i64>().ok();
     let bad = || {
@@ -510,8 +509,8 @@ pub async fn login_via_link(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePag
     let Some(user) = user else {
         return Ok(bad());
     };
-    let mut out = SitePage::redirect(format!("{}home.php", project.config.master_url));
-    out.set_cookie = Some(login_cookie(project, &user.authenticator, true));
+    let mut out = SitePage::redirect(format!("{}home.php", ctx.base));
+    out.set_cookie = Some(login_cookie(ctx.base, &user.authenticator, true));
     Ok(out)
 }
 
@@ -666,7 +665,7 @@ pub async fn validate_email_addr(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<Si
         ));
     }
     let Some(user) = viewer(ctx).await? else {
-        return Ok(to_login(project, "validate_email_addr.php"));
+        return Ok(to_login(ctx.base, "validate_email_addr.php"));
     };
     if user.email_validated != 0 {
         return Ok(page(
@@ -903,7 +902,7 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
          <a href=\"reset_account_key.php\">replace the account key</a>; computers attached \
          with the old key have to be attached again.</p>\n",
     );
-    done.set_cookie = Some(logout_cookie(project));
+    done.clear_login(ctx.base);
     Ok(done)
 }
 
@@ -950,6 +949,7 @@ mod tests {
         let ctx = SiteCtx {
             db: &db,
             project: &project,
+            base: &project.config.master_url,
             auth: None,
             post: true,
             pepper: None,

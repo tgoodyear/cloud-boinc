@@ -140,7 +140,7 @@ fn build_workunit(
         &sub.input_template,
         &job.input_files,
         staged,
-        &config.download_url,
+        &config.download_urls(),
         job.command_line.as_deref(),
         job.additional_xml.as_deref(),
     )?;

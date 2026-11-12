@@ -1,7 +1,8 @@
 //! The master URL page, the web RPCs of clients and account managers, the
 //! server status and the site pages. PHP file names stay in the URLs because
-//! clients have them built in. Everything past routing is in
-//! `cb_core::web` and `cb_core::site`.
+//! clients have them built in. With a stock layout in the config
+//! (`cb_core::stock`) the pages also answer under its page prefix. Everything
+//! past routing is in `cb_core::web` and `cb_core::site`.
 
 use std::collections::HashMap;
 
@@ -10,6 +11,7 @@ use cb_core::mail::Mailer;
 use cb_core::site::{auth_from_cookie, site_page, SiteCtx, SitePage, SITE_HEADERS, SITE_PATHS};
 use cb_core::site_boards::{public_cache_key, CACHE_SECS, PUBLIC_PATHS};
 use cb_core::site_work::{work, FeedState};
+use cb_core::stock::{route_web, url_origin, WebRoute};
 use cb_core::web::{
     am_get_info, am_set_host_info, am_set_info, create_account, html_cache_control, lookup_account,
     master_page_with, project_config, server_status, server_status_page, server_status_xml,
@@ -49,20 +51,23 @@ fn cacheable_xml(body: String) -> Result<Response> {
 
 /// A site page. These depend on the visitor's cookie, so no cache keeps them.
 fn site_response(page: SitePage) -> Result<Response> {
-    let mut builder = Response::builder()
-        .with_status(page.status)
-        .with_header("Content-Type", page.content_type)?
-        .with_header("Cache-Control", &html_cache_control("private, no-store"))?;
+    let headers = Headers::new();
+    headers.set("Content-Type", page.content_type)?;
+    headers.set("Cache-Control", &html_cache_control("private, no-store"))?;
     for (name, value) in SITE_HEADERS {
-        builder = builder.with_header(name, value)?;
+        headers.set(name, value)?;
     }
     if let Some(location) = &page.location {
-        builder = builder.with_header("Location", location)?;
+        headers.set("Location", location)?;
     }
-    if let Some(cookie) = &page.set_cookie {
-        builder = builder.with_header("Set-Cookie", cookie)?;
+    // One header line per cookie: they cannot be joined.
+    for cookie in page.set_cookie.iter().chain(&page.more_cookies) {
+        headers.append("Set-Cookie", cookie)?;
     }
-    Ok(builder.fixed(page.body.into_bytes()))
+    Ok(Response::builder()
+        .with_status(page.status)
+        .with_headers(headers)
+        .fixed(page.body.into_bytes()))
 }
 
 /// A dashboard page: the same for every visitor, so a shared cache may keep it
@@ -130,6 +135,29 @@ fn public_key(req: &Request, path: &str) -> Result<Option<String>> {
     Ok(Some(canonical.to_string()))
 }
 
+/// The edge cache's copy of a dashboard page, with the headers a client gets.
+async fn cached_public(key: &str) -> Result<Option<Response>> {
+    let Some(hit) = Cache::default().get(key, false).await? else {
+        return Ok(None);
+    };
+    // As for the master page: the zone may rewrite Cache-Control on a stored
+    // response, so the headers are set again.
+    let headers = Headers::new();
+    if let Some(kind) = hit.headers().get("Content-Type")? {
+        headers.set("Content-Type", &kind)?;
+    }
+    headers.set(
+        "Cache-Control",
+        &html_cache_control(&format!("public, max-age={CACHE_SECS}")),
+    )?;
+    for (name, value) in SITE_HEADERS {
+        headers.set(name, value)?;
+    }
+    Ok(Some(
+        Response::from_body(hit.body().clone())?.with_headers(headers),
+    ))
+}
+
 /// Pages that are the same for every client and need no database read when
 /// the edge cache has them.
 fn is_static_page(req: &Request, path: &str) -> bool {
@@ -155,62 +183,62 @@ async fn params(req: &mut Request) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// The edge cache's copy of a static page, with the headers a client gets.
+async fn cached(key: &str) -> Result<Option<Response>> {
+    let Some(hit) = Cache::default().get(key, false).await? else {
+        return Ok(None);
+    };
+    // The zone's browser cache setting rewrites Cache-Control on a stored
+    // response; clients get the lifetime the page was built with.
+    let headers = Headers::new();
+    if let Some(kind) = hit.headers().get("Content-Type")? {
+        headers.set("Content-Type", &kind)?;
+    }
+    let base = format!("public, max-age={PAGE_CACHE_SECS}");
+    let is_html = hit
+        .headers()
+        .get("Content-Type")?
+        .is_some_and(|k| k.starts_with("text/html"));
+    headers.set(
+        "Cache-Control",
+        &if is_html {
+            html_cache_control(&base)
+        } else {
+            base
+        },
+    )?;
+    Ok(Some(
+        Response::from_body(hit.body().clone())?.with_headers(headers),
+    ))
+}
+
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
     if !matches!(req.method(), Method::Get | Method::Head | Method::Post) {
         return text(405, "method not allowed\n");
     }
-    let path = req.path();
-    if path == "/favicon.ico" && matches!(req.method(), Method::Get | Method::Head) {
+    let raw_path = req.path();
+    if raw_path == "/favicon.ico" && matches!(req.method(), Method::Get | Method::Head) {
         return Ok(Response::builder()
             .with_header("Content-Type", "image/svg+xml")?
             .with_header("Cache-Control", "public, max-age=86400")?
             .with_header("X-Content-Type-Options", "nosniff")?
             .fixed(FAVICON_SVG.as_bytes().to_vec()));
     }
-    let cache_key = is_static_page(&req, &path).then(|| req.url().map(|u| u.to_string()));
-    let cache_key = cache_key.transpose()?;
-    let public_cache_key = public_key(&req, &path)?;
-    if let Some(key) = &public_cache_key {
-        if let Some(hit) = Cache::default().get(key.as_str(), false).await? {
-            // As for the master page: the zone may rewrite Cache-Control on a
-            // stored response, so the headers are set again.
-            let headers = Headers::new();
-            if let Some(kind) = hit.headers().get("Content-Type")? {
-                headers.set("Content-Type", &kind)?;
-            }
-            headers.set(
-                "Cache-Control",
-                &html_cache_control(&format!("public, max-age={CACHE_SECS}")),
-            )?;
-            for (name, value) in SITE_HEADERS {
-                headers.set(name, value)?;
-            }
-            return Ok(Response::from_body(hit.body().clone())?.with_headers(headers));
+    // Pages at the root need no database read when the cache has them.
+    let mut cache_key = is_static_page(&req, &raw_path)
+        .then(|| req.url().map(|u| u.to_string()))
+        .transpose()?;
+    if let Some(key) = &cache_key {
+        if let Some(hit) = cached(key).await? {
+            return Ok(hit);
         }
     }
-    if let Some(key) = &cache_key {
-        if let Some(hit) = Cache::default().get(key.as_str(), false).await? {
-            // The zone's browser cache setting rewrites Cache-Control on a
-            // stored response; clients get the lifetime the page was built with.
-            let headers = Headers::new();
-            if let Some(kind) = hit.headers().get("Content-Type")? {
-                headers.set("Content-Type", &kind)?;
-            }
-            let base = format!("public, max-age={PAGE_CACHE_SECS}");
-            let is_html = hit
-                .headers()
-                .get("Content-Type")?
-                .is_some_and(|k| k.starts_with("text/html"));
-            headers.set(
-                "Cache-Control",
-                &if is_html {
-                    html_cache_control(&base)
-                } else {
-                    base
-                },
-            )?;
-            return Ok(Response::from_body(hit.body().clone())?.with_headers(headers));
+    // Dashboard pages too, under a key made from their validated parameters.
+    let mut public_key = public_key(&req, &raw_path)?;
+    if let Some(key) = &public_key {
+        if let Some(hit) = cached_public(key).await? {
+            return Ok(hit);
         }
     }
     let db = db(&env)?;
@@ -220,6 +248,43 @@ async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
             console_error!("settings: {e}");
             return text(503, "The project is temporarily unavailable.\n");
         }
+    };
+    // Pages answer at the root and, with a stock layout, under its page
+    // prefix. The handlers below name pages as they are at the root.
+    let stock = project.config.stock.as_ref();
+    let (path, prefixed) = match route_web(&raw_path, stock) {
+        WebRoute::Page { path, prefixed } => (path.to_string(), prefixed),
+        WebRoute::Redirect(mut to) => {
+            if let Some(q) = req.url()?.query() {
+                to.push('?');
+                to.push_str(q);
+            }
+            return Ok(Response::builder()
+                .with_status(301)
+                .with_header("Location", &to)?
+                .empty());
+        }
+    };
+    if prefixed && cache_key.is_none() && is_static_page(&req, &path) {
+        let key = req.url()?.to_string();
+        if let Some(hit) = cached(&key).await? {
+            return Ok(hit);
+        }
+        cache_key = Some(key);
+    }
+    if prefixed && public_key.is_none() {
+        public_key = self::public_key(&req, &path)?;
+        if let Some(key) = &public_key {
+            if let Some(hit) = cached_public(key).await? {
+                return Ok(hit);
+            }
+        }
+    }
+    // Where redirects and the login cookie point: the directory the request
+    // came in under.
+    let base = match (stock, url_origin(&project.config.master_url)) {
+        (Some(stock), Some(origin)) if prefixed => stock.page_base(origin),
+        _ => project.config.master_url.clone(),
     };
     match path.as_str() {
         "/" | "/index.php" | "/get_project_config.php" => {
@@ -349,6 +414,7 @@ async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
             let ctx = SiteCtx {
                 db: &db,
                 project: &project,
+                base: &base,
                 auth: cookie.as_deref(),
                 post,
                 pepper: pepper.as_deref(),
@@ -371,7 +437,7 @@ async fn fetch(mut req: Request, env: Env, exec: Context) -> Result<Response> {
                         db.rows_read()
                     );
                     let mut response = public_response(page, Some(timing))?;
-                    if let (true, Some(key)) = (ok, public_cache_key) {
+                    if let (true, Some(key)) = (ok, public_key) {
                         let copy = response.cloned()?;
                         exec.wait_until(async move {
                             if let Err(e) = Cache::default().put(key.as_str(), copy).await {

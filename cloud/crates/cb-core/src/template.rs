@@ -8,6 +8,7 @@ use cb_crypto::Signer;
 use cb_proto::xml::{line, strip_whitespace, XmlParser};
 
 use crate::model::Workunit;
+use crate::stock::FileUrls;
 use crate::{CoreError, CoreResult};
 
 const OUTFILE_MACRO: &str = "<OUTFILE_";
@@ -138,7 +139,7 @@ struct FileOut {
 
 fn process_file_info(
     xp: &mut XmlParser,
-    download_url: &str,
+    download_urls: &FileUrls,
     var_infiles: &[InputFile],
     staged: &HashMap<String, StagedFile>,
     out: &mut String,
@@ -254,8 +255,11 @@ fn process_file_info(
                     }
                     let st = lookup(&vf.name)?;
                     out.push_str(&format!(
-                        "    <name>{}</name>\n    <url>{}/{}</url>\n    <md5_cksum>{}</md5_cksum>\n    <nbytes>{:.0}</nbytes>\n",
-                        vf.name, download_url, vf.name, st.md5, st.nbytes
+                        "    <name>{}</name>\n    <url>{}</url>\n    <md5_cksum>{}</md5_cksum>\n    <nbytes>{:.0}</nbytes>\n",
+                        vf.name,
+                        download_urls.download(&vf.name),
+                        st.md5,
+                        st.nbytes
                     ));
                     if st.no_delete {
                         out.push_str("    <no_delete/>\n");
@@ -266,8 +270,11 @@ fn process_file_info(
             } else {
                 let st = lookup(&physical_name)?;
                 out.push_str(&format!(
-                    "    <name>{}</name>\n    <url>{}/{}</url>\n    <md5_cksum>{}</md5_cksum>\n    <nbytes>{:.0}</nbytes>\n",
-                    physical_name, download_url, physical_name, st.md5, st.nbytes
+                    "    <name>{}</name>\n    <url>{}</url>\n    <md5_cksum>{}</md5_cksum>\n    <nbytes>{:.0}</nbytes>\n",
+                    physical_name,
+                    download_urls.download(&physical_name),
+                    st.md5,
+                    st.nbytes
                 ));
                 if st.no_delete {
                     out.push_str("    <no_delete/>\n");
@@ -417,7 +424,7 @@ pub fn process_input_template(
     template: &str,
     var_infiles: &[InputFile],
     staged: &HashMap<String, StagedFile>,
-    download_url: &str,
+    download_urls: &FileUrls,
     command_line: Option<&str>,
     additional_xml: Option<&str>,
 ) -> CoreResult<()> {
@@ -436,7 +443,7 @@ pub fn process_input_template(
         if xp.match_tag("file_info") {
             process_file_info(
                 &mut xp,
-                download_url,
+                download_urls,
                 var_infiles,
                 staged,
                 &mut out,
@@ -624,6 +631,13 @@ pub fn output_files(xml_doc_in: &str) -> Vec<OutputFile> {
 mod tests {
     use super::*;
 
+    fn flat(base: &str) -> FileUrls {
+        FileUrls {
+            base: base.into(),
+            fanout: 0,
+        }
+    }
+
     const OUT_TEMPLATE: &str = "<output_template>\n<file_info>\n    <name><OUTFILE_0/></name>\n    <generated_locally/>\n    <upload_when_present/>\n    <max_nbytes>5000000</max_nbytes>\n    <url><UPLOAD_URL/></url>\n</file_info>\n<result>\n    <file_ref>\n        <file_name><OUTFILE_0/></file_name>\n        <open_name>out</open_name>\n        <optional/>\n    </file_ref>\n</result>\n</output_template>\n";
 
     #[test]
@@ -734,7 +748,7 @@ mod tests {
             template,
             &files,
             &staged,
-            "https://x.example/download",
+            &flat("https://x.example/download"),
             Some("--n 3"),
             None,
         )
@@ -768,7 +782,7 @@ mod tests {
             template,
             &files,
             &staged,
-            "https://x.example/download",
+            &flat("https://x.example/download"),
             None,
             None,
         )
@@ -784,7 +798,15 @@ mod tests {
     fn input_template_needs_every_file() {
         let template = "<file_info>\n<number>0</number>\n</file_info>\n<workunit>\n<file_ref><file_number>0</file_number><open_name>in</open_name></file_ref>\n</workunit>";
         let mut wu = Workunit::default();
-        let err = process_input_template(&mut wu, template, &[], &HashMap::new(), "d", None, None);
+        let err = process_input_template(
+            &mut wu,
+            template,
+            &[],
+            &HashMap::new(),
+            &flat("d"),
+            None,
+            None,
+        );
         assert!(matches!(err, Err(CoreError::Invalid(_))));
     }
 }
