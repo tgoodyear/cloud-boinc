@@ -139,12 +139,18 @@ impl World {
             // ID the client holds, the sequence number it sent then (the next request sends one
             // more), and the CPID the stock server derives from the client's.
             block_on(w.db.run(stmt!(
-                "INSERT INTO host (id, create_time, userid, rpc_seqno, rpc_time, host_cpid, domain_name, venue) \
-                 VALUES (?, 1700000100, 2, ?, ?, ?, 'fixture-host', '')",
+                "INSERT INTO host (id, create_time, userid, rpc_seqno, rpc_time, host_cpid, domain_name, venue, \
+                 p_ncpus, p_vendor, p_model, os_name, os_version) \
+                 VALUES (?, 1700000100, 2, ?, ?, ?, 'fixture-host', '', ?, ?, ?, ?, ?)",
                 req.hostid,
                 i64::from(req.rpc_seqno) - 1,
                 STOCK_LAST_RPC,
-                host_cpid(CLIENT_CPID, EMAIL)
+                host_cpid(CLIENT_CPID, EMAIL),
+                req.host_info.p_ncpus,
+                req.host_info.p_vendor.as_str(),
+                req.host_info.p_model.as_str(),
+                req.host_info.os_name.as_str(),
+                req.host_info.os_version.as_str()
             )))
             .unwrap();
         }
@@ -444,13 +450,20 @@ fn a_renumbered_host_row_is_found_by_its_cpid() {
     for (version, text) in captures() {
         let req = parse(&text).unwrap();
         let w = World::new(Rows::NoHost, &req, "");
-        // The row came across under another ID, with the CPID the stock server stored.
+        // The row came across under another ID, with the CPID and the hardware the stock server
+        // stored (a CPID match that describes other hardware is not taken, `obviously_different`).
         block_on(w.db.run(stmt!(
-            "INSERT INTO host (id, create_time, userid, rpc_seqno, rpc_time, host_cpid, domain_name) \
-             VALUES (?, 1700000100, 2, 0, ?, ?, 'fixture-host')",
+            "INSERT INTO host (id, create_time, userid, rpc_seqno, rpc_time, host_cpid, domain_name, \
+             p_ncpus, p_vendor, p_model, os_name, os_version) \
+             VALUES (?, 1700000100, 2, 0, ?, ?, 'fixture-host', ?, ?, ?, ?, ?)",
             req.hostid + 1000,
             STOCK_LAST_RPC,
-            host_cpid(CLIENT_CPID, EMAIL)
+            host_cpid(CLIENT_CPID, EMAIL),
+            req.host_info.p_ncpus,
+            req.host_info.p_vendor.as_str(),
+            req.host_info.p_model.as_str(),
+            req.host_info.os_name.as_str(),
+            req.host_info.os_version.as_str()
         )))
         .unwrap();
         let out = w.rpc(&text);
