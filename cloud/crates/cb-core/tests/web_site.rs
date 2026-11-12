@@ -683,6 +683,7 @@ fn login_sets_a_cookie_and_logout_clears_it() {
     assert_eq!(out.status, 303);
     assert_eq!(out.location.as_deref(), Some("https://p.example/"));
     assert!(out.set_cookie.unwrap().starts_with("auth=; Path=/;"));
+    assert!(out.more_cookies.is_empty());
 
     let form = w.get(
         "/login_form.php",
@@ -753,6 +754,12 @@ fn pages_under_a_stock_prefix_stay_under_it() {
         .set_cookie
         .unwrap()
         .starts_with("auth=; Path=/testproj/;"));
+    // A login made at the root has Path=/, which pages under the prefix also
+    // receive, so the logout clears that path too.
+    assert_eq!(
+        out.more_cookies,
+        ["auth=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"]
+    );
 
     // A request at the root keeps the master URL.
     *w.base.borrow_mut() = None;

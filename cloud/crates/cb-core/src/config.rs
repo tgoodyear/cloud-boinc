@@ -275,7 +275,7 @@ impl Config {
             // The master URL is an identity: clients compare it as text, with
             // the trailing slash.
             self.master_url.push('/');
-            let base = self.master_url.clone();
+            let base = self.native_base();
             let stock = self.stock_urls();
             let advertise = self.stock.as_ref().is_some_and(|s| s.advertise);
             if self.download_url.is_empty() {
@@ -292,6 +292,18 @@ impl Config {
                     _ => format!("{base}upload/file_upload_handler"),
                 };
             }
+        }
+    }
+
+    /// Where the native paths (`/sched`, `/download/`, `/upload/`) are. The
+    /// Workers' routes are at the root of the master URL's host, so with a
+    /// stock layout, whose master URL is usually `https://host/<short>/`, they
+    /// are under the origin, not under the master URL's directory. Without
+    /// one the master URL is used as before.
+    fn native_base(&self) -> String {
+        match (&self.stock, url_origin(&self.master_url)) {
+            (Some(_), Some(origin)) => format!("{origin}/"),
+            _ => self.master_url.clone(),
         }
     }
 
@@ -316,7 +328,7 @@ impl Config {
         ) {
             return stock.scheduler_url(origin);
         }
-        format!("{}sched", self.master_url)
+        format!("{}sched", self.native_base())
     }
 
     /// The URL of a download file is `<base>/<name>`, with a hash directory
@@ -344,6 +356,11 @@ impl Config {
         let mut bases = vec![self.download_url.clone()];
         if !self.master_url.is_empty() {
             bases.push(format!("{}download", self.master_url));
+        }
+        // The native directory is at the origin's root whatever path the
+        // master URL has.
+        if let Some(origin) = url_origin(&self.master_url) {
+            bases.push(format!("{origin}/download"));
         }
         if let Some((download, _)) = self.stock_urls() {
             bases.push(download);
@@ -449,14 +466,41 @@ mod tests {
         assert!(c.is_own_download_url("https://example.org/testproj/download/319/wu_1_0"));
     }
 
-    /// A master URL under the short name makes the native download URL the
-    /// stock one. The hash directory goes in then, because that is the only
-    /// path under it that the files Worker serves.
+    /// The native paths are served at the host root, so with a stock layout
+    /// and a master URL under the short name the native URLs are not under it.
     #[test]
-    fn a_native_download_url_on_the_stock_path_gets_the_directory() {
+    fn native_urls_are_at_the_origin_root_with_a_stock_layout() {
         let c = stock(
             "<stock_short_name>testproj</stock_short_name><stock_advertise>0</stock_advertise>\
-             <uldl_dir_fanout>1024</uldl_dir_fanout>",
+             <uldl_dir_fanout>1024</uldl_dir_fanout>\
+             <stock_download_prefix>/testproj_download</stock_download_prefix>",
+        );
+        assert_eq!(c.scheduler_url(), "https://example.org/sched");
+        assert_eq!(c.download_url, "https://example.org/download");
+        assert_eq!(
+            c.upload_url,
+            "https://example.org/upload/file_upload_handler"
+        );
+        assert_eq!(
+            c.download_urls().download("wu_1_0"),
+            "https://example.org/download/wu_1_0"
+        );
+        assert!(c.is_own_download_url("https://example.org/download/input"));
+        assert!(c.is_own_download_url("https://example.org/testproj_download/319/input"));
+        // Advertised stock URLs: the native directory is still the project's.
+        let c = stock("<stock_short_name>testproj</stock_short_name>");
+        assert_eq!(c.download_url, "https://example.org/testproj/download");
+        assert!(c.is_own_download_url("https://example.org/download/input"));
+    }
+
+    /// A download URL set to the stock one gets the hash directory, because
+    /// that is the only path under it that the files Worker serves.
+    #[test]
+    fn a_download_url_on_the_stock_path_gets_the_directory() {
+        let c = stock(
+            "<stock_short_name>testproj</stock_short_name><stock_advertise>0</stock_advertise>\
+             <uldl_dir_fanout>1024</uldl_dir_fanout>\
+             <download_url>https://example.org/testproj/download</download_url>",
         );
         assert_eq!(c.download_url, "https://example.org/testproj/download");
         assert_eq!(

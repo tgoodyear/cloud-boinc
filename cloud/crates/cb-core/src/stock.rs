@@ -325,12 +325,20 @@ pub enum FilesRoute<'a> {
 /// Routes a path for the files Worker. The native paths need no setting; the
 /// stock ones only match when `stock` is given, so a caller tries
 /// `route_files(path, None)` first and loads the settings only on
-/// `NotFound`.
+/// `NotFound`. A path below `/download/` with a further `/` is not a native
+/// name, so with a stock download prefix of `/download` it is routed as a
+/// stock download.
 pub fn route_files<'a>(path: &'a str, stock: Option<&StockLayout>) -> FilesRoute<'a> {
     if path == "/upload/file_upload_handler" {
         return FilesRoute::Upload;
     }
-    if let Some(name) = path.strip_prefix("/download/") {
+    // A native name is flat. A longer path may be a stock download below a
+    // stock download prefix that starts with `/download`, so it is left to
+    // the stock routing below.
+    if let Some(name) = path
+        .strip_prefix("/download/")
+        .filter(|n| !n.contains('/'))
+    {
         return FilesRoute::Download(name);
     }
     if let Some(s) = stock {
@@ -675,6 +683,37 @@ mod tests {
         assert_eq!(r("/testproj_cgi/cgi", Some(&s)), FilesRoute::NotFound);
         assert_eq!(
             r("/testproj_cgi/file_upload_handler/x", Some(&s)),
+            FilesRoute::NotFound
+        );
+    }
+
+    /// A stock download prefix of `/download`, as a project whose `download_url`
+    /// was the host's `/download` directory would have.
+    #[test]
+    fn a_stock_prefix_of_download_is_reached_by_nested_paths() {
+        let s = StockSpec {
+            short_name: "testproj".into(),
+            download_prefix: "/download".into(),
+            ..Default::default()
+        }
+        .resolve(1024)
+        .unwrap()
+        .unwrap();
+        // Without the layout loaded the nested path is not a native name.
+        assert_eq!(
+            route_files("/download/319/wu_1_0", None),
+            FilesRoute::NotFound
+        );
+        assert_eq!(
+            route_files("/download/319/wu_1_0", Some(&s)),
+            FilesRoute::Download("wu_1_0")
+        );
+        assert_eq!(
+            route_files("/download/wu_1_0", Some(&s)),
+            FilesRoute::Download("wu_1_0")
+        );
+        assert_eq!(
+            route_files("/download/318/wu_1_0", Some(&s)),
             FilesRoute::NotFound
         );
     }

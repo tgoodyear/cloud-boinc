@@ -16,7 +16,7 @@ use cb_db::{stmt, Stmt};
 use crate::mail::Mail;
 use crate::model::User;
 use crate::site::{
-    error_page, layout, login_cookie, logout_cookie, str_param, time_str, to_login, viewer, Params,
+    error_page, layout, login_cookie, str_param, time_str, to_login, viewer, Params,
     SiteCtx, SitePage,
 };
 use crate::site_account::{token_fields, token_ok, TIMED_OUT};
@@ -902,7 +902,7 @@ pub async fn recover_email(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage
          <a href=\"reset_account_key.php\">replace the account key</a>; computers attached \
          with the old key have to be attached again.</p>\n",
     );
-    done.set_cookie = Some(logout_cookie(ctx.base));
+    done.clear_login(ctx.base);
     Ok(done)
 }
 

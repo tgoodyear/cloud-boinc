@@ -48,20 +48,23 @@ fn cacheable_xml(body: String) -> Result<Response> {
 
 /// A site page. These depend on the visitor's cookie, so no cache keeps them.
 fn site_response(page: SitePage) -> Result<Response> {
-    let mut builder = Response::builder()
-        .with_status(page.status)
-        .with_header("Content-Type", page.content_type)?
-        .with_header("Cache-Control", "private, no-store")?;
+    let headers = Headers::new();
+    headers.set("Content-Type", page.content_type)?;
+    headers.set("Cache-Control", "private, no-store")?;
     for (name, value) in SITE_HEADERS {
-        builder = builder.with_header(name, value)?;
+        headers.set(name, value)?;
     }
     if let Some(location) = &page.location {
-        builder = builder.with_header("Location", location)?;
+        headers.set("Location", location)?;
     }
-    if let Some(cookie) = &page.set_cookie {
-        builder = builder.with_header("Set-Cookie", cookie)?;
+    // One header line per cookie: they cannot be joined.
+    for cookie in page.set_cookie.iter().chain(&page.more_cookies) {
+        headers.append("Set-Cookie", cookie)?;
     }
-    Ok(builder.fixed(page.body.into_bytes()))
+    Ok(Response::builder()
+        .with_status(page.status)
+        .with_headers(headers)
+        .fixed(page.body.into_bytes()))
 }
 
 /// Pages that are the same for every client and need no database read when

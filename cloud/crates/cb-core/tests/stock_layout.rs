@@ -31,8 +31,12 @@ fn keys() -> &'static (PrivateKey, PublicKey) {
 }
 
 fn config(extra: &str) -> String {
+    config_at("https://p.example/", extra)
+}
+
+fn config_at(master: &str, extra: &str) -> String {
     format!(
-        "<config>\n<long_name>Test Project</long_name>\n<master_url>https://p.example/</master_url>\n<account_creation>1</account_creation>\n{extra}</config>\n"
+        "<config>\n<long_name>Test Project</long_name>\n<master_url>{master}</master_url>\n<account_creation>1</account_creation>\n{extra}</config>\n"
     )
 }
 
@@ -71,6 +75,10 @@ struct Run {
 }
 
 fn run(extra: &str) -> Run {
+    run_with(&config(extra))
+}
+
+fn run_with(config_xml: &str) -> Run {
     let db = SqliteDb::with_schema().unwrap();
     let seq = Cell::new(0u32);
     let rand = || {
@@ -79,7 +87,7 @@ fn run(extra: &str) -> Run {
     };
     let (private, public) = keys();
     let signer = Signer::new(private).unwrap();
-    block_on(put_setting(&db, SETTING_CONFIG, &config(extra), 1)).unwrap();
+    block_on(put_setting(&db, SETTING_CONFIG, config_xml, 1)).unwrap();
     block_on(put_setting(
         &db,
         SETTING_CODE_SIGN_KEY,
@@ -279,6 +287,33 @@ fn a_stock_layout_can_be_served_without_advertising_it() {
     assert!(r
         .result_doc
         .contains("<url>https://p.example/upload/file_upload_handler</url>"));
+}
+
+/// The master URL of a migrated project is under its short name, but the
+/// native paths are served at the host root, so a stock layout whose stock
+/// URLs are not advertised advertises root URLs.
+#[test]
+fn native_urls_are_at_the_root_when_the_master_url_has_a_path() {
+    let r = run_with(&config_at(
+        "https://p.example/example/",
+        &format!("{STOCK}<stock_advertise>0</stock_advertise>\n"),
+    ));
+    assert!(r
+        .master_page
+        .contains("<link rel=\"boinc_scheduler\" href=\"https://p.example/sched\">"));
+    assert!(r
+        .wu_doc
+        .contains("<url>https://p.example/download/in_1</url>"));
+    assert!(r
+        .result_doc
+        .contains("<url>https://p.example/upload/file_upload_handler</url>"));
+    assert!(r
+        .reply
+        .contains("<url>https://p.example/upload/file_upload_handler</url>"));
+    // The master URL is what clients attach to.
+    assert!(r
+        .project_config
+        .contains("<master_url>https://p.example/example/</master_url>"));
 }
 
 #[test]

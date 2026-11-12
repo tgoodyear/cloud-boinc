@@ -20,7 +20,7 @@ use crate::model::User;
 use crate::prefs::{PrefsForm, Subset, VENUES};
 use crate::project::Project;
 use crate::site::{
-    error_page, label_row, layout, local_url, login_cookie, logout_cookie, row2, str_param,
+    error_page, label_row, layout, local_url, login_cookie, row2, str_param,
     to_login, user_by_auth, viewer, Params, SiteCtx, SitePage,
 };
 use crate::site_email::{self, EMAIL_CHANGE_WAIT_SECS};
@@ -144,7 +144,7 @@ pub async fn logout(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
         return Ok(error_page(project, 403, TIMED_OUT));
     }
     let mut out = SitePage::redirect(ctx.base.to_string());
-    out.set_cookie = Some(logout_cookie(ctx.base));
+    out.clear_login(ctx.base);
     Ok(out)
 }
 

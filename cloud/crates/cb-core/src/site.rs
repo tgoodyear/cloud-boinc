@@ -76,6 +76,9 @@ pub struct SitePage {
     /// A redirect target, sent with status 303.
     pub location: Option<String>,
     pub set_cookie: Option<String>,
+    /// Further `Set-Cookie` values, sent after `set_cookie`: the clearing of
+    /// the login cookie on the other paths it may have been set for.
+    pub more_cookies: Vec<String>,
 }
 
 const HTML: &str = "text/html; charset=utf-8";
@@ -89,6 +92,7 @@ impl SitePage {
             body,
             location: None,
             set_cookie: None,
+            more_cookies: Vec::new(),
         }
     }
 
@@ -99,7 +103,21 @@ impl SitePage {
             body,
             location: None,
             set_cookie: None,
+            more_cookies: Vec::new(),
         }
+    }
+
+    /// Logs the browser out: clears the login cookie for the path of `base`
+    /// and for every directory above it. A cookie is sent to the paths below
+    /// the one it was set for, so a login made at the root of the host (`/`)
+    /// reaches pages under a stock page prefix, and clearing only the
+    /// prefix's own path would leave it in place.
+    pub(crate) fn clear_login(&mut self, base: &str) {
+        self.set_cookie = Some(logout_cookie(base));
+        self.more_cookies = parent_paths(&cookie_path(base))
+            .into_iter()
+            .map(|path| logout_cookie_for(&path))
+            .collect();
     }
 
     pub(crate) fn redirect(location: String) -> SitePage {
@@ -109,6 +127,7 @@ impl SitePage {
             body: String::new(),
             location: Some(location),
             set_cookie: None,
+            more_cookies: Vec::new(),
         }
     }
 }
@@ -457,10 +476,23 @@ pub fn login_cookie(base: &str, authenticator: &str, permanent: bool) -> String 
 
 /// `Set-Cookie` value that logs a browser out.
 pub fn logout_cookie(base: &str) -> String {
-    format!(
-        "{AUTH_COOKIE}=; Path={}; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
-        cookie_path(base)
-    )
+    logout_cookie_for(&cookie_path(base))
+}
+
+fn logout_cookie_for(path: &str) -> String {
+    format!("{AUTH_COOKIE}=; Path={path}; HttpOnly; Secure; SameSite=Lax; Max-Age=0")
+}
+
+/// The directories above a cookie path, outermost last: `/a/b/` gives `/a/`
+/// and `/`.
+fn parent_paths(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut p = path.trim_end_matches('/');
+    while let Some(i) = p.rfind('/') {
+        p = &p[..i];
+        out.push(format!("{p}/"));
+    }
+    out
 }
 
 /// `sanitize_local_url`, stricter: a page of this site and its query, or
@@ -2116,6 +2148,13 @@ pub async fn workunit(ctx: &SiteCtx<'_>, q: &Params) -> CoreResult<SitePage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_parent_paths() {
+        assert_eq!(parent_paths("/a/b/"), ["/a/", "/"]);
+        assert_eq!(parent_paths("/a/"), ["/"]);
+        assert!(parent_paths("/").is_empty());
+    }
 
     #[test]
     fn dates_and_numbers() {
