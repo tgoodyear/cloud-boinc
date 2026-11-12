@@ -1874,9 +1874,12 @@ fn reopening_keeps_a_running_replica_on_the_schedule_and_deletes_nothing() {
     );
     // The sweep picks it up at once, not never.
     assert_eq!(block_on(due_workunits(&w.db, 1400, 10)).unwrap(), vec![wu]);
-    // Long after the delete delay: with assimilation ready the pass
-    // schedules nothing for deletion and deletes nothing, and it keeps the
-    // replica's deadline as the next look.
+    // The pass keeps the replica's deadline as the next look.
+    let rep = w.transition(wu, 1500);
+    assert_eq!(rep.files_deleted, 0);
+    assert_eq!(rep.transition_time, 1100 + 3600);
+    // Long after the delete delay, with the replica timed out: assimilation
+    // is still ready, so the pass schedules and does no file deletion.
     let rep = w.transition(wu, 9000);
     assert_eq!(rep.files_deleted, 0);
     let row = w.wu(wu);
@@ -1884,7 +1887,6 @@ fn reopening_keeps_a_running_replica_on_the_schedule_and_deletes_nothing() {
     assert_eq!(row.file_delete_state, FILE_DELETE_INIT);
     assert_eq!(w.results(wu)[0].file_delete_state, FILE_DELETE_INIT);
     assert_eq!(w.files.objects.borrow().len(), 1);
-    assert_ne!(row.transition_time, NEVER);
 }
 
 #[test]
