@@ -1,6 +1,6 @@
 # Shared by serve.sh and reset.sh. Expects STATE, PORT and PUBLIC_PORT.
-PROJECT_NAME=diff
-DB_NAME=diff
+PROJECT_NAME="${PROJECT_NAME:-diff}"
+DB_NAME="$PROJECT_NAME"
 PROJECT_DIR="$STATE/project"
 SOCKET=/run/mysqld/mysqld.sock
 APACHE_DIR="$STATE/apache"
@@ -30,7 +30,7 @@ start_mariadb() {
 }
 
 setup_project() {
-    local base="http://127.0.0.1:$PUBLIC_PORT/"
+    local base="${URL_BASE:-http://127.0.0.1:$PUBLIC_PORT/}"
     rm -rf "$PROJECT_DIR"
     (cd /opt/boinc/tools && as_boincadm "./make_project --no_query --delete_prev_inst \
         --drop_db_first --project_root '$PROJECT_DIR' --url_base '$base' \
