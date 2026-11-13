@@ -30,9 +30,11 @@ pub const SECRET_UPLOAD_KEY: &str = "UPLOAD_PRIVATE_KEY";
 pub const SECRET_ADMIN_TOKENS: &str = "ADMIN_TOKENS";
 /// Secret: the pepper of stored password hashes.
 pub const SECRET_PASSWD_PEPPER: &str = "PASSWD_PEPPER";
-/// Secret, optional: sent as a bearer token with validator and assimilation
-/// webhooks.
+/// Secret, optional: sent as a bearer token with the validator webhook.
 pub const SECRET_WEBHOOK_TOKEN: &str = "WEBHOOK_TOKEN";
+/// Secret, optional: signs the validator webhook (timestamp and HMAC
+/// headers). Never sent. Without it no signature headers are sent.
+pub const SECRET_WEBHOOK_SIGNING: &str = "WEBHOOK_SIGNING_SECRET";
 
 /// How long an isolate keeps the project settings. A changed setting
 /// reaches every isolate within this time.
@@ -284,6 +286,7 @@ impl Files for R2Files {
 /// `fetch` behind the core's [`Webhook`] trait.
 pub struct FetchWebhook {
     pub token: Option<String>,
+    pub signing_secret: Option<String>,
     /// How long one call may take, answer included.
     pub timeout: std::time::Duration,
 }
@@ -292,6 +295,11 @@ impl FetchWebhook {
     pub fn from_env(env: &Env, timeout_secs: i32) -> Self {
         FetchWebhook {
             token: env.secret(SECRET_WEBHOOK_TOKEN).ok().map(|s| s.to_string()),
+            signing_secret: env
+                .secret(SECRET_WEBHOOK_SIGNING)
+                .ok()
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty()),
             timeout: std::time::Duration::from_secs(timeout_secs.max(1) as u64),
         }
     }
@@ -307,15 +315,20 @@ impl FetchWebhook {
         headers
             .set("Content-Type", "application/json")
             .map_err(fail)?;
-        if let Some(token) = &self.token {
-            headers
-                .set("Authorization", &format!("Bearer {token}"))
-                .map_err(fail)?;
+        // Serialized once: the signature covers exactly these bytes.
+        let text = body.to_string();
+        for (name, value) in cb_core::webhook_headers(
+            self.token.as_deref(),
+            self.signing_secret.as_deref(),
+            now(),
+            &text,
+        ) {
+            headers.set(name, &value).map_err(fail)?;
         }
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
-            .with_body(Some(JsValue::from_str(&body.to_string())));
+            .with_body(Some(JsValue::from_str(&text)));
         let request = Request::new_with_init(url, &init).map_err(fail)?;
         let mut response = Fetch::Request(request)
             .send_with_signal(signal)
