@@ -1566,6 +1566,36 @@ fn assimilation_list_pages_with_has_more() {
 }
 
 #[test]
+fn assimilation_list_caps_the_page_at_500_whatever_limit_is_asked() {
+    let w = World::new("trivial");
+    // 501 workunits ready to assimilate, inserted directly: the listing reads
+    // only the workunit rows.
+    let stmts: Vec<Stmt> = (1..=501)
+        .map(|i| {
+            stmt!(
+                "INSERT INTO workunit (id, create_time, appid, name, xml_doc, rsc_fpops_est, \
+                 rsc_fpops_bound, rsc_memory_bound, rsc_disk_bound, transition_time, delay_bound, \
+                 assimilate_state, min_quorum, target_nresults, max_error_results, \
+                 max_total_results, max_success_results, result_template) \
+                 VALUES (?, 0, 1, ?, '', 1e12, 1e13, 1e8, 1e8, 2147483647, 3600, ?, 1, 1, 3, 3, 1, '')",
+                i as i64,
+                format!("cap_{i}"),
+                ASSIMILATE_READY
+            )
+        })
+        .collect();
+    block_on(w.db.batch(stmts)).unwrap();
+    let page = ready(&w, AssimilateList::Ready, 0, 0, 1000);
+    assert_eq!(page.workunits.len(), 500);
+    assert!(page.has_more);
+    assert_eq!(page.next_after, Some(page.workunits[499].id));
+    assert_eq!(page.next_after, Some(500));
+    let rest = ready(&w, AssimilateList::Ready, 500, 0, 1000);
+    assert_eq!(rest.workunits.len(), 1);
+    assert!(!rest.has_more);
+}
+
+#[test]
 fn an_acknowledged_workunit_can_be_listed_and_reopened_until_deletion_starts() {
     let w = World::new("trivial");
     let wu = ready_job(&w, "r1");

@@ -21,6 +21,9 @@ use futures_lite::future::block_on;
 
 const LINUX: &str = "x86_64-pc-linux-gnu";
 const MAC: &str = "arm64-apple-darwin";
+/// Platforms the test host also lists, for tests that need more versions of one
+/// number than one platform can hold.
+const EXTRA_PLATFORMS: [&str; 5] = ["extra-1", "extra-2", "extra-3", "extra-4", "extra-5"];
 const INPUT_TEMPLATE: &str = "<input_template>\n<workunit>\n<rsc_fpops_est>1e12</rsc_fpops_est>\n<rsc_memory_bound>1e8</rsc_memory_bound>\n<rsc_disk_bound>1e8</rsc_disk_bound>\n<delay_bound>3600</delay_bound>\n</workunit>\n</input_template>\n";
 const RESULT_TEMPLATE: &str = "<output_template>\n<file_info>\n    <name><OUTFILE_0/></name>\n    <generated_locally/>\n    <upload_when_present/>\n    <max_nbytes>5000000</max_nbytes>\n    <url><UPLOAD_URL/></url>\n</file_info>\n<result>\n    <file_ref>\n        <file_name><OUTFILE_0/></file_name>\n        <open_name>out</open_name>\n    </file_ref>\n</result>\n</output_template>\n";
 
@@ -129,8 +132,12 @@ impl World {
     }
 
     fn rpc(&self, hostid: i64, seqno: i32, other: Option<&[&str]>, now: i64) -> SchedOutcome {
+        let extra: String = EXTRA_PLATFORMS
+            .iter()
+            .map(|p| format!("<alt_platform><name>{p}</name></alt_platform>\n"))
+            .collect();
         let mut xml = format!(
-            "<scheduler_request>\n<authenticator>auth1</authenticator>\n<hostid>{hostid}</hostid>\n<rpc_seqno>{seqno}</rpc_seqno>\n<core_client_major_version>8</core_client_major_version>\n<core_client_minor_version>0</core_client_minor_version>\n<core_client_release>4</core_client_release>\n<client_cap_plan_class>1</client_cap_plan_class>\n<work_req_seconds>100000</work_req_seconds>\n<cpu_req_secs>100000</cpu_req_secs>\n<cpu_req_instances>1</cpu_req_instances>\n<estimated_delay>0</estimated_delay>\n<platform_name>{LINUX}</platform_name>\n<alt_platform><name>{MAC}</name></alt_platform>\n<host_info>\n<domain_name>box</domain_name>\n<ip_addr>192.0.2.17</ip_addr>\n<host_cpid>c0ffee</host_cpid>\n<p_ncpus>4</p_ncpus>\n<p_vendor>GenuineIntel</p_vendor>\n<p_model>cpu</p_model>\n<p_fpops>2e9</p_fpops>\n<m_nbytes>8e9</m_nbytes>\n<d_total>1e11</d_total>\n<d_free>5e10</d_free>\n<os_name>Linux</os_name>\n<os_version>6.1</os_version>\n</host_info>\n"
+            "<scheduler_request>\n<authenticator>auth1</authenticator>\n<hostid>{hostid}</hostid>\n<rpc_seqno>{seqno}</rpc_seqno>\n<core_client_major_version>8</core_client_major_version>\n<core_client_minor_version>0</core_client_minor_version>\n<core_client_release>4</core_client_release>\n<client_cap_plan_class>1</client_cap_plan_class>\n<work_req_seconds>100000</work_req_seconds>\n<cpu_req_secs>100000</cpu_req_secs>\n<cpu_req_instances>1</cpu_req_instances>\n<estimated_delay>0</estimated_delay>\n<platform_name>{LINUX}</platform_name>\n<alt_platform><name>{MAC}</name></alt_platform>\n{extra}<host_info>\n<domain_name>box</domain_name>\n<ip_addr>192.0.2.17</ip_addr>\n<host_cpid>c0ffee</host_cpid>\n<p_ncpus>4</p_ncpus>\n<p_vendor>GenuineIntel</p_vendor>\n<p_model>cpu</p_model>\n<p_fpops>2e9</p_fpops>\n<m_nbytes>8e9</m_nbytes>\n<d_total>1e11</d_total>\n<d_free>5e10</d_free>\n<os_name>Linux</os_name>\n<os_version>6.1</os_version>\n</host_info>\n"
         );
         if let Some(names) = other {
             xml.push_str("<other_results>\n");
@@ -375,4 +382,65 @@ fn assigned_rules_do_not_spend_the_budget_of_queries_that_do_not_run() {
         "{regular:?}"
     );
     assert!(log.iter().all(|s| !s.contains("FROM assignment")));
+}
+
+#[test]
+fn versions_with_the_same_routing_clause_are_charged_once() {
+    // Sixty-four rules, each refusing every version, make one condition of
+    // about 7 KB: it fits the 40,000-byte budget of a statement once, six times
+    // it does not. Six usable versions share a number and have no plan class,
+    // so their clauses are the same text and only one may be charged.
+    let mut rules: Vec<String> = (0..63)
+        .map(|i| {
+            format!(
+                r#"{{"app":"a","name":"r{i:02}_{}*","max_batch":9223372036854775807,"allow":[]}}"#,
+                "x".repeat(44)
+            )
+        })
+        .collect();
+    rules.push(
+        r#"{"app":"a","name":"none_*","max_batch":9223372036854775807,"allow":[]}"#.to_string(),
+    );
+    let rules = format!(r#"{{"rules":[{}]}}"#, rules.join(","));
+    let w = World::new(&rules);
+    let one = w
+        .routing
+        .borrow()
+        .sql_condition(
+            "a",
+            false,
+            Some(&cb_core::routing::VersionRef {
+                platform: LINUX,
+                plan_class: "",
+                version_num: 100,
+            }),
+        )
+        .len();
+    assert!(one <= 40_000 && one * 6 > 40_000, "{one}");
+    // Five more platforms, each with a version of number 100: six with the
+    // Linux one.
+    let mut extra: Vec<Stmt> = Vec::new();
+    for (i, name) in EXTRA_PLATFORMS.iter().enumerate() {
+        let id = 3 + i as i64;
+        extra.push(stmt!(
+            "INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (?, 0, ?, ?)",
+            id,
+            *name,
+            *name
+        ));
+        extra.push(stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (?, 0, 1, 100, ?, ?)", 100 + id, id, version_xml(100)));
+    }
+    block_on(w.db.batch(extra)).unwrap();
+    let host = w.host();
+    // More refused workunits than the four windows of 100 one request reads,
+    // all older than the one the host may take: only the conditions in the
+    // query let it reach that one.
+    let names: Vec<String> = (0..450).map(|i| format!("none_{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ids = w.submit(&refs, 0, None);
+    let open = w.submit(&["free_1"], 0, None)[0];
+    let out = w.rpc(host, 2, None, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert!(sent_with(&w, open).is_some());
+    assert!(ids.iter().all(|id| sent_with(&w, *id).is_none()));
 }
