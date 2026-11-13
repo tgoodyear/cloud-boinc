@@ -71,7 +71,7 @@ flowchart LR
   admin --> d1 & r2 & q
   q --> pipe
   pipe --> d1 & r2
-  pipe -. validate / assimilate webhooks .-> ops
+  pipe -. validate webhook .-> ops
 ```
 
 | Stock component | Replacement |
@@ -80,7 +80,7 @@ flowchart LR
 | `feeder` and the shared-memory job cache | an indexed query on unsent results plus an atomic claim (see "Dispatch without a feeder") |
 | `transitioner` | `pipeline` Worker, driven by the queue, with a cron sweep for deadlines |
 | validators | `pipeline` Worker: built-in trivial and bitwise validators, and a webhook validator for project code |
-| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API or receives a webhook |
+| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API |
 | `file_deleter` | part of the transition in the `pipeline` Worker |
 | `db_purge` | cron handler in the `pipeline` Worker |
 | `file_upload_handler` | `files` Worker writing to R2 |
@@ -1127,8 +1127,8 @@ per file is the one that was already made.
 The stock assimilator is project code that runs next to the database. Here the project pulls:
 `GET /admin/v1/assimilate?limit=<n>` (optionally with `app=<name>`) returns ready workunits with their canonical
 result, output file names and sizes; output bodies are fetched from `/admin/v1/outputs/<name>`;
-`POST /admin/v1/assimilate/ack` marks them done. An optional webhook announces new work so the
-project does not have to poll. Outputs are deleted once the workunit is acknowledged and
+`POST /admin/v1/assimilate/ack` marks them done. There is no assimilation webhook (the validator
+webhook is the only one the server sends), so the project polls. Outputs are deleted once the workunit is acknowledged and
 `delete_delay_hours` have passed since its most recently returned result, the rule upstream
 uses. The project fetches outputs before it acknowledges, so an acknowledgement that comes
 after the delay can delete them at once.
