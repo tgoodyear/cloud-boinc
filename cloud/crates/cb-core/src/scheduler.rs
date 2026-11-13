@@ -2314,6 +2314,9 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             } else {
                 format!("{clause} AND {refused}")
             };
+            if clauses.contains(&routed) {
+                continue;
+            }
             let clause = if routing_sql(left, refused) {
                 routed
             } else {
