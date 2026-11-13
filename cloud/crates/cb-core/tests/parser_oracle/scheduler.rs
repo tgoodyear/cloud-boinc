@@ -274,6 +274,7 @@ impl World {
             db: &self.db,
             config: &self.config,
             plan_classes: &self.plan_classes,
+            routing: &cb_core::routing::NONE,
             catalog: &catalog,
             code_sign_key: &key,
             now,

@@ -56,6 +56,7 @@ use crate::model::{
     AppVersion, Host, HostAppVersion, Platform, User, Workunit,
 };
 use crate::plan_class::{gpu_peak_flops, HostUsage, PlanClassSpecs, PlanHost, DEFAULT_FPOPS};
+use crate::routing::{RoutingRules, VersionRef};
 use crate::site_delete::{account_guard, is_guard_failure};
 use crate::template::output_files;
 use crate::{Config, CoreError, CoreResult};
@@ -192,6 +193,8 @@ pub struct SchedCtx<'a> {
     pub db: &'a dyn Db,
     pub config: &'a Config,
     pub plan_classes: &'a PlanClassSpecs,
+    /// The project's routing rules, the hook of `wu_is_infeasible_custom`.
+    pub routing: &'a RoutingRules,
     pub catalog: &'a Catalog,
     /// The project's code-signing public key, as text; empty when unset.
     pub code_sign_key: &'a str,
@@ -2220,7 +2223,21 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // without a feeder" in `docs/architecture.md`. The IDs and numbers are
     // integers of the catalog and the plan class file. The client's own
     // versions are none: an app with a client version has no clause.
-    let version_gate = |app_id: i64| -> String {
+    // The routing conditions one statement may hold, in bytes (a fresh
+    // `Cell` for each statement that runs). Past it a gate leaves them out,
+    // and `admitted` alone enforces the rules, which can let a window of
+    // refused results through. A statement is limited to 100,000 bytes on D1.
+    let routing_budget = || std::cell::Cell::new(40_000usize);
+    let routing_sql = |left: &std::cell::Cell<usize>, text: String| -> bool {
+        if text.len() <= left.get() {
+            left.set(left.get() - text.len());
+            true
+        } else {
+            false
+        }
+    };
+    let version_gate = |app_id: i64, assigned: bool, left: &std::cell::Cell<usize>| -> String {
+        let app_name = catalog.app(app_id).map_or("", |a| a.name.as_str());
         let hav = catalog
             .app(app_id)
             .is_some_and(|a| a.homogeneous_app_version != 0);
@@ -2228,8 +2245,13 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         for v in versions.iter().filter(|v| v.appid == app_id) {
             let Some(av) = v.av else {
                 // The client's own version takes any workunit of a plain
-                // app (`admitted` below).
-                return "1 = 1".to_string();
+                // app (`admitted` below), but not one a routing rule selects.
+                let refused = ctx.routing.sql_condition(app_name, assigned, None);
+                return if refused.is_empty() || !routing_sql(left, refused.clone()) {
+                    "1 = 1".to_string()
+                } else {
+                    refused
+                };
             };
             let vn = av.version_num;
             // Uncommitted workunits: a pinned one needs this number; one that
@@ -2273,6 +2295,33 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     }
                 }
             }
+            // A workunit a routing rule refuses this version for
+            // (`RoutingRules::permits`, below in `admitted`). A clause that
+            // is already there with its condition costs nothing; one that is
+            // new is charged what its condition adds, and is left unrouted
+            // when that no longer fits the budget.
+            let refused = ctx.routing.sql_condition(
+                app_name,
+                assigned,
+                Some(&VersionRef {
+                    platform: v.platform,
+                    plan_class: v.plan_class,
+                    version_num: v.version_num,
+                }),
+            );
+            let routed = if refused.is_empty() {
+                clause.clone()
+            } else {
+                format!("{clause} AND {refused}")
+            };
+            if clauses.contains(&routed) {
+                continue;
+            }
+            let clause = if routing_sql(left, refused) {
+                routed
+            } else {
+                clause
+            };
             if !clauses.contains(&clause) {
                 clauses.push(clause);
             }
@@ -2283,10 +2332,21 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             format!("({})", clauses.join(" OR "))
         }
     };
-    let assigned_version_gate: String = assigned_list
-        .iter()
-        .map(|id| format!(" AND (w.appid != {id} OR {})", version_gate(*id)))
-        .collect();
+    // Built only for a request that sends assigned jobs, from its own budget.
+    let assigned_version_gate: String = if want_assigned {
+        let left = routing_budget();
+        assigned_list
+            .iter()
+            .map(|id| {
+                format!(
+                    " AND (w.appid != {id} OR {})",
+                    version_gate(*id, true, &left)
+                )
+            })
+            .collect()
+    } else {
+        String::new()
+    };
     let assigned_class_gate: String = assigned_list
         .iter()
         .filter(|id| homog[id].hr_type != 0)
@@ -2338,7 +2398,10 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             sql.push_str(" AND w.hr_class IN (0, ?)");
             params.push(h.host_class.into());
         }
-        sql.push_str(&format!(" AND {}", version_gate(*id)));
+        sql.push_str(&format!(
+            " AND {}",
+            version_gate(*id, false, &routing_budget())
+        ));
         if replica_rule {
             // A workunit the host or user already has a result of
             // (`slow_check` in `sched/sched_check.cpp`).
@@ -2497,7 +2560,25 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
         let placed = homog
             .get(&c.wu.appid)
             .is_none_or(|h| h.hr_type == 0 || (!h.unknown && !h.other_class(&c.wu)));
+        // The routing rules too (`wu_is_infeasible_custom`, which
+        // `wu_is_infeasible_fast` calls): a lost result a rule refuses the
+        // chosen version for is not sent again.
+        let routed = usable.as_ref().is_none_or(|s| {
+            let version = VersionRef {
+                platform: &s.platform,
+                plan_class: &s.plan_class,
+                version_num: s.version_num,
+            };
+            ctx.routing.permits(
+                catalog.app(c.wu.appid).map_or("", |a| a.name.as_str()),
+                &c.wu.name,
+                c.wu.batch,
+                false,
+                (!s.anon).then_some(&version),
+            )
+        });
         let wanted = placed
+            && routed
             && c.wu.error_mask == 0
             && c.wu.canonical_resultid == 0
             && c.wu.assimilate_state == ASSIMILATE_INIT;
@@ -2769,13 +2850,29 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                                         c.wu.id,
                                         c.wu.batch,
                                     )
+                                    && ctx.routing.permits(
+                                        &app.name,
+                                        &c.wu.name,
+                                        c.wu.batch,
+                                        assigned,
+                                        Some(&VersionRef {
+                                            platform: v.platform,
+                                            plan_class: v.plan_class,
+                                            version_num: v.version_num,
+                                        }),
+                                    )
                             }
                             // The client's own versions are never used for an
                             // app with homogeneous app version. A workunit
                             // pinned to a version number is sent to them
                             // regardless, as upstream's
                             // `get_app_version_anonymous` does not look at it.
-                            None => !hom.hav,
+                            None => {
+                                !hom.hav
+                                    && ctx
+                                        .routing
+                                        .permits(&app.name, &c.wu.name, c.wu.batch, assigned, None)
+                            }
                         }
                 };
                 let mut chosen: Option<(usize, usize, f64)> = None;

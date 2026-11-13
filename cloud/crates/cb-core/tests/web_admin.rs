@@ -360,6 +360,7 @@ fn a_registered_version_is_sent_to_a_client() {
         db: &w.db,
         config: &project.config,
         plan_classes: &project.plan_classes,
+        routing: &cb_core::routing::NONE,
         catalog: &project.catalog,
         code_sign_key: &project.code_sign_key,
         now: 300,

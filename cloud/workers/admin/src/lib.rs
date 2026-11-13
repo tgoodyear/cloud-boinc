@@ -6,7 +6,10 @@ use cb_core::admin::{
     set_app_version_deprecated, set_host_max_results_day, set_user_blocked, NewApp, NewAppVersion,
     NewPlatform, ResetTarget, ResetWhat,
 };
-use cb_core::project::{change_config_tag, get_setting, put_setting, SETTING_CONFIG};
+use cb_core::project::{
+    change_config_tag, delete_setting, get_setting, put_setting, SETTING_CONFIG,
+    SETTING_ROUTING_RULES,
+};
 use cb_core::status::{operator_summary, STATUS_COUNTS_TTL};
 use cb_core::web::{make_user, server_status, NewAccount};
 use cb_core::work::{
@@ -299,6 +302,36 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
                 Err(e) => core_error(e),
             }
         }
+
+        // The routing rules (`cb_core::routing`): the stored document, or no
+        // rules; replaced as a whole after it has been checked; removed.
+        (Method::Get, ["routing"]) => match get_setting(&db, SETTING_ROUTING_RULES).await {
+            Ok(Some(v)) => text(200, &v),
+            Ok(None) => text(200, "{\"rules\":[]}\n"),
+            Err(e) => core_error(e),
+        },
+        (Method::Put, ["routing"]) => {
+            let Some(value) = read_body(&mut req, MAX_SETTING_BYTES).await? else {
+                return error(413, "the rules are too large");
+            };
+            let Ok(value) = String::from_utf8(value) else {
+                return error(400, "the rules are not UTF-8 text");
+            };
+            match put_setting(&db, SETTING_ROUTING_RULES, &value, now()).await {
+                Ok(()) => {
+                    forget_project();
+                    ok(&json!({ "ok": true }))
+                }
+                Err(e) => core_error(e),
+            }
+        }
+        (Method::Delete, ["routing"]) => match delete_setting(&db, SETTING_ROUTING_RULES).await {
+            Ok(removed) => {
+                forget_project();
+                ok(&json!({ "ok": true, "removed": removed }))
+            }
+            Err(e) => core_error(e),
+        },
 
         // One tag of the `config` setting, changed as one guarded
         // read-modify-write on the stored document.

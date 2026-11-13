@@ -90,6 +90,25 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Print the routing rules: which app versions each kind of workunit may
+    /// be sent with. A project with none prints an empty list.
+    RoutingShow {
+        #[command(flatten)]
+        server: Server,
+    },
+    /// Replace the routing rules with the JSON document in a file. The server
+    /// checks the document and refuses one that is not valid.
+    RoutingSet {
+        #[command(flatten)]
+        server: Server,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Remove all routing rules, so every workunit may go with any version.
+    RoutingClear {
+        #[command(flatten)]
+        server: Server,
+    },
     /// Set one option of the config, leaving the rest as it is. The server
     /// reads the stored config, changes the tag and writes it back only if
     /// nothing changed it meanwhile, so two operators cannot undo each
@@ -563,6 +582,26 @@ fn run(cli: Cli) -> Res<()> {
                     .set("Content-Type", "text/plain")
                     .send_string(&body),
             )?;
+        }
+        Command::RoutingShow { server } => {
+            let c = Client::new(&server)?;
+            let r = Client::finish(c.request("GET", "routing").call())?;
+            print!("{}", r.into_string().map_err(|e| e.to_string())?);
+        }
+        Command::RoutingSet { server, file } => {
+            let c = Client::new(&server)?;
+            let body = read(&file)?;
+            Client::finish(
+                c.request("PUT", "routing")
+                    .set("Content-Type", "application/json")
+                    .send_string(&body),
+            )?;
+        }
+        Command::RoutingClear { server } => {
+            let c = Client::new(&server)?;
+            show(&Client::json(Client::finish(
+                c.request("DELETE", "routing").call(),
+            )?)?)
         }
         Command::ConfigSet {
             server,

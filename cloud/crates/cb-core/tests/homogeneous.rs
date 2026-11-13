@@ -339,6 +339,7 @@ impl World {
             db,
             config: &self.config,
             plan_classes: &self.plan_classes,
+            routing: &cb_core::routing::NONE,
             catalog,
             code_sign_key: "",
             now,
