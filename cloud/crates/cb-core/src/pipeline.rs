@@ -749,7 +749,9 @@ fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bo
                 }
             }
             let mut canonical: Option<usize> = None;
-            if good_results >= st.wu.min_quorum {
+            // With a retry pending no comparison is acted on: it would mark
+            // results invalid, and commit that, on a set that is incomplete.
+            if good_results >= st.wu.min_quorum && !retry {
                 for (k, &i) in viable.iter().enumerate() {
                     if had_error[k] {
                         continue;

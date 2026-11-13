@@ -2371,3 +2371,49 @@ fn fingerprint_replies_are_unchanged_by_the_pairwise_form() {
     assert_eq!(w.wu(wu).canonical_resultid, 0);
     assert_eq!(rep.transition_time, 1300 + 600);
 }
+
+#[test]
+fn a_retry_verdict_commits_no_comparison_result_and_the_next_call_decides() {
+    // Quorum 2, A B C readable, D asks for a retry, only A~B listed. C must
+    // not be marked invalid on this incomplete set. Same for fingerprints.
+    for pairwise in [true, false] {
+        let (w, wu, rs) = pairwise_set("rt", 2, 4);
+        let mut reply = if pairwise {
+            pairwise_reply(&rs, &[(0, 1)])
+        } else {
+            serde_json::json!({"results": [
+                {"id": rs[0].id, "fingerprint": "f"},
+                {"id": rs[1].id, "fingerprint": "f"},
+                {"id": rs[2].id, "fingerprint": "g"},
+                {"id": rs[3].id, "fingerprint": "g"},
+            ]})
+        };
+        reply["results"][3] = serde_json::json!({"id": rs[3].id, "retry": true});
+        *w.hook.reply.borrow_mut() = Some(reply);
+        let rep = w.transition(wu, 1300);
+        assert_eq!(w.wu(wu).canonical_resultid, 0, "pairwise {pairwise}");
+        assert_eq!(
+            states(&w, wu),
+            [VALIDATE_STATE_INIT; 4],
+            "pairwise {pairwise}"
+        );
+        assert_eq!(rep.transition_time, 1300 + 600);
+
+        // The retry: D is readable and C matches A and B.
+        let reply = if pairwise {
+            pairwise_reply(&rs, &[(0, 1), (1, 2), (0, 2), (2, 3)])
+        } else {
+            serde_json::json!({"results": rs.iter()
+                .map(|r| serde_json::json!({"id": r.id, "fingerprint": "f"}))
+                .collect::<Vec<_>>()})
+        };
+        *w.hook.reply.borrow_mut() = Some(reply);
+        w.transition(wu, 1300 + 600);
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id, "pairwise {pairwise}");
+        assert_eq!(
+            states(&w, wu),
+            [VALIDATE_STATE_VALID; 4],
+            "pairwise {pairwise}"
+        );
+    }
+}

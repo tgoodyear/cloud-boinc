@@ -1038,6 +1038,13 @@ new request fields by a validator written against the old request):
   `invalid` or `retry` verdict are read but count for nothing, as stock leaves a result that
   had an error out of the comparison. How the pairs decide (`check_set` and `check_pair` in
   `sched/validate_util2.cpp`):
+  - Any `retry` verdict (or a result with no entry) in a `check_set` call defers the whole call: no
+    canonical result is chosen and no result is marked valid or invalid by comparison, so a
+    result is never judged against an incomplete set. Explicit `invalid` verdicts still apply.
+    This holds for fingerprint replies too. Stock's `check_set` is different here: a transient
+    error in `init_result` sets `retry` but the comparison goes on among the other results and
+    its states are kept (only a transient error inside a comparison abandons it); the
+    validator then retries later.
   - `check_set`: the results with a usable verdict are taken in the workunit's result order
     (ascending ID). If fewer than `min_quorum` of them are usable, nothing is decided. The
     first result that matches at least `min_quorum/2+1` results, itself counted, is the
