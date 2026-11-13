@@ -465,10 +465,14 @@ pub struct OutputFileInfo {
     /// The `<open_name>` of the result template's `<file_ref>` for this
     /// file; null when the template gives none.
     pub open_name: Option<String>,
-    /// Position of the file in the result template, from 0. Files that were
-    /// not stored are left out of the list but keep their position, so
-    /// `index` of the others does not change.
+    /// Position of the file in the result template, from 0 over every
+    /// `<file_ref>`, one with no file name included (that one is not listed).
     pub index: usize,
+    /// False when the file is not in storage (an optional output that was
+    /// not uploaded, or a file with no upload URL, which stays on the
+    /// client); `nbytes` is then 0 and `md5` empty, and there is nothing to
+    /// download.
+    pub present: bool,
     pub nbytes: u64,
     pub md5: String,
 }
@@ -478,6 +482,10 @@ pub struct OutputFileInfo {
 pub struct ReadyWorkunit {
     pub id: i64,
     pub name: String,
+    /// The name of the workunit's application.
+    pub app: String,
+    /// The batch number, a JSON integer; 0 when the job was submitted
+    /// without a batch.
     pub batch: i64,
     /// Non-zero when the workunit failed; there is then no canonical result.
     pub error_mask: i32,
@@ -492,8 +500,8 @@ pub struct CanonicalResult {
     pub user_id: i64,
     pub elapsed_time: f64,
     pub granted_credit: f64,
-    /// Stored output files, in template order; an optional file that was not
-    /// uploaded is absent (see `OutputFileInfo::index`).
+    /// The files the result template names, in template order, each with
+    /// `present` telling whether it is in storage.
     pub files: Vec<OutputFileInfo>,
 }
 
@@ -523,6 +531,7 @@ pub struct ReadyPage {
 struct ReadyRow {
     id: i64,
     name: String,
+    app_name: String,
     batch: i64,
     error_mask: i32,
     canonical_resultid: i64,
@@ -547,42 +556,40 @@ fn outputs_kept() -> String {
     )
 }
 
-/// Workunits of `app` in the given list, by ID, after `after_id`. `since`
-/// (Unix time, 0 for none) keeps only workunits changed at or after it; the
-/// ready list ignores it. At most `limit` workunits (1 to 1000) come back
+/// Workunits of `app`, or of every app when it is `None`, in the given list,
+/// by ID, after `after_id`. `since` (Unix time, 0 for none) keeps only
+/// workunits changed at or after it; the ready list ignores it. At most
+/// `limit` workunits (1 to 500) come back
 /// with `has_more` telling whether another follows.
 pub async fn ready_to_assimilate(
     db: &dyn Db,
     files: &dyn Files,
-    app: &str,
+    app: Option<&str>,
     list: AssimilateList,
     after_id: i64,
     since: i64,
     limit: i64,
 ) -> CoreResult<ReadyPage> {
-    let limit = limit.clamp(1, 1000);
+    let limit = limit.clamp(1, 500);
     let cond = match list {
         AssimilateList::Ready => "w.assimilate_state = 1".to_string(),
         AssimilateList::Done => format!("{} AND w.mod_time >= {}", outputs_kept(), since.max(0)),
     };
     // One row more than the page, to learn whether another page follows.
-    let mut rows = cb_db::query::<ReadyRow>(
-        db,
-        stmt!(
-            &format!(
-                "SELECT w.id, w.name, w.batch, w.error_mask, w.canonical_resultid, r.name AS r_name, \
+    let app_cond = if app.is_some() { "AND a.name = ?" } else { "" };
+    let mut stmt = Stmt::new(format!(
+                "SELECT w.id, w.name, a.name AS app_name, w.batch, w.error_mask, w.canonical_resultid, r.name AS r_name, \
                  r.xml_doc_in AS r_xml_doc_in, r.hostid AS r_hostid, r.userid AS r_userid, \
                  r.elapsed_time AS r_elapsed_time, r.granted_credit AS r_granted_credit \
-                 FROM workunit w LEFT JOIN result r ON r.id = w.canonical_resultid AND w.canonical_resultid > 0 \
-                 WHERE {cond} AND w.appid = (SELECT id FROM app WHERE name = ?) AND w.id > ? \
+                 FROM workunit w JOIN app a ON a.id = w.appid \
+                 LEFT JOIN result r ON r.id = w.canonical_resultid AND w.canonical_resultid > 0 \
+                 WHERE {cond} {app_cond} AND w.id > ? \
                  ORDER BY w.id LIMIT ?"
-            ),
-            app,
-            after_id,
-            limit + 1
-        ),
-    )
-    .await?;
+    ));
+    if let Some(app) = app {
+        stmt = stmt.bind(app);
+    }
+    let mut rows = cb_db::query::<ReadyRow>(db, stmt.bind(after_id).bind(limit + 1)).await?;
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
     let mut out = Vec::with_capacity(rows.len());
@@ -591,15 +598,15 @@ pub async fn ready_to_assimilate(
             (true, Some(name)) => {
                 let mut fs = Vec::new();
                 for f in output_files(row.r_xml_doc_in.as_deref().unwrap_or("")) {
-                    if let Some(s) = files.stat(FileKind::Upload, &f.name).await? {
-                        fs.push(OutputFileInfo {
-                            name: f.name,
-                            open_name: Some(f.open_name).filter(|n| !n.is_empty()),
-                            index: f.index,
-                            nbytes: s.nbytes,
-                            md5: s.md5,
-                        });
-                    }
+                    let stat = files.stat(FileKind::Upload, &f.name).await?;
+                    fs.push(OutputFileInfo {
+                        name: f.name,
+                        open_name: Some(f.open_name).filter(|n| !n.is_empty()),
+                        index: f.index,
+                        present: stat.is_some(),
+                        nbytes: stat.as_ref().map_or(0, |s| s.nbytes),
+                        md5: stat.map(|s| s.md5).unwrap_or_default(),
+                    });
                 }
                 Some(CanonicalResult {
                     id: row.canonical_resultid,
@@ -616,6 +623,7 @@ pub async fn ready_to_assimilate(
         out.push(ReadyWorkunit {
             id: row.id,
             name: row.name,
+            app: row.app_name,
             batch: row.batch,
             error_mask: row.error_mask,
             canonical_result,
@@ -636,9 +644,37 @@ fn ids_of(rows: Vec<cb_db::Rows>) -> Vec<i64> {
         .collect()
 }
 
+/// What an acknowledgement did, per ID asked for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AckReport {
+    /// The IDs that changed; the caller queues a transition for each.
+    pub acknowledged: Vec<i64>,
+    /// Workunits that were acknowledged before this call.
+    pub already_acked: Vec<i64>,
+    /// Workunits that exist but are not ready to assimilate yet.
+    pub not_ready: Vec<i64>,
+    /// IDs that are not workunits.
+    pub unknown: Vec<i64>,
+}
+
 /// Marks workunits assimilated. Returns the IDs that changed; the caller
 /// queues a transition for each, which schedules file deletion.
 pub async fn acknowledge_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> CoreResult<Vec<i64>> {
+    Ok(acknowledge_assimilation_report(db, ids, now)
+        .await?
+        .acknowledged)
+}
+
+/// As [`acknowledge_assimilation`], and also says why each other ID did not
+/// change. Each chunk of IDs adds one `SELECT` to the same batch, run after
+/// the update: a workunit in the done state that the update did not change
+/// was acknowledged before, one in any other state is not ready yet, and an
+/// ID with no row is unknown.
+pub async fn acknowledge_assimilation_report(
+    db: &dyn Db,
+    ids: &[i64],
+    now: i64,
+) -> CoreResult<AckReport> {
     let mut stmts = Vec::new();
     for chunk in ids.chunks(MAX_IN_LIST) {
         let mut s = Stmt::new(format!(
@@ -654,11 +690,46 @@ pub async fn acknowledge_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> Cor
             s = s.bind(*id);
         }
         stmts.push(s);
+        let mut r = Stmt::new(format!(
+            "SELECT id, assimilate_state FROM workunit WHERE id IN ({})",
+            in_list(chunk.len())
+        ));
+        for id in chunk {
+            r = r.bind(*id);
+        }
+        stmts.push(r);
     }
+    let mut report = AckReport::default();
     if stmts.is_empty() {
-        return Ok(Vec::new());
+        return Ok(report);
     }
-    Ok(ids_of(db.batch(stmts).await?))
+    let mut state = HashMap::new();
+    for (i, rows) in db.batch(stmts).await?.into_iter().enumerate() {
+        for row in rows.rows {
+            let Some(id) = row.get("id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if i % 2 == 0 {
+                report.acknowledged.push(id);
+            } else if let Some(s) = row.get("assimilate_state").and_then(|v| v.as_i64()) {
+                state.insert(id, s);
+            }
+        }
+    }
+    // Membership by set, so a large request is not quadratic; the Vec keeps
+    // the reply's order.
+    let mut seen: HashSet<i64> = report.acknowledged.iter().copied().collect();
+    for id in ids {
+        if !seen.insert(*id) {
+            continue;
+        }
+        match state.get(id) {
+            None => report.unknown.push(*id),
+            Some(s) if *s == i64::from(ASSIMILATE_DONE) => report.already_acked.push(*id),
+            Some(_) => report.not_ready.push(*id),
+        }
+    }
+    Ok(report)
 }
 
 /// Puts acknowledged workunits back in the ready list, so a consumer that

@@ -339,8 +339,9 @@ enum Command {
     Assimilate {
         #[command(flatten)]
         server: Server,
+        /// Only this app; every app when omitted.
         #[arg(long)]
-        app: String,
+        app: Option<String>,
         /// `ready` (the default) or `done`.
         #[arg(long, default_value = "ready")]
         state: String,
@@ -864,9 +865,12 @@ fn run(cli: Cli) -> Res<()> {
             since,
             after,
             limit,
-        } => show(&Client::new(&server)?.get(&format!(
-            "assimilate?app={app}&state={state}&since={since}&after={after}&limit={limit}"
-        ))?),
+        } => {
+            let app = app.map(|a| format!("app={a}&")).unwrap_or_default();
+            show(&Client::new(&server)?.get(&format!(
+                "assimilate?{app}state={state}&since={since}&after={after}&limit={limit}"
+            ))?)
+        }
         Command::AssimilateReopen {
             server,
             workunit_ids,

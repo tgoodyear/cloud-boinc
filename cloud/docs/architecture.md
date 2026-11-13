@@ -1055,7 +1055,7 @@ per file is the one that was already made.
 ### Assimilation
 
 The stock assimilator is project code that runs next to the database. Here the project pulls:
-`GET /admin/v1/assimilate?app=<name>&limit=<n>` returns ready workunits with their canonical
+`GET /admin/v1/assimilate?limit=<n>` (optionally with `app=<name>`) returns ready workunits with their canonical
 result, output file names and sizes; output bodies are fetched from `/admin/v1/outputs/<name>`;
 `POST /admin/v1/assimilate/ack` marks them done. An optional webhook announces new work so the
 project does not have to poll. Outputs are deleted once the workunit is acknowledged and
@@ -1064,8 +1064,9 @@ uses. The project fetches outputs before it acknowledges, so an acknowledgement 
 after the delay can delete them at once.
 
 The list (`ready_to_assimilate` in `crates/cb-core/src/work.rs`) takes these query parameters:
-`app` (required), `state` (`ready`, the default, or `done`), `after` (a workunit ID; the list is
-in ID order and returns IDs greater than it), `limit` (1 to 500, default 100) and, with
+`app` (optional: omitted or empty lists every app, and each workunit names its app), `state` (`ready`, the default, or `done`), `after` (a workunit ID; the list is
+in ID order and returns IDs greater than it), `limit` (1 to 500, default 100; a value outside the range is cut to it, in the Worker and in
+`ready_to_assimilate` alike) and, with
 `state=done`, `since` (a Unix time; keep only workunits whose row changed at or after it). The
 reply:
 
@@ -1075,6 +1076,7 @@ reply:
     {
       "id": 1234,
       "name": "job_1234",
+      "app": "myapp",
       "batch": 5,
       "error_mask": 0,
       "canonical_result": {
@@ -1085,8 +1087,9 @@ reply:
         "elapsed_time": 100.0,
         "granted_credit": 0.46,
         "files": [
-          {"name": "job_1234_0_0", "open_name": "out", "index": 0, "nbytes": 3, "md5": "0cc175b9c0f1b6a831c399e269772661"},
-          {"name": "job_1234_0_2", "open_name": null, "index": 2, "nbytes": 1, "md5": "92eb5ffee6ae2fec3ad71c777531578f"}
+          {"name": "job_1234_0_0", "open_name": "out", "index": 0, "present": true, "nbytes": 3, "md5": "0cc175b9c0f1b6a831c399e269772661"},
+          {"name": "job_1234_0_2", "open_name": null, "index": 2, "present": true, "nbytes": 1, "md5": "92eb5ffee6ae2fec3ad71c777531578f"},
+          {"name": "job_1234_0_3", "open_name": "extra", "index": 3, "present": false, "nbytes": 0, "md5": ""}
         ]
       }
     }
@@ -1096,19 +1099,51 @@ reply:
 }
 ```
 
-- `open_name` is the `<open_name>` of the result template's `<file_ref>` for the file (null when
-  the template has none), and `index` its position in the template from 0 over every `<file_ref>`, one with no file name included, so a puller can write
-  the names the stock assimilator writes (`<workunit name>__file_<open_name>`). `files` is in
-  template order.
-- A file that is not in storage (an optional output that was not uploaded, or a file with no
-  upload URL, which stays on the client) is left out of `files`, and the others keep their
-  positions: the list shows a gap in `index`, it does not renumber. It is not listed with a flag
-  because a puller has nothing to read for it, and the gap is enough to see that it is missing.
+- `batch` is a JSON integer, never null. It is 0 for a job submitted without a batch.
+- `open_name` is the `<open_name>` of the result template's `<file_ref>` for the file, and
+  `index` its position in the template from 0 over every `<file_ref>`, one with no file name
+  included, so a puller can write the names the stock assimilator writes
+  (`<workunit name>__file_<open_name>`). `files` is in template order. `open_name` is null when
+  the file's `<file_ref>` has no `<open_name>` or an empty one (`output_files` in
+  `crates/cb-core/src/template.rs`). A consumer that needs a name for such a file should build
+  one from `index` (for example `<workunit name>__file_<index>`) or from `name`; it must not
+  treat null as an error. A `<file_ref>` with no `<file_name>` has no file and is not listed at
+  all, but it still takes an `index`, so the others do not shift. A file the template does not
+  name in a `<file_ref>` is not an output of the result and never appears.
+- `present` is true when the file is in storage and false when it is not (an optional output
+  that was not uploaded, or a file with no upload URL, which stays on the client). The listing
+  already makes one head request per file to get `nbytes` and `md5`, so the flag costs nothing
+  more. For a file that is not present `nbytes` is 0 and `md5` is an empty string, and
+  `/admin/v1/outputs/<name>` answers 404. A successful workunit whose files are all absent shows
+  every file with `present` false, which is different from a workunit whose template names no
+  output files (an empty `files`).
 - `has_more` is true when another workunit follows this page, and `next_after` is the ID to pass
   as `after` for the next page (null when the page is empty). A page that ends exactly at the
   last workunit has `has_more` false.
+- A workunit stays in the ready list (`assimilate_state` 1) until it is acknowledged. Fetching
+  it does not remove it. A consumer that does not acknowledge what it has fetched must page with
+  `after` (pass `next_after` until `has_more` is false), or it receives the same workunits at
+  the top of every call.
+- Without `app` the ready list is read across all apps in workunit ID order. It is cheaper with
+  `app`, because the `wu_assim` index is by app and then ID; a puller with many ready workunits
+  should keep `limit` modest.
 - A failed workunit (`error_mask` not 0) has no `canonical_result`.
 - `canonical_result.files` is read from storage, one head request per file, as before.
+
+Output download. `GET /admin/v1/outputs/<name>` streams the object with `Content-Length` and
+`X-Content-Bytes` (both the stored size) and `X-Content-MD5`, the lowercase hex MD5 R2 stored
+with the object when it was written. The header is read from the same object response, so it
+costs no extra request; it is left out only for an object that has no stored MD5. A downloader
+can check the bytes it received against the header, or against `md5` in the listing. The runtime
+may drop `Content-Length` when it re-encodes the body, so `X-Content-Bytes` stays.
+
+Acknowledging. `POST /admin/v1/assimilate/ack` with `{"workunit_ids": [...]}` answers
+`{"acknowledged": [ids], "already_acked": [ids], "not_ready": [ids], "unknown": [ids]}`:
+`acknowledged` is the IDs that changed (the field it always had), `already_acked` workunits that
+were acknowledged before, `not_ready` workunits that exist but are not ready to assimilate, and
+`unknown` IDs with no workunit. A repeated ID is reported once. Each chunk of 90 IDs adds one
+`SELECT` to the batch that holds the update, so a call of up to 90 IDs now runs two statements
+instead of one.
 
 Re-opening. `state=done` lists workunits that were acknowledged and whose files are still kept:
 `assimilate_state` is done and neither the workunit's nor its canonical result's
