@@ -21,6 +21,9 @@ use futures_lite::future::block_on;
 
 const LINUX: &str = "x86_64-pc-linux-gnu";
 const MAC: &str = "arm64-apple-darwin";
+/// Platforms the test host also lists, for tests that need more versions of one
+/// number than one platform can hold.
+const EXTRA_PLATFORMS: [&str; 5] = ["extra-1", "extra-2", "extra-3", "extra-4", "extra-5"];
 const INPUT_TEMPLATE: &str = "<input_template>\n<workunit>\n<rsc_fpops_est>1e12</rsc_fpops_est>\n<rsc_memory_bound>1e8</rsc_memory_bound>\n<rsc_disk_bound>1e8</rsc_disk_bound>\n<delay_bound>3600</delay_bound>\n</workunit>\n</input_template>\n";
 const RESULT_TEMPLATE: &str = "<output_template>\n<file_info>\n    <name><OUTFILE_0/></name>\n    <generated_locally/>\n    <upload_when_present/>\n    <max_nbytes>5000000</max_nbytes>\n    <url><UPLOAD_URL/></url>\n</file_info>\n<result>\n    <file_ref>\n        <file_name><OUTFILE_0/></file_name>\n        <open_name>out</open_name>\n    </file_ref>\n</result>\n</output_template>\n";
 
@@ -129,8 +132,12 @@ impl World {
     }
 
     fn rpc(&self, hostid: i64, seqno: i32, other: Option<&[&str]>, now: i64) -> SchedOutcome {
+        let extra: String = EXTRA_PLATFORMS
+            .iter()
+            .map(|p| format!("<alt_platform><name>{p}</name></alt_platform>\n"))
+            .collect();
         let mut xml = format!(
-            "<scheduler_request>\n<authenticator>auth1</authenticator>\n<hostid>{hostid}</hostid>\n<rpc_seqno>{seqno}</rpc_seqno>\n<core_client_major_version>8</core_client_major_version>\n<core_client_minor_version>0</core_client_minor_version>\n<core_client_release>4</core_client_release>\n<client_cap_plan_class>1</client_cap_plan_class>\n<work_req_seconds>100000</work_req_seconds>\n<cpu_req_secs>100000</cpu_req_secs>\n<cpu_req_instances>1</cpu_req_instances>\n<estimated_delay>0</estimated_delay>\n<platform_name>{LINUX}</platform_name>\n<alt_platform><name>{MAC}</name></alt_platform>\n<host_info>\n<domain_name>box</domain_name>\n<ip_addr>192.0.2.17</ip_addr>\n<host_cpid>c0ffee</host_cpid>\n<p_ncpus>4</p_ncpus>\n<p_vendor>GenuineIntel</p_vendor>\n<p_model>cpu</p_model>\n<p_fpops>2e9</p_fpops>\n<m_nbytes>8e9</m_nbytes>\n<d_total>1e11</d_total>\n<d_free>5e10</d_free>\n<os_name>Linux</os_name>\n<os_version>6.1</os_version>\n</host_info>\n"
+            "<scheduler_request>\n<authenticator>auth1</authenticator>\n<hostid>{hostid}</hostid>\n<rpc_seqno>{seqno}</rpc_seqno>\n<core_client_major_version>8</core_client_major_version>\n<core_client_minor_version>0</core_client_minor_version>\n<core_client_release>4</core_client_release>\n<client_cap_plan_class>1</client_cap_plan_class>\n<work_req_seconds>100000</work_req_seconds>\n<cpu_req_secs>100000</cpu_req_secs>\n<cpu_req_instances>1</cpu_req_instances>\n<estimated_delay>0</estimated_delay>\n<platform_name>{LINUX}</platform_name>\n<alt_platform><name>{MAC}</name></alt_platform>\n{extra}<host_info>\n<domain_name>box</domain_name>\n<ip_addr>192.0.2.17</ip_addr>\n<host_cpid>c0ffee</host_cpid>\n<p_ncpus>4</p_ncpus>\n<p_vendor>GenuineIntel</p_vendor>\n<p_model>cpu</p_model>\n<p_fpops>2e9</p_fpops>\n<m_nbytes>8e9</m_nbytes>\n<d_total>1e11</d_total>\n<d_free>5e10</d_free>\n<os_name>Linux</os_name>\n<os_version>6.1</os_version>\n</host_info>\n"
         );
         if let Some(names) = other {
             xml.push_str("<other_results>\n");
@@ -410,12 +417,19 @@ fn versions_with_the_same_routing_clause_are_charged_once() {
         )
         .len();
     assert!(one <= 40_000 && one * 6 > 40_000, "{one}");
-    // Five more versions of number 100 for Linux: six with the first.
-    let extra: Vec<Stmt> = (9..14)
-        .map(|id| {
-            stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (?, 0, 1, 100, 1, ?)", id as i64, version_xml(100))
-        })
-        .collect();
+    // Five more platforms, each with a version of number 100: six with the
+    // Linux one.
+    let mut extra: Vec<Stmt> = Vec::new();
+    for (i, name) in EXTRA_PLATFORMS.iter().enumerate() {
+        let id = 3 + i as i64;
+        extra.push(stmt!(
+            "INSERT INTO platform (id, create_time, name, user_friendly_name) VALUES (?, 0, ?, ?)",
+            id,
+            *name,
+            *name
+        ));
+        extra.push(stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (?, 0, 1, 100, ?, ?)", 100 + id, id, version_xml(100)));
+    }
     block_on(w.db.batch(extra)).unwrap();
     let host = w.host();
     // More refused workunits than the four windows of 100 one request reads,
