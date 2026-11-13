@@ -2228,12 +2228,12 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
     // and `admitted` alone enforces the rules, which can let a window of
     // refused results through. A statement is limited to 100,000 bytes on D1.
     let routing_budget = || std::cell::Cell::new(40_000usize);
-    let routing_sql = |left: &std::cell::Cell<usize>, text: String| -> String {
+    let routing_sql = |left: &std::cell::Cell<usize>, text: String| -> bool {
         if text.len() <= left.get() {
             left.set(left.get() - text.len());
-            text
+            true
         } else {
-            String::new()
+            false
         }
     };
     let version_gate = |app_id: i64, assigned: bool, left: &std::cell::Cell<usize>| -> String {
@@ -2246,9 +2246,8 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
             let Some(av) = v.av else {
                 // The client's own version takes any workunit of a plain
                 // app (`admitted` below), but not one a routing rule selects.
-                let refused =
-                    routing_sql(left, ctx.routing.sql_condition(app_name, assigned, None));
-                return if refused.is_empty() {
+                let refused = ctx.routing.sql_condition(app_name, assigned, None);
+                return if refused.is_empty() || !routing_sql(left, refused.clone()) {
                     "1 = 1".to_string()
                 } else {
                     refused
@@ -2281,24 +2280,6 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                 // such a version.
                 (false, None) => "0 = 1".to_string(),
             };
-            // A workunit a routing rule refuses this version for
-            // (`RoutingRules::permits`, below in `admitted`).
-            let refused = routing_sql(
-                left,
-                ctx.routing.sql_condition(
-                    app_name,
-                    assigned,
-                    Some(&VersionRef {
-                        platform: v.platform,
-                        plan_class: v.plan_class,
-                        version_num: v.version_num,
-                    }),
-                ),
-            );
-            if !refused.is_empty() {
-                clause.push_str(" AND ");
-                clause.push_str(&refused);
-            }
             if let Some(spec) = ctx.plan_classes.find(&av.plan_class) {
                 for (column, bound, upper) in [
                     ("w.id", spec.min_wu_id, false),
@@ -2314,6 +2295,33 @@ pub async fn handle_request(ctx: &SchedCtx<'_>, body: &str) -> CoreResult<SchedO
                     }
                 }
             }
+            // A workunit a routing rule refuses this version for
+            // (`RoutingRules::permits`, below in `admitted`). A clause that
+            // is already there with its condition costs nothing; one that is
+            // new is charged what its condition adds, and is left unrouted
+            // when that no longer fits the budget.
+            let refused = ctx.routing.sql_condition(
+                app_name,
+                assigned,
+                Some(&VersionRef {
+                    platform: v.platform,
+                    plan_class: v.plan_class,
+                    version_num: v.version_num,
+                }),
+            );
+            let routed = if refused.is_empty() {
+                clause.clone()
+            } else {
+                format!("{clause} AND {refused}")
+            };
+            if clauses.contains(&routed) {
+                continue;
+            }
+            let clause = if routing_sql(left, refused) {
+                routed
+            } else {
+                clause
+            };
             if !clauses.contains(&clause) {
                 clauses.push(clause);
             }

@@ -218,11 +218,12 @@ fn a_workunit_no_version_may_take_is_skipped_and_others_still_go() {
 
 #[test]
 fn refused_workunits_in_front_do_not_hide_the_ones_behind() {
-    // More refused results than one window reads, all older than the one the
-    // host can take.
+    // More refused results than the four windows of 100 that one request reads,
+    // all older than the one the host can take: only the query's own condition
+    // lets it reach the allowed one.
     let w = World::new(BY_NAME);
     let host = w.host();
-    let names: Vec<String> = (0..130).map(|i| format!("none_{i}")).collect();
+    let names: Vec<String> = (0..450).map(|i| format!("none_{i}")).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let ids = w.submit(&refs, 0, None);
     let open = w.submit(&["free_1"], 0, None)[0];
