@@ -2399,9 +2399,9 @@ fn a_retry_verdict_commits_no_comparison_result_and_the_next_call_decides() {
         );
         assert_eq!(rep.transition_time, 1300 + 600);
 
-        // The retry: D is readable and C matches A and B.
+        // The retry: D is readable and every result matches.
         let reply = if pairwise {
-            pairwise_reply(&rs, &[(0, 1), (1, 2), (0, 2), (2, 3)])
+            pairwise_reply(&rs, &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
         } else {
             serde_json::json!({"results": rs.iter()
                 .map(|r| serde_json::json!({"id": r.id, "fingerprint": "f"}))
