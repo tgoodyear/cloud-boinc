@@ -916,12 +916,15 @@ entry points of upstream's validator framework (`check_set` and `check_pair` in
 ```
 
 - `call_id` is `wu<workunit id>-rev<revision>-<mode>`. The revision is the workunit's
-  `rev` as the transition read it. The ID repeats only when a Worker is stopped after the call and
-  the transition runs again on a workunit whose revision and mode have not changed. A transition
-  that loses the revision race reloads the workunit at its newer revision, so its next call has a
-  new ID, as does a call repeated after a failure: the failed transition wrote the workunit (it
-  set the retry time). A validator that keeps records can use the ID to ignore a duplicate
-  delivery in the stopped-Worker case, not to match a retry with the call that failed.
+  `rev` as the transition read it, and the webhook is called before the revision-guarded commit
+  (`transition` in `crates/cb-core/src/pipeline.rs`). A repeated `call_id` therefore means the
+  same revision and mode were delivered again, in one of two ways: a Worker was stopped after
+  the call and the transition ran again on an unchanged workunit, or two `transition` calls for
+  the workunit loaded the same revision and both sent their webhook before either reached the
+  commit (the loser reloads the newer revision only after it has delivered). A validator should
+  treat a repeat as the same call. A call that follows a commit has a new ID: a call repeated
+  after a failure comes from a transition that wrote the workunit (it set the retry time), so the
+  ID is not a way to match a retry with the call that failed.
 - `mode` is `check_set` or `check_pair`. `canonical_result_id` is null in `check_set`, and the
   canonical result's ID in `check_pair`, where the result with that ID also has
   `"canonical": true`. Its fingerprint, with the others, is what the pass compares.
