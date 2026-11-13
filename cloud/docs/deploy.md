@@ -178,6 +178,8 @@ URL reaches the Worker meant for it.
 | `UPLOAD_PRIVATE_KEY` | `pipeline`, `admin` | contents of `keys/upload_private` |
 | `ADMIN_TOKENS` | `admin` | one or more bearer tokens, separated by commas |
 | `PASSWD_PEPPER` | `web`, `admin` | a random string; changing it invalidates every stored password |
+| `WEBHOOK_TOKEN` | `pipeline` | optional: sent as a bearer token with the validator webhook |
+| `WEBHOOK_SIGNING_SECRET` | `pipeline` | optional: when set, the validator webhook carries `X-CB-Timestamp` and `X-CB-Signature` (see "Webhook call" in `architecture.md`); the validator needs the same value |
 
 Set each with `npx wrangler secret put <NAME>` in the Worker's directory.
 

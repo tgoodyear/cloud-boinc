@@ -18,7 +18,7 @@
 //! where normal dispatch does not see them; the scheduler claims them for
 //! the assigned host or user.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cb_crypto::Signer;
 use cb_db::{stmt, Db, Stmt, Value};
@@ -647,6 +647,7 @@ fn results_to_fingerprint(st: &State) -> Vec<usize> {
 /// in-memory state. Returns true when the transitioner pass must run again.
 fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bool {
     let fps = &checked.fps;
+    let ids: Vec<i64> = st.results.iter().map(|r| r.row.id).collect();
     let now = ctx.now;
     let max_granted_credit = ctx.config.max_granted_credit;
     let mut transition_time = TransitionTime::NoChange;
@@ -687,7 +688,7 @@ fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bo
                 // look at file deletion.
                 transition_time = TransitionTime::Immediate;
                 let valid = match (mine, canon) {
-                    (Fp::Ok(a), Fp::Ok(b)) => Some(a == b),
+                    (Fp::Ok(_), Fp::Ok(_)) => Some(checked.agree(&ids, i, ci)),
                     _ => None,
                 };
                 let wu = &st.wu;
@@ -748,7 +749,9 @@ fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bo
                 }
             }
             let mut canonical: Option<usize> = None;
-            if good_results >= st.wu.min_quorum {
+            // With a retry pending no comparison is acted on: it would mark
+            // results invalid, and commit that, on a set that is incomplete.
+            if good_results >= st.wu.min_quorum && !retry {
                 for (k, &i) in viable.iter().enumerate() {
                     if had_error[k] {
                         continue;
@@ -756,7 +759,7 @@ fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bo
                     let matches: Vec<bool> = viable
                         .iter()
                         .enumerate()
-                        .map(|(m, &j)| !had_error[m] && fps.get(&i) == fps.get(&j))
+                        .map(|(m, &j)| !had_error[m] && checked.agree(&ids, i, j))
                         .collect();
                     if matches.iter().filter(|&&b| b).count() >= min_valid {
                         for (m, &j) in viable.iter().enumerate() {
@@ -874,6 +877,45 @@ fn validator_pass(st: &mut State, app: &App, checked: &Checked, ctx: &Ctx) -> bo
 struct WebhookReply {
     #[serde(default)]
     results: Vec<WebhookResult>,
+    /// Pairwise equivalence: result-ID pairs that match. Present (even when
+    /// empty) selects the pairwise form; see `pairwise_matches`.
+    #[serde(default)]
+    matches: Option<Vec<(i64, i64)>>,
+}
+
+/// The most pairs a reply may list. Pairs grow with the square of the
+/// results of a workunit, so the list is bounded: 4096 covers every pair of
+/// 91 results, far above any quorum.
+pub const MAX_WEBHOOK_PAIRS: usize = 4096;
+
+/// A pair of result IDs as a set member: smaller ID first.
+fn pair_key(a: i64, b: i64) -> (i64, i64) {
+    (a.min(b), a.max(b))
+}
+
+/// Reads the pairwise form of a reply. `Ok(None)` is the fingerprint form
+/// (no `matches`, or `null`). `Ok(Some(set))` is the pairwise form. `Err(())`
+/// rejects the whole reply, which then counts as a failed call: more than
+/// `MAX_WEBHOOK_PAIRS` pairs, a pair of a result with itself, an ID the
+/// request did not name, or `matches` beside any `fingerprint`.
+fn pairwise_matches(
+    reply: &WebhookReply,
+    request_ids: &[i64],
+) -> Result<Option<HashSet<(i64, i64)>>, ()> {
+    let Some(pairs) = &reply.matches else {
+        return Ok(None);
+    };
+    if pairs.len() > MAX_WEBHOOK_PAIRS || reply.results.iter().any(|r| r.fingerprint.is_some()) {
+        return Err(());
+    }
+    let mut set = HashSet::new();
+    for &(a, b) in pairs {
+        if a == b || !request_ids.contains(&a) || !request_ids.contains(&b) {
+            return Err(());
+        }
+        set.insert(pair_key(a, b));
+    }
+    Ok(Some(set))
 }
 
 #[derive(Deserialize)]
@@ -921,6 +963,20 @@ type CreditOverrides = HashMap<usize, f64>;
 struct Checked {
     fps: HashMap<usize, Fp>,
     credits: CreditOverrides,
+    /// Pairs of result IDs the webhook said match, when it answered in the
+    /// pairwise form. `None`: results agree when their fingerprints are equal.
+    pairs: Option<HashSet<(i64, i64)>>,
+}
+
+impl Checked {
+    /// Whether results `i` and `j` (indexes into the workunit's results)
+    /// match: a listed pair, or equal fingerprints. A result matches itself.
+    fn agree(&self, ids: &[i64], i: usize, j: usize) -> bool {
+        match &self.pairs {
+            Some(p) => i == j || p.contains(&pair_key(ids[i], ids[j])),
+            None => self.fps.get(&i) == self.fps.get(&j),
+        }
+    }
 }
 
 struct OutputStat {
@@ -997,6 +1053,7 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> Checked {
     let wanted = results_to_fingerprint(st);
     let mut fps = HashMap::new();
     let mut credits = CreditOverrides::new();
+    let mut pairs = None;
     if wanted.is_empty() {
         return Checked::default();
     }
@@ -1049,12 +1106,25 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> Checked {
             }
             if !body_results.is_empty() {
                 let body = webhook_request(st, app, &body_results);
+                let request_ids: Vec<i64> = body_results
+                    .iter()
+                    .filter_map(|r| r["id"].as_i64())
+                    .collect();
                 let reply = ctx
                     .webhook
                     .post_json(&app.validator_url, &body)
                     .await
                     .ok()
                     .and_then(|v| serde_json::from_value::<WebhookReply>(v).ok());
+                // A reply with unusable pairs is a failed call.
+                let reply = reply.and_then(|rep| match pairwise_matches(&rep, &request_ids) {
+                    Ok(p) => {
+                        pairs = p;
+                        Some(rep)
+                    }
+                    Err(()) => None,
+                });
+                let pairwise = pairs.is_some();
                 for &i in &wanted {
                     if fps.contains_key(&i) {
                         continue;
@@ -1075,6 +1145,9 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> Checked {
                             fingerprint: Some(f),
                             ..
                         }) => Fp::Ok(f.clone()),
+                        // Pairwise form: an entry with no flag is a result
+                        // the validator could read; the pairs decide.
+                        Some(_) if pairwise => Fp::Ok(String::new()),
                         // No answer for this result, or no usable reply.
                         _ => Fp::Transient,
                     };
@@ -1103,7 +1176,11 @@ async fn fingerprints(st: &State, app: &App, ctx: &Ctx<'_>) -> Checked {
             }
         }
     }
-    Checked { fps, credits }
+    Checked {
+        fps,
+        credits,
+        pairs,
+    }
 }
 
 #[derive(Deserialize, Default, Clone)]

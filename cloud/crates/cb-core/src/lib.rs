@@ -117,7 +117,38 @@ pub trait Files {
     async fn put(&self, kind: FileKind, name: &str, bytes: Vec<u8>) -> CoreResult<()>;
 }
 
-/// Outbound JSON POST for validator and assimilation webhooks.
+/// Header carrying the Unix time a webhook call was signed.
+pub const WEBHOOK_TIMESTAMP_HEADER: &str = "X-CB-Timestamp";
+/// Header carrying `v1=` and the hex HMAC-SHA-256 of the timestamp, a `.` and
+/// the body.
+pub const WEBHOOK_SIGNATURE_HEADER: &str = "X-CB-Signature";
+
+/// The headers of a webhook call beside `Content-Type`: the bearer token
+/// when one is configured, and, when a signing secret is configured, the
+/// timestamp and the signature over `body`, the exact text sent. With neither
+/// configured the list is empty, as it was before signing existed.
+pub fn webhook_headers(
+    token: Option<&str>,
+    signing_secret: Option<&str>,
+    timestamp: i64,
+    body: &str,
+) -> Vec<(&'static str, String)> {
+    let mut v = Vec::new();
+    if let Some(t) = token {
+        v.push(("Authorization", format!("Bearer {t}")));
+    }
+    if let Some(s) = signing_secret {
+        v.push((WEBHOOK_TIMESTAMP_HEADER, timestamp.to_string()));
+        v.push((
+            WEBHOOK_SIGNATURE_HEADER,
+            cb_crypto::webhook_signature(s.as_bytes(), timestamp, body.as_bytes()),
+        ));
+    }
+    v
+}
+
+/// Outbound JSON POST for the validator webhook (the only webhook the
+/// server sends).
 #[async_trait(?Send)]
 pub trait Webhook {
     async fn post_json(&self, url: &str, body: &serde_json::Value)

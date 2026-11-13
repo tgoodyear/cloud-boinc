@@ -2077,3 +2077,343 @@ fn assimilation_list_across_two_apps_keeps_id_order_and_filters() {
     assert_eq!(a, vec![ids[0], ids[2]]);
     assert_eq!(b, vec![ids[1], ids[3]]);
 }
+
+// Pairwise webhook replies: stock `check_set` and `check_pair` semantics.
+
+/// A webhook workunit with `n` results, all dispatched and reported with
+/// output, ready for a `check_set` call at time 1300.
+fn pairwise_set(name: &str, quorum: i32, n: i32) -> (World, i64, Vec<JobResult>) {
+    let w = webhook_world();
+    let wu = w.submit(name, 1000, quorum, n);
+    let rs = w.results(wu);
+    assert_eq!(rs.len() as i32, n);
+    for (k, r) in rs.iter().enumerate() {
+        w.dispatch(r, k as i64 + 1, 1100);
+        w.report(r, 1200, Some("x"), 0);
+    }
+    (w, wu, rs)
+}
+
+/// A reply in the pairwise form: one entry per result, no fingerprints.
+fn pairwise_reply(rs: &[JobResult], pairs: &[(usize, usize)]) -> serde_json::Value {
+    serde_json::json!({
+        "results": rs.iter().map(|r| serde_json::json!({"id": r.id})).collect::<Vec<_>>(),
+        "matches": pairs.iter().map(|&(a, b)| [rs[a].id, rs[b].id]).collect::<Vec<_>>(),
+    })
+}
+
+fn states(w: &World, wu: i64) -> Vec<i32> {
+    w.results(wu).iter().map(|r| r.validate_state).collect()
+}
+
+#[test]
+fn pairwise_non_transitive_triple_takes_the_first_result_with_enough_matches() {
+    // A~B and B~C but A!~C. With quorum 2 or 3 a result needs 2 matches
+    // (itself included). Stock check_set tries results in order, so A is the
+    // canonical result although B matches more; C does not match A.
+    for quorum in [2, 3] {
+        let (w, wu, rs) = pairwise_set("p1", quorum, 3);
+        *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &[(0, 1), (1, 2)]));
+        w.transition(wu, 1300);
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id, "quorum {quorum}");
+        assert_eq!(
+            states(&w, wu),
+            [
+                VALIDATE_STATE_VALID,
+                VALIDATE_STATE_VALID,
+                VALIDATE_STATE_INVALID
+            ],
+            "quorum {quorum}"
+        );
+    }
+}
+
+#[test]
+fn pairwise_pair_order_and_direction_do_not_matter() {
+    let (w, wu, rs) = pairwise_set("p2", 2, 3);
+    // Listed as (B,A) and (C,B), the later pair first.
+    *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &[(2, 1), (1, 0)]));
+    w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+}
+
+#[test]
+fn pairwise_needs_a_candidate_with_min_valid_matches() {
+    // Quorum 4 needs 3 matching results. Only B matches everything.
+    let (w, wu, rs) = pairwise_set("p3", 4, 4);
+    *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &[(0, 1), (1, 2), (1, 3)]));
+    w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, rs[1].id);
+    assert_eq!(states(&w, wu), [VALIDATE_STATE_VALID; 4]);
+
+    // No candidate has 3: no canonical result, the results are inconclusive
+    // and one more is asked for, as with fingerprints that split.
+    let (w, wu, rs) = pairwise_set("p3b", 4, 4);
+    *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &[(0, 1), (2, 3)]));
+    w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, 0);
+    // The replacement result the transitioner creates is not validated yet.
+    assert_eq!(states(&w, wu)[..4], [VALIDATE_STATE_INCONCLUSIVE; 4]);
+    assert_eq!(w.wu(wu).target_nresults, 5);
+}
+
+#[test]
+fn pairwise_invalid_result_is_left_out_of_the_matching() {
+    // A is a validate error, so its pairs count for nothing: B~C is the only
+    // pair that can reach 2 matches.
+    let (w, wu, rs) = pairwise_set("p4", 2, 3);
+    let mut reply = pairwise_reply(&rs, &[(0, 1), (1, 2)]);
+    reply["results"][0]["invalid"] = true.into();
+    *w.hook.reply.borrow_mut() = Some(reply);
+    w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, rs[1].id);
+    let after = w.results(wu);
+    assert_eq!(after[0].outcome, RESULT_OUTCOME_VALIDATE_ERROR);
+    assert_eq!(after[0].validate_state, VALIDATE_STATE_INVALID);
+    assert_eq!(after[1].validate_state, VALIDATE_STATE_VALID);
+    assert_eq!(after[2].validate_state, VALIDATE_STATE_VALID);
+}
+
+#[test]
+fn pairwise_retry_verdict_asks_again_later() {
+    let (w, wu, rs) = pairwise_set("p5", 2, 3);
+    let mut reply = pairwise_reply(&rs, &[(0, 1)]);
+    reply["results"][2]["retry"] = true.into();
+    *w.hook.reply.borrow_mut() = Some(reply);
+    let rep = w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, 0);
+    assert_eq!(rep.transition_time, 1300 + 600);
+}
+
+#[test]
+fn pairwise_check_pair_compares_the_late_result_with_the_canonical_one() {
+    for (pairs, expect) in [
+        (vec![(1, 0)], VALIDATE_STATE_VALID),
+        (vec![], VALIDATE_STATE_INVALID),
+    ] {
+        let w = webhook_world();
+        let wu = w.submit("p6", 1000, 1, 2);
+        let rs = w.results(wu);
+        w.dispatch(&rs[0], 1, 1100);
+        w.dispatch(&rs[1], 2, 1100);
+        w.report(&rs[0], 1200, Some("x"), 0);
+        // Quorum 1: the result alone is canonical; with no other result there
+        // is nothing to pair, so the empty list is a pairwise reply.
+        *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs[..1], &[]));
+        w.transition(wu, 1200);
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+
+        w.report(&rs[1], 1300, Some("x"), 0);
+        // A pair between the late result and the canonical one decides; the
+        // order inside the pair is free.
+        *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &pairs));
+        w.transition(wu, 1300);
+        {
+            let calls = w.hook.calls.borrow();
+            assert_eq!(calls[1]["mode"], "check_pair");
+            assert_eq!(calls[1]["canonical_result_id"], rs[0].id);
+        }
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+        assert_eq!(states(&w, wu)[1], expect);
+    }
+}
+
+#[test]
+fn pairwise_check_pair_ignores_pairs_between_late_results() {
+    // Stock check_pair compares each late result only with the canonical one.
+    let w = webhook_world();
+    let wu = w.submit("p7", 1000, 1, 3);
+    let rs = w.results(wu);
+    for (k, r) in rs.iter().enumerate() {
+        w.dispatch(r, k as i64 + 1, 1100);
+    }
+    w.report(&rs[0], 1200, Some("x"), 0);
+    *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs[..1], &[]));
+    w.transition(wu, 1200);
+    w.report(&rs[1], 1300, Some("x"), 0);
+    w.report(&rs[2], 1300, Some("x"), 0);
+    *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &[(1, 2), (2, 0)]));
+    w.transition(wu, 1300);
+    assert_eq!(
+        states(&w, wu),
+        [
+            VALIDATE_STATE_VALID,
+            VALIDATE_STATE_INVALID,
+            VALIDATE_STATE_VALID
+        ]
+    );
+}
+
+/// A reply the server rejects counts as a failed call: nothing is decided and
+/// the workunit comes back after the fixed delay.
+fn assert_rejected(name: &str, reply: impl FnOnce(&[JobResult]) -> serde_json::Value) {
+    let (w, wu, rs) = pairwise_set(name, 2, 3);
+    *w.hook.reply.borrow_mut() = Some(reply(&rs));
+    let rep = w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, 0, "{name}");
+    assert_eq!(states(&w, wu), [VALIDATE_STATE_INIT; 3], "{name}");
+    assert_eq!(rep.transition_time, 1300 + 600, "{name}");
+}
+
+#[test]
+fn pairwise_rejects_oversize_and_malformed_pair_lists() {
+    use cb_core::pipeline::MAX_WEBHOOK_PAIRS;
+    let many = |rs: &[JobResult], n: usize| {
+        let mut r = pairwise_reply(rs, &[]);
+        r["matches"] = (0..n)
+            .map(|_| serde_json::json!([rs[0].id, rs[1].id]))
+            .collect();
+        r
+    };
+    assert_rejected("r1", |rs| many(rs, MAX_WEBHOOK_PAIRS + 1));
+    assert_rejected("r2", |rs| {
+        let mut r = pairwise_reply(rs, &[]);
+        r["matches"] = serde_json::json!([[rs[0].id, rs[0].id]]);
+        r
+    });
+    for (k, bad) in [
+        serde_json::json!([[1, 2, 3]]),
+        serde_json::json!([[1]]),
+        serde_json::json!(["a", "b"]),
+        serde_json::json!([[1, "x"]]),
+        serde_json::json!({"a": 1}),
+        serde_json::json!(7),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_rejected(&format!("r3-{k}"), |rs| {
+            let mut r = pairwise_reply(rs, &[]);
+            r["matches"] = bad;
+            r
+        });
+    }
+    // Exactly at the cap is accepted (the pairs repeat; repeats are one pair).
+    let (w, wu, rs) = pairwise_set("r4", 2, 3);
+    *w.hook.reply.borrow_mut() = Some(many(&rs, MAX_WEBHOOK_PAIRS));
+    w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+}
+
+#[test]
+fn pairwise_rejects_ids_the_request_did_not_name() {
+    assert_rejected("i1", |rs| {
+        let mut r = pairwise_reply(rs, &[(0, 1)]);
+        r["matches"] = serde_json::json!([[rs[0].id, 999_999]]);
+        r
+    });
+    // A result of the workunit that was not in this request is also unknown:
+    // here the third result is not in the request because it is not reported.
+    let w = webhook_world();
+    let wu = w.submit("i2", 1000, 2, 3);
+    let rs = w.results(wu);
+    for (k, r) in rs.iter().enumerate() {
+        w.dispatch(r, k as i64 + 1, 1100);
+    }
+    w.report(&rs[0], 1200, Some("x"), 0);
+    w.report(&rs[1], 1200, Some("x"), 0);
+    let mut r = pairwise_reply(&rs[..2], &[]);
+    r["matches"] = serde_json::json!([[rs[0].id, rs[2].id]]);
+    *w.hook.reply.borrow_mut() = Some(r);
+    w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, 0);
+    assert_eq!(states(&w, wu)[0], VALIDATE_STATE_INIT);
+}
+
+#[test]
+fn pairwise_and_fingerprints_in_one_reply_are_rejected() {
+    assert_rejected("m1", |rs| {
+        let mut r = pairwise_reply(rs, &[(0, 1)]);
+        r["results"][0]["fingerprint"] = "f".into();
+        r
+    });
+    // An empty list still selects the pairwise form, so it is also mixed.
+    assert_rejected("m2", |rs| {
+        let mut r = pairwise_reply(rs, &[]);
+        r["results"][1]["fingerprint"] = "f".into();
+        r
+    });
+}
+
+#[test]
+fn fingerprint_replies_are_unchanged_by_the_pairwise_form() {
+    // `matches` absent or null: fingerprints decide, transitively, as before.
+    for null in [false, true] {
+        let (w, wu, rs) = pairwise_set("f1", 2, 3);
+        let mut reply = serde_json::json!({"results": [
+            {"id": rs[0].id, "fingerprint": "f"},
+            {"id": rs[1].id, "fingerprint": "f"},
+            {"id": rs[2].id, "fingerprint": "g"},
+        ]});
+        if null {
+            reply["matches"] = serde_json::Value::Null;
+        }
+        *w.hook.reply.borrow_mut() = Some(reply);
+        w.transition(wu, 1300);
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id);
+        assert_eq!(
+            states(&w, wu),
+            [
+                VALIDATE_STATE_VALID,
+                VALIDATE_STATE_VALID,
+                VALIDATE_STATE_INVALID
+            ]
+        );
+    }
+    // An entry with no fingerprint and no flag is still no answer.
+    let (w, wu, rs) = pairwise_set("f2", 2, 3);
+    *w.hook.reply.borrow_mut() = Some(serde_json::json!({"results": [
+        {"id": rs[0].id, "fingerprint": "f"},
+        {"id": rs[1].id, "fingerprint": "f"},
+        {"id": rs[2].id},
+    ]}));
+    let rep = w.transition(wu, 1300);
+    assert_eq!(w.wu(wu).canonical_resultid, 0);
+    assert_eq!(rep.transition_time, 1300 + 600);
+}
+
+#[test]
+fn a_retry_verdict_commits_no_comparison_result_and_the_next_call_decides() {
+    // Quorum 2, A B C readable, D asks for a retry, only A~B listed. C must
+    // not be marked invalid on this incomplete set. Same for fingerprints.
+    for pairwise in [true, false] {
+        let (w, wu, rs) = pairwise_set("rt", 2, 4);
+        let mut reply = if pairwise {
+            pairwise_reply(&rs, &[(0, 1)])
+        } else {
+            serde_json::json!({"results": [
+                {"id": rs[0].id, "fingerprint": "f"},
+                {"id": rs[1].id, "fingerprint": "f"},
+                {"id": rs[2].id, "fingerprint": "g"},
+                {"id": rs[3].id, "fingerprint": "g"},
+            ]})
+        };
+        reply["results"][3] = serde_json::json!({"id": rs[3].id, "retry": true});
+        *w.hook.reply.borrow_mut() = Some(reply);
+        let rep = w.transition(wu, 1300);
+        assert_eq!(w.wu(wu).canonical_resultid, 0, "pairwise {pairwise}");
+        assert_eq!(
+            states(&w, wu),
+            [VALIDATE_STATE_INIT; 4],
+            "pairwise {pairwise}"
+        );
+        assert_eq!(rep.transition_time, 1300 + 600);
+
+        // The retry: D is readable and every result matches.
+        let reply = if pairwise {
+            pairwise_reply(&rs, &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)])
+        } else {
+            serde_json::json!({"results": rs.iter()
+                .map(|r| serde_json::json!({"id": r.id, "fingerprint": "f"}))
+                .collect::<Vec<_>>()})
+        };
+        *w.hook.reply.borrow_mut() = Some(reply);
+        w.transition(wu, 1300 + 600);
+        assert_eq!(w.wu(wu).canonical_resultid, rs[0].id, "pairwise {pairwise}");
+        assert_eq!(
+            states(&w, wu),
+            [VALIDATE_STATE_VALID; 4],
+            "pairwise {pairwise}"
+        );
+    }
+}

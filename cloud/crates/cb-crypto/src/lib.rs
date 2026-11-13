@@ -36,6 +36,7 @@ pub mod key;
 pub mod keygen;
 pub mod md5;
 pub mod sign;
+pub mod webhook;
 
 pub use account::{
     check_weak_auth, constant_time_eq, email_hash, host_cpid, passwd_hash, pepper_passwd_hash,
@@ -56,3 +57,4 @@ pub use sign::{
     sign_upload_certificate, upload_certificate_text, verify_bytes, verify_md5, verify_text,
     verify_upload_certificate, Signer,
 };
+pub use webhook::{verify_webhook_signature, webhook_signature, WEBHOOK_SIGNATURE_PREFIX};

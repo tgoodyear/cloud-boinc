@@ -71,7 +71,7 @@ flowchart LR
   admin --> d1 & r2 & q
   q --> pipe
   pipe --> d1 & r2
-  pipe -. validate / assimilate webhooks .-> ops
+  pipe -. validate webhook .-> ops
 ```
 
 | Stock component | Replacement |
@@ -80,7 +80,7 @@ flowchart LR
 | `feeder` and the shared-memory job cache | an indexed query on unsent results plus an atomic claim (see "Dispatch without a feeder") |
 | `transitioner` | `pipeline` Worker, driven by the queue, with a cron sweep for deadlines |
 | validators | `pipeline` Worker: built-in trivial and bitwise validators, and a webhook validator for project code |
-| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API or receives a webhook |
+| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API |
 | `file_deleter` | part of the transition in the `pipeline` Worker |
 | `db_purge` | cron handler in the `pipeline` Worker |
 | `file_upload_handler` | `files` Worker writing to R2 |
@@ -945,7 +945,8 @@ Per app, one of:
   and optionally a credit. This is where project-specific compare code runs (the stock
   `script_validator` case). The endpoint is the app's `validator_url`, which must be an `https`
   URL. Each call carries the bearer token
-  `WEBHOOK_TOKEN` when that secret is set. The workunit stays in "needs validation" until a call
+  `WEBHOOK_TOKEN` when that secret is set, and a timestamp and a signature when
+  `WEBHOOK_SIGNING_SECRET` is set (see "Signed calls" below). The workunit stays in "needs validation" until a call
   succeeds; see "Webhook call" below for the request, the reply, the timeout and the retry.
 
 #### Webhook call
@@ -1019,6 +1020,46 @@ new request fields by a validator written against the old request):
   transitive: a project that matches by similarity clusters the results itself and returns the
   same fingerprint for one cluster. In `check_pair` the late result is valid when its fingerprint
   equals the canonical result's.
+- `matches` (optional, top level): the pairwise form, for a validator whose test of two results
+  is not transitive (stock `compare_results`, a script validator's compare script). A list of
+  pairs of result IDs, each pair `[id, id]` naming two results that match; the order inside a
+  pair and the order of the list do not matter, and a repeated pair counts once. Each result
+  still has an entry in `results` (an entry with only `id` means "readable"; `invalid`,
+  `retry` and `credit` work as below), but gives no `fingerprint`. A result with no entry is a
+  `retry`, as in the fingerprint form. `matches` absent or `null` is the fingerprint form,
+  handled as before, byte for byte. Rules, with a reply that breaks one rejected (it counts as
+  a failed call: every result is `retry` and the workunit is looked at again after the fixed
+  delay): `matches` beside any `fingerprint` in the same reply (there is no precedence; an
+  empty `matches` still selects the pairwise form); more than 4096 pairs (`MAX_WEBHOOK_PAIRS`
+  in `crates/cb-core/src/pipeline.rs`: pairs grow with the square of the results, and 4096
+  covers every pair of 91 results); a pair whose two IDs are equal; an ID that is not a result
+  in this request (a result left out because its output was not stored is not in it); anything
+  in `matches` that is not a list of two-integer lists. Pairs that name a result with an
+  `invalid` or `retry` verdict are read but count for nothing, as stock leaves a result that
+  had an error out of the comparison. How the pairs decide (`check_set` and `check_pair` in
+  `sched/validate_util2.cpp`):
+  - Any `retry` verdict (or a result with no entry) in a `check_set` call defers the whole call: no
+    canonical result is chosen and no result is marked valid or invalid by comparison, so a
+    result is never judged against an incomplete set. Explicit `invalid` verdicts still apply.
+    This holds for fingerprint replies too. Stock's `check_set` is different here: a transient
+    error in `init_result` sets `retry` but the comparison goes on among the other results and
+    its states are kept (only a transient error inside a comparison abandons it); the
+    validator then retries later.
+  - `check_set`: the results with a usable verdict are taken in the workunit's result order
+    (ascending ID). If fewer than `min_quorum` of them are usable, nothing is decided. The
+    first result that matches at least `min_quorum/2+1` results, itself counted, is the
+    canonical result; there is no search for the one with the most matches. Every usable
+    result that matches it is valid and every other usable result is invalid. If none has
+    enough matches there is no canonical result: the results are inconclusive and one more is
+    asked for, as when fingerprints split.
+  - `check_pair`: the request is the late results and the canonical result, as before. A late
+    result is valid exactly when the pair of it and the canonical result is listed, and
+    invalid when it is not. Pairs between two late results are ignored, as stock compares a
+    late result only with the canonical one. If the canonical result's own entry says `invalid`
+    or `retry`, the late result is not judged this call (`retry`) or is a validate error
+    (`invalid`), as in the fingerprint form.
+  Differences from stock are in D39 in [compatibility.md](compatibility.md): a pair is
+  unordered, and the suspicious-result handling has no form here.
 - `invalid: true`: the output is unusable (the result gets the validate-error outcome and is
   marked invalid). `retry: true`: no verdict yet; the whole workunit is looked at again later. A
   result with no entry, or a reply that is not valid JSON or has a non-success status, counts as
@@ -1029,6 +1070,42 @@ new request fields by a validator written against the old request):
   (see "Credit"). The workunit's `canonical_credit` is the granted credit of the canonical result.
   In `check_pair` the late result's own `credit` is used, and if it has none it gets the
   canonical result's credit.
+
+Signed calls. With `WEBHOOK_SIGNING_SECRET` set on the `pipeline` Worker, each call also carries:
+
+- `X-CB-Timestamp`: the Unix time, in seconds and as decimal text, when the call was built.
+- `X-CB-Signature`: `v1=` and the lowercase hex HMAC-SHA-256, keyed with the signing secret, of
+  the timestamp text, a `.` and the request body exactly as sent (`webhook_signature` in
+  `crates/cb-crypto/src/webhook.rs`; the Worker serializes the body once and signs and sends
+  those bytes).
+
+These come beside `Authorization: Bearer <WEBHOOK_TOKEN>`, which is unchanged and still sent
+only when `WEBHOOK_TOKEN` is set, so a consumer that checks only the token keeps working. With
+no signing secret the two headers are not sent and the call is as it was. The signing key is a
+secret of its own, not the bearer token, because the token travels in every call: a system that
+logs requests would then hold the key that signs them. It is never sent. Setting it is a
+secret binding on the `pipeline` Worker, as in `docs/deploy.md`; the project's validator needs
+the same value.
+
+To verify a call, a consumer:
+
+1. Reads the raw body bytes before parsing JSON, and the two headers. A missing header, a
+   timestamp that is not an integer, or a signature without the `v1=` prefix is a rejection.
+2. Computes HMAC-SHA-256 with the signing secret over the timestamp text, `.` and the raw body,
+   and compares its hex with the header's using a constant-time comparison (for example
+   `hmac.compare_digest` in Python, `crypto.timingSafeEqual` in Node, `hmac.Equal` in Go;
+   not `==`).
+3. Rejects the call unless the timestamp is within the freshness window of the consumer's
+   clock. A window of 5 minutes either way is recommended: it covers clock skew between the
+   Worker and the consumer and a slow network, and keeps the time in which a captured call could
+   be replayed short. The consumer has to keep its own clock in sync; the request does not
+   carry the server's time except in the timestamp.
+4. Treats a repeated `call_id` as the same call (see above). A signature does not stop a
+   replay inside the window; a consumer that must refuse repeats keeps the `call_id` values it
+   has seen for the window and answers a repeat with the stored answer.
+
+Rotating the secret: the server signs with one key, so a consumer that wants a changeover
+accepts both the old and the new key for a while.
 
 Timeout and retry. `<webhook_timeout_secs>` in the config (default 20, from 1 to 120; a value
 outside that range is cut to it) bounds the whole call, answer body included. A call that takes
@@ -1057,8 +1134,8 @@ per file is the one that was already made.
 The stock assimilator is project code that runs next to the database. Here the project pulls:
 `GET /admin/v1/assimilate?limit=<n>` (optionally with `app=<name>`) returns ready workunits with their canonical
 result, output file names and sizes; output bodies are fetched from `/admin/v1/outputs/<name>`;
-`POST /admin/v1/assimilate/ack` marks them done. An optional webhook announces new work so the
-project does not have to poll. Outputs are deleted once the workunit is acknowledged and
+`POST /admin/v1/assimilate/ack` marks them done. There is no assimilation webhook (the validator
+webhook is the only one the server sends), so the project polls. Outputs are deleted once the workunit is acknowledged and
 `delete_delay_hours` have passed since its most recently returned result, the rule upstream
 uses. The project fetches outputs before it acknowledges, so an acknowledgement that comes
 after the delay can delete them at once.
