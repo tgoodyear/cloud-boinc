@@ -2152,7 +2152,8 @@ fn pairwise_needs_a_candidate_with_min_valid_matches() {
     *w.hook.reply.borrow_mut() = Some(pairwise_reply(&rs, &[(0, 1), (2, 3)]));
     w.transition(wu, 1300);
     assert_eq!(w.wu(wu).canonical_resultid, 0);
-    assert_eq!(states(&w, wu), [VALIDATE_STATE_INCONCLUSIVE; 4]);
+    // The replacement result the transitioner creates is not validated yet.
+    assert_eq!(states(&w, wu)[..4], [VALIDATE_STATE_INCONCLUSIVE; 4]);
     assert_eq!(w.wu(wu).target_nresults, 5);
 }
 
