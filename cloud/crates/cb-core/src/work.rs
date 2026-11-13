@@ -462,6 +462,13 @@ pub async fn register_job_file(
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OutputFileInfo {
     pub name: String,
+    /// The `<open_name>` of the result template's `<file_ref>` for this
+    /// file; null when the template gives none.
+    pub open_name: Option<String>,
+    /// Position of the file in the result template, from 0. Files that were
+    /// not stored are left out of the list but keep their position, so
+    /// `index` of the others does not change.
+    pub index: usize,
     pub nbytes: u64,
     pub md5: String,
 }
@@ -485,8 +492,30 @@ pub struct CanonicalResult {
     pub user_id: i64,
     pub elapsed_time: f64,
     pub granted_credit: f64,
-    /// Stored output files; an optional file that was not uploaded is absent.
+    /// Stored output files, in template order; an optional file that was not
+    /// uploaded is absent (see `OutputFileInfo::index`).
     pub files: Vec<OutputFileInfo>,
+}
+
+/// Which workunits the assimilation list returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssimilateList {
+    /// Ready and not yet acknowledged.
+    Ready,
+    /// Acknowledged, with their files not yet scheduled for deletion, so a
+    /// consumer can still read them or re-open them.
+    Done,
+}
+
+/// One page of the assimilation list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReadyPage {
+    pub workunits: Vec<ReadyWorkunit>,
+    /// More workunits follow this page.
+    pub has_more: bool,
+    /// The `after` value that asks for the next page: the ID of the last
+    /// workunit returned; null when the page is empty.
+    pub next_after: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -505,29 +534,57 @@ struct ReadyRow {
     r_granted_credit: Option<f64>,
 }
 
-/// Workunits of `app` that are ready to assimilate, by ID, after `after_id`.
+/// The test of a workunit that can still be read or re-opened after its
+/// acknowledgement: no file deletion has been scheduled for it or for its
+/// canonical result. A transition that starts the deletion sets
+/// `file_delete_state` on the workunit in the same pass that marks the
+/// canonical result, so the second test is a guard, not a second condition.
+fn outputs_kept() -> String {
+    format!(
+        "w.assimilate_state = {ASSIMILATE_DONE} AND w.file_delete_state = {FILE_DELETE_INIT} \
+         AND (w.canonical_resultid = 0 OR EXISTS (SELECT 1 FROM result c \
+         WHERE c.id = w.canonical_resultid AND c.file_delete_state = {FILE_DELETE_INIT}))"
+    )
+}
+
+/// Workunits of `app` in the given list, by ID, after `after_id`. `since`
+/// (Unix time, 0 for none) keeps only workunits changed at or after it; the
+/// ready list ignores it. At most `limit` workunits (1 to 1000) come back
+/// with `has_more` telling whether another follows.
 pub async fn ready_to_assimilate(
     db: &dyn Db,
     files: &dyn Files,
     app: &str,
+    list: AssimilateList,
     after_id: i64,
+    since: i64,
     limit: i64,
-) -> CoreResult<Vec<ReadyWorkunit>> {
-    let rows = cb_db::query::<ReadyRow>(
+) -> CoreResult<ReadyPage> {
+    let limit = limit.clamp(1, 1000);
+    let cond = match list {
+        AssimilateList::Ready => "w.assimilate_state = 1".to_string(),
+        AssimilateList::Done => format!("{} AND w.mod_time >= {}", outputs_kept(), since.max(0)),
+    };
+    // One row more than the page, to learn whether another page follows.
+    let mut rows = cb_db::query::<ReadyRow>(
         db,
         stmt!(
-            "SELECT w.id, w.name, w.batch, w.error_mask, w.canonical_resultid, r.name AS r_name, \
-             r.xml_doc_in AS r_xml_doc_in, r.hostid AS r_hostid, r.userid AS r_userid, \
-             r.elapsed_time AS r_elapsed_time, r.granted_credit AS r_granted_credit \
-             FROM workunit w LEFT JOIN result r ON r.id = w.canonical_resultid AND w.canonical_resultid > 0 \
-             WHERE w.assimilate_state = 1 AND w.appid = (SELECT id FROM app WHERE name = ?) AND w.id > ? \
-             ORDER BY w.id LIMIT ?",
+            &format!(
+                "SELECT w.id, w.name, w.batch, w.error_mask, w.canonical_resultid, r.name AS r_name, \
+                 r.xml_doc_in AS r_xml_doc_in, r.hostid AS r_hostid, r.userid AS r_userid, \
+                 r.elapsed_time AS r_elapsed_time, r.granted_credit AS r_granted_credit \
+                 FROM workunit w LEFT JOIN result r ON r.id = w.canonical_resultid AND w.canonical_resultid > 0 \
+                 WHERE {cond} AND w.appid = (SELECT id FROM app WHERE name = ?) AND w.id > ? \
+                 ORDER BY w.id LIMIT ?"
+            ),
             app,
             after_id,
-            limit.clamp(1, 1000)
+            limit + 1
         ),
     )
     .await?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let canonical_result = match (row.canonical_resultid > 0, row.r_name) {
@@ -537,6 +594,8 @@ pub async fn ready_to_assimilate(
                     if let Some(s) = files.stat(FileKind::Upload, &f.name).await? {
                         fs.push(OutputFileInfo {
                             name: f.name,
+                            open_name: Some(f.open_name).filter(|n| !n.is_empty()),
+                            index: f.index,
                             nbytes: s.nbytes,
                             md5: s.md5,
                         });
@@ -562,7 +621,12 @@ pub async fn ready_to_assimilate(
             canonical_result,
         });
     }
-    Ok(out)
+    let next_after = out.last().map(|w| w.id);
+    Ok(ReadyPage {
+        workunits: out,
+        has_more,
+        next_after,
+    })
 }
 
 fn ids_of(rows: Vec<cb_db::Rows>) -> Vec<i64> {
@@ -586,6 +650,45 @@ pub async fn acknowledge_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> Cor
         .bind(now)
         .bind(now)
         .bind(ASSIMILATE_READY);
+        for id in chunk {
+            s = s.bind(*id);
+        }
+        stmts.push(s);
+    }
+    if stmts.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(ids_of(db.batch(stmts).await?))
+}
+
+/// Puts acknowledged workunits back in the ready list, so a consumer that
+/// lost its copy can pull them again. Only a workunit whose files are still
+/// there changes: acknowledged, no file deletion scheduled for it or for its
+/// canonical result (`outputs_kept`). The update is one conditional
+/// statement, so a repeat finds nothing to change and a transition that is
+/// scheduling the deletion at the same moment loses the revision race or
+/// finds the files marked, never both outcomes. `transition_time` is set to
+/// `now`, so the next sweep runs a transition that works out again what is
+/// pending (a replica's deadline, a validation retry) while assimilation is
+/// ready; that pass keeps the canonical result's outputs and makes no new
+/// deletion reservation (reserving starts only once the workunit is
+/// acknowledged again). It does not stop the deletion of a non-canonical
+/// result that was already marked for it. The delay then still counts from
+/// the most recently returned result, so a re-opened workunit is deleted on
+/// the original schedule or at once if that has passed, exactly as a first
+/// acknowledgement is. Returns the IDs that changed.
+pub async fn reopen_assimilation(db: &dyn Db, ids: &[i64], now: i64) -> CoreResult<Vec<i64>> {
+    let mut stmts = Vec::new();
+    for chunk in ids.chunks(MAX_IN_LIST) {
+        let mut s = Stmt::new(format!(
+            "UPDATE workunit AS w SET assimilate_state = ?, transition_time = ?, mod_time = ?, rev = w.rev + 1 \
+             WHERE {} AND w.id IN ({}) RETURNING id",
+            outputs_kept(),
+            in_list(chunk.len())
+        ))
+        .bind(ASSIMILATE_READY)
+        .bind(now)
+        .bind(now);
         for id in chunk {
             s = s.bind(*id);
         }

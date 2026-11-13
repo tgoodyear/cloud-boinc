@@ -15,6 +15,11 @@ pub const MAX_NCPUS: i32 = 64;
 /// (`SCHED_CONFIG::parse` in `sched/sched_config.cpp`).
 pub const DEFAULT_MAINTENANCE_DELAY: f64 = 3600.0;
 
+/// How long a validator webhook call may take unless the config says.
+pub const DEFAULT_WEBHOOK_TIMEOUT_SECS: i32 = 20;
+/// The longest `<webhook_timeout_secs>` the config can ask for.
+pub const MAX_WEBHOOK_TIMEOUT_SECS: i32 = 120;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub master_url: String,
@@ -113,6 +118,10 @@ pub struct Config {
     pub robots_tag: String,
     /// Upper bound on the credit of one job; 0 is no bound.
     pub max_granted_credit: f64,
+    /// Seconds a validator webhook call may take, answer included, before it
+    /// counts as a failed call and is tried again later (1 to 120). Not in
+    /// upstream, which has no webhook.
+    pub webhook_timeout_secs: i32,
     /// Upper bound in bytes on one uploaded file, whatever its certificate says.
     pub max_upload_nbytes: f64,
     /// Days to keep finished workunits before they are purged; 0 keeps them.
@@ -200,6 +209,7 @@ impl Default for Config {
             enable_delete_account: 0,
             robots_tag: String::new(),
             max_granted_credit: 200.0 * 1000.0 * 365.0,
+            webhook_timeout_secs: DEFAULT_WEBHOOK_TIMEOUT_SECS,
             max_upload_nbytes: 100e6,
             purge_days: 0.0,
             dashboard_feed_url: String::new(),
@@ -500,6 +510,16 @@ static OPTIONS: &[ConfigOption] = &[
     },
     option!("robots_tag", Str, c.robots_tag),
     option!("max_granted_credit", Double, c.max_granted_credit),
+    ConfigOption {
+        name: "webhook_timeout_secs",
+        kind: OptionKind::Int,
+        set: |p, v| {
+            // Out of range is cut to the range, not refused: a long wait is
+            // never what the project meant.
+            p.c.webhook_timeout_secs = v.int().clamp(1, MAX_WEBHOOK_TIMEOUT_SECS);
+            Ok(())
+        },
+    },
     option!("max_upload_nbytes", Double, c.max_upload_nbytes),
     option!("purge_days", Double, c.purge_days),
     ConfigOption {
@@ -792,6 +812,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_timeout_has_a_default_and_a_range() {
+        let parse = |extra: &str| {
+            Config::parse(&format!(
+                "<config><master_url>https://p.example/</master_url>{extra}</config>"
+            ))
+            .unwrap()
+            .webhook_timeout_secs
+        };
+        assert_eq!(parse(""), DEFAULT_WEBHOOK_TIMEOUT_SECS);
+        assert_eq!(parse("<webhook_timeout_secs>5</webhook_timeout_secs>"), 5);
+        assert_eq!(parse("<webhook_timeout_secs>0</webhook_timeout_secs>"), 1);
+        assert_eq!(
+            parse("<webhook_timeout_secs>100000</webhook_timeout_secs>"),
+            MAX_WEBHOOK_TIMEOUT_SECS
+        );
+    }
 
     #[test]
     fn parses_upstream_style_config() {
