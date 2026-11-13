@@ -13,7 +13,7 @@ use cb_core::project::{
 use cb_core::status::{operator_summary, STATUS_COUNTS_TTL};
 use cb_core::web::{make_user, server_status, NewAccount};
 use cb_core::work::{
-    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate,
+    acknowledge_assimilation_report, cancel_workunits, create_work, ready_to_assimilate,
     register_job_file, reopen_assimilation, AssimilateList, CancelTarget, Submission,
 };
 use cb_core::{CoreError, FileKind};
@@ -255,13 +255,20 @@ async fn get_output(env: &Env, name: &str) -> Result<Response> {
         return error(404, "no such output file");
     };
     let size = object.size();
+    // The MD5 R2 keeps for the object, read with the object itself: no
+    // extra request. It is absent only for an object stored some other way.
+    let md5 = object.checksum().md5.map(hex::encode);
     let Some(body) = object.body() else {
         return error(404, "no such output file");
     };
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .with_header("Content-Type", "application/octet-stream")?
-        .with_header("X-Content-Bytes", &size.to_string())?
-        .body(body.response_body()?))
+        .with_header("Content-Length", &size.to_string())?
+        .with_header("X-Content-Bytes", &size.to_string())?;
+    if let Some(md5) = md5 {
+        builder = builder.with_header("X-Content-MD5", &md5)?;
+    }
+    Ok(builder.body(body.response_body()?))
 }
 
 async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
@@ -477,9 +484,7 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
         },
 
         (Method::Get, ["assimilate"]) => {
-            let Some(app) = query(&req, "app")? else {
-                return error(400, "app is required");
-            };
+            let app = query(&req, "app")?.filter(|a| !a.is_empty());
             let after = query(&req, "after")?
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(0);
@@ -496,7 +501,7 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(0);
             let files = R2Files(env.bucket(BUCKET)?);
-            reply(ready_to_assimilate(&db, &files, &app, list, after, since, limit).await)
+            reply(ready_to_assimilate(&db, &files, app.as_deref(), list, after, since, limit).await)
         }
         (Method::Post, ["assimilate", "reopen"]) => {
             let a: Ack = parse!(req);
@@ -507,10 +512,10 @@ async fn route(mut req: Request, env: &Env, rest: &str) -> Result<Response> {
         }
         (Method::Post, ["assimilate", "ack"]) => {
             let a: Ack = parse!(req);
-            match acknowledge_assimilation(&db, &a.workunit_ids, now()).await {
-                Ok(ids) => {
-                    enqueue(env, &ids).await;
-                    ok(&json!({ "acknowledged": ids }))
+            match acknowledge_assimilation_report(&db, &a.workunit_ids, now()).await {
+                Ok(report) => {
+                    enqueue(env, &report.acknowledged).await;
+                    ok(&report)
                 }
                 Err(e) => core_error(e),
             }

@@ -8,8 +8,9 @@ use cb_core::model::{JobResult, Workunit};
 use cb_core::pipeline::{due_workunits, transition, Ctx};
 use cb_core::purge::{commit_purge, plan_purge, purge_pass};
 use cb_core::work::{
-    acknowledge_assimilation, cancel_workunits, create_work, ready_to_assimilate,
-    reopen_assimilation, Assign, AssignTarget, AssimilateList, CancelTarget, JobSpec, Submission,
+    acknowledge_assimilation, acknowledge_assimilation_report, cancel_workunits, create_work,
+    ready_to_assimilate, reopen_assimilation, Assign, AssignTarget, AssimilateList, CancelTarget,
+    JobSpec, Submission,
 };
 use cb_core::{Config, CoreError, CoreResult, FileKind, FileStat, Files, Webhook, NEVER};
 use cb_crypto::Signer;
@@ -889,7 +890,13 @@ fn ready(
     limit: i64,
 ) -> cb_core::work::ReadyPage {
     block_on(ready_to_assimilate(
-        &w.db, &w.files, "a", list, after, since, limit,
+        &w.db,
+        &w.files,
+        Some("a"),
+        list,
+        after,
+        since,
+        limit,
     ))
     .unwrap()
 }
@@ -1493,7 +1500,8 @@ fn concurrent_transitions_for_one_team_lose_no_average_sample() {
 #[test]
 fn assimilation_files_carry_their_template_position() {
     // Of the four files only a and the unnamed fourth are stored: the
-    // others keep their positions, so 0 and 3 come back, not 0 and 1.
+    // others are listed with `present` false, and every file keeps its
+    // template position.
     let w = World::new("trivial");
     let wu = w.submit_job_with(
         JobSpec {
@@ -1515,14 +1523,27 @@ fn assimilation_files_carry_their_template_position() {
     w.transition(wu, 1200);
     let page = ready(&w, AssimilateList::Ready, 0, 0, 10);
     let files = &page.workunits[0].canonical_result.as_ref().unwrap().files;
-    let got: Vec<(Option<&str>, usize)> = files
+    let got: Vec<(Option<&str>, usize, bool)> = files
         .iter()
-        .map(|f| (f.open_name.as_deref(), f.index))
+        .map(|f| (f.open_name.as_deref(), f.index, f.present))
         .collect();
-    assert_eq!(got, [(Some("a"), 0), (None, 3)]);
+    assert_eq!(
+        got,
+        [
+            (Some("a"), 0, true),
+            (Some("b"), 1, false),
+            (Some("c"), 2, false),
+            (None, 3, true)
+        ]
+    );
+    assert_eq!((files[1].nbytes, files[1].md5.as_str()), (0, ""));
     assert_eq!(files[0].name, outs[0].name);
     let json = serde_json::to_value(&page).unwrap();
-    assert!(json["workunits"][0]["canonical_result"]["files"][1]["open_name"].is_null());
+    assert!(json["workunits"][0]["canonical_result"]["files"][3]["open_name"].is_null());
+    assert_eq!(
+        json["workunits"][0]["canonical_result"]["files"][1]["present"],
+        false
+    );
 }
 
 #[test]
@@ -1912,4 +1933,62 @@ fn an_unusable_credit_value_does_not_cost_the_reply_its_verdicts() {
         assert_eq!(w.wu(wu).canonical_resultid, rs[0].id, "{bad}");
         assert!((w.results(wu)[0].granted_credit - computed).abs() < 1e-9);
     }
+}
+
+#[test]
+fn assimilation_list_without_an_app_names_the_app_of_each_workunit() {
+    let w = World::new("trivial");
+    let wu = ready_job(&w, "p1");
+    let all = block_on(ready_to_assimilate(
+        &w.db,
+        &w.files,
+        None,
+        AssimilateList::Ready,
+        0,
+        0,
+        10,
+    ))
+    .unwrap();
+    assert_eq!(all.workunits.len(), 1);
+    assert_eq!(
+        (all.workunits[0].id, all.workunits[0].app.as_str()),
+        (wu, "a")
+    );
+    let json = serde_json::to_value(&all).unwrap();
+    assert_eq!(json["workunits"][0]["batch"], 0);
+    assert!(json["workunits"][0]["batch"].is_i64());
+    let other = block_on(ready_to_assimilate(
+        &w.db,
+        &w.files,
+        Some("no_such_app"),
+        AssimilateList::Ready,
+        0,
+        0,
+        10,
+    ))
+    .unwrap();
+    assert!(other.workunits.is_empty());
+}
+
+#[test]
+fn acknowledgement_tells_repeats_and_unknown_ids_apart() {
+    let w = World::new("trivial");
+    let wu = ready_job(&w, "k1");
+    let unsent = w.submit("k2", 1000, 1, 1);
+    let first = block_on(acknowledge_assimilation_report(
+        &w.db,
+        &[wu, wu, unsent, 987654],
+        1300,
+    ))
+    .unwrap();
+    assert_eq!(first.acknowledged, vec![wu]);
+    assert!(first.already_acked.is_empty());
+    assert_eq!(first.not_ready, vec![unsent]);
+    assert_eq!(first.unknown, vec![987654]);
+    let again = block_on(acknowledge_assimilation_report(&w.db, &[wu, 987654], 1301)).unwrap();
+    assert!(again.acknowledged.is_empty());
+    assert_eq!(again.already_acked, vec![wu]);
+    assert_eq!(again.unknown, vec![987654]);
+    let empty = block_on(acknowledge_assimilation_report(&w.db, &[], 1301)).unwrap();
+    assert_eq!(empty, Default::default());
 }
