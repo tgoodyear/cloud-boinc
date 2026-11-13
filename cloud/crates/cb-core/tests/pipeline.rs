@@ -1992,3 +1992,58 @@ fn acknowledgement_tells_repeats_and_unknown_ids_apart() {
     let empty = block_on(acknowledge_assimilation_report(&w.db, &[], 1301)).unwrap();
     assert_eq!(empty, Default::default());
 }
+
+#[test]
+fn assimilation_list_across_two_apps_keeps_id_order_and_filters() {
+    let w = World::new("trivial");
+    let ids: Vec<i64> = (0..4).map(|i| ready_job(&w, &format!("m{i}"))).collect();
+    // Move the second and fourth workunits to another app, so the IDs of
+    // the two apps interleave.
+    block_on(w.db.batch(vec![
+        stmt!("INSERT INTO app (id, create_time, name, user_friendly_name, validator, target_nresults) VALUES (2, 0, 'b', 'B', 'trivial', 2)"),
+        stmt!("UPDATE workunit SET appid = 2 WHERE id IN (?, ?)", ids[1], ids[3]),
+    ]))
+    .unwrap();
+    let page = |app: Option<&str>, after: i64, limit: i64| {
+        block_on(ready_to_assimilate(
+            &w.db,
+            &w.files,
+            app,
+            AssimilateList::Ready,
+            after,
+            0,
+            limit,
+        ))
+        .unwrap()
+    };
+    // No app: both apps, in ID order, across pages of two.
+    let mut seen = Vec::new();
+    let mut after = 0;
+    loop {
+        let p = page(None, after, 2);
+        seen.extend(p.workunits.iter().map(|x| (x.id, x.app.clone())));
+        if !p.has_more {
+            break;
+        }
+        after = p.next_after.unwrap();
+    }
+    let want: Vec<(i64, String)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, if i % 2 == 0 { "a" } else { "b" }.to_string()))
+        .collect();
+    assert_eq!(seen, want);
+    // Each app alone excludes the other.
+    let a: Vec<i64> = page(Some("a"), 0, 10)
+        .workunits
+        .iter()
+        .map(|x| x.id)
+        .collect();
+    let b: Vec<i64> = page(Some("b"), 0, 10)
+        .workunits
+        .iter()
+        .map(|x| x.id)
+        .collect();
+    assert_eq!(a, vec![ids[0], ids[2]]);
+    assert_eq!(b, vec![ids[1], ids[3]]);
+}

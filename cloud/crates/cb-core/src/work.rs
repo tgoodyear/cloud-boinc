@@ -716,9 +716,11 @@ pub async fn acknowledge_assimilation_report(
             }
         }
     }
-    let mut seen = HashSet::new();
+    // Membership by set, so a large request is not quadratic; the Vec keeps
+    // the reply's order.
+    let mut seen: HashSet<i64> = report.acknowledged.iter().copied().collect();
     for id in ids {
-        if !seen.insert(*id) || report.acknowledged.contains(id) {
+        if !seen.insert(*id) {
             continue;
         }
         match state.get(id) {
