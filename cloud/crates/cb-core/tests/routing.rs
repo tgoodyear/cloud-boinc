@@ -376,3 +376,57 @@ fn assigned_rules_do_not_spend_the_budget_of_queries_that_do_not_run() {
     );
     assert!(log.iter().all(|s| !s.contains("FROM assignment")));
 }
+
+#[test]
+fn versions_with_the_same_routing_clause_are_charged_once() {
+    // Sixty-four rules, each refusing every version, make one condition of
+    // about 7 KB: it fits the 40,000-byte budget of a statement once, six times
+    // it does not. Six usable versions share a number and have no plan class,
+    // so their clauses are the same text and only one may be charged.
+    let mut rules: Vec<String> = (0..63)
+        .map(|i| {
+            format!(
+                r#"{{"app":"a","name":"r{i:02}_{}*","max_batch":9223372036854775807,"allow":[]}}"#,
+                "x".repeat(44)
+            )
+        })
+        .collect();
+    rules.push(
+        r#"{"app":"a","name":"none_*","max_batch":9223372036854775807,"allow":[]}"#.to_string(),
+    );
+    let rules = format!(r#"{{"rules":[{}]}}"#, rules.join(","));
+    let w = World::new(&rules);
+    let one = w
+        .routing
+        .borrow()
+        .sql_condition(
+            "a",
+            false,
+            Some(&cb_core::routing::VersionRef {
+                platform: LINUX,
+                plan_class: "",
+                version_num: 100,
+            }),
+        )
+        .len();
+    assert!(one <= 40_000 && one * 6 > 40_000, "{one}");
+    // Five more versions of number 100 for Linux: six with the first.
+    let extra: Vec<Stmt> = (9..14)
+        .map(|id| {
+            stmt!("INSERT INTO app_version (id, create_time, appid, version_num, platformid, xml_doc) VALUES (?, 0, 1, 100, 1, ?)", id as i64, version_xml(100))
+        })
+        .collect();
+    block_on(w.db.batch(extra)).unwrap();
+    let host = w.host();
+    // More refused workunits than the four windows of 100 one request reads,
+    // all older than the one the host may take: only the conditions in the
+    // query let it reach that one.
+    let names: Vec<String> = (0..450).map(|i| format!("none_{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ids = w.submit(&refs, 0, None);
+    let open = w.submit(&["free_1"], 0, None)[0];
+    let out = w.rpc(host, 2, None, 2000);
+    assert_eq!(out.n_sent, 1);
+    assert!(sent_with(&w, open).is_some());
+    assert!(ids.iter().all(|id| sent_with(&w, *id).is_none()));
+}
