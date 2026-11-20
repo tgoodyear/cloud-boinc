@@ -2423,7 +2423,10 @@ fn a_retry_verdict_commits_no_comparison_result_and_the_next_call_decides() {
 #[derive(Default)]
 struct Store {
     objects: RefCell<HashMap<String, FileStat>>,
+    /// The ledgers, parsed, by key.
     ledgers: RefCell<HashMap<String, serde_json::Value>>,
+    /// Every `put`, raw, by key (ledgers and the cursor).
+    blobs: RefCell<HashMap<String, Vec<u8>>>,
     writes: RefCell<Vec<String>>,
     /// The MD5 the next copies come out with, standing for a bad copy.
     corrupt: Cell<bool>,
@@ -2466,22 +2469,43 @@ impl cb_core::export::ResultStore for Export<'_> {
         if self.store.fail.get() {
             return Err(CoreError::Files("down".into()));
         }
-        self.store
-            .ledgers
-            .borrow_mut()
-            .insert(key.to_string(), serde_json::from_slice(&bytes).unwrap());
+        if key.starts_with("ready/") {
+            self.store
+                .ledgers
+                .borrow_mut()
+                .insert(key.to_string(), serde_json::from_slice(&bytes).unwrap());
+        }
+        self.store.blobs.borrow_mut().insert(key.to_string(), bytes);
         self.store.writes.borrow_mut().push(key.to_string());
         Ok(())
     }
+
+    async fn get(&self, key: &str) -> CoreResult<Option<Vec<u8>>> {
+        Ok(self.store.blobs.borrow().get(key).cloned())
+    }
 }
 
+/// One pass from the oldest, as run `r1`.
 fn export(w: &World, store: &Store, limit: i64, now: i64) -> cb_core::export::ExportReport {
+    export_run(w, store, 0, limit, now, "r1")
+}
+
+fn export_run(
+    w: &World,
+    store: &Store,
+    after: i64,
+    limit: i64,
+    now: i64,
+    run: &str,
+) -> cb_core::export::ExportReport {
     block_on(cb_core::export::export_pass(
         &w.db,
         &w.files,
         &Export { w, store },
+        after,
         limit,
         now,
+        run,
     ))
     .unwrap()
 }
@@ -2520,15 +2544,16 @@ fn export_copies_outputs_then_writes_the_ledger_then_acknowledges() {
     assert_eq!(
         writes,
         [
-            format!("files/e1/{}", outs[0].name),
-            format!("files/e1/{}", outs[3].name),
-            "ready/e1.json".to_string()
+            format!("files/{wu}-r1/{}", outs[0].name),
+            format!("files/{wu}-r1/{}", outs[3].name),
+            format!("ready/{wu}-r1.json")
         ]
     );
-    let ledger = store.ledgers.borrow()["ready/e1.json"].clone();
-    assert_eq!(ledger["schema"], 1);
+    let ledger = store.ledgers.borrow()[&format!("ready/{wu}-r1.json")].clone();
+    assert_eq!(ledger["schema"], 2);
+    assert_eq!(ledger["run"], "r1");
     assert_eq!(ledger["exported_at"], 1300);
-    assert_eq!(ledger["files_prefix"], "files/e1/");
+    assert_eq!(ledger["files_prefix"], format!("files/{wu}-r1/"));
     assert_eq!(ledger["workunit"]["id"], wu);
     assert_eq!(ledger["workunit"]["app"], "a");
     let files = &ledger["workunit"]["canonical_result"]["files"];
@@ -2559,7 +2584,10 @@ fn a_copy_that_does_not_match_the_listed_md5_leaves_the_workunit_ready() {
     store.corrupt.set(false);
     let report = export(&w, &store, 10, 1400);
     assert_eq!(report.ack.acknowledged, [wu]);
-    assert!(store.ledgers.borrow().contains_key("ready/e2.json"));
+    assert!(store
+        .ledgers
+        .borrow()
+        .contains_key(&format!("ready/{wu}-r1.json")));
 }
 
 #[test]
@@ -2588,8 +2616,10 @@ fn a_store_failure_or_a_missing_output_leaves_the_workunit_ready() {
                 store: &missing,
             },
         },
+        0,
         10,
         1300,
+        "r1",
     ))
     .unwrap();
     assert_eq!(report.failed.len(), 1);
@@ -2616,6 +2646,9 @@ impl cb_core::export::ResultStore for Vanishing<'_> {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> CoreResult<()> {
         self.inner.put(key, bytes).await
     }
+    async fn get(&self, key: &str) -> CoreResult<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
 }
 
 #[test]
@@ -2637,8 +2670,8 @@ fn a_failed_workunit_gets_a_ledger_and_no_files() {
     let report = export(&w, &store, 10, now);
     assert_eq!((report.exported, report.files), (1, 0));
     assert_eq!(report.ack.acknowledged, [wu]);
-    assert_eq!(*store.writes.borrow(), ["ready/e4.json"]);
-    let ledger = store.ledgers.borrow()["ready/e4.json"].clone();
+    assert_eq!(*store.writes.borrow(), [format!("ready/{wu}-r1.json")]);
+    let ledger = store.ledgers.borrow()[&format!("ready/{wu}-r1.json")].clone();
     assert_eq!(
         ledger["workunit"]["error_mask"],
         WU_ERROR_TOO_MANY_ERROR_RESULTS
@@ -2662,19 +2695,191 @@ fn export_takes_at_most_limit_workunits_oldest_first() {
 }
 
 #[test]
-fn a_reopened_workunit_is_exported_again_to_the_same_keys() {
+fn a_reopened_workunit_is_published_again_under_another_run() {
     let w = World::new("trivial");
     let wu = ready_job(&w, "e8");
     let store = Store::default();
-    export(&w, &store, 10, 1300);
+    export_run(&w, &store, 0, 10, 1300, "a");
     let first = store.writes.borrow().clone();
     assert_eq!(
         block_on(reopen_assimilation(&w.db, &[wu], 1350)).unwrap(),
         [wu]
     );
-    let report = export(&w, &store, 10, 1400);
+    let report = export_run(&w, &store, 0, 10, 1400, "b");
     assert_eq!(report.ack.acknowledged, [wu]);
-    let writes = store.writes.borrow().clone();
-    assert_eq!(writes[first.len()..], first[..]);
-    assert_eq!(store.ledgers.borrow()["ready/e8.json"]["exported_at"], 1400);
+    let second = store.writes.borrow()[first.len()..].to_vec();
+    assert_eq!(second.len(), first.len());
+    // Same layout, other run; the first publication is untouched.
+    for (a, b) in first.iter().zip(&second) {
+        assert_eq!(a.replace("-a", "-b"), *b);
+        assert_ne!(a, b);
+    }
+    let ledgers = store.ledgers.borrow();
+    assert_eq!(ledgers[&format!("ready/{wu}-a.json")]["exported_at"], 1300);
+    assert_eq!(ledgers[&format!("ready/{wu}-b.json")]["exported_at"], 1400);
+    assert_eq!(ledgers[&format!("ready/{wu}-b.json")]["run"], "b");
+    assert_eq!(
+        cb_core::export::file_key(wu, "b", "f"),
+        format!("files/{wu}-b/f")
+    );
+}
+
+/// A result template with a required output `a`, an optional one `b` and one
+/// without an upload URL `c`.
+const MIXED_FILES: &str = "<output_template>\n\
+<file_info><name><OUTFILE_0/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_1/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<file_info><name><OUTFILE_2/></name><generated_locally/></file_info>\n\
+<result>\n\
+<file_ref><file_name><OUTFILE_0/></file_name><open_name>a</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_1/></file_name><open_name>b</open_name><optional/></file_ref>\n\
+<file_ref><file_name><OUTFILE_2/></file_name><open_name>c</open_name></file_ref>\n\
+</result>\n</output_template>\n";
+
+/// A quorum-1 job with `MIXED_FILES` whose outputs `present` are stored, ready
+/// to assimilate. Returns the workunit and its output file names.
+fn mixed_job(
+    w: &World,
+    name: &str,
+    present: &[usize],
+) -> (i64, Vec<cb_core::template::OutputFile>) {
+    let wu = w.submit_job_with(
+        JobSpec {
+            name: name.into(),
+            min_quorum: Some(1),
+            target_nresults: Some(1),
+            ..Default::default()
+        },
+        MIXED_FILES,
+        1000,
+    );
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    w.files.objects.borrow_mut().clear();
+    let outs = cb_core::template::output_files(&rs[0].xml_doc_in);
+    for i in present {
+        put_output(w, &outs[*i].name);
+    }
+    w.transition(wu, 1200);
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_READY);
+    (wu, outs)
+}
+
+#[test]
+fn a_required_output_missing_at_listing_leaves_the_workunit_ready() {
+    let w = World::new("trivial");
+    let (wu, outs) = mixed_job(&w, "e9", &[0, 1]);
+    assert!(outs[0].uploadable && outs[1].uploadable && !outs[2].uploadable);
+    // The required output disappears from the project bucket after validation.
+    w.files
+        .objects
+        .borrow_mut()
+        .remove(&(FileKind::Upload, outs[0].name.clone()));
+    let store = Store::default();
+    let report = export(&w, &store, 10, 1300);
+    assert_eq!(report.exported, 0);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, wu);
+    assert!(
+        report.failed[0].1.contains("required"),
+        "{}",
+        report.failed[0].1
+    );
+    assert!(report.ack.acknowledged.is_empty());
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_READY);
+    // No ledger, so the optional file copied before it is never published.
+    assert!(store.ledgers.borrow().is_empty());
+
+    // Back in place: the next pass exports it.
+    put_output(&w, &outs[0].name);
+    let report = export(&w, &store, 10, 1400);
+    assert_eq!((report.exported, report.files), (1, 2));
+    assert_eq!(report.ack.acknowledged, [wu]);
+}
+
+#[test]
+fn a_missing_optional_or_non_uploadable_output_is_still_exported() {
+    let w = World::new("trivial");
+    let (wu, outs) = mixed_job(&w, "e10", &[0]);
+    let store = Store::default();
+    let report = export(&w, &store, 10, 1300);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!((report.exported, report.files), (1, 1));
+    assert_eq!(report.ack.acknowledged, [wu]);
+    assert_eq!(
+        *store.writes.borrow(),
+        [
+            format!("files/{wu}-r1/{}", outs[0].name),
+            format!("ready/{wu}-r1.json")
+        ]
+    );
+    let ledger = store.ledgers.borrow()[&format!("ready/{wu}-r1.json")].clone();
+    let files = &ledger["workunit"]["canonical_result"]["files"];
+    assert_eq!(files[0]["present"], true);
+    assert_eq!(files[1]["present"], false);
+    assert_eq!(files[2]["present"], false);
+}
+
+#[test]
+fn failing_workunits_do_not_block_newer_ones() {
+    let w = World::new("trivial");
+    let a = ready_job(&w, "e11");
+    let b = ready_job(&w, "e12");
+    let c = ready_job(&w, "e13");
+    // The two oldest lose their outputs, so they fail on every pass.
+    let page = ready(&w, AssimilateList::Ready, 0, 0, 10);
+    for wu in &page.workunits[..2] {
+        for f in &wu.canonical_result.as_ref().unwrap().files {
+            w.files
+                .objects
+                .borrow_mut()
+                .remove(&(FileKind::Upload, f.name.clone()));
+        }
+    }
+    let store = Store::default();
+    let first = export_run(&w, &store, 0, 2, 1300, "r1");
+    assert_eq!(first.exported, 0);
+    assert_eq!(first.failed.iter().map(|f| f.0).collect::<Vec<_>>(), [a, b]);
+    assert!(first.has_more);
+    assert_eq!(first.next_after, b);
+
+    // Walking on from the cursor reaches the newer workunit.
+    let second = export_run(&w, &store, first.next_after, 2, 1300, "r1");
+    assert_eq!(second.ack.acknowledged, [c]);
+    assert!(!second.has_more);
+    assert_eq!(second.next_after, 0);
+    assert_eq!(w.wu(a).assimilate_state, ASSIMILATE_READY);
+    assert_eq!(w.wu(b).assimilate_state, ASSIMILATE_READY);
+
+    // At the end the walk starts over from the oldest.
+    let third = export_run(&w, &store, second.next_after, 2, 1400, "r1");
+    assert_eq!(third.failed.len(), 2);
+}
+
+#[test]
+fn the_cursor_round_trips_and_a_bad_one_reads_as_the_start() {
+    use cb_core::export::{read_cursor, write_cursor, Cursor, CURSOR_KEY};
+    let w = World::new("trivial");
+    let store = Store::default();
+    let ex = Export {
+        w: &w,
+        store: &store,
+    };
+    assert_eq!(block_on(read_cursor(&ex)).unwrap(), Cursor { after: 0 });
+    block_on(write_cursor(&ex, Cursor { after: 42 })).unwrap();
+    assert_eq!(store.writes.borrow().last().unwrap(), CURSOR_KEY);
+    assert_eq!(block_on(read_cursor(&ex)).unwrap(), Cursor { after: 42 });
+
+    for garbage in [&b"not json"[..], b"{}", b"{\"after\":\"x\"}", b""] {
+        store
+            .blobs
+            .borrow_mut()
+            .insert(CURSOR_KEY.to_string(), garbage.to_vec());
+        assert_eq!(
+            block_on(read_cursor(&ex)).unwrap(),
+            Cursor { after: 0 },
+            "{garbage:?}"
+        );
+    }
 }

@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use cb_core::cron::run_cron;
-use cb_core::export::{export_pass, EXPORT_BATCH};
+use cb_core::export::{export_pass, read_cursor, write_cursor, EXPORT_BATCH};
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
 use cb_core::status::record_sweep;
 use cb_core::CoreResult;
@@ -182,8 +182,12 @@ async fn export_cron(env: &Env) -> Result<()> {
     };
     let db = db(env)?;
     let files = R2Files(env.bucket(BUCKET)?);
+    // Each invocation publishes under a run of its own, so an overlapping
+    // one never writes the keys this one's consumer may be deleting.
+    let run = format!("{:08x}", cb_worker::random_u32());
+    let mut cursor = read_cursor(&store).await.map_err(cb_worker::core_err)?;
     for _ in 0..EXPORT_PASSES {
-        let report = export_pass(&db, &files, &store, EXPORT_BATCH, now())
+        let report = export_pass(&db, &files, &store, cursor.after, EXPORT_BATCH, now(), &run)
             .await
             .map_err(cb_worker::core_err)?;
         enqueue(env, &report.ack.acknowledged).await;
@@ -199,13 +203,16 @@ async fn export_cron(env: &Env) -> Result<()> {
                 report.failed.len()
             );
         }
-        // A failure stays at the head of the list, so another pass now
-        // would only meet it again.
-        if !report.has_more || !report.failed.is_empty() {
+        // Failures stay ready behind the cursor; the walk goes on past them
+        // and comes back to them once it reaches the end of the list.
+        cursor.after = report.next_after;
+        if cursor.after == 0 {
             break;
         }
     }
-    Ok(())
+    write_cursor(&store, cursor)
+        .await
+        .map_err(cb_worker::core_err)
 }
 
 #[event(scheduled)]

@@ -473,6 +473,10 @@ pub struct OutputFileInfo {
     /// client); `nbytes` is then 0 and `md5` empty, and there is nothing to
     /// download.
     pub present: bool,
+    /// True when the client is told to upload the file and the template does
+    /// not mark it `<optional/>`: a successful result then has it, so a
+    /// required file that is not present has gone missing from storage.
+    pub required: bool,
     pub nbytes: u64,
     pub md5: String,
 }
@@ -604,6 +608,7 @@ pub async fn ready_to_assimilate(
                         open_name: Some(f.open_name).filter(|n| !n.is_empty()),
                         index: f.index,
                         present: stat.is_some(),
+                        required: f.uploadable && !f.optional,
                         nbytes: stat.as_ref().map_or(0, |s| s.nbytes),
                         md5: stat.map(|s| s.md5).unwrap_or_default(),
                     });

@@ -365,6 +365,16 @@ impl cb_core::export::ResultStore for R2Export {
             .map_err(files_err)?;
         Ok(())
     }
+
+    async fn get(&self, key: &str) -> CoreResult<Option<Vec<u8>>> {
+        let Some(object) = self.results.get(key).execute().await.map_err(files_err)? else {
+            return Ok(None);
+        };
+        let Some(body) = object.body() else {
+            return Ok(None);
+        };
+        Ok(Some(body.bytes().await.map_err(files_err)?))
+    }
 }
 
 /// `fetch` behind the core's [`Webhook`] trait.

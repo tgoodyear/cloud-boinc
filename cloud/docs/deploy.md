@@ -245,9 +245,13 @@ bucket_name = "cloud-boinc-dev-results"
 
 Run one consumer of the results bucket or of the admin API, not both: the export acknowledges
 what it copies, so a puller would find the ready list empty. Give the consumer an R2 API token
-for this bucket only, with object read and write (write is for deleting what it has taken). A
-lifecycle rule is the backstop for a consumer that stops; set it longer than the consumer could
-ever fall behind:
+for this bucket only, with object read and write (R2 tokens are scoped to buckets, not prefixes;
+write is for deleting what it has taken under `ready/` and `files/`). The consumer must leave
+`export/` alone: the pipeline keeps its cursor there (`export/cursor.json`), and rewrites it on
+every export run, so the lifecycle rule below never expires it.
+A lifecycle rule is the backstop for a consumer that stops, and it also removes the files of an
+export attempt that failed before its ledger; set it longer than the consumer could ever fall
+behind:
 
 ```
 npx wrangler r2 bucket lifecycle add cloud-boinc-dev-results --name taken --prefix "" --expire-days 30
