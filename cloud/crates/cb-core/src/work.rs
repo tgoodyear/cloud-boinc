@@ -574,65 +574,10 @@ pub async fn ready_to_assimilate(
     since: i64,
     limit: i64,
 ) -> CoreResult<ReadyPage> {
-    let limit = limit.clamp(1, 500);
-    let cond = match list {
-        AssimilateList::Ready => "w.assimilate_state = 1".to_string(),
-        AssimilateList::Done => format!("{} AND w.mod_time >= {}", outputs_kept(), since.max(0)),
-    };
-    // One row more than the page, to learn whether another page follows.
-    let app_cond = if app.is_some() { "AND a.name = ?" } else { "" };
-    let mut stmt = Stmt::new(format!(
-                "SELECT w.id, w.name, a.name AS app_name, w.batch, w.error_mask, w.canonical_resultid, r.name AS r_name, \
-                 r.xml_doc_in AS r_xml_doc_in, r.hostid AS r_hostid, r.userid AS r_userid, \
-                 r.elapsed_time AS r_elapsed_time, r.granted_credit AS r_granted_credit \
-                 FROM workunit w JOIN app a ON a.id = w.appid \
-                 LEFT JOIN result r ON r.id = w.canonical_resultid AND w.canonical_resultid > 0 \
-                 WHERE {cond} {app_cond} AND w.id > ? \
-                 ORDER BY w.id LIMIT ?"
-    ));
-    if let Some(app) = app {
-        stmt = stmt.bind(app);
-    }
-    let mut rows = cb_db::query::<ReadyRow>(db, stmt.bind(after_id).bind(limit + 1)).await?;
-    let has_more = rows.len() as i64 > limit;
-    rows.truncate(limit as usize);
+    let (rows, has_more) = ready_rows(db, app, list, after_id, None, since, limit).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let canonical_result = match (row.canonical_resultid > 0, row.r_name) {
-            (true, Some(name)) => {
-                let mut fs = Vec::new();
-                for f in output_files(row.r_xml_doc_in.as_deref().unwrap_or("")) {
-                    let stat = files.stat(FileKind::Upload, &f.name).await?;
-                    fs.push(OutputFileInfo {
-                        name: f.name,
-                        open_name: Some(f.open_name).filter(|n| !n.is_empty()),
-                        index: f.index,
-                        present: stat.is_some(),
-                        required: f.uploadable && !f.optional,
-                        nbytes: stat.as_ref().map_or(0, |s| s.nbytes),
-                        md5: stat.map(|s| s.md5).unwrap_or_default(),
-                    });
-                }
-                Some(CanonicalResult {
-                    id: row.canonical_resultid,
-                    name,
-                    host_id: row.r_hostid.unwrap_or(0),
-                    user_id: row.r_userid.unwrap_or(0),
-                    elapsed_time: row.r_elapsed_time.unwrap_or(0.0),
-                    granted_credit: row.r_granted_credit.unwrap_or(0.0),
-                    files: fs,
-                })
-            }
-            _ => None,
-        };
-        out.push(ReadyWorkunit {
-            id: row.id,
-            name: row.name,
-            app: row.app_name,
-            batch: row.batch,
-            error_mask: row.error_mask,
-            canonical_result,
-        });
+        out.push(describe_ready(files, row).await?);
     }
     let next_after = out.last().map(|w| w.id);
     Ok(ReadyPage {
@@ -640,6 +585,122 @@ pub async fn ready_to_assimilate(
         has_more,
         next_after,
     })
+}
+
+/// The ready list for the results-bucket export: like
+/// [`ready_to_assimilate`] over every app, also bounded above by `until`
+/// (inclusive), with a storage error kept with its workunit instead of
+/// failing the page, so one unreadable output cannot stop the others.
+pub(crate) async fn ready_for_export(
+    db: &dyn Db,
+    files: &dyn Files,
+    after_id: i64,
+    until: i64,
+    limit: i64,
+) -> CoreResult<(Vec<(i64, CoreResult<ReadyWorkunit>)>, bool)> {
+    let (rows, has_more) = ready_rows(
+        db,
+        None,
+        AssimilateList::Ready,
+        after_id,
+        Some(until),
+        0,
+        limit,
+    )
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.id;
+        out.push((id, describe_ready(files, row).await));
+    }
+    Ok((out, has_more))
+}
+
+/// One page of rows, and whether another follows. One statement.
+async fn ready_rows(
+    db: &dyn Db,
+    app: Option<&str>,
+    list: AssimilateList,
+    after_id: i64,
+    until: Option<i64>,
+    since: i64,
+    limit: i64,
+) -> CoreResult<(Vec<ReadyRow>, bool)> {
+    let limit = limit.clamp(1, 500);
+    let cond = match list {
+        AssimilateList::Ready => "w.assimilate_state = 1".to_string(),
+        AssimilateList::Done => format!("{} AND w.mod_time >= {}", outputs_kept(), since.max(0)),
+    };
+    // One row more than the page, to learn whether another page follows.
+    let app_cond = if app.is_some() { "AND a.name = ?" } else { "" };
+    let until_cond = if until.is_some() { "AND w.id <= ?" } else { "" };
+    let mut stmt = Stmt::new(format!(
+                "SELECT w.id, w.name, a.name AS app_name, w.batch, w.error_mask, w.canonical_resultid, r.name AS r_name, \
+                 r.xml_doc_in AS r_xml_doc_in, r.hostid AS r_hostid, r.userid AS r_userid, \
+                 r.elapsed_time AS r_elapsed_time, r.granted_credit AS r_granted_credit \
+                 FROM workunit w JOIN app a ON a.id = w.appid \
+                 LEFT JOIN result r ON r.id = w.canonical_resultid AND w.canonical_resultid > 0 \
+                 WHERE {cond} {app_cond} AND w.id > ? {until_cond} \
+                 ORDER BY w.id LIMIT ?"
+    ));
+    if let Some(app) = app {
+        stmt = stmt.bind(app);
+    }
+    stmt = stmt.bind(after_id);
+    if let Some(until) = until {
+        stmt = stmt.bind(until);
+    }
+    let mut rows = cb_db::query::<ReadyRow>(db, stmt.bind(limit + 1)).await?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    Ok((rows, has_more))
+}
+
+/// A listed row with its canonical result's files looked up in storage.
+async fn describe_ready(files: &dyn Files, row: ReadyRow) -> CoreResult<ReadyWorkunit> {
+    let canonical_result = match (row.canonical_resultid > 0, row.r_name) {
+        (true, Some(name)) => {
+            let mut fs = Vec::new();
+            for f in output_files(row.r_xml_doc_in.as_deref().unwrap_or("")) {
+                let stat = files.stat(FileKind::Upload, &f.name).await?;
+                fs.push(OutputFileInfo {
+                    name: f.name,
+                    open_name: Some(f.open_name).filter(|n| !n.is_empty()),
+                    index: f.index,
+                    present: stat.is_some(),
+                    required: f.uploadable && !f.optional,
+                    nbytes: stat.as_ref().map_or(0, |s| s.nbytes),
+                    md5: stat.map(|s| s.md5).unwrap_or_default(),
+                });
+            }
+            Some(CanonicalResult {
+                id: row.canonical_resultid,
+                name,
+                host_id: row.r_hostid.unwrap_or(0),
+                user_id: row.r_userid.unwrap_or(0),
+                elapsed_time: row.r_elapsed_time.unwrap_or(0.0),
+                granted_credit: row.r_granted_credit.unwrap_or(0.0),
+                files: fs,
+            })
+        }
+        _ => None,
+    };
+    Ok(ReadyWorkunit {
+        id: row.id,
+        name: row.name,
+        app: row.app_name,
+        batch: row.batch,
+        error_mask: row.error_mask,
+        canonical_result,
+    })
+}
+
+/// The highest workunit ID there is, 0 when there is none. One statement.
+pub(crate) async fn max_workunit_id(db: &dyn Db) -> CoreResult<i64> {
+    let rows = db
+        .run(Stmt::new("SELECT MAX(id) AS id FROM workunit"))
+        .await?;
+    Ok(rows.scalar_i64().unwrap_or(0))
 }
 
 fn ids_of(rows: Vec<cb_db::Rows>) -> Vec<i64> {

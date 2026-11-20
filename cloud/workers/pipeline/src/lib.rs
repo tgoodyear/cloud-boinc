@@ -187,7 +187,7 @@ async fn export_cron(env: &Env) -> Result<()> {
     let run = format!("{:08x}", cb_worker::random_u32());
     let mut cursor = read_cursor(&store).await.map_err(cb_worker::core_err)?;
     for _ in 0..EXPORT_PASSES {
-        let report = export_pass(&db, &files, &store, cursor.after, EXPORT_BATCH, now(), &run)
+        let report = export_pass(&db, &files, &store, cursor, EXPORT_BATCH, now(), &run)
             .await
             .map_err(cb_worker::core_err)?;
         enqueue(env, &report.ack.acknowledged).await;
@@ -205,7 +205,7 @@ async fn export_cron(env: &Env) -> Result<()> {
         }
         // Failures stay ready behind the cursor; the walk goes on past them
         // and comes back to them once it reaches the end of the list.
-        cursor.after = report.next_after;
+        cursor = report.next;
         if cursor.after == 0 {
             break;
         }

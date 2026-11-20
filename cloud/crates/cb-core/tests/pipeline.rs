@@ -27,12 +27,14 @@ struct MemFiles {
     objects: RefCell<HashMap<(FileKind, String), FileStat>>,
     archive: RefCell<HashMap<String, Vec<u8>>>,
     fail: Cell<bool>,
+    /// Names whose `stat` fails, the rest of the bucket being fine.
+    fail_stat: RefCell<Vec<String>>,
 }
 
 #[async_trait(?Send)]
 impl Files for MemFiles {
     async fn stat(&self, kind: FileKind, name: &str) -> CoreResult<Option<FileStat>> {
-        if self.fail.get() {
+        if self.fail.get() || self.fail_stat.borrow().iter().any(|n| n == name) {
             return Err(CoreError::Files("down".into()));
         }
         Ok(self
@@ -2487,13 +2489,13 @@ impl cb_core::export::ResultStore for Export<'_> {
 
 /// One pass from the oldest, as run `r1`.
 fn export(w: &World, store: &Store, limit: i64, now: i64) -> cb_core::export::ExportReport {
-    export_run(w, store, 0, limit, now, "r1")
+    export_run(w, store, Default::default(), limit, now, "r1")
 }
 
 fn export_run(
     w: &World,
     store: &Store,
-    after: i64,
+    cursor: cb_core::export::Cursor,
     limit: i64,
     now: i64,
     run: &str,
@@ -2502,7 +2504,7 @@ fn export_run(
         &w.db,
         &w.files,
         &Export { w, store },
-        after,
+        cursor,
         limit,
         now,
         run,
@@ -2616,7 +2618,7 @@ fn a_store_failure_or_a_missing_output_leaves_the_workunit_ready() {
                 store: &missing,
             },
         },
-        0,
+        Default::default(),
         10,
         1300,
         "r1",
@@ -2699,13 +2701,13 @@ fn a_reopened_workunit_is_published_again_under_another_run() {
     let w = World::new("trivial");
     let wu = ready_job(&w, "e8");
     let store = Store::default();
-    export_run(&w, &store, 0, 10, 1300, "a");
+    export_run(&w, &store, Default::default(), 10, 1300, "a");
     let first = store.writes.borrow().clone();
     assert_eq!(
         block_on(reopen_assimilation(&w.db, &[wu], 1350)).unwrap(),
         [wu]
     );
-    let report = export_run(&w, &store, 0, 10, 1400, "b");
+    let report = export_run(&w, &store, Default::default(), 10, 1400, "b");
     assert_eq!(report.ack.acknowledged, [wu]);
     let second = store.writes.borrow()[first.len()..].to_vec();
     assert_eq!(second.len(), first.len());
@@ -2838,22 +2840,23 @@ fn failing_workunits_do_not_block_newer_ones() {
         }
     }
     let store = Store::default();
-    let first = export_run(&w, &store, 0, 2, 1300, "r1");
+    let first = export_run(&w, &store, Default::default(), 2, 1300, "r1");
     assert_eq!(first.exported, 0);
     assert_eq!(first.failed.iter().map(|f| f.0).collect::<Vec<_>>(), [a, b]);
     assert!(first.has_more);
-    assert_eq!(first.next_after, b);
+    assert_eq!(first.next.after, b);
+    assert!(first.next.until >= c);
 
     // Walking on from the cursor reaches the newer workunit.
-    let second = export_run(&w, &store, first.next_after, 2, 1300, "r1");
+    let second = export_run(&w, &store, first.next, 2, 1300, "r1");
     assert_eq!(second.ack.acknowledged, [c]);
     assert!(!second.has_more);
-    assert_eq!(second.next_after, 0);
+    assert_eq!(second.next, cb_core::export::Cursor::default());
     assert_eq!(w.wu(a).assimilate_state, ASSIMILATE_READY);
     assert_eq!(w.wu(b).assimilate_state, ASSIMILATE_READY);
 
     // At the end the walk starts over from the oldest.
-    let third = export_run(&w, &store, second.next_after, 2, 1400, "r1");
+    let third = export_run(&w, &store, second.next, 2, 1400, "r1");
     assert_eq!(third.failed.len(), 2);
 }
 
@@ -2866,10 +2869,33 @@ fn the_cursor_round_trips_and_a_bad_one_reads_as_the_start() {
         w: &w,
         store: &store,
     };
-    assert_eq!(block_on(read_cursor(&ex)).unwrap(), Cursor { after: 0 });
-    block_on(write_cursor(&ex, Cursor { after: 42 })).unwrap();
+    assert_eq!(block_on(read_cursor(&ex)).unwrap(), Cursor::default());
+    block_on(write_cursor(
+        &ex,
+        Cursor {
+            after: 42,
+            until: 99,
+        },
+    ))
+    .unwrap();
     assert_eq!(store.writes.borrow().last().unwrap(), CURSOR_KEY);
-    assert_eq!(block_on(read_cursor(&ex)).unwrap(), Cursor { after: 42 });
+    assert_eq!(
+        block_on(read_cursor(&ex)).unwrap(),
+        Cursor {
+            after: 42,
+            until: 99
+        }
+    );
+
+    // A cursor written before `until` existed reads with until 0.
+    store
+        .blobs
+        .borrow_mut()
+        .insert(CURSOR_KEY.to_string(), br#"{"after":5}"#.to_vec());
+    assert_eq!(
+        block_on(read_cursor(&ex)).unwrap(),
+        Cursor { after: 5, until: 0 }
+    );
 
     for garbage in [&b"not json"[..], b"{}", b"{\"after\":\"x\"}", b""] {
         store
@@ -2878,8 +2904,129 @@ fn the_cursor_round_trips_and_a_bad_one_reads_as_the_start() {
             .insert(CURSOR_KEY.to_string(), garbage.to_vec());
         assert_eq!(
             block_on(read_cursor(&ex)).unwrap(),
-            Cursor { after: 0 },
+            Cursor::default(),
             "{garbage:?}"
         );
     }
+}
+
+#[test]
+fn the_walk_ends_at_the_id_bound_it_started_with() {
+    use cb_core::export::Cursor;
+    let w = World::new("trivial");
+    let a = ready_job(&w, "w1");
+    let b = ready_job(&w, "w2");
+    let store = Store::default();
+    // Make the first two fail so they stay ready and the walk is visible.
+    let page = ready(&w, AssimilateList::Ready, 0, 0, 10);
+    for wu in &page.workunits {
+        for f in &wu.canonical_result.as_ref().unwrap().files {
+            w.files
+                .objects
+                .borrow_mut()
+                .remove(&(FileKind::Upload, f.name.clone()));
+        }
+    }
+    let first = export_run(&w, &store, Cursor::default(), 1, 1300, "r1");
+    assert_eq!(first.failed.iter().map(|f| f.0).collect::<Vec<_>>(), [a]);
+    assert_eq!(first.next, Cursor { after: a, until: b });
+
+    // Newer workunits become ready while the walk is under way.
+    let c = ready_job(&w, "w3");
+    let d = ready_job(&w, "w4");
+    assert!(c > b && d > c);
+    let second = export_run(&w, &store, first.next, 1, 1300, "r1");
+    assert_eq!(second.failed.iter().map(|f| f.0).collect::<Vec<_>>(), [b]);
+    assert!(!second.has_more);
+    assert_eq!(second.next, Cursor::default());
+    assert!(second.ack.acknowledged.is_empty());
+    assert_eq!(w.wu(c).assimilate_state, ASSIMILATE_READY);
+    assert_eq!(w.wu(d).assimilate_state, ASSIMILATE_READY);
+
+    // The next walk starts over and picks them up.
+    let third = export_run(&w, &store, second.next, 10, 1400, "r1");
+    assert_eq!(third.ack.acknowledged, [c, d]);
+    assert_eq!(third.failed.iter().map(|f| f.0).collect::<Vec<_>>(), [a, b]);
+}
+
+#[test]
+fn a_storage_error_fails_only_its_workunit() {
+    let w = World::new("trivial");
+    let a = ready_job(&w, "s1");
+    let b = ready_job(&w, "s2");
+    let c = ready_job(&w, "s3");
+    let page = ready(&w, AssimilateList::Ready, 0, 0, 10);
+    let bad = page.workunits[1].canonical_result.as_ref().unwrap().files[0]
+        .name
+        .clone();
+    assert_eq!(page.workunits[1].id, b);
+    w.files.fail_stat.borrow_mut().push(bad);
+    let store = Store::default();
+    let report = export(&w, &store, 10, 1300);
+    assert_eq!(report.exported, 2);
+    assert_eq!(report.ack.acknowledged, [a, c]);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, b);
+    assert!(
+        report.failed[0].1.starts_with("storage:"),
+        "{}",
+        report.failed[0].1
+    );
+    assert_eq!(w.wu(b).assimilate_state, ASSIMILATE_READY);
+    assert_eq!(w.wu(a).assimilate_state, ASSIMILATE_DONE);
+    assert_eq!(w.wu(c).assimilate_state, ASSIMILATE_DONE);
+    assert!(!store
+        .ledgers
+        .borrow()
+        .contains_key(&format!("ready/{b}-r1.json")));
+}
+
+#[test]
+fn an_output_named_twice_is_copied_once() {
+    const TWICE: &str = "<output_template>\n\
+<file_info><name><OUTFILE_0/></name><max_nbytes>100</max_nbytes><url><UPLOAD_URL/></url></file_info>\n\
+<result>\n\
+<file_ref><file_name><OUTFILE_0/></file_name><open_name>one</open_name></file_ref>\n\
+<file_ref><file_name><OUTFILE_0/></file_name><open_name>two</open_name></file_ref>\n\
+</result>\n</output_template>\n";
+    let w = World::new("trivial");
+    let wu = w.submit_job_with(
+        JobSpec {
+            name: "t1".into(),
+            min_quorum: Some(1),
+            target_nresults: Some(1),
+            ..Default::default()
+        },
+        TWICE,
+        1000,
+    );
+    let rs = w.results(wu);
+    w.dispatch(&rs[0], 1, 1100);
+    w.report(&rs[0], 1200, Some("x"), 0);
+    w.files.objects.borrow_mut().clear();
+    let outs = cb_core::template::output_files(&rs[0].xml_doc_in);
+    put_output(&w, &outs[0].name);
+    w.transition(wu, 1200);
+    assert_eq!(w.wu(wu).assimilate_state, ASSIMILATE_READY);
+
+    let store = Store::default();
+    let report = export(&w, &store, 10, 1300);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!((report.exported, report.files), (1, 1));
+    assert_eq!(report.ack.acknowledged, [wu]);
+    assert_eq!(
+        *store.writes.borrow(),
+        [
+            format!("files/{wu}-r1/{}", outs[0].name),
+            format!("ready/{wu}-r1.json")
+        ]
+    );
+    let ledger = store.ledgers.borrow()[&format!("ready/{wu}-r1.json")].clone();
+    let files = ledger["workunit"]["canonical_result"]["files"]
+        .as_array()
+        .unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["name"], files[1]["name"]);
+    assert_eq!(files[0]["open_name"], "one");
+    assert_eq!(files[1]["open_name"], "two");
 }

@@ -30,9 +30,12 @@
 //!
 //! A workunit is left ready, and tried again by a later pass, when a copy
 //! fails or does not match, or when a required output (uploadable and not
-//! `<optional/>`) is missing from the project bucket. Passes walk the ready
-//! list with a cursor that survives invocations, so workunits that keep failing
-//! never stop newer ones from being exported.
+//! `<optional/>`) is missing from the project bucket, and when its outputs
+//! cannot be looked up in storage. Passes walk the ready list with a cursor
+//! that survives invocations, so workunits that keep failing never stop newer
+//! ones from being exported. A walk ends at the highest workunit ID there was
+//! when it started, then the next one starts over from the oldest, so a steady
+//! stream of new work cannot keep the walk from coming back to older work.
 //!
 //! A crash after the ledger, before the acknowledgement, leaves the workunit
 //! ready, and so does an overlapping invocation; the workunit is then
@@ -47,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::upload::is_flat_name;
 use crate::work::{
-    acknowledge_assimilation_report, ready_to_assimilate, AckReport, AssimilateList, ReadyWorkunit,
+    acknowledge_assimilation_report, max_workunit_id, ready_for_export, AckReport, ReadyWorkunit,
 };
 use crate::{CoreResult, FileStat, Files};
 use cb_db::Db;
@@ -110,11 +113,17 @@ pub struct Ledger<'a> {
     pub workunit: &'a ReadyWorkunit,
 }
 
-/// The document at [`CURSOR_KEY`]: the next invocation lists ready workunits
-/// with IDs above `after`. 0 starts from the oldest.
+/// The document at [`CURSOR_KEY`]: where a walk over the ready list stands.
+/// The next pass lists ready workunits with IDs above `after` and at most
+/// `until`. `until` is fixed when a walk starts (the highest workunit ID at
+/// that time), so workunits that become ready faster than the walk advances
+/// cannot keep it from ever coming back to the older ones. `until` 0 starts a
+/// new walk bounded by the highest ID then.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Cursor {
     pub after: i64,
+    #[serde(default)]
+    pub until: i64,
 }
 
 /// The stored cursor; a missing or unreadable one starts from the oldest.
@@ -144,55 +153,60 @@ pub struct ExportReport {
     /// The acknowledgement of the exported workunits. The caller queues a
     /// transition for each ID in `acknowledged`.
     pub ack: AckReport,
-    /// More workunits were ready after this pass's page.
+    /// More workunits of this walk were ready after this pass's page.
     pub has_more: bool,
-    /// Where the next pass starts: the last listed ID while more follow, 0
-    /// once the end of the list is reached (the next pass then goes back to
-    /// the oldest, failed workunits included).
-    pub next_after: i64,
+    /// Where the next pass starts: the last listed ID while more of this walk
+    /// follow, and 0 (with `next.until` 0) once the walk reaches its end. The
+    /// next pass then starts a new walk from the oldest, failed workunits
+    /// included.
+    pub next: Cursor,
 }
 
-/// Exports up to `limit` ready workunits (1 to 500) with IDs above `after`,
-/// oldest first, as publications of `run`, and acknowledges the ones whose
-/// files and ledger are in place. Two database statements whatever the
-/// count: the list and the acknowledgement.
+/// Exports up to `limit` ready workunits (1 to 500) from `cursor`, oldest
+/// first, as publications of `run`, and acknowledges the ones whose files and
+/// ledger are in place. Two database statements whatever the count (the list
+/// and the acknowledgement), and a third when the pass starts a walk.
 pub async fn export_pass(
     db: &dyn Db,
     files: &dyn Files,
     store: &dyn ResultStore,
-    after: i64,
+    cursor: Cursor,
     limit: i64,
     now: i64,
     run: &str,
 ) -> CoreResult<ExportReport> {
-    let page = ready_to_assimilate(
-        db,
-        files,
-        None,
-        AssimilateList::Ready,
-        after.max(0),
-        0,
-        limit,
-    )
-    .await?;
-    let next_after = match page.workunits.last() {
-        Some(last) if page.has_more => last.id,
-        _ => 0,
+    let after = cursor.after.max(0);
+    let until = if cursor.until > 0 {
+        cursor.until
+    } else {
+        max_workunit_id(db).await?
+    };
+    let (page, has_more) = ready_for_export(db, files, after, until, limit).await?;
+    let next = match page.last() {
+        Some((last, _)) if has_more => Cursor {
+            after: *last,
+            until,
+        },
+        _ => Cursor::default(),
     };
     let mut report = ExportReport {
-        has_more: page.has_more,
-        next_after,
+        has_more,
+        next,
         ..ExportReport::default()
     };
     let mut done = Vec::new();
-    for wu in &page.workunits {
-        match export_one(store, wu, now, run).await {
+    for (id, wu) in &page {
+        let outcome = match wu {
+            Ok(wu) => export_one(store, wu, now, run).await,
+            Err(e) => Err(format!("storage: {e}")),
+        };
+        match outcome {
             Ok(n) => {
                 report.exported += 1;
                 report.files += n;
-                done.push(wu.id);
+                done.push(*id);
             }
-            Err(reason) => report.failed.push((wu.id, reason)),
+            Err(reason) => report.failed.push((*id, reason)),
         }
     }
     if !done.is_empty() {
@@ -211,13 +225,12 @@ async fn export_one(
 ) -> Result<usize, String> {
     let mut copied = 0;
     if let Some(canonical) = &wu.canonical_result {
-        let mut seen = std::collections::HashSet::new();
+        // Two template references can name one stored file; it is copied once,
+        // and the ledger keeps both references.
+        let mut copied_names = std::collections::HashSet::new();
         for f in &canonical.files {
             if !is_flat_name(&f.name) {
                 return Err(format!("file name {:?} cannot be a key", f.name));
-            }
-            if !seen.insert(f.name.as_str()) {
-                return Err(format!("file {} listed twice", f.name));
             }
             if !f.present {
                 if f.required {
@@ -226,6 +239,9 @@ async fn export_one(
                         f.name
                     ));
                 }
+                continue;
+            }
+            if copied_names.contains(f.name.as_str()) {
                 continue;
             }
             let key = file_key(wu.id, run, &f.name);
@@ -241,7 +257,10 @@ async fn export_one(
                         f.name, s.nbytes, s.md5, f.nbytes, f.md5
                     ))
                 }
-                Some(_) => copied += 1,
+                Some(_) => {
+                    copied += 1;
+                    copied_names.insert(f.name.as_str());
+                }
             }
         }
     }

@@ -1269,14 +1269,15 @@ binding, on a cron trigger of its own (`EXPORT_CRON`, every two minutes, in
 Every export of a workunit is a publication of its own, named `<workunit id>-<run>`. The
 workunit ID is never reused (a name can be, once the row is purged), and `run` is random per cron
 invocation. Each invocation reads the cursor `export/cursor.json` in the results bucket (an
-object for the export's own use, not for consumers) and makes up to four passes. Each pass reads
-up to 25 workunits with IDs above the cursor from the ready list (`ready_to_assimilate`, every
-app, in ID order) and, for each:
+object for the export's own use, not for consumers), `{"after", "until"}`, and makes up to four
+passes. Each pass reads up to 25 workunits with IDs above `after` and at most `until` from the
+ready list (`ready_to_assimilate`, every app, in ID order) and, for each:
 
 1. copies every present output of the canonical result from `upload/<name>` in the project bucket
    to `files/<workunit id>-<run>/<name>` in the results bucket. The put carries the listed MD5,
    so R2 refuses a copy whose bytes differ, and the stored size and MD5 are compared with the
-   listing as well;
+   listing as well. One stored file named by two references of the template is copied once, and
+   the ledger lists both references;
 2. writes the ledger `ready/<workunit id>-<run>.json`, `{"schema": 2, "exported_at", "run",
    "files_prefix", "workunit"}`, where `workunit` is the workunit exactly as
    `GET /admin/v1/assimilate` lists it (open names, template positions, `present` and `required`
@@ -1285,13 +1286,18 @@ app, in ID order) and, for each:
 3. then acknowledges the workunits whose files and ledger are in place, in one call, and queues
    their transitions as the admin acknowledgement does.
 
-A workunit whose copy fails, that lists a file name which cannot be a key, or that is missing a required output
+A workunit whose copy fails, whose outputs cannot be looked up in storage (a storage error for
+one workunit fails that workunit, reported as `storage: ...`, and not the pass), that lists a file
+name which cannot be a key, or that is missing a required output
 (an output the client is told to upload and the template does not mark `<optional/>`, which the
 listing shows with `required` true and `present` false) is logged and left ready. The walk does
 not stop there: the cursor moves on to newer workunits, so a workunit that keeps failing never
-blocks the ones behind it. When the walk reaches the end of the ready list the cursor wraps to
-the oldest, and the failed workunits are tried again. The pass sends two statements whatever the
-count (the list and the acknowledgement).
+blocks the ones behind it. The upper bound of a walk is fixed when it starts: with `until` 0 the
+pass reads the highest workunit ID (one more statement) and keeps it in the cursor as `until`
+while the walk has more, so workunits that become ready faster than the walk advances cannot keep
+it from coming back. When the walk reaches `until` the cursor resets to 0 and the next walk
+starts from the oldest, failed workunits and newer ones included. A pass sends two statements
+whatever the count (the list and the acknowledgement), and a third when it starts a walk.
 
 A crash between the ledger and the acknowledgement leaves the workunit ready, and so does an
 overlapping invocation. The workunit is then published again under another run, so a consumer
