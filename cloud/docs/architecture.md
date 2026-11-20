@@ -80,7 +80,7 @@ flowchart LR
 | `feeder` and the shared-memory job cache | an indexed query on unsent results plus an atomic claim (see "Dispatch without a feeder") |
 | `transitioner` | `pipeline` Worker, driven by the queue, with a cron sweep for deadlines |
 | validators | `pipeline` Worker: built-in trivial and bitwise validators, and a webhook validator for project code |
-| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API |
+| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API, or the pipeline exports it to a results bucket |
 | `file_deleter` | part of the transition in the `pipeline` Worker |
 | `db_purge` | cron handler in the `pipeline` Worker |
 | `file_upload_handler` | `files` Worker writing to R2 |
@@ -1164,9 +1164,9 @@ reply:
         "elapsed_time": 100.0,
         "granted_credit": 0.46,
         "files": [
-          {"name": "job_1234_0_0", "open_name": "out", "index": 0, "present": true, "nbytes": 3, "md5": "0cc175b9c0f1b6a831c399e269772661"},
-          {"name": "job_1234_0_2", "open_name": null, "index": 2, "present": true, "nbytes": 1, "md5": "92eb5ffee6ae2fec3ad71c777531578f"},
-          {"name": "job_1234_0_3", "open_name": "extra", "index": 3, "present": false, "nbytes": 0, "md5": ""}
+          {"name": "job_1234_0_0", "open_name": "out", "index": 0, "present": true, "required": true, "nbytes": 3, "md5": "0cc175b9c0f1b6a831c399e269772661"},
+          {"name": "job_1234_0_2", "open_name": null, "index": 2, "present": true, "required": true, "nbytes": 1, "md5": "92eb5ffee6ae2fec3ad71c777531578f"},
+          {"name": "job_1234_0_3", "open_name": "extra", "index": 3, "present": false, "required": false, "nbytes": 0, "md5": ""}
         ]
       }
     }
@@ -1194,6 +1194,10 @@ reply:
   `/admin/v1/outputs/<name>` answers 404. A successful workunit whose files are all absent shows
   every file with `present` false, which is different from a workunit whose template names no
   output files (an empty `files`).
+- `required` is true when the client is told to upload the file and the template does not mark
+  it `<optional/>` (`OutputFileInfo` in `crates/cb-core/src/work.rs`). A successful result then
+  has the file, so a required file with `present` false has gone missing from storage. An
+  optional file, or one with no upload URL, has `required` false.
 - `has_more` is true when another workunit follows this page, and `next_after` is the ID to pass
   as `after` for the next page (null when the page is empty). A page that ends exactly at the
   last workunit has `has_more` false.
@@ -1252,6 +1256,61 @@ marks files for deletion (see "Job pipeline"). `POST /admin/v1/assimilate/reopen
 
 `cboinc assimilate` takes `--state` and `--since`, and `cboinc assimilate-reopen --workunit-id N`
 (repeatable) calls the re-open route.
+
+#### Export to a results bucket
+
+A deployment can let the pipeline assimilate into a second R2 bucket instead of pulling
+(`export_pass` in `crates/cb-core/src/export.rs`). The consumer then needs only a token for that
+bucket: no admin token and no call to the server, and the outputs stay there after the server
+deletes its copies and purges the rows. It runs when the pipeline Worker has a `RESULTS` bucket
+binding, on a cron trigger of its own (`EXPORT_CRON`, every two minutes, in
+`workers/pipeline/src/lib.rs`), and does nothing without the binding.
+
+Every export of a workunit is a publication of its own, named `<workunit id>-<run>`. The
+workunit ID is never reused (a name can be, once the row is purged), and `run` is random per cron
+invocation. Each invocation reads the cursor `export/cursor.json` in the results bucket (an
+object for the export's own use, not for consumers), `{"after", "until"}`, and makes up to four
+passes. Each pass reads up to 25 workunits with IDs above `after` and at most `until` from the
+ready list (`ready_to_assimilate`, every app, in ID order) and, for each:
+
+1. copies every present output of the canonical result from `upload/<name>` in the project bucket
+   to `files/<workunit id>-<run>/<name>` in the results bucket. The put carries the listed MD5,
+   so R2 refuses a copy whose bytes differ, and the stored size and MD5 are compared with the
+   listing as well. One stored file named by two references of the template is copied once, and
+   the ledger lists both references;
+2. writes the ledger `ready/<workunit id>-<run>.json`, `{"schema": 2, "exported_at", "run",
+   "files_prefix", "workunit"}`, where `workunit` is the workunit exactly as
+   `GET /admin/v1/assimilate` lists it (open names, template positions, `present` and `required`
+   included). The ledger is written after the files, so a ledger marks a complete workunit. A
+   failed workunit gets a ledger and no files;
+3. then acknowledges the workunits whose files and ledger are in place, in one call, and queues
+   their transitions as the admin acknowledgement does.
+
+A workunit whose copy fails, whose outputs cannot be looked up in storage (a storage error for
+one workunit fails that workunit, reported as `storage: ...`, and not the pass), that lists a file
+name which cannot be a key, or that is missing a required output
+(an output the client is told to upload and the template does not mark `<optional/>`, which the
+listing shows with `required` true and `present` false) is logged and left ready. The walk does
+not stop there: the cursor moves on to newer workunits, so a workunit that keeps failing never
+blocks the ones behind it. The upper bound of a walk is fixed when it starts: with `until` 0 the
+pass reads the highest workunit ID (one more statement) and keeps it in the cursor as `until`
+while the walk has more, so workunits that become ready faster than the walk advances cannot keep
+it from coming back. When the walk reaches `until` the cursor resets to 0 and the next walk
+starts from the oldest, failed workunits and newer ones included. A pass sends two statements
+whatever the count (the list and the acknowledgement), and a third when it starts a walk.
+
+A crash between the ledger and the acknowledgement leaves the workunit ready, and so does an
+overlapping invocation. The workunit is then published again under another run, so a consumer
+can see a workunit twice and should key on the workunit ID. A workunit re-opened with
+`/admin/v1/assimilate/reopen` is published again the same way. The files of an attempt that
+failed before its ledger are never named by a ledger; the results bucket's lifecycle rule removes
+them.
+
+The consumer lists `ready/`, fetches the files the ledger names under `files_prefix`, checks
+each against the ledger's `nbytes` and `md5`, and deletes the ledger and that prefix when it has
+them. Deleting one publication never touches another's files. A consumer must ignore `export/`.
+A lifecycle rule on the results bucket is the backstop for a consumer that stops (see "Results
+bucket" in `docs/deploy.md`).
 
 ### Credit
 

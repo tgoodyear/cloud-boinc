@@ -100,8 +100,8 @@ dev/build.sh
 for w in scheduler files pipeline web admin; do (cd workers/$w && npx wrangler deploy); done
 ```
 
-The configs declare the routes, the queue consumer and the pipeline's two cron triggers (the
-sweep every minute, the purge every five) for `wrangler deploy` to create. The dev deployment's resources and Workers were created through
+The configs declare the routes, the queue consumer and the pipeline's three cron triggers (the
+sweep every minute, the purge every five, the export to a results bucket every two) for `wrangler deploy` to create. The dev deployment's resources and Workers were created through
 the Cloudflare API, so the `wrangler` commands on this page have not been run as written.
 
 ## Stock layout routes
@@ -222,6 +222,43 @@ adds (see step 4 under Email).
 `migrations/0005_upload_epoch.sql` adds the table the files Worker reads to tell the pieces of a
 resent task's earlier attempt from its current one; apply it before the scheduler and files
 Workers that use it are deployed.
+
+## Results bucket
+
+Optional. With a second bucket bound to the pipeline Worker as `RESULTS`, the pipeline copies
+each finished workunit's canonical outputs there with a ledger and acknowledges it itself (see
+"Export to a results bucket" in `architecture.md`). The project's consumer then reads that
+bucket with a token scoped to it, and needs no admin token. Leave the binding out to keep pulling
+from the admin API; the export trigger then does nothing.
+
+```
+npx wrangler r2 bucket create cloud-boinc-dev-results
+```
+
+and in `workers/pipeline/wrangler.toml`:
+
+```
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "cloud-boinc-dev-results"
+```
+
+Run one consumer of the results bucket or of the admin API, not both: the export acknowledges
+what it copies, so a puller would find the ready list empty. Give the consumer an R2 API token
+for this bucket only, with object read and write (R2 tokens are scoped to buckets, not prefixes;
+write is for deleting what it has taken under `ready/` and `files/`). The consumer must leave
+`export/` alone: the pipeline keeps its cursor there (`export/cursor.json`), and rewrites it on
+every export run, so the lifecycle rule below never expires it.
+A lifecycle rule is the backstop for a consumer that stops, and it also removes the files of an
+export attempt that failed before its ledger; set it longer than the consumer could ever fall
+behind:
+
+```
+npx wrangler r2 bucket lifecycle add cloud-boinc-dev-results --name taken --prefix "" --expire-days 30
+```
+
+The export adds a third cron trigger to the pipeline Worker. Each pass copies through the
+Worker, so its CPU time grows with the size of the outputs.
 
 ## Dashboards
 
