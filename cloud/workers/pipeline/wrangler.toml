@@ -35,4 +35,6 @@ max_retries = 5
 
 [triggers]
 # Every minute: the sweep. Every five minutes: the purge (PURGE_CRON in src/lib.rs).
-crons = ["* * * * *", "*/5 * * * *"]
+# Every two minutes: the export to the results bucket (EXPORT_CRON), which does
+# nothing while no RESULTS bucket is bound (see docs/deploy.md, "Results bucket").
+crons = ["* * * * *", "*/5 * * * *", "*/2 * * * *"]

@@ -80,7 +80,7 @@ flowchart LR
 | `feeder` and the shared-memory job cache | an indexed query on unsent results plus an atomic claim (see "Dispatch without a feeder") |
 | `transitioner` | `pipeline` Worker, driven by the queue, with a cron sweep for deadlines |
 | validators | `pipeline` Worker: built-in trivial and bitwise validators, and a webhook validator for project code |
-| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API |
+| assimilators | `pipeline` Worker marks work ready; the project pulls it from the admin API, or the pipeline exports it to a results bucket |
 | `file_deleter` | part of the transition in the `pipeline` Worker |
 | `db_purge` | cron handler in the `pipeline` Worker |
 | `file_upload_handler` | `files` Worker writing to R2 |
@@ -1252,6 +1252,41 @@ marks files for deletion (see "Job pipeline"). `POST /admin/v1/assimilate/reopen
 
 `cboinc assimilate` takes `--state` and `--since`, and `cboinc assimilate-reopen --workunit-id N`
 (repeatable) calls the re-open route.
+
+#### Export to a results bucket
+
+A deployment can let the pipeline assimilate into a second R2 bucket instead of pulling
+(`export_pass` in `crates/cb-core/src/export.rs`). The consumer then needs only a token for that
+bucket: no admin token and no call to the server, and the outputs stay there after the server
+deletes its copies and purges the rows. It runs when the pipeline Worker has a `RESULTS` bucket
+binding, on a cron trigger of its own (`EXPORT_CRON`, every two minutes, in
+`workers/pipeline/src/lib.rs`), and does nothing without the binding.
+
+Each pass reads up to 25 workunits from the ready list (`ready_to_assimilate`, every app, in ID
+order) and, for each:
+
+1. copies every present output of the canonical result from `upload/<name>` in the project bucket
+   to `files/<workunit name>/<name>` in the results bucket. The put carries the listed MD5, so
+   R2 refuses a copy whose bytes differ, and the stored size and MD5 are compared with the
+   listing as well;
+2. writes the ledger `ready/<workunit name>.json`, `{"schema": 1, "exported_at", "files_prefix",
+   "workunit"}`, where `workunit` is the workunit exactly as `GET /admin/v1/assimilate` lists it
+   (open names, template positions and `present` included). The ledger is written after the
+   files, so a ledger marks a complete workunit. A failed workunit gets a ledger and no files;
+3. then acknowledges the workunits whose files and ledger are in place, in one call, and queues
+   their transitions as the admin acknowledgement does.
+
+A workunit whose copy fails, whose output is gone, or whose name cannot be a key, is logged and
+left ready, and the pass stops paging so that it does not meet it again at once. The pass sends
+two statements whatever the count (the list and the acknowledgement); an invocation makes up
+to four passes. A crash between the ledger and the acknowledgement leaves the workunit ready,
+and the next pass writes the same keys again, so a consumer may see a ledger twice and should key
+on the workunit ID. A workunit re-opened with `/admin/v1/assimilate/reopen` is exported again.
+
+The consumer lists `ready/`, fetches the files the ledger names under `files_prefix`, checks
+each against the ledger's `nbytes` and `md5`, and deletes the ledger and the files when it has
+them. A lifecycle rule on the results bucket is the backstop for a consumer that stops (see
+"Results bucket" in `docs/deploy.md`).
 
 ### Credit
 

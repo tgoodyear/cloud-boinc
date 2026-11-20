@@ -1,15 +1,19 @@
 //! The job pipeline: a consumer of the `transitions` queue, a cron sweep
 //! for workunits whose `transition_time` has passed, and a second cron
 //! that purges finished workunits, carries on account deletions and runs the
-//! rollup behind the dashboards.
+//! rollup behind the dashboards, and, when a results bucket is bound, a third
+//! that assimilates finished work into it (`cb_core::export`).
 
 use std::collections::BTreeSet;
 
 use cb_core::cron::run_cron;
+use cb_core::export::{export_pass, EXPORT_BATCH};
 use cb_core::pipeline::{due_workunits, transition, Ctx, TransitionReport};
 use cb_core::status::record_sweep;
 use cb_core::CoreResult;
-use cb_worker::{db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Files, BUCKET};
+use cb_worker::{
+    db, enqueue, now, project, random_u32, signer, FetchWebhook, R2Export, R2Files, BUCKET,
+};
 use worker::{
     console_error, console_log, event, Context, Env, MessageBatch, MessageExt, Result,
     ScheduleContext, ScheduledEvent,
@@ -22,6 +26,11 @@ const SWEEP_LIMIT: i64 = 500;
 /// trigger runs the sweep. The purge has an invocation of its own so that
 /// its queries do not come out of the sweep's allowance.
 const PURGE_CRON: &str = "*/5 * * * *";
+/// The cron expression of the export trigger. It runs in an invocation of
+/// its own too, and does nothing unless the `RESULTS` bucket is bound.
+const EXPORT_CRON: &str = "*/2 * * * *";
+/// Export passes one invocation makes at most; each sends two statements.
+const EXPORT_PASSES: usize = 4;
 
 struct Runner {
     db: cb_worker::D1Db,
@@ -165,11 +174,49 @@ async fn purge_cron(env: &Env) -> Result<()> {
     Ok(())
 }
 
+/// Assimilates finished work into the results bucket, a page at a time, while
+/// pages are full and the pass budget lasts.
+async fn export_cron(env: &Env) -> Result<()> {
+    let Some(store) = R2Export::from_env(env)? else {
+        return Ok(());
+    };
+    let db = db(env)?;
+    let files = R2Files(env.bucket(BUCKET)?);
+    for _ in 0..EXPORT_PASSES {
+        let report = export_pass(&db, &files, &store, EXPORT_BATCH, now())
+            .await
+            .map_err(cb_worker::core_err)?;
+        enqueue(env, &report.ack.acknowledged).await;
+        for (id, reason) in &report.failed {
+            console_error!("export: workunit {id} left ready: {reason}");
+        }
+        if report.exported > 0 || !report.failed.is_empty() {
+            console_log!(
+                "export: {} workunits, {} files, {} acknowledged, {} failed",
+                report.exported,
+                report.files,
+                report.ack.acknowledged.len(),
+                report.failed.len()
+            );
+        }
+        // A failure stays at the head of the list, so another pass now
+        // would only meet it again.
+        if !report.has_more || !report.failed.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     if event.cron() == PURGE_CRON {
         if let Err(e) = purge_cron(&env).await {
             console_error!("purge cron: {e}");
+        }
+    } else if event.cron() == EXPORT_CRON {
+        if let Err(e) = export_cron(&env).await {
+            console_error!("export cron: {e}");
         }
     } else if let Err(e) = sweep(env).await {
         console_error!("sweep: {e}");

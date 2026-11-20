@@ -18,12 +18,18 @@ pub use email::{mailer, EmailBinding, EMAIL};
 pub use feed::{fetch_feed, FEED_TIMEOUT_MS};
 use futures_util::StreamExt;
 use worker::wasm_bindgen::JsValue;
-use worker::{Bucket, Date, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result};
+use worker::{
+    Bucket, Date, Env, Fetch, FixedLengthStream, Headers, Method, Request, RequestInit, Response,
+    Result,
+};
 
 /// Binding names, the same in every Worker's `wrangler.toml`.
 pub const DB: &str = "DB";
 pub const BUCKET: &str = "FILES";
 pub const QUEUE: &str = "TRANSITIONS";
+/// Optional, pipeline only: the bucket finished work is assimilated into
+/// (`cb_core::export`). Without the binding nothing is exported.
+pub const RESULTS_BUCKET: &str = "RESULTS";
 /// Secret: the upload private key, in the BOINC key file format.
 pub const SECRET_UPLOAD_KEY: &str = "UPLOAD_PRIVATE_KEY";
 /// Secret: admin bearer tokens, separated by commas.
@@ -231,6 +237,18 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The 16 bytes of a 32-digit hex MD5, or `None` for anything else.
+fn md5_bytes(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 pub fn object_key(kind: FileKind, name: &str) -> String {
     format!("{}{}", kind.prefix(), name)
 }
@@ -276,6 +294,72 @@ impl Files for R2Files {
     async fn put(&self, kind: FileKind, name: &str, bytes: Vec<u8>) -> CoreResult<()> {
         self.0
             .put(object_key(kind, name), bytes)
+            .execute()
+            .await
+            .map_err(files_err)?;
+        Ok(())
+    }
+}
+
+/// The project bucket and the results bucket behind the core's
+/// [`cb_core::export::ResultStore`] trait.
+pub struct R2Export {
+    pub project: Bucket,
+    pub results: Bucket,
+}
+
+impl R2Export {
+    /// The pair, or `None` when the Worker has no results bucket bound.
+    pub fn from_env(env: &Env) -> Result<Option<Self>> {
+        let Ok(results) = env.bucket(RESULTS_BUCKET) else {
+            return Ok(None);
+        };
+        Ok(Some(R2Export {
+            project: env.bucket(BUCKET)?,
+            results,
+        }))
+    }
+}
+
+#[async_trait(?Send)]
+impl cb_core::export::ResultStore for R2Export {
+    async fn copy_output(&self, name: &str, key: &str, md5: &str) -> CoreResult<Option<FileStat>> {
+        let Some(object) = self
+            .project
+            .get(object_key(FileKind::Upload, name))
+            .execute()
+            .await
+            .map_err(files_err)?
+        else {
+            return Ok(None);
+        };
+        let size = object.size();
+        let Some(body) = object.body() else {
+            return Ok(None);
+        };
+        let stream = FixedLengthStream::wrap(body.stream().map_err(files_err)?, size);
+        let mut put = self.results.put(key, stream);
+        // R2 refuses the write when the bytes do not have this MD5.
+        if let Some(want) = md5_bytes(md5) {
+            put = put.md5(want.to_vec());
+        }
+        let Some(stored) = put.execute().await.map_err(files_err)? else {
+            return Err(CoreError::Files(format!("{key}: the put stored nothing")));
+        };
+        let md5 = stored
+            .checksum()
+            .md5
+            .map(|m| hex(&m))
+            .ok_or_else(|| CoreError::Files(format!("{key}: the copy has no MD5")))?;
+        Ok(Some(FileStat {
+            nbytes: stored.size(),
+            md5,
+        }))
+    }
+
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> CoreResult<()> {
+        self.results
+            .put(key, bytes)
             .execute()
             .await
             .map_err(files_err)?;
