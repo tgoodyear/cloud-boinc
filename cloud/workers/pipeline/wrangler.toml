@@ -23,6 +23,11 @@ migrations_dir = "../../migrations"
 binding = "FILES"
 bucket_name = "cloud-boinc-dev"
 
+# The results bucket the export writes to (docs/deploy.md, "Results bucket").
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "cloud-boinc-dev-results"
+
 [[queues.producers]]
 binding = "TRANSITIONS"
 queue = "cloud-boinc-dev-transitions"
@@ -36,5 +41,6 @@ max_retries = 5
 [triggers]
 # Every minute: the sweep. Every five minutes: the purge (PURGE_CRON in src/lib.rs).
 # Every two minutes: the export to the results bucket (EXPORT_CRON), which does
-# nothing while no RESULTS bucket is bound (see docs/deploy.md, "Results bucket").
+# nothing in a deployment that binds no RESULTS bucket (see docs/deploy.md,
+# "Results bucket").
 crons = ["* * * * *", "*/5 * * * *", "*/2 * * * *"]
