@@ -5,8 +5,8 @@ Cloudflare zone. The `wrangler.toml` files under `workers/` describe the referen
 deployment at `boinc-dev.usnewsmap.com`. For another deployment, change the route patterns,
 `zone_name`, `database_id` and the database, bucket and queue names in all five.
 
-You need Rust with the `wasm32-unknown-unknown` target, `worker-build` (`cargo install
-worker-build`), Node.js for `wrangler`, and a Cloudflare API token that can edit Workers, D1,
+You need Rust with the `wasm32-unknown-unknown` target, `worker-build` 0.8 (`cargo install
+worker-build --version ^0.8`; 0.9 refuses the `worker` 0.8 crate these Workers use), Node.js for `wrangler`, and a Cloudflare API token that can edit Workers, D1,
 R2, Queues and the zone's routes and DNS.
 
 ## Local stack
