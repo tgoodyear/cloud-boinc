@@ -1,6 +1,6 @@
 # Deploying
 
-A deployment is five Workers, one D1 database, one R2 bucket and one queue on a hostname in a
+A deployment is five Workers, one D1 database, two R2 buckets (files and results) and one queue on a hostname in a
 Cloudflare zone. The `wrangler.toml` files under `workers/` describe the reference dev
 deployment at `boinc-dev.usnewsmap.com`. For another deployment, change the route patterns,
 `zone_name`, `database_id` and the database, bucket and queue names in all five.
@@ -52,6 +52,7 @@ verifies the signatures stored in the imported app versions. See [migration.md](
 ```
 npx wrangler d1 create cloud-boinc-dev
 npx wrangler r2 bucket create cloud-boinc-dev
+npx wrangler r2 bucket create cloud-boinc-dev-results
 npx wrangler queues create cloud-boinc-dev-transitions
 ```
 
@@ -225,23 +226,20 @@ Workers that use it are deployed.
 
 ## Results bucket
 
-Optional. With a second bucket bound to the pipeline Worker as `RESULTS`, the pipeline copies
-each finished workunit's canonical outputs there with a ledger and acknowledges it itself (see
-"Export to a results bucket" in `architecture.md`). The project's consumer then reads that
-bucket with a token scoped to it, and needs no admin token. Leave the binding out to keep pulling
-from the admin API; the export trigger then does nothing.
-
-```
-npx wrangler r2 bucket create cloud-boinc-dev-results
-```
-
-and in `workers/pipeline/wrangler.toml`:
+The reference `workers/pipeline/wrangler.toml` binds a second bucket as `RESULTS`:
 
 ```
 [[r2_buckets]]
 binding = "RESULTS"
 bucket_name = "cloud-boinc-dev-results"
 ```
+
+With it bound, the pipeline copies each finished workunit's canonical outputs there with a
+ledger and acknowledges it itself (see "Export to a results bucket" in `architecture.md`). The
+project's consumer then reads that bucket with a token scoped to it, and needs no admin token.
+A deployment that pulls from the admin API instead removes that block from
+`workers/pipeline/wrangler.toml` before deploying, and skips creating the bucket; the export
+trigger then does nothing.
 
 Run one consumer of the results bucket or of the admin API, not both: the export acknowledges
 what it copies, so a puller would find the ready list empty. Give the consumer an R2 API token
